@@ -83,7 +83,13 @@ The CDB startup path then truncates the unreadable tail to the last valid record
   strategy.
 - Snapshot visibility before and after a batch commit.
 - Index fold visibility for add, remove, and add/remove specs in one batch.
-- Hot backup compatibility.
+- Hot backup compatibility for the standard `retain` path, including
+  journal-only restore after a batch and journal-only restore after
+  replacement/delete batches have been compacted.
+- Reload of a single batch larger than `?LOADING_BATCH`; the explicit coverage
+  uses a 500-object patch-sized batch and verifies every value and secondary
+  index from journal rebuild.
+- SQN-order object folds over multiple same-SQN batch records.
 - CDB partial-tail behavior for multi-record writes. The chosen behavior is to
   ignore an incomplete same-SQN batch during startup replay and continue from the
   last complete committed batch.
@@ -95,6 +101,13 @@ compaction. Existing reload strategies therefore keep their standard meaning:
 `retain` keeps enough key deltas to rebuild indexes after journal compaction,
 `recovr` keeps its existing recovery contract, and app-defined `recalc` tags can
 recompute indexes from app metadata during reload.
+
+Hot backup keeps leveled's existing reload-strategy constraint: backups are
+unsafe for indexed data under `recovr`, because `recovr` deliberately allows old
+key-change history to be discarded and expects ledger loss to be recovered by an
+external anti-entropy path. HyperBob's standard object path uses `retain`, so a
+journal-only hot backup can rebuild current values and secondary indexes after
+batch writes and after retain compaction.
 
 Policy: app-defined `recalc` tags are supported for batch writes. The test suite
 includes a custom tag with override metadata extraction and index diffing, writes

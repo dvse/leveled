@@ -108,7 +108,18 @@ Focused tests added in `leveled_bookie` cover:
 - journal compaction under `retain`;
 - `recovr` reload and app-defined `recalc`;
 - snapshots and folds, including early fold termination;
+- hot backup from a batch-written journal-only backup;
+- hot backup after replacement/delete batches and retain compaction, restored
+  from journal without a ledger;
+- 500-object batch reload from journal, verifying every value and secondary
+  index;
+- `sqn_order` objectfold over multiple same-SQN batch records;
 - pause semantics.
+
+Hot backup preserves leveled's existing safety boundary: indexed data is unsafe
+with `recovr` because that strategy may discard the key-change history needed to
+rebuild a lost ledger. The batch API is covered for the standard `retain` path,
+which is the intended HyperBob usage.
 
 Policy note: app-defined `recalc` tags are supported for standard batch writes.
 Coverage includes a custom tag with override metadata extraction and index
