@@ -53,6 +53,8 @@
     book_put/6,
     book_put/8,
     book_tempput/7,
+    book_batchput/2,
+    book_batchput/3,
     book_mput/2,
     book_mput/3,
     book_delete/4,
@@ -576,6 +578,28 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
         {put, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync},
         infinity
     ).
+
+-spec book_batchput(pid(), list(leveled_codec:batch_object_spec())) ->
+    ok | pause | {error, term()}.
+%% @doc
+%%
+%% Batch standard-mode object puts/deletes under one Bookie call. The batch is
+%% invalid in head_only mode. All objects are written to the Journal under one
+%% SQN, and their object/index ledger changes are inserted into the ledger
+%% cache before the caller is acknowledged. A `pause' return has the same
+%% meaning as book_put/8: the batch has been accepted, and the caller should
+%% back off before sending more writes.
+book_batchput(Pid, BatchSpecs) ->
+    book_batchput(Pid, BatchSpecs, false).
+
+-spec book_batchput(
+    pid(), list(leveled_codec:batch_object_spec()), boolean()
+) ->
+    ok | pause | {error, term()}.
+%% @doc
+%% See book_batchput/2.  DataSync applies to the whole batch.
+book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
+    gen_server:call(Pid, {batchput, BatchSpecs, DataSync}, infinity).
 
 -spec book_mput(pid(), list(leveled_codec:object_spec())) -> ok | pause.
 %% @doc
@@ -1503,6 +1527,86 @@ handle_call(
         {returned, Cache} ->
             {noreply, State#state{slow_offer = true, ledger_cache = Cache}}
     end;
+handle_call({batchput, BatchSpecs, DataSync}, From, State) when
+    State#state.head_only == false
+->
+    case normalise_batch_specs(BatchSpecs) of
+        {ok, ObjectChanges} ->
+            SWLR = os:timestamp(),
+            SW0 = leveled_monitor:maybe_time(State#state.monitor),
+            case
+                leveled_inker:ink_batchput(
+                    State#state.inker,
+                    ObjectChanges,
+                    DataSync
+                )
+            of
+                {ok, SQN, ObjectWriteInfos} ->
+                    {T0, SW1} = leveled_monitor:step_time(SW0),
+                    PreparedChanges =
+                        lists:map(
+                            fun({LedgerKey, Object, KeyChanges, ObjSize}) ->
+                                preparefor_ledgercache(
+                                    null,
+                                    LedgerKey,
+                                    SQN,
+                                    Object,
+                                    ObjSize,
+                                    KeyChanges
+                                )
+                            end,
+                            ObjectWriteInfos
+                        ),
+                    {T1, SW2} = leveled_monitor:step_time(SW1),
+                    Cache0 =
+                        lists:foldl(
+                            fun addto_ledgercache/2,
+                            State#state.ledger_cache,
+                            PreparedChanges
+                        ),
+                    ObjSizeTotal =
+                        lists:sum([
+                            ObjSize
+                         || {_LK, _Obj, _KeyChanges, ObjSize} <-
+                                ObjectWriteInfos
+                        ]),
+                    {T2, _SW3} = leveled_monitor:step_time(SW2),
+                    case State#state.slow_offer of
+                        true ->
+                            gen_server:reply(From, pause);
+                        false ->
+                            gen_server:reply(From, ok)
+                    end,
+                    maybe_longrunning(SWLR, overall_put),
+                    maybelog_put_timing(
+                        State#state.monitor, T0, T1, T2, ObjSizeTotal
+                    ),
+                    case
+                        maybepush_ledgercache(
+                            State#state.cache_size,
+                            State#state.cache_multiple,
+                            Cache0,
+                            State#state.penciller,
+                            State#state.monitor
+                        )
+                    of
+                        {ok, Cache} ->
+                            {noreply, State#state{
+                                slow_offer = false, ledger_cache = Cache
+                            }};
+                        {returned, Cache} ->
+                            {noreply, State#state{
+                                slow_offer = true, ledger_cache = Cache
+                            }}
+                    end;
+                {error, Reason} ->
+                    gen_server:reply(From, {error, Reason}),
+                    {noreply, State}
+            end;
+        {error, Reason} ->
+            gen_server:reply(From, {error, Reason}),
+            {noreply, State}
+    end;
 handle_call({mput, ObjectSpecs, TTL}, From, State) when
     State#state.head_only == true
 ->
@@ -1850,9 +1954,11 @@ empty_ledgercache() ->
 %% The push to penciller must start as a tree to correctly de-duplicate
 %% the list by order before becoming a de-duplicated list for loading
 push_to_penciller(Penciller, LoadItemList, LedgerCache, ReloadStrategy) ->
+    CompleteLoadItemList = drop_incomplete_batch_loaditems(LoadItemList),
     UpdLedgerCache =
         lists:foldl(
-            fun({InkTag, PK, SQN, Obj, IndexSpecs, ValSize}, AccLC) ->
+            fun({InkTag, PK, SQN, Obj, IndexSpecs0, ValSize}, AccLC) ->
+                IndexSpecs = leveled_codec:unwrap_batch_keychanges(IndexSpecs0),
                 Chngs =
                     case leveled_codec:get_tagstrategy(PK, ReloadStrategy) of
                         recalc ->
@@ -1874,7 +1980,7 @@ push_to_penciller(Penciller, LoadItemList, LedgerCache, ReloadStrategy) ->
                 addto_ledgercache(Chngs, AccLC, loader)
             end,
             LedgerCache,
-            lists:reverse(LoadItemList)
+            lists:reverse(CompleteLoadItemList)
         ),
     case length(UpdLedgerCache#ledger_cache.load_queue) of
         N when N > ?LOADING_BATCH ->
@@ -2732,6 +2838,82 @@ check_notfound(CheckFrequency, CheckFun) ->
             {false, CheckFrequency}
     end.
 
+-spec normalise_batch_specs(list()) ->
+    {ok, list({
+        leveled_codec:ledger_key(),
+        any(),
+        leveled_codec:journal_keychanges()
+    })}
+    | {error, term()}.
+normalise_batch_specs([]) ->
+    {error, empty_batch};
+normalise_batch_specs(BatchSpecs) when is_list(BatchSpecs) ->
+    normalise_batch_specs(BatchSpecs, #{}, []);
+normalise_batch_specs(_BatchSpecs) ->
+    {error, invalid_batch}.
+
+normalise_batch_specs([], _Seen, Acc) ->
+    {ok, lists:reverse(Acc)};
+normalise_batch_specs([Spec | Rest], Seen, Acc) ->
+    case normalise_batch_spec(Spec) of
+        {ok, LedgerKey, Object, KeyChanges} ->
+            case maps:is_key(LedgerKey, Seen) of
+                true ->
+                    {error, {duplicate_key, LedgerKey}};
+                false ->
+                    normalise_batch_specs(
+                        Rest,
+                        maps:put(LedgerKey, true, Seen),
+                        [{LedgerKey, Object, KeyChanges} | Acc]
+                    )
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+normalise_batch_spec(
+    {put, Bucket, Key, Object, IndexSpecs, Tag, TTL}
+) when is_atom(Tag) ->
+    normalise_batch_spec(Bucket, Key, Object, IndexSpecs, Tag, TTL);
+normalise_batch_spec(
+    {delete, Bucket, Key, IndexSpecs, Tag, TTL}
+) when is_atom(Tag) ->
+    normalise_batch_spec(Bucket, Key, delete, IndexSpecs, Tag, TTL);
+normalise_batch_spec(Spec) ->
+    {error, {invalid_batch_object_spec, Spec}}.
+
+normalise_batch_spec(_Bucket, _Key, _Object, _IndexSpecs, ?HEAD_TAG, _TTL) ->
+    {error, head_tag_not_supported};
+normalise_batch_spec(Bucket, Key, Object, IndexSpecs, Tag, TTL) ->
+    case {valid_index_specs(IndexSpecs), valid_ttl(TTL)} of
+        {true, true} ->
+            LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+            {ok, LedgerKey, Object, {IndexSpecs, TTL}};
+        {false, _} ->
+            {error, invalid_index_specs};
+        {_, false} ->
+            {error, invalid_ttl}
+    end.
+
+valid_index_specs(IndexSpecs) when is_list(IndexSpecs) ->
+    lists:all(
+        fun
+            ({add, _IdxField, _IdxTerm}) -> true;
+            ({remove, _IdxField, _IdxTerm}) -> true;
+            (_Other) -> false
+        end,
+        IndexSpecs
+    );
+valid_index_specs(_IndexSpecs) ->
+    false.
+
+valid_ttl(infinity) ->
+    true;
+valid_ttl(TTL) when is_integer(TTL) ->
+    true;
+valid_ttl(_TTL) ->
+    false.
+
 -spec preparefor_ledgercache(
     leveled_codec:journal_key_tag() | null,
     leveled_codec:primary_key() | ?DUMMY,
@@ -2752,19 +2934,21 @@ preparefor_ledgercache(?INKT_MPUT, ?DUMMY, SQN, _O, _S, {ObjSpecs, TTL}) ->
     ObjChanges = leveled_codec:obj_objectspecs(ObjSpecs, SQN, TTL),
     {no_lookup, SQN, ObjChanges};
 preparefor_ledgercache(
-    ?INKT_KEYD, LedgerKey, SQN, _Obj, _Size, {IdxSpecs, TTL}
+    ?INKT_KEYD, LedgerKey, SQN, _Obj, _Size, KeyChanges0
 ) when
     LedgerKey =/= ?DUMMY
 ->
+    {IdxSpecs, TTL} = leveled_codec:unwrap_batch_keychanges(KeyChanges0),
     {Bucket, Key} = leveled_codec:from_ledgerkey(LedgerKey),
     KeyChanges =
         leveled_codec:idx_indexspecs(IdxSpecs, Bucket, Key, SQN, TTL),
     {no_lookup, SQN, KeyChanges};
 preparefor_ledgercache(
-    _InkTag, LedgerKey, SQN, Obj, Size, {IdxSpecs, TTL}
+    _InkTag, LedgerKey, SQN, Obj, Size, KeyChanges0
 ) when
     LedgerKey =/= ?DUMMY
 ->
+    {IdxSpecs, TTL} = leveled_codec:unwrap_batch_keychanges(KeyChanges0),
     {Bucket, Key, MetaValue, {KeyH, _ObjH}, _LastMods} =
         leveled_codec:generate_ledgerkv(LedgerKey, SQN, Obj, Size, TTL),
     KeyChanges =
@@ -2833,6 +3017,44 @@ recalcfor_ledgercache(
     {KeyH, SQN,
         [{LK, MetaValue}] ++
             leveled_codec:idx_indexspecs(IdxSpecs, Bucket, Key, SQN, TTL)}.
+
+drop_incomplete_batch_loaditems(LoadItemList) ->
+    BatchCounts =
+        lists:foldl(
+            fun({_InkTag, _PK, SQN, _Obj, KeyChanges, _ValSize}, Acc) ->
+                case leveled_codec:batch_keychange_count(KeyChanges) of
+                    undefined ->
+                        Acc;
+                    BatchSize ->
+                        maps:update_with(
+                            SQN,
+                            fun({Count, _Expected}) ->
+                                {Count + 1, BatchSize}
+                            end,
+                            {1, BatchSize},
+                            Acc
+                        )
+                end
+            end,
+            #{},
+            LoadItemList
+        ),
+    lists:filter(
+        fun({_InkTag, _PK, SQN, _Obj, KeyChanges, _ValSize}) ->
+            case leveled_codec:batch_keychange_count(KeyChanges) of
+                undefined ->
+                    true;
+                BatchSize ->
+                    case maps:get(SQN, BatchCounts) of
+                        {BatchSize, BatchSize} ->
+                            true;
+                        _ ->
+                            false
+                    end
+            end
+        end,
+        LoadItemList
+    ).
 
 -spec addto_ledgercache(
     {
@@ -2979,8 +3201,15 @@ get_loadfun() ->
                 % VBin may already be a term
                 {Obj, IdxSpecs} =
                     leveled_codec:revert_value_from_journal(VBin),
+                StopAtSQN =
+                    case leveled_codec:batch_keychange_count(IdxSpecs) of
+                        undefined ->
+                            MaxSQN;
+                        _BatchSize ->
+                            MaxSQN + 1
+                    end,
                 case SQN of
-                    MaxSQN ->
+                    StopAtSQN ->
                         {stop,
                             {MinSQN, MaxSQN, [
                                 {InkTag, PK, SQN, Obj, IdxSpecs, ValSize}
@@ -3965,6 +4194,729 @@ erase_journal_test() ->
     HeadsNotFound2 = lists:foldl(CheckHeadFun(Bookie2), 0, ObjL1),
     ?assertMatch(500, HeadsNotFound2),
     ok = book_destroy(Bookie2).
+
+batchput_standard_objects_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    BatchSpecs = [
+        {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+            {add, <<"city_bin">>, <<"NYC">>}
+        ], ?STD_TAG, infinity},
+        {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+            {add, <<"city_bin">>, <<"SYD">>}
+        ], ?STD_TAG, infinity}
+    ],
+    ok = book_batchput(Bookie1, BatchSpecs),
+    {ok, {value, <<"V1">>}} = book_get(Bookie1, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}} = book_get(Bookie1, <<"B">>, <<"K2">>),
+    {ok, _Head1} = book_head(Bookie1, <<"B">>, <<"K1">>),
+    {ok, SQN1} = book_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, SQN1} = book_sqn(Bookie1, <<"B">>, <<"K2">>),
+    {async, IdxFolder1} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"NYC">>, <<"NYC">>},
+            {true, undefined}
+        ),
+    ?assertMatch([{<<"NYC">>, <<"K1">>}], IdxFolder1()),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    {ok, {value, <<"V1">>}} = book_get(Bookie2, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}} = book_get(Bookie2, <<"B">>, <<"K2">>),
+    {async, IdxFolder2} =
+        book_indexfold(
+            Bookie2,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"NYC">>, <<"NYC">>},
+            {true, undefined}
+        ),
+    ?assertMatch([{<<"NYC">>, <<"K1">>}], IdxFolder2()),
+    ok =
+        book_batchput(Bookie2, [
+            {delete, <<"B">>, <<"K1">>, [
+                {remove, <<"city_bin">>, <<"NYC">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    not_found = book_get(Bookie2, <<"B">>, <<"K1">>),
+    not_found = book_head(Bookie2, <<"B">>, <<"K1">>),
+    {async, IdxFolder3} =
+        book_indexfold(
+            Bookie2,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"NYC">>, <<"NYC">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], IdxFolder3()),
+    ok = book_destroy(Bookie2).
+
+batchput_indexfold_atomic_visibility_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"K0">>,
+            {value, <<"V0">>},
+            [{add, <<"city_bin">>, <<"OLD">>}],
+            ?STD_TAG
+        ),
+    ?assertEqual([], indexfold_matches(Bookie1, <<"city_bin">>, <<"BATCH">>)),
+    ?assertEqual(
+        [{<<"OLD">>, <<"K0">>}],
+        indexfold_matches(Bookie1, <<"city_bin">>, <<"OLD">>)
+    ),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"city_bin">>, <<"BATCH">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"city_bin">>, <<"BATCH">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K0">>, {value, <<"V0B">>}, [
+                {remove, <<"city_bin">>, <<"OLD">>},
+                {add, <<"city_bin">>, <<"NEW">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K2">>),
+    {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K0">>),
+    ?assertEqual(
+        [{<<"BATCH">>, <<"K1">>}, {<<"BATCH">>, <<"K2">>}],
+        indexfold_matches(Bookie1, <<"city_bin">>, <<"BATCH">>)
+    ),
+    ?assertEqual([], indexfold_matches(Bookie1, <<"city_bin">>, <<"OLD">>)),
+    ?assertEqual(
+        [{<<"NEW">>, <<"K0">>}],
+        indexfold_matches(Bookie1, <<"city_bin">>, <<"NEW">>)
+    ),
+    ok = book_destroy(Bookie1).
+
+batchput_roll_retry_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {max_journalobjectcount, 5},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    lists:foreach(
+        fun(N) ->
+            Key = integer_to_binary(N),
+            ok = book_put(Bookie1, <<"B">>, Key, {seed, N}, [], ?STD_TAG)
+        end,
+        lists:seq(1, 4)
+    ),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    BeforeManifestCount = length(gen_server:call(Inker, get_manifest)),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K5">>, {value, <<"V5">>}, [], ?STD_TAG, infinity}
+        ]),
+    AfterManifestCount = length(gen_server:call(Inker, get_manifest)),
+    ?assert(AfterManifestCount > BeforeManifestCount),
+    {ok, {value, <<"V5">>}} = book_get(Bookie1, <<"B">>, <<"K5">>),
+    ok = book_destroy(Bookie1).
+
+batchput_too_large_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 5000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    BigObject = binary:copy(<<"x">>, 20000),
+    ?assertMatch(
+        {error, batch_too_large},
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, BigObject, [], ?STD_TAG, infinity}
+        ])
+    ),
+    not_found = book_get(Bookie1, <<"B">>, <<"K1">>),
+    not_found = book_head(Bookie1, <<"B">>, <<"K1">>),
+    ?assertMatch(true, book_isempty(Bookie1, ?STD_TAG)),
+    ok = book_destroy(Bookie1).
+
+batchput_crash_recovery_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_plainstart(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"city_bin">>, <<"CRASH">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"city_bin">>, <<"CRASH">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    {ok, SQN1} = book_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, SQN1} = book_sqn(Bookie1, <<"B">>, <<"K2">>),
+    {ok, Inker, Penciller} = book_returnactors(Bookie1),
+    BookieRef = erlang:monitor(process, Bookie1),
+    InkerRef = erlang:monitor(process, Inker),
+    PencillerRef = erlang:monitor(process, Penciller),
+    exit(Bookie1, kill),
+    wait_down(BookieRef, Bookie1, bookie),
+    wait_down(InkerRef, Inker, inker),
+    wait_down(PencillerRef, Penciller, penciller),
+    {ok, Bookie2} = book_start(Opts),
+    {ok, {value, <<"V1">>}} = book_get(Bookie2, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}} = book_get(Bookie2, <<"B">>, <<"K2">>),
+    ?assertEqual(
+        [{<<"CRASH">>, <<"K1">>}, {<<"CRASH">>, <<"K2">>}],
+        indexfold_matches(Bookie2, <<"city_bin">>, <<"CRASH">>)
+    ),
+    ok = book_destroy(Bookie2).
+
+batchput_loading_boundary_test() ->
+    batchput_loading_boundary_case(199, ?LOADING_BATCH),
+    batchput_loading_boundary_case(200, ?LOADING_BATCH + 1).
+
+batchput_loading_boundary_case(SeedCount, ExpectedSQN) ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_plainstart(Opts),
+    lists:foreach(
+        fun(N) ->
+            Key = integer_to_binary(N),
+            ok = book_put(Bookie1, <<"B">>, Key, {seed, N}, [], ?STD_TAG)
+        end,
+        lists:seq(1, SeedCount)
+    ),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"KA">>, {value, <<"VA">>}, [
+                {add, <<"idx_bin">>, <<"BOUNDARY">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"KB">>, {value, <<"VB">>}, [
+                {add, <<"idx_bin">>, <<"BOUNDARY">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    {ok, BoundarySQN} = book_sqn(Bookie1, <<"B">>, <<"KA">>),
+    ?assertEqual(ExpectedSQN, BoundarySQN),
+    {ok, BoundarySQN} = book_sqn(Bookie1, <<"B">>, <<"KB">>),
+    {ok, Inker, Penciller} = book_returnactors(Bookie1),
+    BookieRef = erlang:monitor(process, Bookie1),
+    InkerRef = erlang:monitor(process, Inker),
+    PencillerRef = erlang:monitor(process, Penciller),
+    exit(Bookie1, kill),
+    wait_down(BookieRef, Bookie1, bookie),
+    wait_down(InkerRef, Inker, inker),
+    wait_down(PencillerRef, Penciller, penciller),
+    {ok, Bookie2} = book_start(Opts),
+    {ok, {value, <<"VA">>}} = book_get(Bookie2, <<"B">>, <<"KA">>),
+    {ok, {value, <<"VB">>}} = book_get(Bookie2, <<"B">>, <<"KB">>),
+    ?assertEqual(
+        [{<<"BOUNDARY">>, <<"KA">>}, {<<"BOUNDARY">>, <<"KB">>}],
+        indexfold_matches(Bookie2, <<"idx_bin">>, <<"BOUNDARY">>)
+    ),
+    ok = book_destroy(Bookie2).
+
+batchput_partial_tail_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_plainstart(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"idx_bin">>, <<"TAIL">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"idx_bin">>, <<"TAIL">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    {ok, Inker, Penciller} = book_returnactors(Bookie1),
+    [ActiveJournal | _] = leveled_inker:ink_getcdbpids(Inker),
+    JournalFile = leveled_cdb:cdb_filename(ActiveJournal),
+    BookieRef = erlang:monitor(process, Bookie1),
+    InkerRef = erlang:monitor(process, Inker),
+    PencillerRef = erlang:monitor(process, Penciller),
+    exit(Bookie1, kill),
+    wait_down(BookieRef, Bookie1, bookie),
+    wait_down(InkerRef, Inker, inker),
+    wait_down(PencillerRef, Penciller, penciller),
+    truncate_after_first_cdb_record(JournalFile),
+    {ok, Bookie2} = book_start(Opts),
+    not_found = book_get(Bookie2, <<"B">>, <<"K1">>),
+    not_found = book_get(Bookie2, <<"B">>, <<"K2">>),
+    ?assertEqual([], indexfold_matches(Bookie2, <<"idx_bin">>, <<"TAIL">>)),
+    ok = book_destroy(Bookie2).
+
+batchput_compaction_retain_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {max_run_length, 1},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none},
+        {reload_strategy, [{?STD_TAG, retain}]},
+        {journalcompaction_scoreonein, 1},
+        {singlefile_compactionpercentage, 0.0},
+        {maxrunlength_compactionpercentage, 0.0}
+    ],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"idx_bin">>, <<"OLD">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"idx_bin">>, <<"DEAD">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
+                {remove, <<"idx_bin">>, <<"OLD">>},
+                {add, <<"idx_bin">>, <<"NEW">>}
+            ], ?STD_TAG, infinity},
+            {delete, <<"B">>, <<"K2">>, [
+                {remove, <<"idx_bin">>, <<"DEAD">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    ok = leveled_inker:ink_roll(Inker),
+    ok = book_compactjournal(Bookie1, 30000),
+    wait_for_batch_compaction(Bookie1),
+    assert_compacted_batch_state(Bookie1),
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+    {ok, Bookie2} = book_start(Opts),
+    assert_compacted_batch_state(Bookie2),
+    ok = book_destroy(Bookie2).
+
+batchput_recovery_strategy_test() ->
+    batchput_recovr_reload_case(),
+    batchput_appdefined_recalc_case().
+
+batchput_recovr_reload_case() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none},
+        {reload_strategy, [{?STD_TAG, recovr}]}
+    ],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"idx_bin">>, <<"RECOVR">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"idx_bin">>, <<"RECOVR">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+    {ok, Bookie2} = book_start(Opts),
+    {ok, {value, <<"V1">>}} = book_get(Bookie2, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}} = book_get(Bookie2, <<"B">>, <<"K2">>),
+    ?assertEqual(
+        [{<<"RECOVR">>, <<"K1">>}, {<<"RECOVR">>, <<"K2">>}],
+        indexfold_matches(Bookie2, <<"idx_bin">>, <<"RECOVR">>)
+    ),
+    ok = book_destroy(Bookie2).
+
+batchput_appdefined_recalc_case() ->
+    RootPath = reset_filestructure(),
+    Tag = batch_recalc_tag,
+    ExtractMDFun =
+        fun(batch_recalc_tag, Size, Obj) ->
+            [{index, Indexes}, {value, _Value}] = Obj,
+            {{erlang:phash2(term_to_binary(Obj)), Size, {index, Indexes}}, []}
+        end,
+    CalcIndexFun =
+        fun(batch_recalc_tag, UpdMeta, PrvMeta) ->
+            {index, UpdIndexes} = element(3, UpdMeta),
+            PrvIndexes =
+                case PrvMeta of
+                    not_present ->
+                        [];
+                    PrvMeta when is_tuple(PrvMeta) ->
+                        {index, Indexes} = element(3, PrvMeta),
+                        Indexes
+                end,
+            AddSpecs =
+                lists:map(
+                    fun(I) -> {add, <<"temp_int">>, I} end,
+                    lists:subtract(UpdIndexes, PrvIndexes)
+                ),
+            RemoveSpecs =
+                lists:map(
+                    fun(I) -> {remove, <<"temp_int">>, I} end,
+                    lists:subtract(PrvIndexes, UpdIndexes)
+                ),
+            AddSpecs ++ RemoveSpecs
+        end,
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {max_run_length, 1},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none},
+        {reload_strategy, [{Tag, recalc}]},
+        {override_functions, [
+            {extract_metadata, ExtractMDFun},
+            {diff_indexspecs, CalcIndexFun}
+        ]},
+        {journalcompaction_scoreonein, 1},
+        {singlefile_compactionpercentage, 0.0},
+        {maxrunlength_compactionpercentage, 0.0}
+    ],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, [{index, [1]}, {value, <<"V1">>}], [
+                {add, <<"temp_int">>, 1}
+            ], Tag, infinity},
+            {put, <<"B">>, <<"K2">>, [{index, [2]}, {value, <<"V2">>}], [
+                {add, <<"temp_int">>, 2}
+            ], Tag, infinity}
+        ]),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, [{index, [3]}, {value, <<"V1B">>}], [
+                {remove, <<"temp_int">>, 1},
+                {add, <<"temp_int">>, 3}
+            ], Tag, infinity}
+        ]),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    ok = leveled_inker:ink_roll(Inker),
+    ok = book_compactjournal(Bookie1, 30000),
+    wait_for_batch_compaction(Bookie1),
+    assert_recalc_batch_state(Bookie1, Tag),
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+    {ok, Bookie2} = book_start(Opts),
+    assert_recalc_batch_state(Bookie2, Tag),
+    ok = book_destroy(Bookie2).
+
+batchput_manifest_sqn_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [], ?STD_TAG, infinity}
+        ]),
+    {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K2">>),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start(Opts),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie2),
+    ?assertMatch({ok, BatchSQN}, leveled_inker:ink_getjournalsqn(Inker)),
+    ?assertMatch(
+        {{BatchSQN, {o, <<"B">>, <<"K1">>, null}}, {{value, <<"V1">>}, _}},
+        leveled_inker:ink_get(Inker, {o, <<"B">>, <<"K1">>, null}, BatchSQN)
+    ),
+    ?assertMatch(
+        {{BatchSQN, {o, <<"B">>, <<"K2">>, null}}, {{value, <<"V2">>}, _}},
+        leveled_inker:ink_get(Inker, {o, <<"B">>, <<"K2">>, null}, BatchSQN)
+    ),
+    [ActiveJournal | _] = leveled_inker:ink_getcdbpids(Inker),
+    ?assertMatch({BatchSQN, ?INKT_STND, _}, leveled_cdb:cdb_lastkey(ActiveJournal)),
+    ok = book_put(Bookie2, <<"B">>, <<"K3">>, {value, <<"V3">>}, [], ?STD_TAG),
+    {ok, NextSQN} = book_sqn(Bookie2, <<"B">>, <<"K3">>),
+    ?assertEqual(BatchSQN + 1, NextSQN),
+    ok = book_destroy(Bookie2).
+
+batchput_snapshot_and_fold_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"K0">>,
+            {value, <<"V0">>},
+            [{add, <<"idx_bin">>, <<"OLD">>}],
+            ?STD_TAG
+        ),
+    {ok, SnapshotBefore} = book_start([{snapshot_bookie, Bookie1}]),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"idx_bin">>, <<"BATCH">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"idx_bin">>, <<"BATCH">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    not_found = book_get(SnapshotBefore, <<"B">>, <<"K1">>),
+    ?assertEqual([], indexfold_matches(SnapshotBefore, <<"idx_bin">>, <<"BATCH">>)),
+    {ok, SnapshotAfter} = book_start([{snapshot_bookie, Bookie1}]),
+    {ok, {value, <<"V1">>}} = book_get(SnapshotAfter, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}} = book_get(SnapshotAfter, <<"B">>, <<"K2">>),
+    ?assertEqual(
+        [{<<"BATCH">>, <<"K1">>}, {<<"BATCH">>, <<"K2">>}],
+        indexfold_matches(SnapshotAfter, <<"idx_bin">>, <<"BATCH">>)
+    ),
+    ?assertEqual(
+        [{<<"B">>, <<"K0">>}, {<<"B">>, <<"K1">>}, {<<"B">>, <<"K2">>}],
+        batch_keylist(Bookie1)
+    ),
+    ?assertEqual(
+        [
+            {<<"B">>, <<"K0">>, {value, <<"V0">>}},
+            {<<"B">>, <<"K1">>, {value, <<"V1">>}},
+            {<<"B">>, <<"K2">>, {value, <<"V2">>}}
+        ],
+        batch_objectfold(Bookie1)
+    ),
+    ?assertEqual(
+        [{<<"B">>, <<"K0">>}, {<<"B">>, <<"K1">>}, {<<"B">>, <<"K2">>}],
+        batch_headfold(Bookie1)
+    ),
+    {async, ThrowingIndexFold} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, _K, _Acc) -> throw(stop_fold) end, []},
+            {<<"idx_bin">>, <<"BATCH">>, <<"BATCH">>},
+            {true, undefined}
+        ),
+    ?assertThrow(stop_fold, ThrowingIndexFold()),
+    ?assertEqual(
+        [{<<"BATCH">>, <<"K1">>}, {<<"BATCH">>, <<"K2">>}],
+        indexfold_matches(Bookie1, <<"idx_bin">>, <<"BATCH">>)
+    ),
+    ok = book_close(SnapshotBefore),
+    ok = book_close(SnapshotAfter),
+    ok = book_destroy(Bookie1).
+
+batchput_pause_semantics_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    _ =
+        sys:replace_state(
+            Bookie1,
+            fun(State) -> State#state{slow_offer = true} end
+        ),
+    pause =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity}
+        ]),
+    {ok, {value, <<"V1">>}} = book_get(Bookie1, <<"B">>, <<"K1">>),
+    ok = book_destroy(Bookie1).
+
+batchput_validation_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    PutSpec = {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity},
+    ?assertMatch({error, empty_batch}, book_batchput(Bookie1, [])),
+    ?assertMatch(
+        {error, {duplicate_key, _}},
+        book_batchput(Bookie1, [PutSpec, PutSpec])
+    ),
+    ?assertMatch(
+        {error, head_tag_not_supported},
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?HEAD_TAG, infinity}
+        ])
+    ),
+    ?assertMatch(
+        {error, invalid_index_specs},
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [bad], ?STD_TAG, infinity}
+        ])
+    ),
+    ok = book_destroy(Bookie1).
+
+indexfold_matches(Bookie, IndexName, IndexValue) ->
+    {async, Folder} =
+        book_indexfold(
+            Bookie,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {IndexName, IndexValue, IndexValue},
+            {true, undefined}
+        ),
+    lists:sort(Folder()).
+
+wait_down(Ref, Pid, Label) ->
+    receive
+        {'DOWN', Ref, process, Pid, _Reason} ->
+            ok
+    after 5000 ->
+        error({process_still_alive, Label})
+    end.
+
+wait_for_batch_compaction(Bookie) ->
+    wait_for_batch_compaction(Bookie, 50).
+
+wait_for_batch_compaction(Bookie, Remaining) when Remaining > 0 ->
+    case book_islastcompactionpending(Bookie) of
+        false ->
+            ok;
+        true ->
+            timer:sleep(100),
+            wait_for_batch_compaction(Bookie, Remaining - 1)
+    end;
+wait_for_batch_compaction(_Bookie, 0) ->
+    error(compaction_still_pending).
+
+assert_compacted_batch_state(Bookie) ->
+    {ok, {value, <<"V1B">>}} = book_get(Bookie, <<"B">>, <<"K1">>),
+    not_found = book_get(Bookie, <<"B">>, <<"K2">>),
+    not_found = book_head(Bookie, <<"B">>, <<"K2">>),
+    ?assertEqual([], indexfold_matches(Bookie, <<"idx_bin">>, <<"OLD">>)),
+    ?assertEqual([], indexfold_matches(Bookie, <<"idx_bin">>, <<"DEAD">>)),
+    ?assertEqual(
+        [{<<"NEW">>, <<"K1">>}],
+        indexfold_matches(Bookie, <<"idx_bin">>, <<"NEW">>)
+    ).
+
+assert_recalc_batch_state(Bookie, Tag) ->
+    {ok, [{index, [3]}, {value, <<"V1B">>}]} =
+        book_get(Bookie, <<"B">>, <<"K1">>, Tag),
+    {ok, [{index, [2]}, {value, <<"V2">>}]} =
+        book_get(Bookie, <<"B">>, <<"K2">>, Tag),
+    ?assertEqual([], indexfold_matches(Bookie, <<"temp_int">>, 1)),
+    ?assertEqual(
+        [{2, <<"K2">>}],
+        indexfold_matches(Bookie, <<"temp_int">>, 2)
+    ),
+    ?assertEqual(
+        [{3, <<"K1">>}],
+        indexfold_matches(Bookie, <<"temp_int">>, 3)
+    ).
+
+truncate_after_first_cdb_record(JournalFile) ->
+    {ok, Handle} = file:open(JournalFile, [read, write, binary]),
+    {ok, 2048} = file:position(Handle, {bof, 2048}),
+    {ok, <<KeyLength:32/little-integer, ValueLength:32/little-integer>>} =
+        file:read(Handle, 8),
+    FirstRecordEnd = 2048 + 8 + KeyLength + ValueLength,
+    {ok, _} = file:position(Handle, {bof, FirstRecordEnd + 4}),
+    ok = file:truncate(Handle),
+    ok = file:close(Handle).
+
+batch_keylist(Bookie) ->
+    {async, Folder} =
+        book_keylist(
+            Bookie,
+            ?STD_TAG,
+            <<"B">>,
+            {fun(B, K, Acc) -> [{B, K} | Acc] end, []}
+        ),
+    lists:sort(Folder()).
+
+batch_objectfold(Bookie) ->
+    {async, Folder} =
+        book_objectfold(
+            Bookie,
+            ?STD_TAG,
+            <<"B">>,
+            all,
+            {fun(B, K, V, Acc) -> [{B, K, V} | Acc] end, []},
+            true
+        ),
+    lists:sort(Folder()).
+
+batch_headfold(Bookie) ->
+    {async, Folder} =
+        book_headfold(
+            Bookie,
+            ?STD_TAG,
+            {range, <<"B">>, all},
+            {fun(B, K, _V, Acc) -> [{B, K} | Acc] end, []},
+            false,
+            true,
+            false
+        ),
+    lists:sort(Folder()).
+
+batchput_headonly_rejection_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {head_only, no_lookup},
+            {compression_method, none}
+        ]),
+    ?assertMatch(
+        {unsupported_message, batchput},
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity}
+        ])
+    ),
+    ok = book_destroy(Bookie1).
 
 sqnorder_fold_test() ->
     RootPath = reset_filestructure(),

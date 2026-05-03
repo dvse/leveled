@@ -11,6 +11,8 @@
 
 -eqwalizer({nowarn_function, convert_to_ledgerv/5}).
 
+-define(BATCH_KEYCHANGES_V1, leveled_batch_keychanges_v1).
+
 -ifdef(TEST).
 -export([convert_to_ledgerv/5]).
 -endif.
@@ -34,6 +36,10 @@
     isvalid_ledgerkey/1,
     to_inkerkey/2,
     to_inkerkv/6,
+    to_standard_inkerkv/6,
+    to_batch_inkerkv/7,
+    unwrap_batch_keychanges/1,
+    batch_keychange_count/1,
     from_inkerkv/1,
     from_inkerkv/2,
     from_journalkey/1,
@@ -128,6 +134,24 @@
     }.
 -type object_spec() ::
     object_spec_v0() | object_spec_v1().
+-type batch_object_spec() ::
+    {
+        put,
+        key(),
+        key(),
+        any(),
+        index_specs(),
+        tag(),
+        infinity | integer()
+    }
+    | {
+        delete,
+        key(),
+        key(),
+        index_specs(),
+        tag(),
+        infinity | integer()
+    }.
 -type compression_method() ::
     lz4 | native | zstd | none.
 -type index_specs() ::
@@ -173,6 +197,7 @@
     single_key/0,
     sqn/0,
     object_spec/0,
+    batch_object_spec/0,
     segment_hash/0,
     ledger_status/0,
     primary_key/0,
@@ -621,6 +646,66 @@ to_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
         create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
     {{SQN, InkerType, LedgerKey}, Value}.
 
+-spec to_standard_inkerkv(
+    primary_key(),
+    non_neg_integer(),
+    any(),
+    journal_keychanges(),
+    compression_method(),
+    boolean()
+) ->
+    {journal_key(), binary()}.
+%% @doc
+%% Convert to a fetchable standard Journal key and value regardless of object
+%% body. This is used by standard-mode batch writes, where puts and deletes
+%% must share the same SQN and normal fetch key shape.
+to_standard_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
+    Value =
+        create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
+    {{SQN, ?INKT_STND, LedgerKey}, Value}.
+
+-spec to_batch_inkerkv(
+    primary_key(),
+    non_neg_integer(),
+    any(),
+    journal_keychanges(),
+    pos_integer(),
+    compression_method(),
+    boolean()
+) ->
+    {journal_key(), binary()}.
+%% @doc
+%% Convert a standard-mode batch object to a fetchable Journal key/value and
+%% carry the expected batch size in the key-change payload. Startup replay uses
+%% this to reject an incomplete same-SQN tail after a crash or torn write.
+to_batch_inkerkv(
+    LedgerKey, SQN, Object, KeyChanges, BatchSize, PressMethod, Compress
+) when
+    is_integer(BatchSize), BatchSize > 0
+->
+    to_standard_inkerkv(
+        LedgerKey,
+        SQN,
+        Object,
+        {?BATCH_KEYCHANGES_V1, BatchSize, KeyChanges},
+        PressMethod,
+        Compress
+    ).
+
+-spec unwrap_batch_keychanges(journal_keychanges()) -> journal_keychanges().
+unwrap_batch_keychanges({?BATCH_KEYCHANGES_V1, _BatchSize, KeyChanges}) ->
+    KeyChanges;
+unwrap_batch_keychanges(KeyChanges) ->
+    KeyChanges.
+
+-spec batch_keychange_count(journal_keychanges()) -> pos_integer() | undefined.
+batch_keychange_count({?BATCH_KEYCHANGES_V1, BatchSize, _KeyChanges}) when
+    is_integer(BatchSize), BatchSize > 0
+->
+    BatchSize;
+batch_keychange_count(_KeyChanges) ->
+    undefined.
+
 -spec revert_to_keydeltas(journal_key(), binary()) -> {journal_key(), any()}.
 %% @doc
 %% If we wish to retain key deltas when an object in the Journal has been
@@ -631,7 +716,7 @@ to_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
 %% types
 revert_to_keydeltas({SQN, ?INKT_STND, LedgerKey}, InkerV) ->
     {_V, KeyDeltas} = revert_value_from_journal(InkerV),
-    {{SQN, ?INKT_KEYD, LedgerKey}, {null, KeyDeltas}}.
+    {{SQN, ?INKT_KEYD, LedgerKey}, {null, unwrap_batch_keychanges(KeyDeltas)}}.
 
 %% Used when fetching objects, so only handles standard, hashable entries
 from_inkerkv(Object) ->
@@ -1053,6 +1138,14 @@ indexspecs_test() ->
         },
         lists:nth(3, Changes)
     ).
+
+standard_inkerkv_batch_delete_test() ->
+    LedgerKey = {?STD_TAG, <<"B">>, <<"K">>, null},
+    SQN = 42,
+    {JournalKey, JournalBin} =
+        to_standard_inkerkv(LedgerKey, SQN, delete, {[], infinity}, none, false),
+    ?assertMatch({SQN, ?INKT_STND, LedgerKey}, JournalKey),
+    ?assertMatch({delete, {[], infinity}}, revert_value_from_journal(JournalBin)).
 
 endkey_passed_test() ->
     TestKey = {i, null, null, null},

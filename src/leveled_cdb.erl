@@ -74,6 +74,7 @@
     cdb_put/3,
     cdb_put/4,
     cdb_mput/2,
+    cdb_mput/3,
     cdb_getpositions/2,
     cdb_directfetch/3,
     cdb_lastkey/1,
@@ -250,7 +251,14 @@ cdb_put(Pid, Key, Value, Sync) ->
 %% It may be preferable to respond to roll by trying individual PUTs until
 %% roll is returned again
 cdb_mput(Pid, KVList) ->
-    gen_statem:call(Pid, {mput_kv, KVList}, infinity).
+    cdb_mput(Pid, KVList, false).
+
+-spec cdb_mput(pid(), list(), boolean()) -> ok | roll.
+%% @doc
+%% See cdb_mput/2.  Addition of force-sync option, to be used when sync mode is
+%% none to force a sync to disk on this particular mput.
+cdb_mput(Pid, KVList, Sync) ->
+    gen_statem:call(Pid, {mput_kv, KVList, Sync}, infinity).
 
 -spec cdb_getpositions(pid(), integer() | all) -> list().
 %% @doc
@@ -596,9 +604,17 @@ writer(
     end;
 writer({call, From}, {mput_kv, []}, _State) ->
     {keep_state_and_data, [{reply, From, ok}]};
+writer({call, From}, {mput_kv, [], _Sync}, _State) ->
+    {keep_state_and_data, [{reply, From, ok}]};
 writer(
     {call, From},
     {mput_kv, KVList},
+    State
+) ->
+    writer({call, From}, {mput_kv, KVList, false}, State);
+writer(
+    {call, From},
+    {mput_kv, KVList, Sync},
     State = #state{last_position = LP, handle = IO}
 ) when
     ?IS_DEF(last_position), ?IS_DEF(IO)
@@ -623,6 +639,15 @@ writer(
                     %% Keys and values could not be written
                     {keep_state_and_data, [{reply, From, roll}]};
                 {UpdHandle, NewPosition, HashTree, LastKey} ->
+                    ok =
+                        case {State#state.sync_strategy, Sync} of
+                            {riak_sync, _} ->
+                                file:datasync(UpdHandle);
+                            {none, true} ->
+                                file:datasync(UpdHandle);
+                            _ ->
+                                ok
+                        end,
                     {keep_state,
                         State#state{
                             handle = UpdHandle,

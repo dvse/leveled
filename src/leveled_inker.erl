@@ -96,6 +96,7 @@
     ink_start/1,
     ink_snapstart/1,
     ink_put/5,
+    ink_batchput/3,
     ink_mput/3,
     ink_get/3,
     ink_fetch/3,
@@ -241,6 +242,23 @@ ink_put(Pid, PrimaryKey, Object, KeyChanges, DataSync) ->
         {put, PrimaryKey, Object, KeyChanges, DataSync},
         infinity
     ).
+
+-spec ink_batchput(
+    pid(),
+    list({
+        leveled_codec:ledger_key(),
+        any(),
+        leveled_codec:journal_keychanges()
+    }),
+    boolean()
+) ->
+    {ok, non_neg_integer(), list()} | {error, term()}.
+%% @doc
+%% PUT a batch of standard objects into the journal under one sequence number.
+%% Each object is still written using its normal standard journal key, so normal
+%% fetch-by-ledger-key behaviour is preserved.
+ink_batchput(Pid, ObjectChanges, DataSync) ->
+    gen_server:call(Pid, {batchput, ObjectChanges, DataSync}, infinity).
 
 -spec ink_mput(pid(), any(), {list(), integer() | infinity}) -> {ok, integer()}.
 %% @doc
@@ -569,6 +587,19 @@ handle_call(
     case put_object(Key, Object, KeyChanges, DataSync, State) of
         {_, UpdState, ObjSize} ->
             {reply, {ok, UpdState#state.journal_sqn, ObjSize}, UpdState}
+    end;
+handle_call(
+    {batchput, ObjectChanges, DataSync},
+    _From,
+    State = #state{is_snapshot = Snap}
+) when Snap == false ->
+    case put_objects_batch(ObjectChanges, DataSync, State) of
+        {_, UpdState, ObjectWriteInfos} ->
+            {reply,
+                {ok, UpdState#state.journal_sqn, ObjectWriteInfos},
+                UpdState};
+        {{error, Reason}, UpdState} ->
+            {reply, {error, Reason}, UpdState}
     end;
 handle_call(
     {mput, Key, ObjChanges},
@@ -1130,6 +1161,93 @@ put_object(
                     active_journaldb = NewJournalP
                 },
                 byte_size(JournalBin)}
+    end.
+
+-spec put_objects_batch(
+    list({
+        leveled_codec:ledger_key(),
+        any(),
+        leveled_codec:journal_keychanges()
+    }),
+    boolean(),
+    ink_state()
+) ->
+    {ok | rolling, ink_state(), list()}
+    | {{error, batch_too_large}, ink_state()}.
+%% @doc
+%% Add a standard-mode object batch to the current journal. All objects share
+%% one SQN, but each has its own normal standard journal key so object fetches
+%% can continue to use {SQN, LedgerKey}.
+put_objects_batch(
+    ObjectChanges,
+    Sync,
+    State =
+        #state{
+            active_journaldb = ActiveJournal,
+            cdb_options = CDBOpts,
+            root_path = RP
+        }
+) when
+    ?IS_DEF(ActiveJournal), ?IS_DEF(CDBOpts), ?IS_DEF(RP)
+->
+    NewSQN = State#state.journal_sqn + 1,
+    BatchSize = length(ObjectChanges),
+    {JournalKVs, ObjectWriteInfos} =
+        lists:unzip(
+            lists:map(
+                fun({LedgerKey, Object, KeyChanges}) ->
+                    {JournalKey, JournalBin} =
+                        leveled_codec:to_batch_inkerkv(
+                            LedgerKey,
+                            NewSQN,
+                            Object,
+                            KeyChanges,
+                            BatchSize,
+                            State#state.compression_method,
+                            State#state.compress_on_receipt
+                        ),
+                    {
+                        {JournalKey, JournalBin},
+                        {LedgerKey, Object, KeyChanges, byte_size(JournalBin)}
+                    }
+                end,
+                ObjectChanges
+            )
+        ),
+    case leveled_cdb:cdb_mput(ActiveJournal, JournalKVs, Sync) of
+        ok ->
+            {ok, State#state{journal_sqn = NewSQN}, ObjectWriteInfos};
+        roll ->
+            case leveled_cdb:cdb_lastkey(ActiveJournal) of
+                empty ->
+                    {{error, batch_too_large}, State};
+                _LastKey ->
+                    SWroll = os:timestamp(),
+                    {NewJournalP, Manifest1, NewManSQN} =
+                        roll_active(
+                            ActiveJournal,
+                            State#state.manifest,
+                            NewSQN,
+                            State#state.cdb_options,
+                            State#state.root_path,
+                            State#state.manifest_sqn
+                        ),
+                    ?TMR_LOG(i0008, [], SWroll),
+                    UpdState =
+                        State#state{
+                            manifest = Manifest1,
+                            manifest_sqn = NewManSQN,
+                            active_journaldb = NewJournalP
+                        },
+                    case leveled_cdb:cdb_mput(NewJournalP, JournalKVs, Sync) of
+                        ok ->
+                            {rolling,
+                                UpdState#state{journal_sqn = NewSQN},
+                                ObjectWriteInfos};
+                        roll ->
+                            {{error, batch_too_large}, UpdState}
+                    end
+            end
     end.
 
 -spec get_object(
