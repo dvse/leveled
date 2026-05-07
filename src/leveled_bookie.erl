@@ -4811,6 +4811,96 @@ batchput_large_batch_reload_test() ->
     ),
     ok = book_destroy(Bookie2).
 
+batchput_mixed_large_reload_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 5000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    ExistingCount = ?LOADING_BATCH + 20,
+    UpdateCount = 80,
+    DeleteCount = 80,
+    AddCount = 80,
+    ?assert(UpdateCount + DeleteCount + AddCount > ?LOADING_BATCH),
+    UpdateRange = lists:seq(1, UpdateCount),
+    DeleteRange = lists:seq(UpdateCount + 1, UpdateCount + DeleteCount),
+    RetainRange = lists:seq(UpdateCount + DeleteCount + 1, ExistingCount),
+    AddRange = lists:seq(ExistingCount + 1, ExistingCount + AddCount),
+    SeedSpecs = [
+        {put, <<"B">>, integer_to_binary(N), {seed, N}, [
+            {add, <<"mix_int">>, N}
+        ], ?STD_TAG, infinity}
+     || N <- lists:seq(1, ExistingCount)
+    ],
+    UpdateSpecs = [
+        {put, <<"B">>, integer_to_binary(N), {updated, N}, [
+            {remove, <<"mix_int">>, N},
+            {add, <<"mix_int">>, N + 1000}
+        ], ?STD_TAG, infinity}
+     || N <- UpdateRange
+    ],
+    DeleteSpecs = [
+        {delete, <<"B">>, integer_to_binary(N), [
+            {remove, <<"mix_int">>, N}
+        ], ?STD_TAG, infinity}
+     || N <- DeleteRange
+    ],
+    AddSpecs = [
+        {put, <<"B">>, integer_to_binary(N), {added, N}, [
+            {add, <<"mix_int">>, N + 1000}
+        ], ?STD_TAG, infinity}
+     || N <- AddRange
+    ],
+
+    {ok, Bookie1} = book_start(Opts),
+    ok = book_batchput(Bookie1, SeedSpecs, true),
+    ok = book_batchput(Bookie1, UpdateSpecs ++ DeleteSpecs ++ AddSpecs, true),
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+
+    {ok, Bookie2} = book_start(Opts),
+    ExpectedObjects =
+        lists:sort(
+            [
+                {<<"B">>, integer_to_binary(N), {updated, N}}
+             || N <- UpdateRange
+            ] ++
+                [
+                    {<<"B">>, integer_to_binary(N), {seed, N}}
+                 || N <- RetainRange
+                ] ++
+                [
+                    {<<"B">>, integer_to_binary(N), {added, N}}
+                 || N <- AddRange
+                ]
+        ),
+    ExpectedIndexes =
+        lists:sort(
+            [
+                {N + 1000, integer_to_binary(N)}
+             || N <- UpdateRange
+            ] ++
+                [
+                    {N, integer_to_binary(N)}
+                 || N <- RetainRange
+                ] ++
+                [
+                    {N + 1000, integer_to_binary(N)}
+                 || N <- AddRange
+                ]
+        ),
+    ?assertEqual(ExpectedObjects, batch_objectfold(Bookie2)),
+    ?assertEqual(
+        ExpectedIndexes,
+        indexfold_matches_range(
+            Bookie2, <<"mix_int">>, 1, ExistingCount + AddCount + 1000
+        )
+    ),
+    ok = book_destroy(Bookie2).
+
 batchput_snapshot_and_fold_test() ->
     RootPath = reset_filestructure(),
     Opts = [
@@ -4883,13 +4973,14 @@ batchput_snapshot_and_fold_test() ->
 
 batchput_sqnorder_fold_test() ->
     RootPath = reset_filestructure(),
-    {ok, Bookie1} =
-        book_start([
-            {root_path, RootPath},
-            {max_journalsize, 1000000},
-            {cache_size, 500},
-            {compression_method, none}
-        ]),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_start(Opts),
     ok = book_put(Bookie1, <<"B">>, <<"K0">>, {value, <<"V0">>}, [], ?STD_TAG),
     ok =
         book_batchput(Bookie1, [
@@ -4900,6 +4991,9 @@ batchput_sqnorder_fold_test() ->
     {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K1">>),
     {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K2">>),
     {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K3">>),
+    ok = book_put(Bookie1, <<"B">>, <<"K4">>, {value, <<"V4">>}, [], ?STD_TAG),
+    {ok, NextSQN} = book_sqn(Bookie1, <<"B">>, <<"K4">>),
+    ?assertEqual(BatchSQN + 1, NextSQN),
 
     FoldObjectsFun = fun(B, K, V, Acc) -> Acc ++ [{B, K, V}] end,
     {async, ObjFPre} =
@@ -4912,11 +5006,20 @@ batchput_sqnorder_fold_test() ->
             {<<"B">>, <<"K0">>, {value, <<"V0">>}},
             {<<"B">>, <<"K1">>, {value, <<"V1">>}},
             {<<"B">>, <<"K2">>, {value, <<"V2">>}},
-            {<<"B">>, <<"K3">>, {value, <<"V3">>}}
+            {<<"B">>, <<"K3">>, {value, <<"V3">>}},
+            {<<"B">>, <<"K4">>, {value, <<"V4">>}}
         ],
         ObjLPre
     ),
-    ok = book_destroy(Bookie1).
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+    {ok, Bookie2} = book_start(Opts),
+    {async, ObjFReload} =
+        book_objectfold(
+            Bookie2, ?STD_TAG, {FoldObjectsFun, []}, true, sqn_order
+        ),
+    ?assertEqual(ObjLPre, ObjFReload()),
+    ok = book_destroy(Bookie2).
 
 batchput_pause_semantics_test() ->
     RootPath = reset_filestructure(),
@@ -4968,22 +5071,160 @@ batchput_validation_test() ->
     ),
     ok = book_destroy(Bookie1).
 
-indexfold_matches(Bookie, IndexName, IndexValue) ->
+batchput_validation_atomic_rejection_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ValidSpec = {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+        {add, <<"idx_bin">>, <<"LEAK">>}
+    ], ?STD_TAG, infinity},
+    ?assertMatch(
+        {error, invalid_index_specs},
+        book_batchput(Bookie1, [
+            ValidSpec,
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [bad], ?STD_TAG,
+                infinity}
+        ])
+    ),
+    not_found = book_get(Bookie1, <<"B">>, <<"K1">>),
+    not_found = book_head(Bookie1, <<"B">>, <<"K1">>),
+    ?assertEqual([], indexfold_matches(Bookie1, <<"idx_bin">>, <<"LEAK">>)),
+
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"K0">>,
+            {value, <<"OLD">>},
+            [{add, <<"idx_bin">>, <<"OLD">>}],
+            ?STD_TAG
+        ),
+    UpdateSpec = {put, <<"B">>, <<"K0">>, {value, <<"NEW">>}, [
+        {remove, <<"idx_bin">>, <<"OLD">>},
+        {add, <<"idx_bin">>, <<"NEW">>}
+    ], ?STD_TAG, infinity},
+    ?assertMatch(
+        {error, {duplicate_key, _}},
+        book_batchput(Bookie1, [UpdateSpec, UpdateSpec])
+    ),
+    {ok, {value, <<"OLD">>}} = book_get(Bookie1, <<"B">>, <<"K0">>),
+    ?assertEqual(
+        [{<<"OLD">>, <<"K0">>}],
+        indexfold_matches(Bookie1, <<"idx_bin">>, <<"OLD">>)
+    ),
+    ?assertEqual([], indexfold_matches(Bookie1, <<"idx_bin">>, <<"NEW">>)),
+    ok = book_destroy(Bookie1).
+
+batchput_bucket_isolation_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B1">>, <<"K1">>, {value, b1_k1}, [
+                {add, <<"shared_bin">>, <<"SAME">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B2">>, <<"K1">>, {value, b2_k1}, [
+                {add, <<"shared_bin">>, <<"SAME">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B2">>, <<"K2">>, {value, b2_k2}, [
+                {add, <<"shared_bin">>, <<"SAME">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    ?assertEqual(
+        [{<<"SAME">>, <<"K1">>}],
+        indexfold_matches(Bookie1, <<"B1">>, <<"shared_bin">>, <<"SAME">>)
+    ),
+    ?assertEqual(
+        [{<<"SAME">>, <<"K1">>}, {<<"SAME">>, <<"K2">>}],
+        indexfold_matches(Bookie1, <<"B2">>, <<"shared_bin">>, <<"SAME">>)
+    ),
+    ok =
+        book_batchput(Bookie1, [
+            {delete, <<"B2">>, <<"K1">>, [
+                {remove, <<"shared_bin">>, <<"SAME">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start(Opts),
+    {ok, {value, b1_k1}} = book_get(Bookie2, <<"B1">>, <<"K1">>),
+    not_found = book_get(Bookie2, <<"B2">>, <<"K1">>),
+    {ok, {value, b2_k2}} = book_get(Bookie2, <<"B2">>, <<"K2">>),
+    ?assertEqual(
+        [{<<"SAME">>, <<"K1">>}],
+        indexfold_matches(Bookie2, <<"B1">>, <<"shared_bin">>, <<"SAME">>)
+    ),
+    ?assertEqual(
+        [{<<"SAME">>, <<"K2">>}],
+        indexfold_matches(Bookie2, <<"B2">>, <<"shared_bin">>, <<"SAME">>)
+    ),
+    ok = book_destroy(Bookie2).
+
+batchput_ttl_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    Future = leveled_util:integer_now() + 300,
+    Past = leveled_util:integer_now() - 300,
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"KF">>, {value, future}, [
+                {add, <<"ttl_bin">>, <<"LIVE">>}
+            ], ?STD_TAG, Future},
+            {put, <<"B">>, <<"KP">>, {value, past}, [
+                {add, <<"ttl_bin">>, <<"LIVE">>}
+            ], ?STD_TAG, Past}
+        ]),
+    {ok, {value, future}} = book_get(Bookie1, <<"B">>, <<"KF">>),
+    not_found = book_get(Bookie1, <<"B">>, <<"KP">>),
+    not_found = book_head(Bookie1, <<"B">>, <<"KP">>),
+    ?assertEqual(
+        [{<<"LIVE">>, <<"KF">>}],
+        indexfold_matches(Bookie1, <<"ttl_bin">>, <<"LIVE">>)
+    ),
+    ok = book_destroy(Bookie1).
+
+indexfold_matches(Bookie, Bucket, IndexName, IndexValue) ->
     {async, Folder} =
         book_indexfold(
             Bookie,
-            <<"B">>,
+            Bucket,
             {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
             {IndexName, IndexValue, IndexValue},
             {true, undefined}
         ),
     lists:sort(Folder()).
 
+indexfold_matches(Bookie, IndexName, IndexValue) ->
+    indexfold_matches(Bookie, <<"B">>, IndexName, IndexValue).
+
 indexfold_matches_range(Bookie, IndexName, LowIndexValue, HighIndexValue) ->
+    indexfold_matches_range(
+        Bookie, <<"B">>, IndexName, LowIndexValue, HighIndexValue
+    ).
+
+indexfold_matches_range(
+    Bookie, Bucket, IndexName, LowIndexValue, HighIndexValue
+) ->
     {async, Folder} =
         book_indexfold(
             Bookie,
-            <<"B">>,
+            Bucket,
             {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
             {IndexName, LowIndexValue, HighIndexValue},
             {true, undefined}
