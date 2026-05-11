@@ -55,13 +55,20 @@
     book_tempput/7,
     book_batchput/2,
     book_batchput/3,
+    book_casput/9,
+    book_casbatchput/3,
+    book_casbatchput/4,
     book_mput/2,
     book_mput/3,
     book_delete/4,
     book_get/3,
     book_get/4,
+    book_get_sqn/3,
+    book_get_sqn/4,
     book_head/3,
     book_head/4,
+    book_head_sqn/3,
+    book_head_sqn/4,
     book_sqn/3,
     book_sqn/4,
     book_headonly/4,
@@ -601,6 +608,70 @@ book_batchput(Pid, BatchSpecs) ->
 book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
     gen_server:call(Pid, {batchput, BatchSpecs, DataSync}, infinity).
 
+-spec book_casput(
+    pid(),
+    leveled_codec:key(),
+    leveled_codec:key(),
+    any(),
+    leveled_codec:index_specs(),
+    leveled_codec:tag(),
+    infinity | integer(),
+    boolean(),
+    absent | present | {sqn, non_neg_integer()}
+) ->
+    ok | pause | {error, term()}.
+%% @doc
+%%
+%% Compare-and-set standard-mode put. The condition is evaluated against the
+%% object identified by Bucket/Key/Tag inside the Bookie gen_server before the
+%% object is written. A failed condition returns without writing the object or
+%% any index changes.
+book_casput(
+    Pid,
+    Bucket,
+    Key,
+    Object,
+    IndexSpecs,
+    Tag,
+    TTL,
+    DataSync,
+    Condition
+) when is_boolean(DataSync), is_atom(Tag) ->
+    book_casbatchput(
+        Pid,
+        [{put, Bucket, Key, Object, IndexSpecs, Tag, TTL}],
+        [{Bucket, Key, Tag, Condition}],
+        DataSync
+    ).
+
+-spec book_casbatchput(
+    pid(),
+    list(leveled_codec:batch_object_spec()),
+    list({leveled_codec:key(), leveled_codec:key(), leveled_codec:tag(), term()})
+) ->
+    ok | pause | {error, term()}.
+%% @doc
+%%
+%% Compare-and-set batch publication. All conditions are evaluated before any
+%% batch object is accepted. Conditions may refer to keys outside the write set
+%% so callers can implement reservation records or multi-key invariants.
+book_casbatchput(Pid, BatchSpecs, Conditions) ->
+    book_casbatchput(Pid, BatchSpecs, Conditions, false).
+
+-spec book_casbatchput(
+    pid(),
+    list(leveled_codec:batch_object_spec()),
+    list({leveled_codec:key(), leveled_codec:key(), leveled_codec:tag(), term()}),
+    boolean()
+) ->
+    ok | pause | {error, term()}.
+%% @doc
+%% See book_casbatchput/3. DataSync applies to the whole accepted batch.
+book_casbatchput(Pid, BatchSpecs, Conditions, DataSync) when is_boolean(DataSync) ->
+    gen_server:call(
+        Pid, {casbatchput, BatchSpecs, Conditions, DataSync}, infinity
+    ).
+
 -spec book_mput(pid(), list(leveled_codec:object_spec())) -> ok | pause.
 %% @doc
 %%
@@ -650,6 +721,13 @@ book_delete(Pid, Bucket, Key, IndexSpecs) ->
     leveled_codec:tag()
 ) ->
     {ok, any()} | not_found.
+-spec book_get_sqn(
+    pid(),
+    leveled_codec:key(),
+    leveled_codec:key(),
+    leveled_codec:tag()
+) ->
+    {ok, any(), non_neg_integer()} | not_found.
 -spec book_head(
     pid(),
     leveled_codec:key(),
@@ -657,6 +735,13 @@ book_delete(Pid, Bucket, Key, IndexSpecs) ->
     leveled_codec:tag()
 ) ->
     {ok, any()} | not_found.
+-spec book_head_sqn(
+    pid(),
+    leveled_codec:key(),
+    leveled_codec:key(),
+    leveled_codec:tag()
+) ->
+    {ok, any(), non_neg_integer()} | not_found.
 
 -spec book_sqn(
     pid(),
@@ -690,14 +775,26 @@ book_delete(Pid, Bucket, Key, IndexSpecs) ->
 book_get(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {get, Bucket, Key, Tag}, infinity).
 
+book_get_sqn(Pid, Bucket, Key, Tag) ->
+    gen_server:call(Pid, {get_sqn, Bucket, Key, Tag}, infinity).
+
 book_head(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {head, Bucket, Key, Tag, false}, infinity).
+
+book_head_sqn(Pid, Bucket, Key, Tag) ->
+    gen_server:call(Pid, {head_sqn, Bucket, Key, Tag}, infinity).
 
 book_get(Pid, Bucket, Key) ->
     book_get(Pid, Bucket, Key, ?STD_TAG).
 
+book_get_sqn(Pid, Bucket, Key) ->
+    book_get_sqn(Pid, Bucket, Key, ?STD_TAG).
+
 book_head(Pid, Bucket, Key) ->
     book_head(Pid, Bucket, Key, ?STD_TAG).
+
+book_head_sqn(Pid, Bucket, Key) ->
+    book_head_sqn(Pid, Bucket, Key, ?STD_TAG).
 
 book_headonly(Pid, Bucket, Key, SubKey) ->
     gen_server:call(
@@ -1532,72 +1629,26 @@ handle_call({batchput, BatchSpecs, DataSync}, From, State) when
 ->
     case normalise_batch_specs(BatchSpecs) of
         {ok, ObjectChanges} ->
-            SWLR = os:timestamp(),
-            SW0 = leveled_monitor:maybe_time(State#state.monitor),
-            case
-                leveled_inker:ink_batchput(
-                    State#state.inker,
-                    ObjectChanges,
-                    DataSync
-                )
-            of
-                {ok, SQN, ObjectWriteInfos} ->
-                    {T0, SW1} = leveled_monitor:step_time(SW0),
-                    PreparedChanges =
-                        lists:map(
-                            fun({LedgerKey, Object, KeyChanges, ObjSize}) ->
-                                preparefor_ledgercache(
-                                    null,
-                                    LedgerKey,
-                                    SQN,
-                                    Object,
-                                    ObjSize,
-                                    KeyChanges
-                                )
-                            end,
-                            ObjectWriteInfos
-                        ),
-                    {T1, SW2} = leveled_monitor:step_time(SW1),
-                    Cache0 =
-                        lists:foldl(
-                            fun addto_ledgercache/2,
-                            State#state.ledger_cache,
-                            PreparedChanges
-                        ),
-                    ObjSizeTotal =
-                        lists:sum([
-                            ObjSize
-                         || {_LK, _Obj, _KeyChanges, ObjSize} <-
-                                ObjectWriteInfos
-                        ]),
-                    {T2, _SW3} = leveled_monitor:step_time(SW2),
-                    case State#state.slow_offer of
-                        true ->
-                            gen_server:reply(From, pause);
-                        false ->
-                            gen_server:reply(From, ok)
-                    end,
-                    maybe_longrunning(SWLR, overall_put),
-                    maybelog_put_timing(
-                        State#state.monitor, T0, T1, T2, ObjSizeTotal
-                    ),
-                    case
-                        maybepush_ledgercache(
-                            State#state.cache_size,
-                            State#state.cache_multiple,
-                            Cache0,
-                            State#state.penciller,
-                            State#state.monitor
-                        )
-                    of
-                        {ok, Cache} ->
-                            {noreply, State#state{
-                                slow_offer = false, ledger_cache = Cache
-                            }};
-                        {returned, Cache} ->
-                            {noreply, State#state{
-                                slow_offer = true, ledger_cache = Cache
-                            }}
+            do_batchput(ObjectChanges, DataSync, From, State);
+        {error, Reason} ->
+            gen_server:reply(From, {error, Reason}),
+            {noreply, State}
+    end;
+handle_call({casbatchput, BatchSpecs, Conditions, DataSync}, From, State) when
+    State#state.head_only == false
+->
+    case normalise_batch_specs(BatchSpecs) of
+        {ok, ObjectChanges} ->
+            case normalise_cas_conditions(Conditions) of
+                {ok, CasConditions} ->
+                    case check_cas_conditions(CasConditions, State) of
+                        ok ->
+                            do_batchput(ObjectChanges, DataSync, From, State);
+                        {error, Failures} ->
+                            gen_server:reply(
+                                From, {error, {precondition_failed, Failures}}
+                            ),
+                            {noreply, State}
                     end;
                 {error, Reason} ->
                     gen_server:reply(From, {error, Reason}),
@@ -1691,6 +1742,37 @@ handle_call({get, Bucket, Key, Tag}, _From, State) when
         State#state.monitor, TS0, TS1, GetResult == not_found
     ),
     {reply, GetResult, State};
+handle_call({get_sqn, Bucket, Key, Tag}, _From, State) when
+    State#state.head_only == false
+->
+    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    SW0 = leveled_monitor:maybe_time(State#state.monitor),
+    HeadResult =
+        case current_head_state(LedgerKey, State) of
+            {active, Seqn, _MD} ->
+                {LedgerKey, Seqn};
+            _Other ->
+                not_found
+        end,
+    {TS0, SW1} = leveled_monitor:step_time(SW0),
+    GetResult =
+        case HeadResult of
+            not_found ->
+                not_found;
+            {LK, SQN} ->
+                Object = fetch_value(State#state.inker, {LK, SQN}),
+                case Object of
+                    not_present ->
+                        not_found;
+                    _ ->
+                        {ok, Object, SQN}
+                end
+        end,
+    {TS1, _SW2} = leveled_monitor:step_time(SW1),
+    maybelog_get_timing(
+        State#state.monitor, TS0, TS1, GetResult == not_found
+    ),
+    {reply, GetResult, State};
 handle_call({head, Bucket, Key, Tag, SQNOnly}, _From, State) when
     State#state.head_lookup == true
 ->
@@ -1746,6 +1828,70 @@ handle_call({head, Bucket, Key, Tag, SQNOnly}, _From, State) when
                 {ok, leveled_head:build_head(Tag, LedgerMD)};
             {_, true} ->
                 {ok, SQN}
+        end,
+    {TS1, _SW2} = leveled_monitor:step_time(SW1),
+    maybelog_head_timing(
+        State#state.monitor, TS0, TS1, LedgerMD == not_found, CacheHit
+    ),
+    case UpdJrnalCheckFreq of
+        JrnalCheckFreq ->
+            {reply, Reply, State};
+        UpdJrnalCheckFreq ->
+            {reply, Reply, State#state{ink_checking = UpdJrnalCheckFreq}}
+    end;
+handle_call({head_sqn, Bucket, Key, Tag}, _From, State) when
+    State#state.head_lookup == true
+->
+    SW0 = leveled_monitor:maybe_time(State#state.monitor),
+    LK = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    {Head, CacheHit} =
+        fetch_head(
+            LK,
+            State#state.penciller,
+            State#state.ledger_cache,
+            State#state.head_only
+        ),
+    {TS0, SW1} = leveled_monitor:step_time(SW0),
+    JrnalCheckFreq =
+        case State#state.head_only of
+            true ->
+                0;
+            false ->
+                State#state.ink_checking
+        end,
+    {LedgerMD, SQN, UpdJrnalCheckFreq} =
+        case Head of
+            not_present ->
+                {not_found, null, JrnalCheckFreq};
+            Head ->
+                case leveled_codec:striphead_to_v1details(Head) of
+                    {_SeqN, tomb, _MH, _MD} ->
+                        {not_found, null, JrnalCheckFreq};
+                    {SeqN, {active, TS}, _MH, MD} ->
+                        case TS >= leveled_util:integer_now() of
+                            true ->
+                                I = State#state.inker,
+                                case
+                                    journal_notfound(
+                                        JrnalCheckFreq, I, LK, SeqN
+                                    )
+                                of
+                                    {true, UppedFrequency} ->
+                                        {not_found, null, UppedFrequency};
+                                    {false, ReducedFrequency} ->
+                                        {MD, SeqN, ReducedFrequency}
+                                end;
+                            false ->
+                                {not_found, null, JrnalCheckFreq}
+                        end
+                end
+        end,
+    Reply =
+        case LedgerMD of
+            not_found ->
+                not_found;
+            LedgerMD when LedgerMD =/= null ->
+                {ok, leveled_head:build_head(Tag, LedgerMD), SQN}
         end,
     {TS1, _SW2} = leveled_monitor:step_time(SW1),
     maybelog_head_timing(
@@ -2775,6 +2921,115 @@ scan_table(Table, StartKey, EndKey, Acc, MinSQN, MaxSQN) ->
             end
     end.
 
+-spec do_batchput(
+    list({leveled_codec:ledger_key(), any(), leveled_codec:journal_keychanges()}),
+    boolean(),
+    gen_server:from(),
+    #state{}
+) ->
+    {noreply, #state{}}.
+do_batchput(ObjectChanges, DataSync, From, State) ->
+    SWLR = os:timestamp(),
+    SW0 = leveled_monitor:maybe_time(State#state.monitor),
+    case
+        leveled_inker:ink_batchput(
+            State#state.inker,
+            ObjectChanges,
+            DataSync
+        )
+    of
+        {ok, SQN, ObjectWriteInfos} ->
+            {T0, SW1} = leveled_monitor:step_time(SW0),
+            PreparedChanges =
+                lists:map(
+                    fun({LedgerKey, Object, KeyChanges, ObjSize}) ->
+                        preparefor_ledgercache(
+                            null,
+                            LedgerKey,
+                            SQN,
+                            Object,
+                            ObjSize,
+                            KeyChanges
+                        )
+                    end,
+                    ObjectWriteInfos
+                ),
+            {T1, SW2} = leveled_monitor:step_time(SW1),
+            Cache0 =
+                lists:foldl(
+                    fun addto_ledgercache/2,
+                    State#state.ledger_cache,
+                    PreparedChanges
+                ),
+            ObjSizeTotal =
+                lists:sum([
+                    ObjSize
+                 || {_LK, _Obj, _KeyChanges, ObjSize} <- ObjectWriteInfos
+                ]),
+            {T2, _SW3} = leveled_monitor:step_time(SW2),
+            case State#state.slow_offer of
+                true ->
+                    gen_server:reply(From, pause);
+                false ->
+                    gen_server:reply(From, ok)
+            end,
+            maybe_longrunning(SWLR, overall_put),
+            maybelog_put_timing(
+                State#state.monitor, T0, T1, T2, ObjSizeTotal
+            ),
+            case
+                maybepush_ledgercache(
+                    State#state.cache_size,
+                    State#state.cache_multiple,
+                    Cache0,
+                    State#state.penciller,
+                    State#state.monitor
+                )
+            of
+                {ok, Cache} ->
+                    {noreply, State#state{
+                        slow_offer = false, ledger_cache = Cache
+                    }};
+                {returned, Cache} ->
+                    {noreply, State#state{
+                        slow_offer = true, ledger_cache = Cache
+                    }}
+            end;
+        {error, Reason} ->
+            gen_server:reply(From, {error, Reason}),
+            {noreply, State}
+    end.
+
+-spec current_head_state(leveled_codec:ledger_key(), #state{}) ->
+    absent
+    | tombstone
+    | expired
+    | {active, non_neg_integer(), term()}.
+current_head_state(LedgerKey, State) ->
+    {Head, _CacheHit} =
+        fetch_head(
+            LedgerKey,
+            State#state.penciller,
+            State#state.ledger_cache,
+            State#state.head_only
+        ),
+    case Head of
+        not_present ->
+            absent;
+        Head ->
+            case leveled_codec:striphead_to_v1details(Head) of
+                {_SeqN, tomb, _MH, _MD} ->
+                    tombstone;
+                {SeqN, {active, TS}, _MH, MD} ->
+                    case TS >= leveled_util:integer_now() of
+                        true ->
+                            {active, SeqN, MD};
+                        false ->
+                            expired
+                    end
+            end
+    end.
+
 -spec fetch_head(leveled_codec:ledger_key(), pid(), ledger_cache()) ->
     {not_present | leveled_codec:ledger_value(), boolean()}.
 %% @doc
@@ -2894,6 +3149,113 @@ normalise_batch_spec(Bucket, Key, Object, IndexSpecs, Tag, TTL) ->
         {_, false} ->
             {error, invalid_ttl}
     end.
+
+-spec normalise_cas_conditions(list()) ->
+    {ok, list({leveled_codec:ledger_key(), absent | present | {sqn, non_neg_integer()}})}
+    | {error, term()}.
+normalise_cas_conditions([]) ->
+    {error, empty_cas_conditions};
+normalise_cas_conditions(Conditions) when is_list(Conditions) ->
+    normalise_cas_conditions(Conditions, #{}, []);
+normalise_cas_conditions(_Conditions) ->
+    {error, invalid_cas_condition}.
+
+normalise_cas_conditions([], _Seen, Acc) ->
+    {ok, lists:reverse(Acc)};
+normalise_cas_conditions([{Bucket, Key, Tag, Condition} | Rest], Seen, Acc) when
+    is_atom(Tag)
+->
+    case normalise_cas_condition(Condition) of
+        {ok, NormalCondition} ->
+            case Tag of
+                ?HEAD_TAG ->
+                    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+                    {error, {precondition_failed, [
+                        {precondition_failed, LedgerKey,
+                            {expected, NormalCondition},
+                            {actual, {invalid_tag, Tag}}}
+                    ]}};
+                _ ->
+                    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+                    case maps:is_key(LedgerKey, Seen) of
+                        true ->
+                            {error, {precondition_failed, [
+                                {precondition_failed, LedgerKey,
+                                    {expected, NormalCondition},
+                                    {actual, duplicate_precondition}}
+                            ]}};
+                        false ->
+                            normalise_cas_conditions(
+                                Rest,
+                                maps:put(LedgerKey, true, Seen),
+                                [{LedgerKey, NormalCondition} | Acc]
+                            )
+                    end
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end;
+normalise_cas_conditions([_Condition | _Rest], _Seen, _Acc) ->
+    {error, invalid_cas_condition}.
+
+normalise_cas_condition(absent) ->
+    {ok, absent};
+normalise_cas_condition(present) ->
+    {ok, present};
+normalise_cas_condition({sqn, SQN}) when is_integer(SQN), SQN >= 0 ->
+    {ok, {sqn, SQN}};
+normalise_cas_condition(_Condition) ->
+    {error, invalid_cas_condition}.
+
+-spec check_cas_conditions(
+    list({leveled_codec:ledger_key(), absent | present | {sqn, non_neg_integer()}}),
+    #state{}
+) ->
+    ok | {error, list(term())}.
+check_cas_conditions(Conditions, State) ->
+    Failures =
+        lists:foldl(
+            fun({LedgerKey, Condition}, Acc) ->
+                Current = current_head_state(LedgerKey, State),
+                case cas_condition_passes(Condition, Current) of
+                    true ->
+                        Acc;
+                    false ->
+                        [
+                            {precondition_failed, LedgerKey,
+                                {expected, Condition},
+                                {actual, cas_actual_state(Current)}}
+                            | Acc
+                        ]
+                end
+            end,
+            [],
+            Conditions
+        ),
+    case Failures of
+        [] ->
+            ok;
+        _ ->
+            {error, lists:reverse(Failures)}
+    end.
+
+cas_condition_passes(absent, absent) ->
+    true;
+cas_condition_passes(absent, tombstone) ->
+    true;
+cas_condition_passes(absent, expired) ->
+    true;
+cas_condition_passes(present, {active, _SQN, _MD}) ->
+    true;
+cas_condition_passes({sqn, ExpectedSQN}, {active, ExpectedSQN, _MD}) ->
+    true;
+cas_condition_passes(_Condition, _Current) ->
+    false.
+
+cas_actual_state({active, SQN, _MD}) ->
+    {active, SQN};
+cas_actual_state(Current) ->
+    Current.
 
 valid_index_specs(IndexSpecs) when is_list(IndexSpecs) ->
     lists:all(
@@ -4267,6 +4629,952 @@ batchput_standard_objects_test() ->
     ?assertMatch([], IdxFolder3()),
     ok = book_destroy(Bookie2).
 
+casput_conditions_and_sqn_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    not_found = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {value, <<"V1">>},
+            [{add, <<"city_bin">>, <<"NYC">>}],
+            ?STD_TAG,
+            infinity,
+            false,
+            absent
+        ),
+    {ok, {value, <<"V1">>}, SQN1} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, _Head1, SQN1} = book_head_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {async, NYCFolder1} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"NYC">>, <<"NYC">>},
+            {true, undefined}
+        ),
+    ?assertMatch([{<<"NYC">>, <<"K1">>}], NYCFolder1()),
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, absent}, {actual, {active, SQN1}}}
+        ]}},
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {value, <<"LEAK">>},
+            [{add, <<"city_bin">>, <<"LEAK">>}],
+            ?STD_TAG,
+            infinity,
+            false,
+            absent
+        )
+    ),
+    {ok, {value, <<"V1">>}, SQN1} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {async, LeakFolder1} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"LEAK">>, <<"LEAK">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], LeakFolder1()),
+    ?assertMatch(
+        {error, {precondition_failed, [_]}},
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {value, <<"STALE">>},
+            [{add, <<"city_bin">>, <<"STALE">>}],
+            ?STD_TAG,
+            infinity,
+            false,
+            {sqn, SQN1 + 1000}
+        )
+    ),
+    {ok, {value, <<"V1">>}, SQN1} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {async, StaleFolder1} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"STALE">>, <<"STALE">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], StaleFolder1()),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {value, <<"V2">>},
+            [
+                {remove, <<"city_bin">>, <<"NYC">>},
+                {add, <<"city_bin">>, <<"SYD">>}
+            ],
+            ?STD_TAG,
+            infinity,
+            false,
+            {sqn, SQN1}
+        ),
+    {ok, {value, <<"V2">>}, SQN2} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    true = SQN2 > SQN1,
+    {async, NYCFolder2} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"NYC">>, <<"NYC">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], NYCFolder2()),
+    {async, SYDFolder1} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"city_bin">>, <<"SYD">>, <<"SYD">>},
+            {true, undefined}
+        ),
+    ?assertMatch([{<<"SYD">>, <<"K1">>}], SYDFolder1()),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {delete, <<"B">>, <<"K1">>, [
+                    {remove, <<"city_bin">>, <<"SYD">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [{<<"B">>, <<"K1">>, ?STD_TAG, present}]
+        ),
+    not_found = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {value, <<"V3">>},
+            [],
+            ?STD_TAG,
+            infinity,
+            false,
+            absent
+        ),
+    {ok, {value, <<"V3">>}, _SQN3} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {value, <<"V4">>},
+            [],
+            ?STD_TAG,
+            infinity,
+            false,
+            present
+        ),
+    {ok, {value, <<"V4">>}, _SQN4} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    Past = leveled_util:integer_now() - 300,
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"KTTL">>,
+            {value, expired},
+            [{add, <<"ttl_bin">>, <<"OLD">>}],
+            ?STD_TAG,
+            Past,
+            false
+        ),
+    not_found = book_get_sqn(Bookie1, <<"B">>, <<"KTTL">>),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"KTTL">>,
+            {value, <<"LIVE">>},
+            [{add, <<"ttl_bin">>, <<"NEW">>}],
+            ?STD_TAG,
+            infinity,
+            false,
+            absent
+        ),
+    {ok, {value, <<"LIVE">>}, _TTLRefreshSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"KTTL">>),
+    {async, OldTTLFolder} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"ttl_bin">>, <<"OLD">>, <<"OLD">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], OldTTLFolder()),
+    {async, NewTTLFolder} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"ttl_bin">>, <<"NEW">>, <<"NEW">>},
+            {true, undefined}
+        ),
+    ?assertMatch([{<<"NEW">>, <<"KTTL">>}], NewTTLFolder()),
+    _ =
+        sys:replace_state(
+            Bookie1,
+            fun(State) -> State#state{slow_offer = true} end
+        ),
+    pause =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"KPAUSE">>,
+            {value, <<"ACCEPTED">>},
+            [],
+            ?STD_TAG,
+            infinity,
+            false,
+            absent
+        ),
+    {ok, {value, <<"ACCEPTED">>}, _PauseSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"KPAUSE">>),
+    ok = book_destroy(Bookie1).
+
+casbatchput_atomic_preconditions_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                {add, <<"idx_bin">>, <<"OLD1">>}
+            ], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                {add, <<"idx_bin">>, <<"OLD2">>}
+            ], ?STD_TAG, infinity}
+        ]),
+    {ok, {value, <<"V1">>}, SQN1} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}, SQN2} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
+    ?assertMatch(
+        {error, {precondition_failed, [_]}},
+        book_casbatchput(
+            Bookie1,
+            [
+                {put, <<"B">>, <<"K1">>, {value, <<"LEAK1">>}, [
+                    {remove, <<"idx_bin">>, <<"OLD1">>},
+                    {add, <<"idx_bin">>, <<"LEAK">>}
+                ], ?STD_TAG, infinity},
+                {put, <<"B">>, <<"K2">>, {value, <<"LEAK2">>}, [
+                    {remove, <<"idx_bin">>, <<"OLD2">>},
+                    {add, <<"idx_bin">>, <<"LEAK">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, ?STD_TAG, {sqn, SQN1 + 1}},
+                {<<"B">>, <<"K2">>, ?STD_TAG, {sqn, SQN2}}
+            ]
+        )
+    ),
+    {ok, {value, <<"V1">>}, SQN1} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}, SQN2} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
+    {async, LeakFolder} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"idx_bin">>, <<"LEAK">>, <<"LEAK">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], LeakFolder()),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
+                    {remove, <<"idx_bin">>, <<"OLD1">>},
+                    {add, <<"idx_bin">>, <<"NEW">>}
+                ], ?STD_TAG, infinity},
+                {delete, <<"B">>, <<"K2">>, [
+                    {remove, <<"idx_bin">>, <<"OLD2">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, ?STD_TAG, {sqn, SQN1}},
+                {<<"B">>, <<"K2">>, ?STD_TAG, {sqn, SQN2}}
+            ],
+            false
+        ),
+    {ok, {value, <<"V1B">>}, BatchSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, _Head, BatchSQN} =
+        book_head_sqn(Bookie1, <<"B">>, <<"K1">>),
+    not_found = book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
+    not_found = book_head_sqn(Bookie1, <<"B">>, <<"K2">>),
+    {ok, BatchSQN} = book_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {async, NewFolder} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"idx_bin">>, <<"NEW">>, <<"NEW">>},
+            {true, undefined}
+        ),
+    ?assertMatch([{<<"NEW">>, <<"K1">>}], NewFolder()),
+    {async, Old2Folder} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"idx_bin">>, <<"OLD2">>, <<"OLD2">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], Old2Folder()),
+    ok = book_destroy(Bookie1).
+
+casbatchput_validation_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    PutSpec = {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity},
+    DuplicatePutSpec = {put, <<"B">>, <<"K1">>, {value, <<"V2">>}, [], ?STD_TAG, infinity},
+    ?assertMatch(
+        {error, empty_cas_conditions},
+        book_casbatchput(Bookie1, [PutSpec], [])
+    ),
+    ?assertMatch(
+        {error, {duplicate_key, _}},
+        book_casbatchput(Bookie1, [PutSpec, DuplicatePutSpec], [
+            {<<"B">>, <<"K1">>, ?STD_TAG, absent}
+        ])
+    ),
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, present}, {actual, duplicate_precondition}}
+        ]}},
+        book_casbatchput(Bookie1, [PutSpec], [
+            {<<"B">>, <<"K1">>, ?STD_TAG, absent},
+            {<<"B">>, <<"K1">>, ?STD_TAG, present}
+        ])
+    ),
+    ?assertMatch(
+        {error, invalid_cas_condition},
+        book_casbatchput(Bookie1, [PutSpec], [
+            {<<"B">>, <<"K1">>, ?STD_TAG, invalid}
+        ])
+    ),
+    ?assertMatch(
+        {error, invalid_cas_condition},
+        book_casbatchput(Bookie1, [PutSpec], invalid)
+    ),
+    ?assertMatch(
+        {error, invalid_cas_condition},
+        book_casbatchput(Bookie1, [PutSpec], [invalid])
+    ),
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, absent}, {actual, {invalid_tag, ?HEAD_TAG}}}
+        ]}},
+        book_casbatchput(Bookie1, [PutSpec], [
+            {<<"B">>, <<"K1">>, ?HEAD_TAG, absent}
+        ])
+    ),
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, present}, {actual, absent}}
+        ]}},
+        book_casbatchput(Bookie1, [PutSpec], [
+            {<<"B">>, <<"KMISSING">>, ?STD_TAG, present}
+        ])
+    ),
+    ok = book_delete(Bookie1, <<"B">>, <<"KTOMB">>, []),
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, present}, {actual, tombstone}}
+        ]}},
+        book_casbatchput(Bookie1, [PutSpec], [
+            {<<"B">>, <<"KTOMB">>, ?STD_TAG, present}
+        ])
+    ),
+    Past = leveled_util:integer_now() - 300,
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"KEXPIRED">>,
+            {value, expired},
+            [],
+            ?STD_TAG,
+            Past,
+            false
+        ),
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, present}, {actual, expired}}
+        ]}},
+        book_casbatchput(Bookie1, [PutSpec], [
+            {<<"B">>, <<"KEXPIRED">>, ?STD_TAG, present}
+        ])
+    ),
+    not_found = book_get(Bookie1, <<"B">>, <<"K1">>),
+    ok = book_destroy(Bookie1).
+
+casput_bookput_interleaving_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {counter, 0},
+            [{add, <<"race_bin">>, <<"OLD">>}],
+            ?STD_TAG,
+            infinity,
+            false
+        ),
+    {ok, {counter, 0}, SQN1} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {counter, 1},
+            [
+                {remove, <<"race_bin">>, <<"OLD">>},
+                {add, <<"race_bin">>, <<"PUT_WON">>}
+            ],
+            ?STD_TAG,
+            infinity,
+            false
+        ),
+    {ok, {counter, 1}, SQN2} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    true = SQN2 > SQN1,
+    ?assertMatch(
+        {error, {precondition_failed, [
+            {precondition_failed, _, {expected, {sqn, SQN1}}, {actual, {active, SQN2}}}
+        ]}},
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {counter, 2},
+            [
+                {remove, <<"race_bin">>, <<"PUT_WON">>},
+                {add, <<"race_bin">>, <<"CAS_LEAK">>}
+            ],
+            ?STD_TAG,
+            infinity,
+            false,
+            {sqn, SQN1}
+        )
+    ),
+    {ok, {counter, 1}, SQN2} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {async, LeakFolder} =
+        book_indexfold(
+            Bookie1,
+            <<"B">>,
+            {fun(_B, {IdxV, K}, Acc) -> [{IdxV, K} | Acc] end, []},
+            {<<"race_bin">>, <<"CAS_LEAK">>, <<"CAS_LEAK">>},
+            {true, undefined}
+        ),
+    ?assertMatch([], LeakFolder()),
+    ok = book_destroy(Bookie1).
+
+casput_concurrent_single_winner_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ok =
+        book_put(
+            Bookie1,
+            <<"B">>,
+            <<"K1">>,
+            {counter, 0},
+            [],
+            ?STD_TAG,
+            infinity,
+            false
+        ),
+    {ok, {counter, 0}, SQN1} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    Parent = self(),
+    Workers =
+        [
+            spawn(fun() ->
+                Result =
+                    book_casput(
+                        Bookie1,
+                        <<"B">>,
+                        <<"K1">>,
+                        {counter, N},
+                        [],
+                        ?STD_TAG,
+                        infinity,
+                        false,
+                        {sqn, SQN1}
+                    ),
+                Parent ! {self(), Result}
+            end)
+         || N <- lists:seq(1, 20)
+        ],
+    Results =
+        [
+            receive
+                {Pid, Result} when Pid == Worker ->
+                    Result
+            after 5000 ->
+                timeout
+            end
+         || Worker <- Workers
+        ],
+    1 = length([Result || Result <- Results, Result == ok]),
+    19 =
+        length([
+            Result
+         || Result <- Results,
+            case Result of
+                {error, {precondition_failed, [_ | _]}} -> true;
+                _ -> false
+            end
+        ]),
+    {ok, {counter, Winner}, SQN2} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    true = Winner >= 1,
+    true = Winner =< 20,
+    true = SQN2 > SQN1,
+    ok = book_destroy(Bookie1).
+
+casbatchput_concurrent_overlapping_keys_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K1">>, {counter, 0}, [], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K2">>, {counter, 0}, [], ?STD_TAG, infinity}
+        ]),
+    {ok, {counter, 0}, SQN1} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, {counter, 0}, SQN2} = book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
+    Parent = self(),
+    Workers =
+        [
+            spawn(fun() ->
+                Result =
+                    book_casbatchput(
+                        Bookie1,
+                        [
+                            {put, <<"B">>, <<"K1">>, {counter, N}, [], ?STD_TAG,
+                                infinity},
+                            {put, <<"B">>, <<"K2">>, {counter, N}, [], ?STD_TAG,
+                                infinity}
+                        ],
+                        [
+                            {<<"B">>, <<"K1">>, ?STD_TAG, {sqn, SQN1}},
+                            {<<"B">>, <<"K2">>, ?STD_TAG, {sqn, SQN2}}
+                        ]
+                    ),
+                Parent ! {self(), Result}
+            end)
+         || N <- lists:seq(1, 20)
+        ],
+    Results =
+        [
+            receive
+                {Pid, Result} when Pid == Worker ->
+                    Result
+            after 5000 ->
+                timeout
+            end
+         || Worker <- Workers
+        ],
+    1 = length([Result || Result <- Results, Result == ok]),
+    19 =
+        length([
+            Result
+         || Result <- Results,
+            case Result of
+                {error, {precondition_failed, [_ | _]}} -> true;
+                _ -> false
+            end
+        ]),
+    {ok, {counter, Winner}, BatchSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, {counter, Winner}, BatchSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
+    ok = book_destroy(Bookie1).
+
+casbatchput_crash_recovery_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_plainstart(Opts),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                    {add, <<"idx_bin">>, <<"CRASH">>}
+                ], ?STD_TAG, infinity},
+                {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                    {add, <<"idx_bin">>, <<"CRASH">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, ?STD_TAG, absent},
+                {<<"B">>, <<"K2">>, ?STD_TAG, absent}
+            ],
+            true
+        ),
+    {ok, {value, <<"V1">>}, BatchSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}, BatchSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"KDEL">>,
+            {value, <<"DELETE_ME">>},
+            [{add, <<"idx_bin">>, <<"DELETE_ME">>}],
+            ?STD_TAG,
+            infinity,
+            true,
+            absent
+        ),
+    {ok, {value, <<"DELETE_ME">>}, DeleteSQN} =
+        book_get_sqn(Bookie1, <<"B">>, <<"KDEL">>),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {delete, <<"B">>, <<"KDEL">>, [
+                    {remove, <<"idx_bin">>, <<"DELETE_ME">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [{<<"B">>, <<"KDEL">>, ?STD_TAG, {sqn, DeleteSQN}}],
+            true
+        ),
+    Future = leveled_util:integer_now() + 300,
+    Past = leveled_util:integer_now() - 300,
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"KTTL_LIVE">>,
+            {value, live},
+            [{add, <<"ttl_bin">>, <<"LIVE">>}],
+            ?STD_TAG,
+            Future,
+            true,
+            absent
+        ),
+    ok =
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"KTTL_EXPIRED">>,
+            {value, expired},
+            [{add, <<"ttl_bin">>, <<"EXPIRED">>}],
+            ?STD_TAG,
+            Past,
+            true,
+            absent
+        ),
+    {ok, Inker, Penciller} = book_returnactors(Bookie1),
+    BookieRef = erlang:monitor(process, Bookie1),
+    InkerRef = erlang:monitor(process, Inker),
+    PencillerRef = erlang:monitor(process, Penciller),
+    exit(Bookie1, kill),
+    wait_down(BookieRef, Bookie1, bookie),
+    wait_down(InkerRef, Inker, inker),
+    wait_down(PencillerRef, Penciller, penciller),
+
+    {ok, Bookie2} = book_start(Opts),
+    {ok, {value, <<"V1">>}, BatchSQN} =
+        book_get_sqn(Bookie2, <<"B">>, <<"K1">>),
+    {ok, _Head1, BatchSQN} =
+        book_head_sqn(Bookie2, <<"B">>, <<"K1">>),
+    {ok, {value, <<"V2">>}, BatchSQN} =
+        book_get_sqn(Bookie2, <<"B">>, <<"K2">>),
+    {ok, _Head2, BatchSQN} =
+        book_head_sqn(Bookie2, <<"B">>, <<"K2">>),
+    not_found = book_get_sqn(Bookie2, <<"B">>, <<"KDEL">>),
+    not_found = book_head_sqn(Bookie2, <<"B">>, <<"KDEL">>),
+    {ok, {value, live}, LiveSQN} =
+        book_get_sqn(Bookie2, <<"B">>, <<"KTTL_LIVE">>),
+    {ok, _LiveHead, LiveSQN} =
+        book_head_sqn(Bookie2, <<"B">>, <<"KTTL_LIVE">>),
+    not_found = book_get_sqn(Bookie2, <<"B">>, <<"KTTL_EXPIRED">>),
+    ?assertEqual(
+        [{<<"CRASH">>, <<"K1">>}, {<<"CRASH">>, <<"K2">>}],
+        indexfold_matches(Bookie2, <<"idx_bin">>, <<"CRASH">>)
+    ),
+    ?assertEqual([], indexfold_matches(Bookie2, <<"idx_bin">>, <<"DELETE_ME">>)),
+    ?assertEqual(
+        [{<<"LIVE">>, <<"KTTL_LIVE">>}],
+        indexfold_matches(Bookie2, <<"ttl_bin">>, <<"LIVE">>)
+    ),
+    ?assertEqual([], indexfold_matches(Bookie2, <<"ttl_bin">>, <<"EXPIRED">>)),
+    ok =
+        book_casput(
+            Bookie2,
+            <<"B">>,
+            <<"KNEXT">>,
+            {value, next},
+            [],
+            ?STD_TAG,
+            infinity,
+            true,
+            absent
+        ),
+    {ok, {value, next}, NextSQN} =
+        book_get_sqn(Bookie2, <<"B">>, <<"KNEXT">>),
+    true = NextSQN > LiveSQN,
+    true = LiveSQN > BatchSQN,
+    ok = book_destroy(Bookie2).
+
+casbatchput_partial_tail_test() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none}
+    ],
+    {ok, Bookie1} = book_plainstart(Opts),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                    {add, <<"idx_bin">>, <<"CASTAIL">>}
+                ], ?STD_TAG, infinity},
+                {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                    {add, <<"idx_bin">>, <<"CASTAIL">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, ?STD_TAG, absent},
+                {<<"B">>, <<"K2">>, ?STD_TAG, absent}
+            ],
+            true
+        ),
+    {ok, Inker, Penciller} = book_returnactors(Bookie1),
+    [ActiveJournal | _] = leveled_inker:ink_getcdbpids(Inker),
+    JournalFile = leveled_cdb:cdb_filename(ActiveJournal),
+    BookieRef = erlang:monitor(process, Bookie1),
+    InkerRef = erlang:monitor(process, Inker),
+    PencillerRef = erlang:monitor(process, Penciller),
+    exit(Bookie1, kill),
+    wait_down(BookieRef, Bookie1, bookie),
+    wait_down(InkerRef, Inker, inker),
+    wait_down(PencillerRef, Penciller, penciller),
+    truncate_after_first_cdb_record(JournalFile),
+    {ok, Bookie2} = book_start(Opts),
+    not_found = book_get(Bookie2, <<"B">>, <<"K1">>),
+    not_found = book_get(Bookie2, <<"B">>, <<"K2">>),
+    ?assertEqual([], indexfold_matches(Bookie2, <<"idx_bin">>, <<"CASTAIL">>)),
+    ok = book_destroy(Bookie2).
+
+casbatchput_compaction_retain_test() ->
+    RootPath = reset_filestructure(),
+    Opts = cas_compaction_opts(RootPath, [{?STD_TAG, retain}]),
+    {ok, Bookie1} = book_start(Opts),
+    seed_cas_compaction_state(Bookie1),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    ok = leveled_inker:ink_roll(Inker),
+    ok = book_compactjournal(Bookie1, 30000),
+    wait_for_batch_compaction(Bookie1),
+    assert_cas_compacted_state(Bookie1),
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+    {ok, Bookie2} = book_start(Opts),
+    assert_cas_compacted_state(Bookie2),
+    ok = book_destroy(Bookie2).
+
+casbatchput_hot_backup_after_compaction_test() ->
+    RootPath = reset_filestructure(),
+    BackupPath = reset_filestructure("test/test_cas_backup"),
+    Opts = cas_compaction_opts(RootPath, [{?STD_TAG, retain}]),
+    {ok, Bookie1} = book_start(Opts),
+    seed_cas_compaction_state(Bookie1),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    ok = leveled_inker:ink_roll(Inker),
+    ok = book_compactjournal(Bookie1, 30000),
+    wait_for_batch_compaction(Bookie1),
+    assert_cas_compacted_state(Bookie1),
+
+    {async, BackupFun} = book_hotbackup(Bookie1),
+    ok = BackupFun(BackupPath),
+    ok = book_destroy(Bookie1),
+
+    {ok, Bookie2} =
+        book_start([{root_path, BackupPath} | proplists:delete(root_path, Opts)]),
+    assert_cas_compacted_state(Bookie2),
+    ok = book_destroy(Bookie2).
+
+casbatchput_recalc_compaction_test() ->
+    RootPath = reset_filestructure(),
+    Tag = cas_recalc_tag,
+    ExtractMDFun =
+        fun(cas_recalc_tag, Size, delete) ->
+            {{erlang:phash2(delete), Size, {index, []}}, []};
+        (cas_recalc_tag, Size, Obj) ->
+            [{index, Indexes}, {value, _Value}] = Obj,
+            {{erlang:phash2(term_to_binary(Obj)), Size, {index, Indexes}}, []}
+        end,
+    CalcIndexFun =
+        fun(cas_recalc_tag, UpdMeta, PrvMeta) ->
+            {index, UpdIndexes} = element(3, UpdMeta),
+            PrvIndexes =
+                case PrvMeta of
+                    not_present ->
+                        [];
+                    PrvMeta when is_tuple(PrvMeta) ->
+                        {index, Indexes} = element(3, PrvMeta),
+                        Indexes
+                end,
+            AddSpecs =
+                lists:map(
+                    fun(I) -> {add, <<"temp_int">>, I} end,
+                    lists:subtract(UpdIndexes, PrvIndexes)
+                ),
+            RemoveSpecs =
+                lists:map(
+                    fun(I) -> {remove, <<"temp_int">>, I} end,
+                    lists:subtract(PrvIndexes, UpdIndexes)
+                ),
+            AddSpecs ++ RemoveSpecs
+        end,
+    Opts =
+        cas_compaction_opts(RootPath, [{Tag, recalc}]) ++
+            [{override_functions, [
+                {extract_metadata, ExtractMDFun},
+                {diff_indexspecs, CalcIndexFun}
+            ]}],
+    {ok, Bookie1} = book_start(Opts),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {put, <<"B">>, <<"K1">>, [{index, [1]}, {value, <<"V1">>}], [
+                    {add, <<"temp_int">>, 1}
+                ], Tag, infinity},
+                {put, <<"B">>, <<"K2">>, [{index, [2]}, {value, <<"V2">>}], [
+                    {add, <<"temp_int">>, 2}
+                ], Tag, infinity},
+                {put, <<"B">>, <<"K3">>, [{index, [3]}, {value, <<"V3">>}], [
+                    {add, <<"temp_int">>, 3}
+                ], Tag, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, Tag, absent},
+                {<<"B">>, <<"K2">>, Tag, absent},
+                {<<"B">>, <<"K3">>, Tag, absent}
+            ],
+            true
+        ),
+    {ok, _V1, SQN1} = book_get_sqn(Bookie1, <<"B">>, <<"K1">>, Tag),
+    {ok, _V2, SQN2} = book_get_sqn(Bookie1, <<"B">>, <<"K2">>, Tag),
+    {ok, _V3, SQN3} = book_get_sqn(Bookie1, <<"B">>, <<"K3">>, Tag),
+    ?assertMatch(
+        {error, {precondition_failed, [_]}},
+        book_casput(
+            Bookie1,
+            <<"B">>,
+            <<"K3">>,
+            [{index, [99]}, {value, <<"STALE">>}],
+            [
+                {remove, <<"temp_int">>, 3},
+                {add, <<"temp_int">>, 99}
+            ],
+            Tag,
+            infinity,
+            true,
+            {sqn, SQN3 + 1000}
+        )
+    ),
+    ok =
+        book_casbatchput(
+            Bookie1,
+            [
+                {put, <<"B">>, <<"K1">>, [{index, [4]}, {value, <<"V1B">>}], [
+                    {remove, <<"temp_int">>, 1},
+                    {add, <<"temp_int">>, 4}
+                ], Tag, infinity},
+                {delete, <<"B">>, <<"K2">>, [
+                    {remove, <<"temp_int">>, 2}
+                ], Tag, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, Tag, {sqn, SQN1}},
+                {<<"B">>, <<"K2">>, Tag, {sqn, SQN2}}
+            ],
+            true
+        ),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    ok = leveled_inker:ink_roll(Inker),
+    ok = book_compactjournal(Bookie1, 30000),
+    wait_for_batch_compaction(Bookie1),
+    assert_cas_recalc_state(Bookie1, Tag),
+    ok = book_close(Bookie1),
+    leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
+    {ok, Bookie2} = book_start(Opts),
+    assert_cas_recalc_state(Bookie2, Tag),
+    ok = book_destroy(Bookie2),
+    application:unset_env(leveled, extract_metadata),
+    application:unset_env(leveled, diff_indexspecs).
+
 batchput_indexfold_atomic_visibility_test() ->
     RootPath = reset_filestructure(),
     {ok, Bookie1} =
@@ -5198,6 +6506,121 @@ batchput_ttl_test() ->
         indexfold_matches(Bookie1, <<"ttl_bin">>, <<"LIVE">>)
     ),
     ok = book_destroy(Bookie1).
+
+cas_compaction_opts(RootPath, ReloadStrategy) ->
+    [
+        {root_path, RootPath},
+        {max_journalsize, 1000000},
+        {max_run_length, 1},
+        {cache_size, 500},
+        {sync_strategy, riak_sync},
+        {compression_method, none},
+        {reload_strategy, ReloadStrategy},
+        {journalcompaction_scoreonein, 1},
+        {singlefile_compactionpercentage, 0.0},
+        {maxrunlength_compactionpercentage, 0.0}
+    ].
+
+seed_cas_compaction_state(Bookie) ->
+    ok =
+        book_casbatchput(
+            Bookie,
+            [
+                {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
+                    {add, <<"idx_bin">>, <<"OLD">>}
+                ], ?STD_TAG, infinity},
+                {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [
+                    {add, <<"idx_bin">>, <<"DEAD">>}
+                ], ?STD_TAG, infinity},
+                {put, <<"B">>, <<"K3">>, {value, <<"V3">>}, [
+                    {add, <<"idx_bin">>, <<"KEEP">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, ?STD_TAG, absent},
+                {<<"B">>, <<"K2">>, ?STD_TAG, absent},
+                {<<"B">>, <<"K3">>, ?STD_TAG, absent}
+            ],
+            true
+        ),
+    {ok, _V1, SQN1} = book_get_sqn(Bookie, <<"B">>, <<"K1">>),
+    {ok, _V2, SQN2} = book_get_sqn(Bookie, <<"B">>, <<"K2">>),
+    {ok, _V3, SQN3} = book_get_sqn(Bookie, <<"B">>, <<"K3">>),
+    ?assertMatch(
+        {error, {precondition_failed, [_]}},
+        book_casput(
+            Bookie,
+            <<"B">>,
+            <<"K3">>,
+            {value, <<"STALE">>},
+            [
+                {remove, <<"idx_bin">>, <<"KEEP">>},
+                {add, <<"idx_bin">>, <<"STALE">>}
+            ],
+            ?STD_TAG,
+            infinity,
+            true,
+            {sqn, SQN3 + 1000}
+        )
+    ),
+    ok =
+        book_casbatchput(
+            Bookie,
+            [
+                {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
+                    {remove, <<"idx_bin">>, <<"OLD">>},
+                    {add, <<"idx_bin">>, <<"NEW">>}
+                ], ?STD_TAG, infinity},
+                {delete, <<"B">>, <<"K2">>, [
+                    {remove, <<"idx_bin">>, <<"DEAD">>}
+                ], ?STD_TAG, infinity}
+            ],
+            [
+                {<<"B">>, <<"K1">>, ?STD_TAG, {sqn, SQN1}},
+                {<<"B">>, <<"K2">>, ?STD_TAG, {sqn, SQN2}}
+            ],
+            true
+        ).
+
+assert_cas_compacted_state(Bookie) ->
+    {ok, {value, <<"V1B">>}} = book_get(Bookie, <<"B">>, <<"K1">>),
+    {ok, _Head1, _SQN1} = book_head_sqn(Bookie, <<"B">>, <<"K1">>),
+    not_found = book_get(Bookie, <<"B">>, <<"K2">>),
+    not_found = book_head(Bookie, <<"B">>, <<"K2">>),
+    {ok, {value, <<"V3">>}} = book_get(Bookie, <<"B">>, <<"K3">>),
+    {ok, _Head3, _SQN3} = book_head_sqn(Bookie, <<"B">>, <<"K3">>),
+    ?assertEqual([], indexfold_matches(Bookie, <<"idx_bin">>, <<"OLD">>)),
+    ?assertEqual([], indexfold_matches(Bookie, <<"idx_bin">>, <<"DEAD">>)),
+    ?assertEqual([], indexfold_matches(Bookie, <<"idx_bin">>, <<"STALE">>)),
+    ?assertEqual(
+        [{<<"NEW">>, <<"K1">>}],
+        indexfold_matches(Bookie, <<"idx_bin">>, <<"NEW">>)
+    ),
+    ?assertEqual(
+        [{<<"KEEP">>, <<"K3">>}],
+        indexfold_matches(Bookie, <<"idx_bin">>, <<"KEEP">>)
+    ).
+
+assert_cas_recalc_state(Bookie, Tag) ->
+    {ok, [{index, [4]}, {value, <<"V1B">>}]} =
+        book_get(Bookie, <<"B">>, <<"K1">>, Tag),
+    {ok, _Head1, _SQN1} = book_head_sqn(Bookie, <<"B">>, <<"K1">>, Tag),
+    not_found = book_get(Bookie, <<"B">>, <<"K2">>, Tag),
+    not_found = book_head(Bookie, <<"B">>, <<"K2">>, Tag),
+    {ok, [{index, [3]}, {value, <<"V3">>}]} =
+        book_get(Bookie, <<"B">>, <<"K3">>, Tag),
+    {ok, _Head3, _SQN3} = book_head_sqn(Bookie, <<"B">>, <<"K3">>, Tag),
+    ?assertEqual([], indexfold_matches(Bookie, <<"temp_int">>, 1)),
+    ?assertEqual([], indexfold_matches(Bookie, <<"temp_int">>, 2)),
+    ?assertEqual([], indexfold_matches(Bookie, <<"temp_int">>, 99)),
+    ?assertEqual(
+        [{3, <<"K3">>}],
+        indexfold_matches(Bookie, <<"temp_int">>, 3)
+    ),
+    ?assertEqual(
+        [{4, <<"K1">>}],
+        indexfold_matches(Bookie, <<"temp_int">>, 4)
+    ).
 
 indexfold_matches(Bookie, Bucket, IndexName, IndexValue) ->
     {async, Folder} =
