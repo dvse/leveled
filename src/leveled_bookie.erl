@@ -55,6 +55,7 @@
     book_tempput/7,
     book_batchput/2,
     book_batchput/3,
+    book_ftssearch/5,
     book_casput/9,
     book_casbatchput/3,
     book_casbatchput/4,
@@ -152,7 +153,8 @@
     {snapshot_timeout_long, ?SNAPTIMEOUT_LONG},
     {stats_percentage, ?DEFAULT_STATS_PERC},
     {stats_logfrequency, element(1, leveled_monitor:get_defaults())},
-    {monitor_loglist, element(2, leveled_monitor:get_defaults())}
+    {monitor_loglist, element(2, leveled_monitor:get_defaults())},
+    {fts_indexes, []}
 ]).
 
 -record(ledger_cache, {
@@ -175,6 +177,7 @@
     slow_offer = false :: boolean(),
     head_only = false :: boolean(),
     head_lookup = true :: boolean(),
+    fts_indexes = [] :: list(),
     ink_checking = ?MAX_KEYCHECK_FREQUENCY :: integer(),
     bookie_monref :: reference() | undefined,
     monitor = {no_monitor, 0} :: leveled_monitor:monitor()
@@ -486,7 +489,7 @@ book_plainstart(Opts) ->
     leveled_codec:index_specs(),
     leveled_codec:tag(),
     integer()
-) -> ok | pause.
+) -> ok | pause | {error, term()}.
 
 %% @doc Put an object with an expiry time
 %%
@@ -564,7 +567,7 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag) ->
     leveled_codec:index_specs(),
     leveled_codec:tag(),
     infinity | integer()
-) -> ok | pause.
+) -> ok | pause | {error, term()}.
 
 book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL) when is_atom(Tag) ->
     book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, false).
@@ -607,6 +610,13 @@ book_batchput(Pid, BatchSpecs) ->
 %% See book_batchput/2.  DataSync applies to the whole batch.
 book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
     gen_server:call(Pid, {batchput, BatchSpecs, DataSync}, infinity).
+
+-spec book_ftssearch(
+    pid(), leveled_codec:key(), term(), iodata() | all_docs, map() | list()
+) ->
+    {async, fun(() -> {ok, list(map())} | {error, term()})}.
+book_ftssearch(Pid, Bucket, Index, Query, Opts) ->
+    leveled_fts:book_ftssearch(Pid, Bucket, Index, Query, Opts).
 
 -spec book_casput(
     pid(),
@@ -894,7 +904,7 @@ when
     IndexVal :: term(),
     Start :: IndexVal,
     End :: IndexVal,
-    ReturnTerms :: boolean() | binary(),
+    ReturnTerms :: boolean() | binary() | payload,
     TermExpression :: leveled_codec:term_expression().
 
 book_indexfold(Pid, Constraint, FoldAccT, Range, TermHandling) when
@@ -1481,6 +1491,10 @@ init([Opts]) ->
             leveled_log:add_forcedlogs(ForcedLogs),
             DatabaseID = proplists:get_value(database_id, Opts),
             leveled_log:set_databaseid(DatabaseID),
+            {ok, FtsIndexes} =
+                leveled_fts:normalise_indexes(
+                    proplists:get_value(fts_indexes, Opts)
+                ),
 
             {ok, Monitor} =
                 leveled_monitor:monitor_start(
@@ -1555,6 +1569,7 @@ init([Opts]) ->
                 head_lookup = HeadLookup,
                 inker = Inker,
                 penciller = Penciller,
+                fts_indexes = FtsIndexes,
                 ledger_cache = #ledger_cache{mem = NewETS},
                 monitor = {Monitor, StatLogFrequency}
             }};
@@ -1584,52 +1599,64 @@ handle_call(
     State#state.head_only == false, Tag =/= ?HEAD_TAG
 ->
     LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
-    SWLR = os:timestamp(),
-    SW0 = leveled_monitor:maybe_time(State#state.monitor),
-    {ok, SQN, ObjSize} =
-        leveled_inker:ink_put(
-            State#state.inker,
-            LedgerKey,
-            Object,
-            {IndexSpecs, TTL},
-            DataSync
-        ),
-    {T0, SW1} = leveled_monitor:step_time(SW0),
-    Changes =
-        preparefor_ledgercache(
-            null, LedgerKey, SQN, Object, ObjSize, {IndexSpecs, TTL}
-        ),
-    {T1, SW2} = leveled_monitor:step_time(SW1),
-    Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
-    {T2, _SW3} = leveled_monitor:step_time(SW2),
-    case State#state.slow_offer of
-        true ->
-            gen_server:reply(From, pause);
-        false ->
-            gen_server:reply(From, ok)
-    end,
-    maybe_longrunning(SWLR, overall_put),
-    maybelog_put_timing(State#state.monitor, T0, T1, T2, ObjSize),
-    case
-        maybepush_ledgercache(
-            State#state.cache_size,
-            State#state.cache_multiple,
-            Cache0,
-            State#state.penciller,
-            State#state.monitor
-        )
-    of
-        {ok, Cache} ->
-            {noreply, State#state{slow_offer = false, ledger_cache = Cache}};
-        {returned, Cache} ->
-            {noreply, State#state{slow_offer = true, ledger_cache = Cache}}
+    case augment_fts_index_specs(Bucket, Key, Tag, Object, IndexSpecs, State) of
+        {ok, AugIndexSpecs} ->
+            SWLR = os:timestamp(),
+            SW0 = leveled_monitor:maybe_time(State#state.monitor),
+            {ok, SQN, ObjSize} =
+                leveled_inker:ink_put(
+                    State#state.inker,
+                    LedgerKey,
+                    Object,
+                    {AugIndexSpecs, TTL},
+                    DataSync
+                ),
+            {T0, SW1} = leveled_monitor:step_time(SW0),
+            Changes =
+                preparefor_ledgercache(
+                    null, LedgerKey, SQN, Object, ObjSize, {AugIndexSpecs, TTL}
+                ),
+            {T1, SW2} = leveled_monitor:step_time(SW1),
+            Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
+            {T2, _SW3} = leveled_monitor:step_time(SW2),
+            case State#state.slow_offer of
+                true ->
+                    gen_server:reply(From, pause);
+                false ->
+                    gen_server:reply(From, ok)
+            end,
+            maybe_longrunning(SWLR, overall_put),
+            maybelog_put_timing(State#state.monitor, T0, T1, T2, ObjSize),
+            case
+                maybepush_ledgercache(
+                    State#state.cache_size,
+                    State#state.cache_multiple,
+                    Cache0,
+                    State#state.penciller,
+                    State#state.monitor
+                )
+            of
+                {ok, Cache} ->
+                    {noreply, State#state{slow_offer = false, ledger_cache = Cache}};
+                {returned, Cache} ->
+                    {noreply, State#state{slow_offer = true, ledger_cache = Cache}}
+            end;
+        {error, Reason} ->
+            gen_server:reply(From, {error, Reason}),
+            {noreply, State}
     end;
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
     State#state.head_only == false
 ->
     case normalise_batch_specs(BatchSpecs) of
         {ok, ObjectChanges} ->
-            do_batchput(ObjectChanges, DataSync, From, State);
+            case augment_fts_object_changes(ObjectChanges, State) of
+                {ok, AugObjectChanges} ->
+                    do_batchput(AugObjectChanges, DataSync, From, State);
+                {error, Reason} ->
+                    gen_server:reply(From, {error, Reason}),
+                    {noreply, State}
+            end;
         {error, Reason} ->
             gen_server:reply(From, {error, Reason}),
             {noreply, State}
@@ -1643,7 +1670,13 @@ handle_call({casbatchput, BatchSpecs, Conditions, DataSync}, From, State) when
                 {ok, CasConditions} ->
                     case check_cas_conditions(CasConditions, State) of
                         ok ->
-                            do_batchput(ObjectChanges, DataSync, From, State);
+                            case augment_fts_object_changes(ObjectChanges, State) of
+                                {ok, AugObjectChanges} ->
+                                    do_batchput(AugObjectChanges, DataSync, From, State);
+                                {error, Reason} ->
+                                    gen_server:reply(From, {error, Reason}),
+                                    {noreply, State}
+                            end;
                         {error, Failures} ->
                             gen_server:reply(
                                 From, {error, {precondition_failed, Failures}}
@@ -2527,6 +2560,18 @@ get_runner(State, {index_query, Constraint, FoldAccT, Range, TermHandling}) ->
     leveled_runner:index_query(
         SnapFun, {StartKey, EndKey, TermHandling}, FoldAccT
     );
+get_runner(State, {fts_query, Bucket, Index, Query, Opts}) ->
+    BookiePid = self(),
+    {async, fun() ->
+        leveled_fts:search(
+            BookiePid,
+            Bucket,
+            Index,
+            Query,
+            Opts,
+            State#state.fts_indexes
+        )
+    end};
 get_runner(
     State,
     {multi_index_query, Bucket, FoldAccT, Queries, ComboFun}
@@ -3005,6 +3050,53 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
     | tombstone
     | expired
     | {active, non_neg_integer(), term()}.
+augment_fts_object_changes(ObjectChanges, State) ->
+    augment_fts_object_changes(ObjectChanges, State, []).
+
+augment_fts_object_changes([], _State, Acc) ->
+    {ok, lists:reverse(Acc)};
+augment_fts_object_changes([{LedgerKey, Object, {IndexSpecs, TTL}} | Rest], State, Acc) ->
+    {Bucket, Key, Tag} = ledger_object_identity(LedgerKey),
+    case augment_fts_index_specs(Bucket, Key, Tag, Object, IndexSpecs, State) of
+        {ok, AugIndexSpecs} ->
+            augment_fts_object_changes(
+                Rest,
+                State,
+                [{LedgerKey, Object, {AugIndexSpecs, TTL}} | Acc]
+            );
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+augment_fts_index_specs(_Bucket, _Key, _Tag, _Object, IndexSpecs, #state{fts_indexes = []}) ->
+    {ok, IndexSpecs};
+augment_fts_index_specs(Bucket, Key, Tag, Object, IndexSpecs, State) ->
+    OldObject = fetch_current_object(Bucket, Key, Tag, State),
+    leveled_fts:augment_index_specs(
+        Bucket,
+        Key,
+        Tag,
+        Object,
+        OldObject,
+        IndexSpecs,
+        State#state.fts_indexes
+    ).
+
+fetch_current_object(Bucket, Key, Tag, State) ->
+    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    case current_head_state(LedgerKey, State) of
+        {active, SQN, _MD} ->
+            case fetch_value(State#state.inker, {LedgerKey, SQN}) of
+                not_present -> not_found;
+                Object -> {ok, Object}
+            end;
+        _Other ->
+            not_found
+    end.
+
+ledger_object_identity({Tag, Bucket, Key, null}) ->
+    {Bucket, Key, Tag}.
+
 current_head_state(LedgerKey, State) ->
     {Head, _CacheHit} =
         fetch_head(
@@ -3261,6 +3353,7 @@ valid_index_specs(IndexSpecs) when is_list(IndexSpecs) ->
     lists:all(
         fun
             ({add, _IdxField, _IdxTerm}) -> true;
+            ({add_payload, _IdxField, _IdxTerm, Payload}) when is_binary(Payload) -> true;
             ({remove, _IdxField, _IdxTerm}) -> true;
             (_Other) -> false
         end,

@@ -1071,24 +1071,29 @@ handle_call(
     ok = leveled_pclerk:clerk_close(Clerk),
     ?STD_LOG(p0008, [close]),
     L0Left = State#state.levelzero_size > 0,
-    case (not State#state.levelzero_pending and L0Left) of
+    State0 =
+        case (not State#state.levelzero_pending and L0Left) of
         true ->
-            {Constructor, _} =
+            {Constructor, none} =
                 roll_memory(
                     leveled_pmanifest:get_manifest_sqn(Manifest) + 1,
                     State#state.ledger_sqn,
                     State#state.root_path,
-                    L0C,
+                    none,
                     length(L0C),
                     State#state.sst_options,
-                    true
+                    false
                 ),
-            ok = leveled_sst:sst_close(Constructor);
+            State#state{
+                levelzero_pending = true,
+                levelzero_constructor = Constructor
+            };
         false ->
-            ?STD_LOG(p0010, [State#state.levelzero_size])
-    end,
+            ?STD_LOG(p0010, [State#state.levelzero_size]),
+            State
+        end,
     gen_server:cast(self(), {maybe_defer_shutdown, close, From}),
-    {noreply, State};
+    {noreply, State0};
 handle_call(
     doom, From, State = #state{clerk = Clerk}
 ) when
@@ -1378,11 +1383,17 @@ handle_cast(
 ) when
     ?IS_DEF(Manifest)
 ->
-    case length(leveled_pmanifest:snapshot_pids(Manifest)) of
-        0 ->
+    case {State#state.levelzero_pending, length(leveled_pmanifest:snapshot_pids(Manifest))} of
+        {false, 0} ->
             gen_server:cast(self(), {complete_shutdown, ShutdownType, From}),
             {noreply, State};
-        N ->
+        {true, _N} ->
+            timer:sleep(?SHUTDOWN_PAUSE div ?SHUTDOWN_LOOPS),
+            gen_server:cast(
+                self(), {maybe_defer_shutdown, ShutdownType, From}
+            ),
+            {noreply, State};
+        {false, N} ->
             % Whilst this process sleeps, then any remaining snapshots may
             % release and have their release messages queued before the
             % complete_shutdown cast is sent

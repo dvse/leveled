@@ -140,7 +140,7 @@ bucket_list(SnapFun, Tag, FoldBucketsFun, InitAcc, MaxBuckets) ->
 -spec index_query(
     snap_fun(),
     {leveled_codec:ledger_key(), leveled_codec:ledger_key(), {
-        boolean() | binary(), leveled_codec:term_expression()
+        boolean() | binary() | payload, leveled_codec:term_expression()
     }},
     {fold_keys_fun(), foldacc()}
 ) -> {async, runner_fun()}.

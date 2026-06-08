@@ -155,7 +155,7 @@
 -type compression_method() ::
     lz4 | native | zstd | none.
 -type index_specs() ::
-    list({add | remove, any(), any()}).
+    list({add | remove, any(), any()} | {add_payload, any(), any(), binary()}).
 -type journal_keychanges() ::
     % {KeyChanges, TTL}
     {index_specs(), infinity | integer()}.
@@ -373,7 +373,7 @@ maybe_accumulate(
     maybe_accumulate(T, Acc, Count, Filter, AccFun).
 
 -spec accumulate_index(
-    {boolean() | binary(), term_expression()},
+    {boolean() | binary() | payload, term_expression()},
     leveled_runner:fold_keys_fun()
 ) ->
     leveled_penciller:pclacc_fun().
@@ -392,6 +392,14 @@ accumulate_index({true, undefined}, FoldKeysFun) ->
         IdxValue =/= null, ObjKey =/= null
     ->
         FoldKeysFun(Bucket, {IdxValue, ObjKey}, Acc)
+    end;
+accumulate_index({payload, undefined}, FoldKeysFun) ->
+    fun(
+        {?IDX_TAG, Bucket, {_IdxFld, IdxValue}, ObjKey}, Value, Acc
+    ) when
+        IdxValue =/= null, ObjKey =/= null
+    ->
+        FoldKeysFun(Bucket, {IdxValue, ObjKey, get_metadata(Value)}, Acc)
     end;
 accumulate_index(
     {AddTerm, {query, EvalFun, FilterFun}}, FoldKeysFun
@@ -917,17 +925,23 @@ obj_objectspecs(ObjectSpecs, SQN, TTL) ->
 %% Convert index specs to KV entries ready for the ledger
 idx_indexspecs(IndexSpecs, Bucket, Key, SQN, TTL) ->
     lists:map(
-        fun({IdxOp, IdxFld, IdxTrm}) ->
-            gen_indexspec(Bucket, Key, IdxOp, IdxFld, IdxTrm, SQN, TTL)
+        fun
+            ({add_payload, IdxFld, IdxTrm, Payload}) ->
+                gen_indexspec(Bucket, Key, add, IdxFld, IdxTrm, SQN, TTL, Payload);
+            ({IdxOp, IdxFld, IdxTrm}) ->
+                gen_indexspec(Bucket, Key, IdxOp, IdxFld, IdxTrm, SQN, TTL)
         end,
         IndexSpecs
     ).
 
 gen_indexspec(Bucket, Key, IdxOp, IdxField, IdxTerm, SQN, TTL) ->
+    gen_indexspec(Bucket, Key, IdxOp, IdxField, IdxTerm, SQN, TTL, null).
+
+gen_indexspec(Bucket, Key, IdxOp, IdxField, IdxTerm, SQN, TTL, Payload) ->
     Status = set_status(IdxOp, TTL),
     {
         to_objectkey(Bucket, Key, ?IDX_TAG, IdxField, IdxTerm),
-        {SQN, Status, no_lookup, null}
+        {SQN, Status, no_lookup, Payload}
     }.
 
 -spec gen_headspec(object_spec(), integer(), integer() | infinity) ->
