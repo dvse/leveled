@@ -1722,10 +1722,12 @@ snapshot_timeout_test() ->
     ?assertMatch(0, length(Man10#manifest.snapshots)).
 
 potential_issue_test() ->
+    %% The levels array is built with array:from_list/1 rather than a literal
+    %% so the fixture is independent of the OTP array record layout.
     Manifest =
-        {manifest,
-            {array, 9, 0, [],
-                {
+        #manifest{
+            levels =
+                array:from_list([
                     [],
                     [
                         {manifest_entry,
@@ -1774,8 +1776,14 @@ potential_issue_test() ->
                     {idxt, 0, {{}, {0, nil}}},
                     {idxt, 0, {{}, {0, nil}}},
                     []
-                }},
-            19, [], 0, new_pending_deletions(), 2, new_blooms()},
+                ]),
+            manifest_sqn = 19,
+            snapshots = [],
+            min_snapshot_sqn = 0,
+            pending_deletes = new_pending_deletions(),
+            basement = 2,
+            blooms = new_blooms()
+        },
     Range1 =
         range_lookup(
             Manifest,
