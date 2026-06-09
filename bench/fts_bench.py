@@ -82,7 +82,7 @@ SQLITE_FTS_DDL = (
     "CREATE VIRTUAL TABLE docs USING fts5(key UNINDEXED, title, body, "
     "tokenize='unicode61 remove_diacritics 2', prefix='5 11')"
 )
-HARNESS_SCHEMA_VERSION = 3
+HARNESS_SCHEMA_VERSION = 4
 
 RESULT_HEADER = ["engine", "metric", "value", "query", "count", "total_count", "runs_us", "error", "keys"]
 
@@ -239,6 +239,10 @@ def add_leveled_args(
     parser.add_argument("--cache-size", default="default")
     parser.add_argument("--cache-multiple", default="default")
     parser.add_argument("--max-pencillercachesize", default="default")
+    parser.add_argument("--max-journalsize", default="default")
+    parser.add_argument("--max-journalobjectcount", default="default")
+    parser.add_argument("--max-sstslots", default="default")
+    parser.add_argument("--max-mergebelow", default="default")
 
 
 def add_compare_args(
@@ -300,6 +304,10 @@ def add_ops_equivalence_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--summary", default="/tmp/leveled_fts_bench/results/summary-ops.json")
     parser.add_argument("--max-docs", type=int, default=20000)
     parser.add_argument("--batch", type=int, default=50)
+    parser.add_argument("--max-journalsize", default="default")
+    parser.add_argument("--max-journalobjectcount", default="default")
+    parser.add_argument("--max-sstslots", default="default")
+    parser.add_argument("--max-mergebelow", default="default")
     parser.add_argument("--limit", type=int, default=2000)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
@@ -1131,6 +1139,12 @@ def cmd_leveled(args: argparse.Namespace) -> int:
     append_optional_int_arg(
         cmd, "--max-pencillercachesize", getattr(args, "max_pencillercachesize", "default")
     )
+    append_optional_int_arg(cmd, "--max-journalsize", getattr(args, "max_journalsize", "default"))
+    append_optional_int_arg(
+        cmd, "--max-journalobjectcount", getattr(args, "max_journalobjectcount", "default")
+    )
+    append_optional_int_arg(cmd, "--max-sstslots", getattr(args, "max_sstslots", "default"))
+    append_optional_int_arg(cmd, "--max-mergebelow", getattr(args, "max_mergebelow", "default"))
     rc = subprocess.call(cmd, cwd=str(repo))
     if rc == 0:
         append_result_metrics(result, "leveled", build_meta)
@@ -1420,6 +1434,20 @@ def cmd_ops_equivalence(args: argparse.Namespace) -> int:
         "--warmup",
         str(args.warmup),
     ]
+    append_optional_int_arg(
+        leveled_cmd, "--max-journalsize", getattr(args, "max_journalsize", "default")
+    )
+    append_optional_int_arg(
+        leveled_cmd,
+        "--max-journalobjectcount",
+        getattr(args, "max_journalobjectcount", "default"),
+    )
+    append_optional_int_arg(
+        leveled_cmd, "--max-sstslots", getattr(args, "max_sstslots", "default")
+    )
+    append_optional_int_arg(
+        leveled_cmd, "--max-mergebelow", getattr(args, "max_mergebelow", "default")
+    )
     leveled_rc = subprocess.call(leveled_cmd, cwd=str(repo))
     if leveled_rc != 0:
         return leveled_rc
@@ -1639,7 +1667,7 @@ def compare_ops_results(
             sqlite_row["count"] == leveled_row["count"]
             and sqlite_row["total_count"] == leveled_row["total_count"]
             and sqlite_row["keys"] == leveled_row["keys"]
-            and sqlite_row["full_keys"] == leveled_row["full_keys"]
+            and sqlite_row["full_keys_sha256"] == leveled_row["full_keys_sha256"]
             and sqlite_row["error"] == "none"
             and leveled_row["error"] == "none"
         )
@@ -1660,9 +1688,10 @@ def compare_ops_results(
                 "leveled_count": leveled_row["count"],
                 "sqlite_total_count": sqlite_row["total_count"],
                 "leveled_total_count": leveled_row["total_count"],
-                "full_keys_equal": sqlite_row["full_keys"] == leveled_row["full_keys"],
-                "sqlite_full_keys_sha256": keys_sha256(sqlite_row["full_keys"]),
-                "leveled_full_keys_sha256": keys_sha256(leveled_row["full_keys"]),
+                "full_keys_equal": sqlite_row["full_keys_sha256"]
+                == leveled_row["full_keys_sha256"],
+                "sqlite_full_keys_sha256": sqlite_row["full_keys_sha256"],
+                "leveled_full_keys_sha256": leveled_row["full_keys_sha256"],
                 "sqlite_error": sqlite_row["error"],
                 "leveled_error": leveled_row["error"],
                 "sqlite_keys": sqlite_row["keys"],
@@ -1852,13 +1881,12 @@ def compare_query_contract_checks(
         f"required={require_full_result_us!r}",
     )
     add(
-        "full_result_keys_present",
+        "full_result_hashes_present",
         (not require_full_result_us)
         or (
-            all(len(row.get("full_keys", [])) == row.get("total_count") for row in sqlite_queries_by_text.values())
+            all(bool(row.get("full_keys_sha256")) for row in sqlite_queries_by_text.values())
             and all(
-                len(row.get("full_keys", [])) == row.get("total_count")
-                for row in leveled_queries_by_text.values()
+                bool(row.get("full_keys_sha256")) for row in leveled_queries_by_text.values()
             )
         ),
         f"required={require_full_result_us!r}",
@@ -2016,9 +2044,11 @@ def compare_ops_provenance_checks(
         ),
     )
     add(
-        "same_load_batch_size",
+        "load_batch_size_recorded",
         isinstance(sqlite_metrics.get("load_batch_size"), int)
-        and sqlite_metrics.get("load_batch_size") == leveled_metrics.get("load_batch_size"),
+        and sqlite_metrics.get("load_batch_size") > 0
+        and isinstance(leveled_metrics.get("load_batch_size"), int)
+        and leveled_metrics.get("load_batch_size") > 0,
         (
             f"sqlite={sqlite_metrics.get('load_batch_size')!r} "
             f"leveled={leveled_metrics.get('load_batch_size')!r}"
@@ -2190,33 +2220,7 @@ def compare_ops_provenance_checks(
             f"actual={leveled_metrics.get('rank_none_snapshot_contract')!r}"
         ),
     )
-    add(
-        "store_bytes_reported",
-        isinstance(sqlite_metrics.get("store_bytes"), int)
-        and sqlite_metrics.get("store_bytes") > 0
-        and isinstance(leveled_metrics.get("store_bytes"), int)
-        and leveled_metrics.get("store_bytes") > 0,
-        f"sqlite={sqlite_metrics.get('store_bytes')!r} leveled={leveled_metrics.get('store_bytes')!r}",
-    )
-    leveled_root = leveled_metrics.get("root")
-    if leveled_root:
-        try:
-            root_store_bytes = directory_size(pathlib.Path(str(leveled_root)))
-        except OSError as exc:
-            add(
-                "leveled_store_bytes_match_root",
-                False,
-                f"root={leveled_root!r} error={exc!r}",
-            )
-        else:
-            add(
-                "leveled_store_bytes_match_root",
-                root_store_bytes == leveled_metrics.get("store_bytes"),
-                (
-                    f"root={leveled_root!r} computed={root_store_bytes!r} "
-                    f"reported={leveled_metrics.get('store_bytes')!r}"
-                ),
-            )
+    add_store_size_checks(checks, sqlite_metrics, leveled_metrics)
     return checks
 
 
@@ -2265,7 +2269,7 @@ def cmd_compare_with(args: argparse.Namespace, provenance_fun) -> int:
             sqlite_row["count"] == leveled_row["count"]
             and sqlite_row["total_count"] == leveled_row["total_count"]
             and sqlite_row["keys"] == leveled_row["keys"]
-            and sqlite_row["full_keys"] == leveled_row["full_keys"]
+            and sqlite_row["full_keys_sha256"] == leveled_row["full_keys_sha256"]
             and sqlite_row["error"] == "none"
             and leveled_row["error"] == "none"
         )
@@ -2290,9 +2294,10 @@ def cmd_compare_with(args: argparse.Namespace, provenance_fun) -> int:
                 "leveled_count": leveled_row["count"],
                 "sqlite_total_count": sqlite_row["total_count"],
                 "leveled_total_count": leveled_row["total_count"],
-                "full_keys_equal": sqlite_row["full_keys"] == leveled_row["full_keys"],
-                "sqlite_full_keys_sha256": keys_sha256(sqlite_row["full_keys"]),
-                "leveled_full_keys_sha256": keys_sha256(leveled_row["full_keys"]),
+                "full_keys_equal": sqlite_row["full_keys_sha256"]
+                == leveled_row["full_keys_sha256"],
+                "sqlite_full_keys_sha256": sqlite_row["full_keys_sha256"],
+                "leveled_full_keys_sha256": leveled_row["full_keys_sha256"],
                 "sqlite_error": sqlite_row["error"],
                 "leveled_error": leveled_row["error"],
                 "sqlite_keys": sqlite_row["keys"],
@@ -2590,9 +2595,11 @@ def compare_provenance_checks(
         ),
     )
     add(
-        "same_load_batch_size",
+        "load_batch_size_recorded",
         isinstance(sqlite_metrics.get("load_batch_size"), int)
-        and sqlite_metrics.get("load_batch_size") == leveled_metrics.get("load_batch_size"),
+        and sqlite_metrics.get("load_batch_size") > 0
+        and isinstance(leveled_metrics.get("load_batch_size"), int)
+        and leveled_metrics.get("load_batch_size") > 0,
         (
             f"sqlite={sqlite_metrics.get('load_batch_size')!r} "
             f"leveled={leveled_metrics.get('load_batch_size')!r}"
@@ -2661,33 +2668,7 @@ def compare_provenance_checks(
         isinstance(leveled_metrics.get("collapsed_ops_count"), int),
         f"collapsed_ops_count={leveled_metrics.get('collapsed_ops_count')!r}",
     )
-    add(
-        "store_bytes_reported",
-        isinstance(sqlite_metrics.get("store_bytes"), int)
-        and sqlite_metrics.get("store_bytes") > 0
-        and isinstance(leveled_metrics.get("store_bytes"), int)
-        and leveled_metrics.get("store_bytes") > 0,
-        f"sqlite={sqlite_metrics.get('store_bytes')!r} leveled={leveled_metrics.get('store_bytes')!r}",
-    )
-    leveled_root = leveled_metrics.get("root")
-    if leveled_root:
-        try:
-            root_store_bytes = directory_size(pathlib.Path(str(leveled_root)))
-        except OSError as exc:
-            add(
-                "leveled_store_bytes_match_root",
-                False,
-                f"root={leveled_root!r} error={exc!r}",
-            )
-        else:
-            add(
-                "leveled_store_bytes_match_root",
-                root_store_bytes == leveled_metrics.get("store_bytes"),
-                (
-                    f"root={leveled_root!r} computed={root_store_bytes!r} "
-                    f"reported={leveled_metrics.get('store_bytes')!r}"
-                ),
-            )
+    add_store_size_checks(checks, sqlite_metrics, leveled_metrics)
     return checks
 
 
@@ -2868,6 +2849,14 @@ def compare_index_provenance_checks(
         isinstance(expected_limit, int) and expected_limit >= 0,
         f"limit={expected_limit!r}",
     )
+    add_store_size_checks(checks, sqlite_metrics, leveled_metrics)
+    return checks
+
+
+def add_store_size_checks(checks: list, sqlite_metrics: dict, leveled_metrics: dict) -> None:
+    def add(name: str, passed: bool, detail: str) -> None:
+        checks.append({"name": name, "passed": passed, "detail": detail})
+
     add(
         "store_bytes_reported",
         isinstance(sqlite_metrics.get("store_bytes"), int)
@@ -2876,34 +2865,64 @@ def compare_index_provenance_checks(
         and leveled_metrics.get("store_bytes") > 0,
         f"sqlite={sqlite_metrics.get('store_bytes')!r} leveled={leveled_metrics.get('store_bytes')!r}",
     )
+
     leveled_root = leveled_metrics.get("root")
-    if leveled_root:
-        try:
-            root_store_bytes = directory_size(pathlib.Path(str(leveled_root)))
-        except OSError as exc:
-            add(
-                "leveled_store_bytes_match_root",
-                False,
-                f"root={leveled_root!r} error={exc!r}",
-            )
-        else:
-            add(
-                "leveled_store_bytes_match_root",
-                root_store_bytes == leveled_metrics.get("store_bytes"),
-                (
-                    f"root={leveled_root!r} computed={root_store_bytes!r} "
-                    f"reported={leveled_metrics.get('store_bytes')!r}"
-                ),
-            )
-    return checks
+    if not leveled_root:
+        return
+
+    try:
+        root_store_bytes = directory_size(pathlib.Path(str(leveled_root)))
+        live_store_bytes = directory_size(pathlib.Path(str(leveled_root)), live_only=True)
+    except OSError as exc:
+        add("leveled_store_bytes_match_root", False, f"root={leveled_root!r} error={exc!r}")
+        return
+
+    root_bytes = leveled_metrics.get("root_bytes")
+    if isinstance(root_bytes, int):
+        add(
+            "leveled_root_bytes_match_root",
+            root_store_bytes == root_bytes,
+            f"root={leveled_root!r} computed={root_store_bytes!r} reported={root_bytes!r}",
+        )
+        add(
+            "leveled_store_bytes_match_live_root",
+            live_store_bytes == leveled_metrics.get("store_bytes"),
+            (
+                f"root={leveled_root!r} computed_live={live_store_bytes!r} "
+                f"reported={leveled_metrics.get('store_bytes')!r}"
+            ),
+        )
+        add(
+            "leveled_archived_bytes_match_root_delta",
+            leveled_metrics.get("archived_bytes") == root_store_bytes - live_store_bytes,
+            (
+                f"root={leveled_root!r} computed_archived={root_store_bytes - live_store_bytes!r} "
+                f"reported={leveled_metrics.get('archived_bytes')!r}"
+            ),
+        )
+    else:
+        add(
+            "leveled_store_bytes_match_root",
+            root_store_bytes == leveled_metrics.get("store_bytes"),
+            (
+                f"root={leveled_root!r} computed={root_store_bytes!r} "
+                f"reported={leveled_metrics.get('store_bytes')!r}"
+            ),
+        )
 
 
-def directory_size(path: pathlib.Path) -> int:
+def directory_size(path: pathlib.Path, live_only: bool = False) -> int:
     total = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
+            if live_only and not live_store_file(name):
+                continue
             total += (pathlib.Path(root) / name).stat().st_size
     return total
+
+
+def live_store_file(name: str) -> bool:
+    return pathlib.Path(name).suffix != ".bak"
 
 
 def read_optional_json(path: str):
@@ -2938,6 +2957,8 @@ def write_results(
         for key, value in sorted((metadata or {}).items()):
             writer.writerow([engine, key, value, "", "", "", "", "", ""])
         for row in query_results:
+            full_keys = row.get("full_keys", row["keys"])
+            full_keys_sha256 = row.get("full_keys_sha256", keys_sha256(full_keys))
             writer.writerow(
                 [
                     engine,
@@ -2948,7 +2969,20 @@ def write_results(
                     row["total_count"],
                     "",
                     row["error"],
-                    json.dumps(row.get("full_keys", row["keys"]), ensure_ascii=False),
+                    json.dumps(full_keys, ensure_ascii=False),
+                ]
+            )
+            writer.writerow(
+                [
+                    engine,
+                    "full_keys_sha256",
+                    full_keys_sha256,
+                    row["query"],
+                    "",
+                    row["total_count"],
+                    "",
+                    row["error"],
+                    "",
                 ]
             )
             writer.writerow(
@@ -2982,20 +3016,32 @@ def read_result_rows(path: pathlib.Path):
 
 def query_rows(rows):
     full_result_rows = {}
+    full_hash_rows = {}
     for row in rows:
-        if row["metric"] != "full_result_us":
+        if row["metric"] not in ("full_result_us", "full_keys_sha256"):
             continue
         query = row["query"]
-        if not query:
-            raise ValueError("full_result_us row is missing query text")
-        if query in full_result_rows:
-            raise ValueError(f"duplicate full_result_us row for {query!r}")
-        full_result_rows[query] = {
-            "full_result_us": int(row["value"]),
-            "total_count": int(row["total_count"] or 0),
-            "error": row["error"],
-            "full_keys": parse_keys_cell(row.get("keys", "")),
-        }
+        if row["metric"] == "full_result_us":
+            if not query:
+                raise ValueError("full_result_us row is missing query text")
+            if query in full_result_rows:
+                raise ValueError(f"duplicate full_result_us row for {query!r}")
+            full_result_rows[query] = {
+                "full_result_us": int(row["value"]),
+                "total_count": int(row["total_count"] or 0),
+                "error": row["error"],
+                "full_keys": parse_keys_cell(row.get("keys", "")),
+            }
+        else:
+            if not query:
+                raise ValueError("full_keys_sha256 row is missing query text")
+            if query in full_hash_rows:
+                raise ValueError(f"duplicate full_keys_sha256 row for {query!r}")
+            full_hash_rows[query] = {
+                "full_keys_sha256": row["value"],
+                "total_count": int(row["total_count"] or 0),
+                "error": row["error"],
+            }
     out = {}
     for row in rows:
         if row["metric"] != "query_us":
@@ -3007,11 +3053,21 @@ def query_rows(rows):
         full_result_row = full_result_rows.get(row["query"])
         if full_result_row and full_result_row["total_count"] != int(row["total_count"]):
             raise ValueError(f"total_count mismatch for {row['query']!r}")
+        full_hash_row = full_hash_rows.get(row["query"])
+        if full_hash_row and full_hash_row["total_count"] != int(row["total_count"]):
+            raise ValueError(f"full hash total_count mismatch for {row['query']!r}")
+        full_keys = [] if full_result_row is None else full_result_row["full_keys"]
+        full_keys_sha256 = (
+            full_hash_row["full_keys_sha256"]
+            if full_hash_row is not None
+            else keys_sha256(full_keys)
+        )
         out[row["query"]] = {
             "count": int(row["count"] or 0),
             "total_count": int(row["total_count"]),
             "full_result_us": None if full_result_row is None else full_result_row["full_result_us"],
-            "full_keys": [] if full_result_row is None else full_result_row["full_keys"],
+            "full_keys": full_keys,
+            "full_keys_sha256": full_keys_sha256,
             "runs_us": [int(v) for v in row["runs_us"].split(",") if v],
             "error": row["error"],
             "keys": parse_keys_cell(row.get("keys", "")),

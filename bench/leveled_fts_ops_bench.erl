@@ -22,6 +22,10 @@ parse_args(Args) ->
         index => <<"main">>,
         ledger_compression => as_store,
         limit => 2000,
+        max_journalobjectcount => 200000,
+        max_journalsize => 1000000000,
+        max_mergebelow => default,
+        max_sstslots => default,
         runs => 5,
         warmup => 1
     },
@@ -53,6 +57,14 @@ parse_args(["--ledger-compression", Method | Rest], Opts) ->
         {ok, Atom} -> parse_args(Rest, Opts#{ledger_compression => Atom});
         error -> {error, {invalid_ledger_compression, Method}}
     end;
+parse_args(["--max-journalsize", N | Rest], Opts) ->
+    parse_args(Rest, Opts#{max_journalsize => list_to_integer(N)});
+parse_args(["--max-journalobjectcount", N | Rest], Opts) ->
+    parse_args(Rest, Opts#{max_journalobjectcount => list_to_integer(N)});
+parse_args(["--max-sstslots", N | Rest], Opts) ->
+    parse_args(Rest, Opts#{max_sstslots => list_to_integer(N)});
+parse_args(["--max-mergebelow", N | Rest], Opts) ->
+    parse_args(Rest, Opts#{max_mergebelow => list_to_integer(N)});
 parse_args(["--limit", N | Rest], Opts) ->
     parse_args(Rest, Opts#{limit => list_to_integer(N)});
 parse_args(["--runs", N | Rest], Opts) ->
@@ -73,8 +85,8 @@ run(Opts) ->
         {root_path, Root},
         {sync_strategy, none},
         {log_level, warn},
-        {max_journalsize, 1000000000},
-        {max_journalobjectcount, 200000},
+        {max_journalsize, maps:get(max_journalsize, Opts)},
+        {max_journalobjectcount, maps:get(max_journalobjectcount, Opts)},
         {compression_method, maps:get(compression_method, Opts)},
         {ledger_compression, maps:get(ledger_compression, Opts)},
         {stats_percentage, 100},
@@ -92,7 +104,7 @@ run(Opts) ->
                 remove_diacritics => 2
             }
         ]}
-    ],
+    ] ++ sst_start_opts(Opts),
     {ok, Bookie} = leveled_bookie:book_start(StartOpts),
     LoadStart = erlang:monotonic_time(microsecond),
     LoadResult = load_ops(Bookie, Opts),
@@ -101,17 +113,29 @@ run(Opts) ->
         case LoadResult of
             {ok, DocCount, TextBytes, LoadStats} ->
                 LoadStatus = leveled_bookie:book_status(Bookie),
+                LoadMemory = memory_snapshot(),
                 CloseStart = erlang:monotonic_time(microsecond),
                 ok = leveled_bookie:book_close(Bookie),
                 CloseEnd = erlang:monotonic_time(microsecond),
+                erlang:garbage_collect(),
+                ClosedMemory = memory_snapshot(),
                 ReopenStart = erlang:monotonic_time(microsecond),
                 {ok, QueryBookie} = leveled_bookie:book_start(StartOpts),
                 ReopenEnd = erlang:monotonic_time(microsecond),
                 Queries = read_queries(maps:get(queries, Opts)),
-                QueryResults = run_queries(QueryBookie, Queries, Opts#{doc_count => DocCount}),
+                QueryRowsPath = maps:get(result, Opts) ++ ".queries.tmp",
+                {ok, QueryStats} = run_queries_to_file(
+                    QueryBookie,
+                    Queries,
+                    Opts#{doc_count => DocCount},
+                    QueryRowsPath
+                ),
+                QueryMemory = memory_snapshot(),
                 QueryCloseStart = erlang:monotonic_time(microsecond),
                 ok = leveled_bookie:book_close(QueryBookie),
                 QueryCloseEnd = erlang:monotonic_time(microsecond),
+                erlang:garbage_collect(),
+                FinalMemory = memory_snapshot(),
                 write_results(
                     maps:get(result, Opts),
                     DocCount,
@@ -122,10 +146,18 @@ run(Opts) ->
                         LoadStats#{
                             close_us => CloseEnd - CloseStart,
                             query_reopen_us => ReopenEnd - ReopenStart,
-                            query_close_us => QueryCloseEnd - QueryCloseStart
+                            query_close_us => QueryCloseEnd - QueryCloseStart,
+                            memory_after_load => LoadMemory,
+                            memory_after_load_close => ClosedMemory,
+                            memory_after_queries => QueryMemory,
+                            memory_after_query_close => FinalMemory,
+                            query_memory_peak_total =>
+                                maps:get(query_memory_peak_total, QueryStats, 0)
                         }
                     ),
-                    QueryResults,
+                    length(Queries),
+                    query_list_sha256(Queries),
+                    QueryRowsPath,
                     Opts
                 );
             {error, Reason} ->
@@ -157,10 +189,11 @@ ledger_compression(Method) -> compression_method(Method).
 load_ops(Bookie, Opts) ->
     Ops = maps:get(ops, Opts),
     BatchSize = maps:get(batch, Opts),
-    case file:open(Ops, [read, binary, {read_ahead, 1024 * 1024}]) of
-        {ok, File} ->
-            Result = load_loop(
-                File,
+    case file:read_file(Ops) of
+        {ok, Bin} ->
+            Lines = [L || L <- binary:split(Bin, <<"\n">>, [global]), L =/= <<>>],
+            load_loop(
+                Lines,
                 Bookie,
                 Opts,
                 BatchSize,
@@ -171,25 +204,23 @@ load_ops(Bookie, Opts) ->
                 #{},
                 #{parse_us => 0, write_us => 0, batches => 0, ops_count => 0,
                     puts => 0, deletes => 0, collapsed_ops_count => 0}
-            ),
-            ok = file:close(File),
-            Result;
+            );
         {error, Reason} ->
             {error, {open_ops, Reason}}
     end.
 
 load_loop(
-    File, Bookie, Opts, BatchSize, Batch, BatchCount, BatchKeys, SourceIdKeys, Active, Stats
+    Lines, Bookie, Opts, BatchSize, Batch, BatchCount, BatchKeys, SourceIdKeys, Active, Stats
 ) ->
-    case file:read_line(File) of
-        eof ->
+    case Lines of
+        [] ->
             case timed_write_batch(Bookie, Batch, Stats) of
                 {ok, FinalStats} ->
                     {ok, maps:size(Active), active_text_bytes(Active), FinalStats};
                 {error, Reason} ->
                     {error, Reason}
             end;
-        {ok, Line} ->
+        [Line | RestLines] ->
             ParseStart = erlang:monotonic_time(microsecond),
             ParseResult = parse_op(Line, Opts),
             ParseEnd = erlang:monotonic_time(microsecond),
@@ -214,7 +245,7 @@ load_loop(
                                             case timed_write_batch(Bookie, Batch1, Stats2) of
                                                 {ok, Stats3} ->
                                                     load_loop(
-                                                        File,
+                                                        RestLines,
                                                         Bookie,
                                                         Opts,
                                                         BatchSize,
@@ -230,7 +261,7 @@ load_loop(
                                             end;
                                         false ->
                                             load_loop(
-                                                File,
+                                                RestLines,
                                                 Bookie,
                                                 Opts,
                                                 BatchSize,
@@ -406,6 +437,9 @@ batch_op_identity(_Op) ->
 add_stat(Key, Value, Stats) ->
     Stats#{Key => maps:get(Key, Stats, 0) + Value}.
 
+memory_snapshot() ->
+    maps:from_list(erlang:memory()).
+
 add_load_status(Status, Stats) ->
     InkUs = maps:get(put_ink_time, Status, 0),
     PrepUs = maps:get(put_prep_time, Status, 0),
@@ -438,8 +472,31 @@ trim_query(Line) ->
 is_comment(<<"#", _/binary>>) -> true;
 is_comment(_Other) -> false.
 
-run_queries(Bookie, Queries, Opts) ->
-    [run_query(Bookie, Query, Opts) || Query <- Queries].
+run_queries_to_file(Bookie, Queries, Opts, Path) ->
+    ok = filelib:ensure_dir(Path),
+    {ok, File} = file:open(Path, [write, binary]),
+    try
+        QueryStats = lists:foldl(
+            fun(Query, Stats) ->
+                Result = run_query(Bookie, Query, Opts),
+                ok = write_query_result(File, Result),
+                erlang:garbage_collect(),
+                Memory = memory_snapshot(),
+                Stats#{
+                    query_memory_peak_total =>
+                        max(
+                            maps:get(query_memory_peak_total, Stats, 0),
+                            maps:get(total, Memory, 0)
+                        )
+                }
+            end,
+            #{},
+            Queries
+        ),
+        {ok, QueryStats}
+    after
+        ok = file:close(File)
+    end.
 
 run_query(Bookie, Query, Opts) ->
     Parent = self(),
@@ -480,17 +537,16 @@ run_query_1(Bookie, Query, Opts) ->
             [] -> result_summary({error, no_timed_runs});
             _ -> lists:last(Summaries)
         end,
-    TotalLimit = max(Limit, maps:get(doc_count, Opts, Limit)),
-    TotalSearchOpts = SearchOpts#{limit := TotalLimit},
+    TotalSearchOpts = SearchOpts#{result => summary},
     TotalStart = erlang:monotonic_time(microsecond),
     TotalResult = search_once(Bookie, Bucket, Index, Query, TotalSearchOpts),
     TotalStop = erlang:monotonic_time(microsecond),
-    TotalCount = result_count(TotalResult),
+    TotalCount = result_total_count(TotalResult),
     TotalError = result_error(total_count, TotalResult),
     Error = first_error([timed_error(Summaries), drift_error(Summaries), TotalError]),
     #{query => Query, count => summary_count(LastSummary), total_count => TotalCount,
         full_result_us => TotalStop - TotalStart, runs_us => Times, error => Error,
-        keys => summary_keys(LastSummary), full_keys => result_keys(TotalResult)}.
+        keys => summary_keys(LastSummary), full_keys_sha256 => result_full_keys_sha256(TotalResult)}.
 
 query_error_result(Query, Reason) ->
     #{query => Query, count => 0, total_count => 0, full_result_us => 0, runs_us => [],
@@ -501,10 +557,17 @@ result_count({ok, Hits}) ->
 result_count({error, _Reason}) ->
     0.
 
-result_keys({ok, Hits}) ->
-    [maps:get(key, Hit) || Hit <- Hits];
-result_keys({error, _Reason}) ->
-    [].
+result_total_count({ok, #{total_count := TotalCount}}) ->
+    TotalCount;
+result_total_count(Result) ->
+    result_count(Result).
+
+result_full_keys_sha256({ok, #{full_keys_sha256 := Hash}}) ->
+    Hash;
+result_full_keys_sha256({ok, Hits}) ->
+    keys_sha256(Hits);
+result_full_keys_sha256({error, _Reason}) ->
+    <<>>.
 
 result_summary({ok, Hits}) ->
     Keys = [maps:get(key, Hit) || Hit <- Hits],
@@ -558,14 +621,14 @@ search_opts(Limit, _Opts) ->
         remove_diacritics => 2
     }.
 
-write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryResults, Opts) ->
+write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryCount, QuerySha, QueryRowsPath, Opts) ->
     ok = filelib:ensure_dir(Path),
     {ok, File} = file:open(Path, [write, binary]),
     ok = io:format(File, "engine\tmetric\tvalue\tquery\tcount\ttotal_count\truns_us\terror\tkeys~n", []),
     ok = write_metric(File, <<"ops">>, unicode:characters_to_binary(maps:get(ops, Opts))),
     ok = write_metric(File, <<"queries">>, unicode:characters_to_binary(maps:get(queries, Opts))),
-    ok = write_metric(File, <<"query_count">>, integer_to_binary(length(QueryResults))),
-    ok = write_metric(File, <<"query_sha256">>, query_results_sha256(QueryResults)),
+    ok = write_metric(File, <<"query_count">>, integer_to_binary(QueryCount)),
+    ok = write_metric(File, <<"query_sha256">>, QuerySha),
     ok = write_metric(File, <<"limit">>, integer_to_binary(maps:get(limit, Opts))),
     ok = write_metric(File, <<"runs">>, integer_to_binary(maps:get(runs, Opts))),
     ok = write_metric(File, <<"warmup">>, integer_to_binary(maps:get(warmup, Opts))),
@@ -643,6 +706,7 @@ write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryResults, Opts) 
         <<"query_close_us">>,
         integer_to_binary(maps:get(query_close_us, LoadStats, 0))
     ),
+    ok = write_memory_metrics(File, LoadStats),
     ok = write_metric(
         File,
         <<"load_transaction_contract">>,
@@ -653,13 +717,28 @@ write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryResults, Opts) 
         <<"query_connection_contract">>,
         <<"close after load, reopen before timed queries">>
     ),
-    ok = write_metric(File, <<"store_bytes">>, integer_to_binary(directory_size(maps:get(root, Opts)))),
+    Root = maps:get(root, Opts),
+    RootBytes = directory_size(Root),
+    StoreBytes = directory_size(Root, live),
+    ok = write_metric(File, <<"store_bytes">>, integer_to_binary(StoreBytes)),
+    ok = write_metric(File, <<"root_bytes">>, integer_to_binary(RootBytes)),
+    ok = write_metric(File, <<"archived_bytes">>, integer_to_binary(RootBytes - StoreBytes)),
     ok = write_metric(
         File, <<"compression_method">>, atom_to_binary(maps:get(compression_method, Opts), utf8)
     ),
     ok = write_metric(
         File, <<"ledger_compression">>, atom_to_binary(maps:get(ledger_compression, Opts), utf8)
     ),
+    ok = write_metric(
+        File, <<"max_journalsize">>, integer_to_binary(maps:get(max_journalsize, Opts))
+    ),
+    ok = write_metric(
+        File,
+        <<"max_journalobjectcount">>,
+        integer_to_binary(maps:get(max_journalobjectcount, Opts))
+    ),
+    ok = write_metric(File, <<"max_sstslots">>, metric_term(maps:get(max_sstslots, Opts))),
+    ok = write_metric(File, <<"max_mergebelow">>, metric_term(maps:get(max_mergebelow, Opts))),
     ok = write_metric(
         File,
         <<"fts_representation_contract">>,
@@ -684,13 +763,76 @@ write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryResults, Opts) 
         <<"search_opts">>,
         list_to_binary(io_lib:format("~p", [search_opts(maps:get(limit, Opts), Opts)]))
     ),
-    lists:foreach(fun(Result) -> write_query_result(File, Result) end, QueryResults),
+    ok = append_query_rows(File, QueryRowsPath),
     ok = file:close(File),
+    _ = file:delete(QueryRowsPath),
     ok.
+
+write_memory_metrics(File, LoadStats) ->
+    lists:foreach(
+        fun({Metric, SnapshotKey}) ->
+            Snapshot = maps:get(SnapshotKey, LoadStats, #{}),
+            ok = write_metric(
+                File,
+                <<(atom_to_binary(Metric, utf8))/binary, "_total">>,
+                integer_to_binary(maps:get(total, Snapshot, 0))
+            ),
+            ok = write_metric(
+                File,
+                <<(atom_to_binary(Metric, utf8))/binary, "_processes">>,
+                integer_to_binary(maps:get(processes, Snapshot, 0))
+            ),
+            ok = write_metric(
+                File,
+                <<(atom_to_binary(Metric, utf8))/binary, "_processes_used">>,
+                integer_to_binary(maps:get(processes_used, Snapshot, 0))
+            ),
+            ok = write_metric(
+                File,
+                <<(atom_to_binary(Metric, utf8))/binary, "_system">>,
+                integer_to_binary(maps:get(system, Snapshot, 0))
+            ),
+            ok = write_metric(
+                File,
+                <<(atom_to_binary(Metric, utf8))/binary, "_binary">>,
+                integer_to_binary(maps:get(binary, Snapshot, 0))
+            )
+        end,
+        [
+            {memory_after_load, memory_after_load},
+            {memory_after_load_close, memory_after_load_close},
+            {memory_after_queries, memory_after_queries},
+            {memory_after_query_close, memory_after_query_close}
+        ]
+    ),
+    ok = write_metric(
+        File,
+        <<"query_memory_peak_total">>,
+        integer_to_binary(maps:get(query_memory_peak_total, LoadStats, 0))
+    ).
 
 write_metric(File, Metric, Value) ->
     ok = io:format(File, "leveled\t~s\t~s\t\t\t\t\t\t~n", [
         escape_cell(Metric), escape_cell(Value)
+    ]).
+
+metric_term(Value) when is_integer(Value) ->
+    integer_to_binary(Value);
+metric_term(Value) when is_atom(Value) ->
+    atom_to_binary(Value, utf8).
+
+sst_start_opts(Opts) ->
+    MaxSSTSlots = maps:get(max_sstslots, Opts, default),
+    MaxMergeBelow = maps:get(max_mergebelow, Opts, default),
+    lists:append([
+        case MaxSSTSlots of
+            default -> [];
+            _ -> [{max_sstslots, MaxSSTSlots}]
+        end,
+        case MaxMergeBelow of
+            default -> [];
+            _ -> [{max_mergebelow, MaxMergeBelow}]
+        end
     ]).
 
 prefix_execution_contract() ->
@@ -702,18 +844,35 @@ payload_visibility_contract() ->
 rank_none_snapshot_contract() ->
     <<"rank_none_payload_key_order">>.
 
+append_query_rows(OutFile, QueryRowsPath) ->
+    {ok, InFile} = file:open(QueryRowsPath, [read, binary]),
+    try append_query_rows_loop(InFile, OutFile) after ok = file:close(InFile) end.
+
+append_query_rows_loop(InFile, OutFile) ->
+    case file:read(InFile, 1024 * 1024) of
+        eof ->
+            ok;
+        {ok, Bin} ->
+            ok = file:write(OutFile, Bin),
+            append_query_rows_loop(InFile, OutFile)
+    end.
+
 write_query_result(
     File,
     #{query := Query, count := Count, total_count := TotalCount, full_result_us := FullResultUs,
-        runs_us := Runs, error := Error, keys := Keys, full_keys := FullKeys}
+        runs_us := Runs, error := Error, keys := Keys, full_keys_sha256 := FullKeysSha256}
 ) ->
     RunsBin = join_integer_list(Runs),
     KeysCell = json_binary_list(Keys),
-    FullKeysCell = json_binary_list(FullKeys),
     ok = io:format(
         File,
-        "leveled\tfull_result_us\t~p\t~s\t\t~p\t\t~s\t~s~n",
-        [FullResultUs, escape_cell(Query), TotalCount, term_cell(Error), escape_cell(FullKeysCell)]
+        "leveled\tfull_result_us\t~p\t~s\t\t~p\t\t~s\t~n",
+        [FullResultUs, escape_cell(Query), TotalCount, term_cell(Error)]
+    ),
+    ok = io:format(
+        File,
+        "leveled\tfull_keys_sha256\t~s\t~s\t\t~p\t\t~s\t~n",
+        [escape_cell(FullKeysSha256), escape_cell(Query), TotalCount, term_cell(Error)]
     ),
     ok = io:format(
         File,
@@ -724,9 +883,8 @@ write_query_result(
 term_cell(Term) ->
     escape_cell(iolist_to_binary(io_lib:format("~w", [Term]))).
 
-query_results_sha256(QueryResults) ->
-    QueryLines = [maps:get(query, Result) || Result <- QueryResults],
-    sha256_hex(iolist_to_binary([[Query, <<"\n">>] || Query <- QueryLines])).
+query_list_sha256(Queries) ->
+    sha256_hex(iolist_to_binary([[Query, <<"\n">>] || Query <- Queries])).
 
 sha256_hex(Bin) ->
     Hex = [
@@ -750,6 +908,10 @@ join_integer_list([N | Rest]) ->
 
 json_binary_list(Keys) ->
     iolist_to_binary([$[, json_binary_items(Keys), $]]).
+
+keys_sha256(Hits) ->
+    Keys = [maps:get(key, Hit) || Hit <- Hits],
+    sha256_hex(json_binary_list(Keys)).
 
 json_binary_items([]) ->
     [];
@@ -799,14 +961,17 @@ escape_cell(Bin) when is_binary(Bin) ->
     end.
 
 directory_size(Path) ->
+    directory_size(Path, all).
+
+directory_size(Path, Mode) ->
     case filelib:is_dir(Path) of
-        true -> directory_size([Path], 0);
+        true -> directory_size([Path], Mode, 0);
         false -> 0
     end.
 
-directory_size([], Acc) ->
+directory_size([], _Mode, Acc) ->
     Acc;
-directory_size([Path | Rest], Acc) ->
+directory_size([Path | Rest], Mode, Acc) ->
     case file:list_dir(Path) of
         {ok, Names} ->
             {Dirs, Size} =
@@ -817,7 +982,10 @@ directory_size([Path | Rest], Acc) ->
                             {ok, #file_info{type = directory}} ->
                                 {[Child | DirAcc], SizeAcc};
                             {ok, #file_info{size = Bytes}} ->
-                                {DirAcc, SizeAcc + Bytes};
+                                case count_store_file(Name, Mode) of
+                                    true -> {DirAcc, SizeAcc + Bytes};
+                                    false -> {DirAcc, SizeAcc}
+                                end;
                             {error, _Reason} ->
                                 {DirAcc, SizeAcc}
                         end
@@ -825,7 +993,12 @@ directory_size([Path | Rest], Acc) ->
                     {[], Acc},
                     Names
                 ),
-            directory_size(Dirs ++ Rest, Size);
+            directory_size(Dirs ++ Rest, Mode, Size);
         {error, _Reason} ->
-            directory_size(Rest, Acc)
+            directory_size(Rest, Mode, Acc)
     end.
+
+count_store_file(_Name, all) ->
+    true;
+count_store_file(Name, live) ->
+    filename:extension(Name) =/= ".bak".
