@@ -1178,6 +1178,14 @@ put_object(
 %% Add a standard-mode object batch to the current journal. All objects share
 %% one SQN, but each has its own normal standard journal key so object fetches
 %% can continue to use {SQN, LedgerKey}.
+serialise_chunks([], _Size) ->
+    [];
+serialise_chunks(List, Size) when length(List) =< Size ->
+    [List];
+serialise_chunks(List, Size) ->
+    {Chunk, Rest} = lists:split(Size, List),
+    [Chunk | serialise_chunks(Rest, Size)].
+
 put_objects_batch(
     ObjectChanges,
     Sync,
@@ -1192,27 +1200,52 @@ put_objects_batch(
 ->
     NewSQN = State#state.journal_sqn + 1,
     BatchSize = length(ObjectChanges),
+    Serialise =
+        fun({LedgerKey, Object, KeyChanges}) ->
+            {JournalKey, JournalBin} =
+                leveled_codec:to_batch_inkerkv(
+                    LedgerKey,
+                    NewSQN,
+                    Object,
+                    KeyChanges,
+                    BatchSize,
+                    State#state.compression_method,
+                    State#state.compress_on_receipt
+                ),
+            {
+                {JournalKey, JournalBin},
+                {LedgerKey, Object, KeyChanges, byte_size(JournalBin)}
+            }
+        end,
+    %% Journal value encoding is pure, so large batches are serialised in
+    %% parallel worker processes (order is preserved by chunk concatenation).
     {JournalKVs, ObjectWriteInfos} =
         lists:unzip(
-            lists:map(
-                fun({LedgerKey, Object, KeyChanges}) ->
-                    {JournalKey, JournalBin} =
-                        leveled_codec:to_batch_inkerkv(
-                            LedgerKey,
-                            NewSQN,
-                            Object,
-                            KeyChanges,
-                            BatchSize,
-                            State#state.compression_method,
-                            State#state.compress_on_receipt
-                        ),
-                    {
-                        {JournalKey, JournalBin},
-                        {LedgerKey, Object, KeyChanges, byte_size(JournalBin)}
-                    }
-                end,
-                ObjectChanges
-            )
+            case BatchSize >= 512 of
+                false ->
+                    lists:map(Serialise, ObjectChanges);
+                true ->
+                    Parent = self(),
+                    Ref = make_ref(),
+                    ChunkSize = max(1, (BatchSize + 7) div 8),
+                    Pids =
+                        [
+                            spawn_opt(
+                                fun() ->
+                                    Parent !
+                                        {Ref, self(), lists:map(Serialise, Chunk)}
+                                end,
+                                [link, {min_heap_size, 8192}]
+                            )
+                         || Chunk <- serialise_chunks(ObjectChanges, ChunkSize)
+                        ],
+                    lists:append([
+                        receive
+                            {Ref, Pid, Result} -> Result
+                        end
+                     || Pid <- Pids
+                    ])
+            end
         ),
     case leveled_cdb:cdb_mput(ActiveJournal, JournalKVs, Sync) of
         ok ->

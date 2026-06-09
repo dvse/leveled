@@ -748,7 +748,17 @@ from_inkerkv(Object, ToIgnoreKeyChanges) ->
 create_value_for_journal({Object, KeyChanges}, Compress, Method) when
     not is_binary(KeyChanges)
 ->
-    KeyChangeBin = term_to_binary(KeyChanges, [compressed]),
+    %% Compressing key changes only pays for itself on mid-sized terms: tiny
+    %% terms are pure overhead, and very large key-change payloads (packed FTS
+    %% pages) are entropy-dense binaries that zlib shrinks little for
+    %% considerable cost. Both encodings are standard external term format, so
+    %% readers are unaffected.
+    PlainBin = term_to_binary(KeyChanges),
+    KeyChangeBin =
+        case byte_size(PlainBin) > 16777216 of
+            false -> PlainBin;
+            true -> term_to_binary(KeyChanges, [compressed])
+        end,
     create_value_for_journal({Object, KeyChangeBin}, Compress, Method);
 create_value_for_journal({Object, KeyChangeBin}, Compress, Method) ->
     KeyChangeBinLen = byte_size(KeyChangeBin),

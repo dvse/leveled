@@ -627,10 +627,10 @@ writer(
             {keep_state_and_data, [{reply, From, roll}]};
         false ->
             Result =
-                mput(
+                mput_write(
                     IO,
                     KVList,
-                    {LP, State#state.hashtree},
+                    LP,
                     State#state.binary_mode,
                     State#state.max_size
                 ),
@@ -638,7 +638,7 @@ writer(
                 roll ->
                     %% Keys and values could not be written
                     {keep_state_and_data, [{reply, From, roll}]};
-                {UpdHandle, NewPosition, HashTree, LastKey} ->
+                {UpdHandle, NewPosition, KPList, LastKey} ->
                     ok =
                         case {State#state.sync_strategy, Sync} of
                             {riak_sync, _} ->
@@ -648,6 +648,12 @@ writer(
                             _ ->
                                 ok
                         end,
+                    %% The batch is durably written, so the caller is released
+                    %% before the in-memory hashtree update; no read can be
+                    %% served until this callback returns, so lookups always
+                    %% see the completed tree.
+                    gen_statem:reply(From, ok),
+                    HashTree = mput_hashtree(KPList, State#state.hashtree),
                     {keep_state,
                         State#state{
                             handle = UpdHandle,
@@ -655,8 +661,7 @@ writer(
                             last_position = NewPosition,
                             last_key = LastKey,
                             hashtree = HashTree
-                        },
-                        [{reply, From, ok}]}
+                        }}
             end
     end;
 writer(
@@ -1186,18 +1191,7 @@ put(
             end
     end.
 
--spec mput(
-    file:io_device(),
-    list(tuple()),
-    {integer(), ets:tid()},
-    boolean(),
-    integer()
-) ->
-    roll | {file:io_device(), integer(), ets:tid(), any()}.
-%% @doc
-%% Multiple puts - either all will succeed or it will return roll with non
-%% succeeding.
-mput(Handle, KVList, {LastPosition, HashTree0}, BinaryMode, MaxSize) ->
+mput_write(Handle, KVList, LastPosition, BinaryMode, MaxSize) ->
     {KPList, Bin, LastKey} = multi_key_value_to_record(
         KVList,
         BinaryMode,
@@ -1209,15 +1203,17 @@ mput(Handle, KVList, {LastPosition, HashTree0}, BinaryMode, MaxSize) ->
             roll;
         true ->
             ok = file:pwrite(Handle, LastPosition, Bin),
-            HashTree1 = lists:foldl(
-                fun({K, P}, Acc) ->
-                    put_hashtree(K, P, Acc)
-                end,
-                HashTree0,
-                KPList
-            ),
-            {Handle, PotentialNewSize, HashTree1, LastKey}
+            {Handle, PotentialNewSize, KPList, LastKey}
     end.
+
+mput_hashtree(KPList, HashTree0) ->
+    lists:foldl(
+        fun({K, P}, Acc) ->
+            put_hashtree(K, P, Acc)
+        end,
+        HashTree0,
+        KPList
+    ).
 
 -spec get_withcache(
     file:io_device(),
