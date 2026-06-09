@@ -87,7 +87,9 @@ has_matching_index(Bucket, Tag, Indexes) ->
 %%
 %% A document's live postings are exactly those written in the batch recorded
 %% by its marker; entries from older batches are filtered out at read time, so
-%% updates and deletes never read or rewrite earlier postings.
+%% updates and deletes never read or rewrite earlier postings. BatchSeq is the
+%% journal SQN of the write carrying the batch (the bookie keeps fts_seq
+%% synced to the SQN returned by the inker), not a separate FTS counter.
 %% ----------------------------------------------------------------------------
 
 augment_object_changes(ObjectChanges, Indexes, BatchSeq) ->

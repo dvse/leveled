@@ -103,8 +103,9 @@ documents of each write batch. Per configured index (`{Bucket, Index, Tag}`):
 
 Page and directory rows are attached to the last matching document of the
 batch, so the object write and all of its index facts commit under one SQN.
-`BatchSeq` is seeded from the journal SQN and increases monotonically across
-restarts.
+`BatchSeq` is the journal SQN of the write that carried the batch -- not a
+separate FTS sequence -- so it is unique per write and monotonic across
+restarts by construction.
 
 Updates and deletes never read or rewrite earlier postings: a new write simply
 stores new pages and replaces the document's marker (deletes remove it). A

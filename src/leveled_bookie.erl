@@ -1670,9 +1670,17 @@ handle_call(
                         )
                     of
                         {ok, Cache} ->
-                            {noreply, State0#state{slow_offer = false, ledger_cache = Cache}};
+                            {noreply, State0#state{
+                                slow_offer = false,
+                                ledger_cache = Cache,
+                                fts_seq = SQN
+                            }};
                         {returned, Cache} ->
-                            {noreply, State0#state{slow_offer = true, ledger_cache = Cache}}
+                            {noreply, State0#state{
+                                slow_offer = true,
+                                ledger_cache = Cache,
+                                fts_seq = SQN
+                            }}
                     end
     end;
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
@@ -3127,11 +3135,15 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
             of
                 {ok, Cache} ->
                     {noreply, State#state{
-                        slow_offer = false, ledger_cache = Cache
+                        slow_offer = false,
+                        ledger_cache = Cache,
+                        fts_seq = SQN
                     }};
                 {returned, Cache} ->
                     {noreply, State#state{
-                        slow_offer = true, ledger_cache = Cache
+                        slow_offer = true,
+                        ledger_cache = Cache,
+                        fts_seq = SQN
                     }}
             end;
         {error, Reason} ->
@@ -3147,8 +3159,8 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
 %% FTS derivation never reads existing objects: documents in the write are
 %% tokenised and written as packed page/marker index specs by leveled_fts, and
 %% superseded postings are filtered against the doc marker at query time. The
-%% batch sequence is seeded from the journal SQN at startup so it stays
-%% monotonic across restarts.
+%% batch sequence is the journal SQN of the write (see
+%% augment_fts_object_changes), so it is monotonic across restarts for free.
 run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
     {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
     IndexFold =
@@ -3188,6 +3200,12 @@ maybe_new_fts_dir_cache([]) ->
 maybe_new_fts_dir_cache(_FtsIndexes) ->
     ets:new(fts_dir_cache, [set, public, {read_concurrency, true}]).
 
+%% fts_seq is not an independent counter: it mirrors the journal SQN. It is
+%% seeded from ink_getjournalsqn at startup and re-synced to the SQN returned
+%% by every successful put/batchput, and the bookie is the journal's only
+%% writer, so the predicted Seq here equals the journal SQN the write will
+%% receive. A batch's pages and markers are therefore stamped with the same
+%% SQN as their journal entries.
 augment_fts_object_changes(ObjectChanges, #state{fts_indexes = []} = State) ->
     {ObjectChanges, State};
 augment_fts_object_changes(ObjectChanges, State) ->
