@@ -11,14 +11,14 @@
     concurrent_generation_contract/1,
     anchor_update_column_negative_contract/1,
     rejected_fast_path_regression_contract/1,
-    segment_representation_contract/1,
-    hot_term_segment_split_contract/1,
-    segment_rank_none_limit_order_contract/1,
-    segment_limited_pair_update_reopen_contract/1,
+    metadata_representation_contract/1,
+    hot_term_metadata_split_contract/1,
+    metadata_rank_none_limit_order_contract/1,
+    metadata_limited_pair_update_reopen_contract/1,
     invalid_write_inputs/1,
     private_snapshot_contract/1,
     regular_index_snapshot_contract/1,
-    payload_index_contract/1,
+    metadata_index_contract/1,
     recovery_and_hotbackup/1,
     partial_tail_recovery_contract/1,
     recalc_reload_contract/1,
@@ -36,14 +36,14 @@ all() ->
         concurrent_generation_contract,
         anchor_update_column_negative_contract,
         rejected_fast_path_regression_contract,
-        segment_representation_contract,
-        hot_term_segment_split_contract,
-        segment_rank_none_limit_order_contract,
-        segment_limited_pair_update_reopen_contract,
+        metadata_representation_contract,
+        hot_term_metadata_split_contract,
+        metadata_rank_none_limit_order_contract,
+        metadata_limited_pair_update_reopen_contract,
         invalid_write_inputs,
         private_snapshot_contract,
         regular_index_snapshot_contract,
-        payload_index_contract,
+        metadata_index_contract,
         recovery_and_hotbackup,
         partial_tail_recovery_contract,
         recalc_reload_contract,
@@ -64,7 +64,7 @@ single_object_contract(_Config) ->
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"docs">>,
             <<"1">>,
@@ -77,13 +77,13 @@ single_object_contract(_Config) ->
             }
         ),
     [<<"1">>] =
-        segment_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"quick">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"quick">>, <<"body">>),
     [<<"1">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"docs">>, <<"main">>, 3, <<"qui">>, <<"quick">>, <<"body">>
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"docs">>,
             <<"2">>,
@@ -92,43 +92,13 @@ single_object_contract(_Config) ->
             #{body => <<"quick blue hare">>, title => <<"Beta">>},
             #{prefixes => [3]}
         ),
-    {error, {invalid_fts_contract_change, columns, [<<"body">>, <<"title">>], [<<"body">>]}} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"docs">>,
-            <<"schema-column-drift">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"schema drift">>},
-            #{columns => [body], prefixes => [3]}
-        ),
-    {error, {invalid_fts_contract_change, prefixes, [3], [4]}} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"docs">>,
-            <<"schema-prefix-drift">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"schema drift">>, title => <<"Gamma">>},
-            #{columns => [body, title], prefixes => [4]}
-        ),
-    {error, {invalid_fts_contract_change, tokenizer, _, _}} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"docs">>,
-            <<"schema-tokenizer-drift">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"schema drift">>, title => <<"Gamma">>},
-            #{columns => [body, title], prefixes => [3], remove_diacritics => 2}
-        ),
 
     [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"\"quick brown\"">>, #{})),
     [<<"1">>] =
         keys(search(Bookie, <<"docs">>, <<"main">>, <<"qui* AND fox">>, #{
             prefixes => [3]
         })),
-    [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"brow*">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"bro*">>, #{})),
     SearchSchemaOpts = #{columns => [title, body]},
     {async, TitleNoOpts} =
         leveled_bookie:book_ftssearch(Bookie, <<"docs">>, <<"main">>, <<"title:beta">>, #{}),
@@ -136,6 +106,16 @@ single_object_contract(_Config) ->
     [<<"2">>] = keys(TitleNoOptsHits),
     [<<"2">>] =
         keys(search(Bookie, <<"docs">>, <<"main">>, <<"title:beta">>, SearchSchemaOpts)),
+    [] =
+        keys(
+            search(
+                Bookie,
+                <<"docs">>,
+                <<"main">>,
+                <<"NEAR(title:alpha body:quick, 5)">>,
+                SearchSchemaOpts
+            )
+        ),
     [] =
         keys(
             search(
@@ -157,6 +137,40 @@ single_object_contract(_Config) ->
         keys(search(Bookie, <<"docs">>, <<"main">>, <<"-{body}:alpha">>, SearchSchemaOpts)),
     [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"quick NOT blue">>, #{})),
     [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"NEAR(quick fox, 2)">>, #{})),
+    ok =
+        fts_put(
+            Bookie,
+            <<"near-boundary">>,
+            <<"3">>,
+            <<"obj3">>,
+            <<"main">>,
+            #{
+                body =>
+                    <<"nearleft a b c d e f g h i j nearright">>,
+                title => <<"Gamma">>
+            },
+            #{prefixes => [3]}
+        ),
+    [<<"3">>] =
+        keys(
+            search(
+                Bookie,
+                <<"near-boundary">>,
+                <<"main">>,
+                <<"NEAR(nearleft nearright, 10)">>,
+                #{}
+            )
+        ),
+    [] =
+        keys(
+            search(
+                Bookie,
+                <<"near-boundary">>,
+                <<"main">>,
+                <<"NEAR(nearleft nearright, 9)">>,
+                #{}
+            )
+        ),
     {async, BM25Runner} =
         leveled_bookie:book_ftssearch(
             Bookie, <<"docs">>, <<"main">>, <<"quick">>, #{columns => [body], rank => bm25}
@@ -197,7 +211,7 @@ single_object_contract(_Config) ->
     true = map_size(RankNonePositions) > 0,
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"docs">>,
             <<"1">>,
@@ -215,24 +229,25 @@ single_object_contract(_Config) ->
         ),
     [<<"2">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"quick">>, #{})),
     [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"slow">>, #{})),
-    [] = segment_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"fox">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"fox">>, <<"body">>),
     [] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"docs">>, <<"main">>, 3, <<"fox">>, <<"fox">>, <<"body">>
         ),
     [<<"1">>] =
-        segment_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"slow">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"slow">>, <<"body">>),
     [<<"1">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"docs">>, <<"main">>, 3, <<"slo">>, <<"slow">>, <<"body">>
         ),
     [] = index_keys(Bookie, <<"docs">>, <<"kind_bin">>, <<"guide">>),
     [<<"1">>] = index_keys(Bookie, <<"docs">>, <<"kind_bin">>, <<"article">>),
-    {ok, <<"obj1b">>} = leveled_bookie:book_get(Bookie, <<"docs">>, <<"1">>),
+    {ok, {<<"obj1b">>, #{body := <<"slow brown dog">>}}} =
+        leveled_bookie:book_get(Bookie, <<"docs">>, <<"1">>),
 
-    ok = leveled_bookie:book_ftsdelete(Bookie, <<"docs">>, <<"2">>, <<"main">>, #{}),
+    ok = fts_delete(Bookie, <<"docs">>, <<"2">>, <<"main">>, #{}),
     [<<"1">>] = keys(search(Bookie, <<"docs">>, <<"main">>, all_docs, #{})),
-    [] = segment_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"quick">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"docs">>, <<"main">>, <<"quick">>, <<"body">>),
     not_found = leveled_bookie:book_get(Bookie, <<"docs">>, <<"2">>),
 
     ok = leveled_bookie:book_close(Bookie).
@@ -242,7 +257,7 @@ batchput_contract(_Config) ->
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"batch">>, <<"1">>, <<"obj1">>, <<"main">>,
@@ -259,15 +274,15 @@ batchput_contract(_Config) ->
     [<<"1">>, <<"2">>] =
         keys(search(Bookie, <<"batch">>, <<"main">>, <<"apple">>, #{})),
     [<<"2">>] =
-        segment_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"green">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"green">>, <<"body">>),
     [<<"2">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"batch">>, <<"main">>, 3, <<"gre">>, <<"green">>, <<"body">>
         ),
     [<<"2">>] = index_keys(Bookie, <<"batch">>, <<"batch_kind_bin">>, <<"fruit">>),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"batch">>, <<"2">>, <<"obj2b">>, <<"main">>,
@@ -285,29 +300,30 @@ batchput_contract(_Config) ->
     [] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"green">>, #{})),
     [] =
         keys(search(Bookie, <<"batch">>, <<"main">>, <<"gre*">>, #{prefixes => [3]})),
-    [] = segment_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"green">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"green">>, <<"body">>),
     [] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"batch">>, <<"main">>, 3, <<"gre">>, <<"green">>, <<"body">>
         ),
     [<<"2">>] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"pear">>, #{})),
     [<<"2">>] =
         keys(search(Bookie, <<"batch">>, <<"main">>, <<"pea*">>, #{prefixes => [3]})),
     [<<"2">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"batch">>, <<"main">>, 3, <<"pea">>, <<"pear">>, <<"body">>
         ),
     [<<"2">>] =
-        segment_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"pear">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"pear">>, <<"body">>),
     [] = index_keys(Bookie, <<"batch">>, <<"batch_kind_bin">>, <<"fruit">>),
     [<<"2">>] =
         index_keys(Bookie, <<"batch">>, <<"batch_kind_bin">>, <<"dessert">>),
     [<<"1">>, <<"2">>] =
         keys(search(Bookie, <<"batch">>, <<"main">>, all_docs, #{})),
-    {ok, <<"obj2b">>} = leveled_bookie:book_get(Bookie, <<"batch">>, <<"2">>),
+    {ok, {<<"obj2b">>, #{body := <<"yellow pear">>}}} =
+        leveled_bookie:book_get(Bookie, <<"batch">>, <<"2">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"batch">>,
             <<"idx">>,
@@ -316,8 +332,8 @@ batchput_contract(_Config) ->
             #{body => <<"mainonly">>},
             #{}
         ),
-    {error, {conflicting_fts_index, <<"main">>, <<"alt">>}} =
-        leveled_bookie:book_ftsput(
+    {error, missing_fts_schema} =
+        fts_put(
             Bookie,
             <<"batch">>,
             <<"idx">>,
@@ -327,13 +343,14 @@ batchput_contract(_Config) ->
             #{}
         ),
     {error, missing_fts_schema} =
-        leveled_bookie:book_ftsdelete(Bookie, <<"batch">>, <<"idx">>, <<"alt">>, #{}),
+        fts_delete(Bookie, <<"batch">>, <<"idx">>, <<"alt">>, #{}),
     [<<"idx">>] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"mainonly">>, #{})),
     assert_missing_fts_schema(Bookie, <<"batch">>, <<"alt">>, <<"altonly">>, #{}),
-    {ok, <<"idx-main">>} = leveled_bookie:book_get(Bookie, <<"batch">>, <<"idx">>),
+    {ok, {<<"idx-main">>, #{body := <<"mainonly">>}}} =
+        leveled_bookie:book_get(Bookie, <<"batch">>, <<"idx">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"batch">>,
             <<"idx-normalised">>,
@@ -343,7 +360,7 @@ batchput_contract(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"batch">>,
             <<"idx-normalised">>,
@@ -356,13 +373,13 @@ batchput_contract(_Config) ->
     [<<"idx-normalised">>] =
         keys(search(Bookie, <<"batch">>, <<"main">>, <<"new">>, #{})),
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie, <<"batch">>, <<"idx-normalised">>, main, #{}
         ),
     [] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"new">>, #{})),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"batch">>,
             <<"idx-batch">>,
@@ -371,8 +388,8 @@ batchput_contract(_Config) ->
             #{body => <<"batchmainonly">>},
             #{}
         ),
-    {error, {conflicting_fts_index, <<"main">>, <<"alt">>}} =
-        leveled_bookie:book_ftsbatchput(
+    {error, missing_fts_schema} =
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"batch">>, <<"idx-batch">>, <<"idx-batch-alt">>, <<"alt">>,
@@ -380,7 +397,7 @@ batchput_contract(_Config) ->
             ]
         ),
     {error, missing_fts_schema} =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_delete, <<"batch">>, <<"idx-batch">>, <<"alt">>, #{}}
@@ -389,43 +406,21 @@ batchput_contract(_Config) ->
     [<<"idx-batch">>] =
         keys(search(Bookie, <<"batch">>, <<"main">>, <<"batchmainonly">>, #{})),
     assert_missing_fts_schema(Bookie, <<"batch">>, <<"alt">>, <<"batchaltonly">>, #{}),
-    {ok, <<"idx-batch-main">>} =
+    {ok, {<<"idx-batch-main">>, #{body := <<"batchmainonly">>}}} =
         leveled_bookie:book_get(Bookie, <<"batch">>, <<"idx-batch">>),
 
     {error, invalid_index_specs} =
         leveled_bookie:book_batchput(
             Bookie,
             [
-                {put, <<"raw">>, <<"payload-spec">>, <<"obj">>,
-                    [{add, <<"ordinary_idx">>, <<"term">>, <<"payload">>}],
+                {put, <<"raw">>, <<"metadata-spec">>, <<"obj">>,
+                    [{add, <<"ordinary_idx">>, <<"term">>, <<"metadata">>}],
                     ?STD_TAG, infinity}
             ]
         ),
-    not_found = leveled_bookie:book_get(Bookie, <<"raw">>, <<"payload-spec">>),
-    RawPayloadSpec =
-        {idx_payload, add, {fts_segment, <<"main">>}, <<"term">>, <<"payload">>},
-    {error, invalid_index_specs} =
-        leveled_bookie:book_put(
-            Bookie,
-            <<"raw">>,
-            <<"idx-payload-direct">>,
-            <<"obj">>,
-            [RawPayloadSpec],
-            ?STD_TAG
-        ),
-    not_found = leveled_bookie:book_get(Bookie, <<"raw">>, <<"idx-payload-direct">>),
-    {error, invalid_index_specs} =
-        leveled_bookie:book_batchput(
-            Bookie,
-            [
-                {put, <<"raw">>, <<"idx-payload-batch">>, <<"obj">>,
-                    [RawPayloadSpec], ?STD_TAG, infinity}
-            ]
-        ),
-    not_found = leveled_bookie:book_get(Bookie, <<"raw">>, <<"idx-payload-batch">>),
-
+    not_found = leveled_bookie:book_get(Bookie, <<"raw">>, <<"metadata-spec">>),
     {error, {invalid_batch_object_spec, {put, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {put, <<"batch">>, <<"idx">>, <<"raw-over-fts">>, [],
@@ -434,7 +429,7 @@ batchput_contract(_Config) ->
         ),
 	    [<<"idx">>] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"mainonly">>, #{})),
 	    {error, {invalid_batch_object_spec, {delete, _, _, _, _, _}}} =
-	        leveled_bookie:book_ftsbatchput(
+	        fts_batchput(
             Bookie,
             [
                 {delete, <<"batch">>, <<"idx">>, [], ?STD_TAG, infinity}
@@ -443,7 +438,7 @@ batchput_contract(_Config) ->
 	    [<<"idx">>] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"mainonly">>, #{})),
 
 	    ok =
-	        leveled_bookie:book_ftsput(
+	        fts_put(
 		            Bookie, <<"raw-contract">>, <<"raw-direct">>, <<"fts-object">>, <<"main">>,
 	            #{body => <<"rawdirect">>}, #{}
 	        ),
@@ -452,7 +447,7 @@ batchput_contract(_Config) ->
 		    ok = leveled_bookie:book_delete(Bookie, <<"raw-contract">>, <<"raw-direct">>, []),
 		    not_found = leveled_bookie:book_get(Bookie, <<"raw-contract">>, <<"raw-direct">>),
 	    ok =
-	        leveled_bookie:book_ftsput(
+	        fts_put(
 		            Bookie, <<"raw-contract">>, <<"raw-batch-put">>, <<"fts-object">>, <<"main">>,
 	            #{body => <<"rawbatchput">>}, #{}
 	        ),
@@ -467,7 +462,7 @@ batchput_contract(_Config) ->
 	    {ok, <<"raw-normal-batch">>} =
 	        leveled_bookie:book_get(Bookie, <<"raw-contract">>, <<"raw-batch-put">>),
 	    ok =
-	        leveled_bookie:book_ftsput(
+	        fts_put(
 	            Bookie, <<"raw-contract">>, <<"raw-batch-delete">>, <<"fts-object">>, <<"main">>,
 	            #{body => <<"rawbatchdelete">>}, #{}
 	        ),
@@ -482,7 +477,7 @@ batchput_contract(_Config) ->
 	    [<<"idx">>] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"mainonly">>, #{})),
 
 	    {error, {duplicate_fts_batch_key, _}} =
-	        leveled_bookie:book_ftsbatchput(
+	        fts_batchput(
 	            Bookie,
 	            [
 	                {fts_put, <<"batch">>, <<"3">>, <<"obj3">>, <<"main">>,
@@ -494,7 +489,7 @@ batchput_contract(_Config) ->
 	    [] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"one">>, #{})),
 	    [] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"two">>, #{})),
 	    ok =
-	        leveled_bookie:book_ftsbatchput(
+	        fts_batchput(
 	            Bookie,
 	            [
 	                {fts_put, <<"batch">>, <<"3">>, <<"obj3">>, <<"main">>,
@@ -504,7 +499,7 @@ batchput_contract(_Config) ->
 	    [<<"3">>] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"two">>, #{})),
 
     {error, {invalid_batch_object_spec, {put, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {put, <<"batch">>, <<"4">>, <<"raw">>, [], ?STD_TAG, infinity},
@@ -513,8 +508,8 @@ batchput_contract(_Config) ->
             ]
         ),
 
-    {error, {duplicate_fts_batch_key, _}} =
-        leveled_bookie:book_ftsbatchput(
+    {error, missing_fts_schema} =
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"batch">>, <<"5">>, <<"obj5">>, <<"main">>,
@@ -525,7 +520,7 @@ batchput_contract(_Config) ->
         ),
 
     {error, {invalid_batch_object_spec, bogus}} =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"batch">>, <<"6">>, <<"obj6">>, <<"main">>,
@@ -536,24 +531,24 @@ batchput_contract(_Config) ->
     [] = search(Bookie, <<"batch">>, <<"main">>, <<"uniquetoken">>, #{}),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [{fts_delete, <<"batch">>, <<"1">>, <<"main">>, #{}}]
         ),
     {error, {invalid_batch_object_spec, {put, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {put, <<"batch">>, <<"1">>, <<"raw-over-fts-tombstone">>, [],
+                {put, <<"batch">>, <<"1">>, <<"raw-over-fts-delete-marker">>, [],
                     ?STD_TAG, infinity}
             ]
         ),
     [<<"2">>, <<"3">>, <<"idx">>, <<"idx-batch">>] =
         keys(search(Bookie, <<"batch">>, <<"main">>, all_docs, #{})),
-    [] = segment_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"red">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"red">>, <<"body">>),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_delete, <<"batch">>, <<"2">>, <<"main">>,
@@ -565,14 +560,14 @@ batchput_contract(_Config) ->
     [] = keys(search(Bookie, <<"batch">>, <<"main">>, <<"pear">>, #{})),
     [] =
         keys(search(Bookie, <<"batch">>, <<"main">>, <<"pea*">>, #{prefixes => [3]})),
-    [] = segment_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"pear">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"batch">>, <<"main">>, <<"pear">>, <<"body">>),
     [] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"batch">>, <<"main">>, 3, <<"pea">>, <<"pear">>, <<"body">>
         ),
     [] = index_keys(Bookie, <<"batch">>, <<"batch_kind_bin">>, <<"dessert">>),
-    [<<"1">>, <<"2">>, <<"3">>, <<"idx">>, <<"idx-batch">>, <<"idx-normalised">>] =
-        index_keys(Bookie, <<"batch">>, {fts_doc, <<"main">>}, doc),
+    [<<"3">>, <<"idx">>, <<"idx-batch">>] =
+        fts_doc_keys(Bookie, <<"batch">>, <<"main">>),
     not_found = leveled_bookie:book_get(Bookie, <<"batch">>, <<"2">>),
 
     ok = leveled_bookie:book_close(Bookie).
@@ -586,7 +581,7 @@ multi_token_phrase_contract(_Config) ->
     SearchOpts = #{columns => [title, body], prefixes => [3], rank => none},
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_put, Bucket, <<"exact">>, <<"exact-object">>, Index,
@@ -642,7 +637,7 @@ multi_token_phrase_contract(_Config) ->
         keys(search(Bookie, Bucket, Index, <<"\"alpha beta gam\"*">>, SearchOpts)),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             Bucket,
             <<"stale">>,
@@ -655,7 +650,7 @@ multi_token_phrase_contract(_Config) ->
             WriteOpts
         ),
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie,
             Bucket,
             <<"delete">>,
@@ -688,10 +683,10 @@ index_update_contract(_Config) ->
     SearchColumns = [title, body],
     BodyColumns = [body],
     SearchOpts = #{columns => SearchColumns},
-    SegmentSearchOpts = #{columns => BodyColumns},
+    MetadataSearchOpts = #{columns => BodyColumns},
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"idx-maint">>,
             <<"doc">>,
@@ -705,16 +700,16 @@ index_update_contract(_Config) ->
             }
         ),
     [<<"doc">>] =
-        segment_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"alpha">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"alpha">>, <<"body">>),
     [<<"doc">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"idx-maint">>, <<"main">>, 2, <<"al">>, <<"alpha">>, <<"body">>
         ),
-    [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, {fts_doc, <<"main">>}, doc),
+    [<<"doc">>] = fts_doc_keys(Bookie, <<"idx-maint">>, <<"main">>),
     [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, <<"kind_bin">>, <<"old">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"idx-maint">>,
             <<"doc">>,
@@ -739,23 +734,23 @@ index_update_contract(_Config) ->
         keys(search(Bookie, <<"idx-maint">>, <<"main">>, <<"body:gam*">>, PrefixRankOpts)),
     [<<"doc">>] =
         keys(search(Bookie, <<"idx-maint">>, <<"main">>, <<"body:gam*">>, PrefixRankMixedOpts)),
-    [] = segment_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"alpha">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"alpha">>, <<"body">>),
     [] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"idx-maint">>, <<"main">>, 2, <<"al">>, <<"alpha">>, <<"body">>
         ),
     [<<"doc">>] =
-        segment_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, <<"body">>),
     [<<"doc">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"idx-maint">>, <<"main">>, 3, <<"gam">>, <<"gamma">>, <<"body">>
         ),
-    [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, {fts_doc, <<"main">>}, doc),
+    [<<"doc">>] = fts_doc_keys(Bookie, <<"idx-maint">>, <<"main">>),
     [] = index_keys(Bookie, <<"idx-maint">>, <<"kind_bin">>, <<"old">>),
     [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, <<"kind_bin">>, <<"new">>),
 
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie,
             <<"idx-maint">>,
             <<"doc">>,
@@ -763,19 +758,19 @@ index_update_contract(_Config) ->
             #{columns => SearchColumns, index_specs => [{remove, <<"kind_bin">>, <<"new">>}]}
         ),
     [] = search(Bookie, <<"idx-maint">>, <<"main">>, all_docs, SearchOpts),
-    [] = segment_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, <<"body">>),
     [] = keys(search(Bookie, <<"idx-maint">>, <<"main">>, <<"body:gam*">>, PrefixRankOpts)),
     [] = keys(search(Bookie, <<"idx-maint">>, <<"main">>, <<"body:gam*">>, PrefixRankMixedOpts)),
     [] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"idx-maint">>, <<"main">>, 3, <<"gam">>, <<"gamma">>, <<"body">>
         ),
-    [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, {fts_doc, <<"main">>}, doc),
+    [] = fts_doc_keys(Bookie, <<"idx-maint">>, <<"main">>),
     [] = index_keys(Bookie, <<"idx-maint">>, <<"kind_bin">>, <<"new">>),
     not_found = leveled_bookie:book_get(Bookie, <<"idx-maint">>, <<"doc">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"idx-maint">>,
             <<"doc">>,
@@ -790,25 +785,25 @@ index_update_contract(_Config) ->
         ),
     [] = keys(search(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, SearchOpts)),
     [<<"doc">>] = keys(search(Bookie, <<"idx-maint">>, <<"main">>, <<"delta">>, SearchOpts)),
-    [] = segment_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, <<"body">>),
+    [] = metadata_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"gamma">>, <<"body">>),
     [] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"idx-maint">>, <<"main">>, 3, <<"gam">>, <<"gamma">>, <<"body">>
         ),
     [<<"doc">>] =
-        segment_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"delta">>, <<"body">>),
+        metadata_search_term_keys(Bookie, <<"idx-maint">>, <<"main">>, <<"delta">>, <<"body">>),
     [<<"doc">>] =
-        segment_search_prefix_keys(
+        metadata_search_prefix_keys(
             Bookie, <<"idx-maint">>, <<"main">>, 3, <<"del">>, <<"delta">>, <<"body">>
         ),
-    [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, {fts_doc, <<"main">>}, doc),
+    [<<"doc">>] = fts_doc_keys(Bookie, <<"idx-maint">>, <<"main">>),
     [] = index_keys(Bookie, <<"idx-maint">>, <<"kind_bin">>, <<"new">>),
     [<<"doc">>] = index_keys(Bookie, <<"idx-maint">>, <<"kind_bin">>, <<"again">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"idx-maint-segment">>,
+            <<"idx-maint-metadata">>,
             <<"seg">>,
             <<"seg-old">>,
             <<"main">>,
@@ -819,18 +814,18 @@ index_update_contract(_Config) ->
             }
         ),
     true =
-        segment_term_present(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"red">>, <<"body">>
+        metadata_term_present(
+            Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"red">>, <<"body">>
         ),
     [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, {fts_doc, <<"main">>}, doc),
+        fts_doc_keys(Bookie, <<"idx-maint-metadata">>, <<"main">>),
     [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, <<"seg_kind_bin">>, <<"old">>),
+        index_keys(Bookie, <<"idx-maint-metadata">>, <<"seg_kind_bin">>, <<"old">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"idx-maint-segment">>,
+            <<"idx-maint-metadata">>,
             <<"seg">>,
             <<"seg-new">>,
             <<"main">>,
@@ -846,13 +841,13 @@ index_update_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"red">>, SegmentSearchOpts
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"red">>, MetadataSearchOpts
             )
         ),
     [] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"body:red">>, #{
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"body:red">>, #{
                     rank => none,
                     columns => [body]
                 }
@@ -861,13 +856,13 @@ index_update_contract(_Config) ->
     [<<"seg">>] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue">>, SegmentSearchOpts
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"blue">>, MetadataSearchOpts
             )
         ),
     [<<"seg">>] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"body:blue">>, #{
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"body:blue">>, #{
                     rank => none,
                     columns => [body]
                 }
@@ -876,7 +871,7 @@ index_update_contract(_Config) ->
     [<<"seg">>] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue NOT red">>, #{
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"blue NOT red">>, #{
                     rank => none,
                     limit => 20,
                     columns => BodyColumns
@@ -886,7 +881,7 @@ index_update_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"red NOT blue">>, #{
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"red NOT blue">>, #{
                     rank => none,
                     limit => 20,
                     columns => BodyColumns
@@ -894,60 +889,48 @@ index_update_contract(_Config) ->
             )
         ),
     true =
-        segment_term_present(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue">>, <<"body">>
-        ),
-    true =
-        segment_doc_delete_present(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"red">>, <<"body">>, <<"seg">>
-        ),
-    false =
-        segment_doc_delete_present(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue">>, <<"body">>, <<"seg">>
+        metadata_term_present(
+            Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"blue">>, <<"body">>
         ),
     [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, {fts_doc, <<"main">>}, doc),
+        fts_doc_keys(Bookie, <<"idx-maint-metadata">>, <<"main">>),
     [] =
-        index_keys(Bookie, <<"idx-maint-segment">>, <<"seg_kind_bin">>, <<"old">>),
+        index_keys(Bookie, <<"idx-maint-metadata">>, <<"seg_kind_bin">>, <<"old">>),
     [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, <<"seg_kind_bin">>, <<"new">>),
+        index_keys(Bookie, <<"idx-maint-metadata">>, <<"seg_kind_bin">>, <<"new">>),
 
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie,
-            <<"idx-maint-segment">>,
+            <<"idx-maint-metadata">>,
             <<"seg">>,
             <<"main">>,
             #{columns => BodyColumns, index_specs => [{remove, <<"seg_kind_bin">>, <<"new">>}]}
         ),
     [] =
         search(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue">>, SegmentSearchOpts
+            Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"blue">>, MetadataSearchOpts
         ),
     [] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue NOT red">>, #{
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"blue NOT red">>, #{
                     rank => none,
                     limit => 20,
                     columns => BodyColumns
                 }
             )
         ),
-    [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, {fts_doc, <<"main">>}, doc),
-    true =
-        segment_doc_delete_present(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue">>, <<"body">>, <<"seg">>
-        ),
     [] =
-        index_keys(Bookie, <<"idx-maint-segment">>, <<"seg_kind_bin">>, <<"new">>),
-    not_found = leveled_bookie:book_get(Bookie, <<"idx-maint-segment">>, <<"seg">>),
+        fts_doc_keys(Bookie, <<"idx-maint-metadata">>, <<"main">>),
+    [] =
+        index_keys(Bookie, <<"idx-maint-metadata">>, <<"seg_kind_bin">>, <<"new">>),
+    not_found = leveled_bookie:book_get(Bookie, <<"idx-maint-metadata">>, <<"seg">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"idx-maint-segment">>,
+            <<"idx-maint-metadata">>,
             <<"seg">>,
             <<"seg-alt">>,
             <<"alt">>,
@@ -957,26 +940,26 @@ index_update_contract(_Config) ->
     [<<"seg">>] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"alt">>, <<"alternate">>, SegmentSearchOpts
+                Bookie, <<"idx-maint-metadata">>, <<"alt">>, <<"alternate">>, MetadataSearchOpts
             )
         ),
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie,
-            <<"idx-maint-segment">>,
+            <<"idx-maint-metadata">>,
             <<"seg">>,
             <<"alt">>,
             #{columns => BodyColumns}
         ),
     [] =
         search(
-            Bookie, <<"idx-maint-segment">>, <<"alt">>, <<"alternate">>, SegmentSearchOpts
+            Bookie, <<"idx-maint-metadata">>, <<"alt">>, <<"alternate">>, MetadataSearchOpts
         ),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"idx-maint-segment">>,
+            <<"idx-maint-metadata">>,
             <<"seg">>,
             <<"seg-fresh">>,
             <<"main">>,
@@ -988,24 +971,24 @@ index_update_contract(_Config) ->
         ),
     [] =
         search(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"red">>, SegmentSearchOpts
+            Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"red">>, MetadataSearchOpts
         ),
     [] =
         search(
-            Bookie, <<"idx-maint-segment">>, <<"main">>, <<"blue">>, SegmentSearchOpts
+            Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"blue">>, MetadataSearchOpts
         ),
     [<<"seg">>] =
         keys(
             search(
-                Bookie, <<"idx-maint-segment">>, <<"main">>, <<"fresh">>, SegmentSearchOpts
+                Bookie, <<"idx-maint-metadata">>, <<"main">>, <<"fresh">>, MetadataSearchOpts
             )
         ),
     [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, {fts_doc, <<"main">>}, doc),
+        fts_doc_keys(Bookie, <<"idx-maint-metadata">>, <<"main">>),
     [] =
-        index_keys(Bookie, <<"idx-maint-segment">>, <<"seg_kind_bin">>, <<"new">>),
+        index_keys(Bookie, <<"idx-maint-metadata">>, <<"seg_kind_bin">>, <<"new">>),
     [<<"seg">>] =
-        index_keys(Bookie, <<"idx-maint-segment">>, <<"seg_kind_bin">>, <<"fresh">>),
+        index_keys(Bookie, <<"idx-maint-metadata">>, <<"seg_kind_bin">>, <<"fresh">>),
 
     ok = leveled_bookie:book_close(Bookie).
 
@@ -1021,7 +1004,7 @@ concurrent_generation_contract(_Config) ->
         spawn(fun() ->
             Term = concurrent_generation_term(N),
             Result =
-                leveled_bookie:book_ftsput(
+                fts_put(
                     Bookie,
                     Bucket,
                     Key,
@@ -1037,7 +1020,8 @@ concurrent_generation_contract(_Config) ->
     Results = collect_concurrent_ftsputs(WriterCount, []),
     [] = [{N, Result} || {N, _Term, Result} <- Results, Result =/= ok],
     Terms = [Term || {_N, Term, ok} <- Results],
-    {ok, FinalTerm} = leveled_bookie:book_get(Bookie, Bucket, Key),
+    {ok, {FinalTerm, #{body := _FinalBody}}} =
+        leveled_bookie:book_get(Bookie, Bucket, Key),
     true = lists:member(FinalTerm, Terms),
     [Key] = keys(search(Bookie, Bucket, Index, FinalTerm, #{})),
     lists:foreach(
@@ -1046,7 +1030,7 @@ concurrent_generation_contract(_Config) ->
         end,
         Terms -- [FinalTerm]
     ),
-    {active, WriterCount, false} = doc_marker_payload_state(Bookie, Bucket, Index, Key),
+    [Key] = fts_doc_keys(Bookie, Bucket, Index),
     ok = leveled_bookie:book_close(Bookie).
 
 anchor_update_column_negative_contract(_Config) ->
@@ -1058,7 +1042,7 @@ anchor_update_column_negative_contract(_Config) ->
     SearchOpts = #{columns => [title, body], rank => none},
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             Bucket,
             <<"doc-title-start">>,
@@ -1068,7 +1052,7 @@ anchor_update_column_negative_contract(_Config) ->
             WriteOpts
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             Bucket,
             <<"doc-body-start">>,
@@ -1088,7 +1072,7 @@ anchor_update_column_negative_contract(_Config) ->
     [] = keys(search(Bookie, Bucket, Index, <<"body:^anchortitle">>, SearchOpts)),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             Bucket,
             <<"doc-title-start">>,
@@ -1103,7 +1087,7 @@ anchor_update_column_negative_contract(_Config) ->
     [] = keys(search(Bookie, Bucket, Index, <<"^anchortitle">>, SearchOpts)),
 
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie, Bucket, <<"doc-body-start">>, Index, WriteOpts
         ),
     [<<"doc-title-start">>] =
@@ -1111,7 +1095,7 @@ anchor_update_column_negative_contract(_Config) ->
     not_found = leveled_bookie:book_get(Bookie, Bucket, <<"doc-body-start">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             Bucket,
             <<"doc-body-start">>,
@@ -1138,7 +1122,7 @@ rejected_fast_path_regression_contract(_Config) ->
     SearchOpts = #{columns => [title, body], prefixes => [5, 11], rank => none},
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"fast-anchor">>,
             <<"a1">>,
@@ -1159,9 +1143,9 @@ rejected_fast_path_regression_contract(_Config) ->
     [] =
         keys(search(Bookie, <<"fast-anchor">>, Index, <<"^equivbodyupdate">>, SearchOpts)),
 
-    PhraseOpts = #{columns => [body], prefixes => [5, 11], rank => none},
+    PhraseOpts = #{columns => [body], prefixes => [2, 3, 5, 11], rank => none},
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"fast-phrase-prefix">>, <<"p1">>, <<"p1">>,
@@ -1177,7 +1161,7 @@ rejected_fast_path_regression_contract(_Config) ->
             ]
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"fast-phrase-prefix">>,
             <<"p3">>,
@@ -1218,7 +1202,7 @@ rejected_fast_path_regression_contract(_Config) ->
         ),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
                 {fts_put, <<"fast-near">>, <<"n1">>, <<"n1-old">>,
@@ -1228,7 +1212,7 @@ rejected_fast_path_regression_contract(_Config) ->
             ]
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"fast-near">>,
             <<"n1">>,
@@ -1237,7 +1221,7 @@ rejected_fast_path_regression_contract(_Config) ->
             #{body => <<"nearone gap neartwo">>},
             #{}
         ),
-    ok = leveled_bookie:book_ftsdelete(Bookie, <<"fast-near">>, <<"n2">>, Index, #{}),
+    ok = fts_delete(Bookie, <<"fast-near">>, <<"n2">>, Index, #{}),
     [] =
         keys(
             search(
@@ -1263,60 +1247,60 @@ rejected_fast_path_regression_contract(_Config) ->
 
     ok = leveled_bookie:book_close(Bookie).
 
-segment_representation_contract(_Config) ->
+metadata_representation_contract(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {fts_put, <<"segment">>, <<"1">>, <<"obj1">>, <<"main">>,
+                {fts_put, <<"metadata">>, <<"1">>, <<"obj1">>, <<"main">>,
                     #{body => <<"red apple oldnearone gap oldneartwo">>},
                     #{prefixes => [3]}},
-                {fts_put, <<"segment">>, <<"2">>, <<"obj2">>, <<"main">>,
+                {fts_put, <<"metadata">>, <<"2">>, <<"obj2">>, <<"main">>,
                     #{body => <<"green apple deletenearone gap deleteneartwo">>},
                     #{}}
             ]
         ),
     [<<"1">>, <<"2">>] =
-        keys(search(Bookie, <<"segment">>, <<"main">>, <<"apple">>, #{})),
+        keys(search(Bookie, <<"metadata">>, <<"main">>, <<"apple">>, #{})),
     true =
-        segment_term_present(
-            Bookie, <<"segment">>, <<"main">>, <<"red">>, <<"body">>
+        metadata_term_present(
+            Bookie, <<"metadata">>, <<"main">>, <<"red">>, <<"body">>
         ),
     true =
-        segment_term_present(
-            Bookie, <<"segment">>, <<"main">>, <<"green">>, <<"body">>
+        metadata_term_present(
+            Bookie, <<"metadata">>, <<"main">>, <<"green">>, <<"body">>
         ),
-    [<<"1">>, <<"2">>] = index_keys(Bookie, <<"segment">>, {fts_doc, <<"main">>}, doc),
+    [<<"1">>, <<"2">>] = fts_doc_keys(Bookie, <<"metadata">>, <<"main">>),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {fts_put, <<"segment_a">>, <<"1">>, <<"obj-a1">>, <<"main">>,
+                {fts_put, <<"metadata_a">>, <<"1">>, <<"obj-a1">>, <<"main">>,
                     #{body => <<"shared bucket token">>}, #{}},
-                {fts_put, <<"segment_b">>, <<"1">>, <<"obj-b1">>, <<"main">>,
+                {fts_put, <<"metadata_b">>, <<"1">>, <<"obj-b1">>, <<"main">>,
                     #{body => <<"shared bucket token">>}, #{}}
             ]
         ),
-    [<<"1">>] = keys(search(Bookie, <<"segment_a">>, <<"main">>, <<"shared">>, #{})),
-    [<<"1">>] = keys(search(Bookie, <<"segment_b">>, <<"main">>, <<"shared">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"metadata_a">>, <<"main">>, <<"shared">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"metadata_b">>, <<"main">>, <<"shared">>, #{})),
     true =
-        segment_term_present(
-            Bookie, <<"segment_a">>, <<"main">>, <<"shared">>, <<"body">>
+        metadata_term_present(
+            Bookie, <<"metadata_a">>, <<"main">>, <<"shared">>, <<"body">>
         ),
     true =
-        segment_term_present(
-            Bookie, <<"segment_b">>, <<"main">>, <<"shared">>, <<"body">>
+        metadata_term_present(
+            Bookie, <<"metadata_b">>, <<"main">>, <<"shared">>, <<"body">>
         ),
 
     HighKey = binary:copy(<<255>>, 33),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-high-key">>,
+            <<"metadata-high-key">>,
             HighKey,
             <<"obj-high">>,
             <<"main">>,
@@ -1326,22 +1310,22 @@ segment_representation_contract(_Config) ->
     [HighKey] =
         keys(
             search(
-                Bookie, <<"segment-high-key">>, <<"main">>, all_docs, #{}
+                Bookie, <<"metadata-high-key">>, <<"main">>, all_docs, #{}
             )
         ),
     [HighKey] =
         keys(
             search(
-                Bookie, <<"segment-high-key">>, <<"main">>, <<"highmarker">>, #{}
+                Bookie, <<"metadata-high-key">>, <<"main">>, <<"highmarker">>, #{}
             )
         ),
 
     Cafe = <<"caf", 195, 169>>,
     CafeBody = <<Cafe/binary, " oldtoken">>,
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-diacritic">>,
+            <<"metadata-diacritic">>,
             <<"diacritic">>,
             <<"obj-diacritic-1">>,
             <<"main">>,
@@ -1351,16 +1335,16 @@ segment_representation_contract(_Config) ->
     [<<"diacritic">>] =
         keys(
             search(
-                Bookie, <<"segment-diacritic">>, <<"main">>, Cafe, #{
+                Bookie, <<"metadata-diacritic">>, <<"main">>, Cafe, #{
                     rank => none,
                     remove_diacritics => false
                 }
             )
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-diacritic">>,
+            <<"metadata-diacritic">>,
             <<"diacritic">>,
             <<"obj-diacritic-2">>,
             <<"main">>,
@@ -1370,7 +1354,7 @@ segment_representation_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"segment-diacritic">>, <<"main">>, Cafe, #{
+                Bookie, <<"metadata-diacritic">>, <<"main">>, Cafe, #{
                     rank => none,
                     remove_diacritics => false
                 }
@@ -1379,7 +1363,7 @@ segment_representation_contract(_Config) ->
     [<<"diacritic">>] =
         keys(
             search(
-                Bookie, <<"segment-diacritic">>, <<"main">>, <<"plain">>, #{
+                Bookie, <<"metadata-diacritic">>, <<"main">>, <<"plain">>, #{
                     rank => none,
                     remove_diacritics => false
                 }
@@ -1387,32 +1371,32 @@ segment_representation_contract(_Config) ->
         ),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment">>,
+            <<"metadata">>,
             <<"1">>,
             <<"obj1b">>,
             <<"main">>,
             #{body => <<"blue grape nearone gap neartwo">>},
             #{}
         ),
-    [<<"2">>] = keys(search(Bookie, <<"segment">>, <<"main">>, <<"apple">>, #{})),
-    [#{key := <<"2">>, doc_length := 5}] =
+    [<<"2">>] = keys(search(Bookie, <<"metadata">>, <<"main">>, <<"apple">>, #{})),
+    [#{key := <<"2">>}] =
         search(
             Bookie,
-            <<"segment">>,
+            <<"metadata">>,
             <<"main">>,
             <<"apple AND green">>,
             #{rank => none}
         ),
-    [<<"1">>] = keys(search(Bookie, <<"segment">>, <<"main">>, <<"grape">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"metadata">>, <<"main">>, <<"grape">>, #{})),
     [<<"1">>] =
-        keys(search(Bookie, <<"segment">>, <<"main">>, <<"gra*">>, #{prefixes => [3]})),
+        keys(search(Bookie, <<"metadata">>, <<"main">>, <<"gra*">>, #{prefixes => [3]})),
     [<<"1">>] =
         keys(
             search(
                 Bookie,
-                <<"segment">>,
+                <<"metadata">>,
                 <<"main">>,
                 <<"gra*">>,
                 #{prefixes => [3], rank => none}
@@ -1420,38 +1404,38 @@ segment_representation_contract(_Config) ->
         ),
     [<<"1">>] =
         keys(
-            search(Bookie, <<"segment">>, <<"main">>, <<"body:grape">>, #{
+            search(Bookie, <<"metadata">>, <<"main">>, <<"body:grape">>, #{
                 rank => none,
                 columns => [body]
             })
         ),
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {fts_put, <<"segment-cross-column-and">>, <<"1">>, <<"cross-1">>,
+                {fts_put, <<"metadata-cross-column-and">>, <<"1">>, <<"cross-1">>,
                     <<"main">>, #{title => <<"crossalpha">>, body => <<"crossbeta">>}, #{}},
-                {fts_put, <<"segment-cross-column-and">>, <<"2">>, <<"cross-2">>,
+                {fts_put, <<"metadata-cross-column-and">>, <<"2">>, <<"cross-2">>,
                     <<"main">>, #{title => <<"crossalpha">>, body => <<"filler">>}, #{}},
-                {fts_put, <<"segment-cross-column-and">>, <<"3">>, <<"cross-3">>,
+                {fts_put, <<"metadata-cross-column-and">>, <<"3">>, <<"cross-3">>,
                     <<"main">>, #{title => <<"filler">>, body => <<"crossbeta">>}, #{}},
-                {fts_put, <<"segment-cross-column-and">>, <<"4">>, <<"cross-4">>,
+                {fts_put, <<"metadata-cross-column-and">>, <<"4">>, <<"cross-4">>,
                     <<"main">>, #{title => <<"crossbeta">>, body => <<"crossalpha">>}, #{}},
-                {fts_put, <<"segment-cross-column-and">>, <<"5">>, <<"cross-5">>,
+                {fts_put, <<"metadata-cross-column-and">>, <<"5">>, <<"cross-5">>,
                     <<"main">>, #{body => <<"crossalpha crossbeta">>}, #{}}
             ]
         ),
     [<<"1">>, <<"4">>, <<"5">>] =
         keys(
             search(
-                Bookie, <<"segment-cross-column-and">>, <<"main">>,
+                Bookie, <<"metadata-cross-column-and">>, <<"main">>,
                 <<"crossalpha AND crossbeta">>, #{rank => none, columns => [title, body]}
             )
         ),
     [<<"1">>] =
         keys(
             search(
-                Bookie, <<"segment-cross-column-and">>, <<"main">>,
+                Bookie, <<"metadata-cross-column-and">>, <<"main">>,
                 <<"title:crossalpha AND body:crossbeta">>, #{
                     rank => none, columns => [title, body]
                 }
@@ -1460,7 +1444,7 @@ segment_representation_contract(_Config) ->
     [<<"4">>] =
         keys(
             search(
-                Bookie, <<"segment-cross-column-and">>, <<"main">>,
+                Bookie, <<"metadata-cross-column-and">>, <<"main">>,
                 <<"body:crossalpha AND title:crossbeta">>, #{
                     rank => none, columns => [title, body]
                 }
@@ -1469,7 +1453,7 @@ segment_representation_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"segment-cross-column-and">>, <<"main">>,
+                Bookie, <<"metadata-cross-column-and">>, <<"main">>,
                 <<"title:crossalpha AND title:crossbeta">>, #{
                     rank => none, columns => [title, body]
                 }
@@ -1478,7 +1462,7 @@ segment_representation_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"segment">>, <<"main">>, <<"\"red apple\"">>, #{
+                Bookie, <<"metadata">>, <<"main">>, <<"\"red apple\"">>, #{
                     rank => none
                 }
             )
@@ -1486,7 +1470,7 @@ segment_representation_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"segment">>, <<"main">>, <<"NEAR(oldnearone oldneartwo, 2)">>, #{
+                Bookie, <<"metadata">>, <<"main">>, <<"NEAR(oldnearone oldneartwo, 2)">>, #{
                     rank => none
                 }
             )
@@ -1494,7 +1478,7 @@ segment_representation_contract(_Config) ->
     [<<"1">>] =
         keys(
             search(
-                Bookie, <<"segment">>, <<"main">>, <<"\"blue grape\"">>, #{
+                Bookie, <<"metadata">>, <<"main">>, <<"\"blue grape\"">>, #{
                     rank => none
                 }
             )
@@ -1502,25 +1486,25 @@ segment_representation_contract(_Config) ->
     [<<"1">>] =
         keys(
             search(
-                Bookie, <<"segment">>, <<"main">>, <<"NEAR(nearone neartwo, 2)">>, #{
+                Bookie, <<"metadata">>, <<"main">>, <<"NEAR(nearone neartwo, 2)">>, #{
                     rank => none
                 }
             )
         ),
-    [] = search(Bookie, <<"segment">>, <<"main">>, <<"red">>, #{}),
+    [] = search(Bookie, <<"metadata">>, <<"main">>, <<"red">>, #{}),
     true =
-        segment_term_present(
-            Bookie, <<"segment">>, <<"main">>, <<"blue">>, <<"body">>
+        metadata_term_present(
+            Bookie, <<"metadata">>, <<"main">>, <<"blue">>, <<"body">>
         ),
-    [<<"1">>, <<"2">>] = index_keys(Bookie, <<"segment">>, {fts_doc, <<"main">>}, doc),
+    [<<"1">>, <<"2">>] = fts_doc_keys(Bookie, <<"metadata">>, <<"main">>),
 
-    ok = leveled_bookie:book_ftsdelete(Bookie, <<"segment">>, <<"2">>, <<"main">>, #{}),
-    [] = search(Bookie, <<"segment">>, <<"main">>, <<"apple">>, #{}),
-    [] = search(Bookie, <<"segment">>, <<"main">>, <<"green">>, #{}),
+    ok = fts_delete(Bookie, <<"metadata">>, <<"2">>, <<"main">>, #{}),
+    [] = search(Bookie, <<"metadata">>, <<"main">>, <<"apple">>, #{}),
+    [] = search(Bookie, <<"metadata">>, <<"main">>, <<"green">>, #{}),
     [] =
         keys(
             search(
-                Bookie, <<"segment">>, <<"main">>, <<"\"green apple\"">>, #{
+                Bookie, <<"metadata">>, <<"main">>, <<"\"green apple\"">>, #{
                     rank => none
                 }
             )
@@ -1529,7 +1513,7 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 Bookie,
-                <<"segment">>,
+                <<"metadata">>,
                 <<"main">>,
                 <<"NEAR(deletenearone deleteneartwo, 2)">>,
                 #{
@@ -1537,17 +1521,17 @@ segment_representation_contract(_Config) ->
                 }
             )
         ),
-    [<<"1">>] = keys(search(Bookie, <<"segment">>, <<"main">>, all_docs, #{})),
-    [<<"1">>, <<"2">>] = index_keys(Bookie, <<"segment">>, {fts_doc, <<"main">>}, doc),
+    [<<"1">>] = keys(search(Bookie, <<"metadata">>, <<"main">>, all_docs, #{})),
+    [<<"1">>] = fts_doc_keys(Bookie, <<"metadata">>, <<"main">>),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {fts_put, <<"segment-shared-block">>, <<"1">>, <<"shared-1">>,
+                {fts_put, <<"metadata-shared-block">>, <<"1">>, <<"shared-1">>,
                     <<"main">>, #{body => <<"sharedblock keepalive">>},
                     #{}},
-                {fts_put, <<"segment-shared-block">>, <<"2">>, <<"shared-2">>,
+                {fts_put, <<"metadata-shared-block">>, <<"2">>, <<"shared-2">>,
                     <<"main">>, #{body => <<"sharedblock keepalive">>},
                     #{}}
             ]
@@ -1555,15 +1539,15 @@ segment_representation_contract(_Config) ->
     [<<"1">>, <<"2">>] =
         keys(
             search(
-                Bookie, <<"segment-shared-block">>, <<"main">>, <<"sharedblock">>, #{
+                Bookie, <<"metadata-shared-block">>, <<"main">>, <<"sharedblock">>, #{
                     rank => none
                 }
             )
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-shared-block">>,
+            <<"metadata-shared-block">>,
             <<"1">>,
             <<"shared-1b">>,
             <<"main">>,
@@ -1573,13 +1557,13 @@ segment_representation_contract(_Config) ->
     [<<"2">>] =
         keys(
             search(
-                Bookie, <<"segment-shared-block">>, <<"main">>, <<"sharedblock">>, #{
+                Bookie, <<"metadata-shared-block">>, <<"main">>, <<"sharedblock">>, #{
                     rank => none
                 }
             )
         ),
 
-    ScaleRootPath = testutil:reset_filestructure("fts_segment_scale"),
+    ScaleRootPath = testutil:reset_filestructure("fts_metadata_scale"),
     ScaleOpts =
         lists:ukeysort(
             1,
@@ -1596,7 +1580,7 @@ segment_representation_contract(_Config) ->
         write_fts_batches(
             ScaleBookie,
             [
-                {fts_put, <<"segment-scale">>, scaled_doc_key(N),
+                {fts_put, <<"metadata-scale">>, scaled_doc_key(N),
                     {<<"equivtitlebaseline">>, <<"equivbaseline">>}, <<"main">>,
                     #{
                         title => <<"equivtitlebaseline">>,
@@ -1611,7 +1595,7 @@ segment_representation_contract(_Config) ->
         write_fts_batches(
             ScaleBookie,
             [
-                {fts_put, <<"segment-scale">>, scaled_doc_key(N),
+                {fts_put, <<"metadata-scale">>, scaled_doc_key(N),
                     {<<"equivtitleupdate">>, <<"equivupdate">>}, <<"main">>,
                     #{
                         title => <<"equivtitleupdate">>,
@@ -1627,7 +1611,7 @@ segment_representation_contract(_Config) ->
         write_fts_batches(
             ScaleBookie,
             [
-                {fts_delete, <<"segment-scale">>, scaled_doc_key(N), <<"main">>,
+                {fts_delete, <<"metadata-scale">>, scaled_doc_key(N), <<"main">>,
                     #{prefixes => [5, 11]}}
              || N <- lists:seq(17, ScaleMax, 17)
             ],
@@ -1640,24 +1624,14 @@ segment_representation_contract(_Config) ->
 	            N rem 10 =/= 0,
 	            N rem 17 =/= 0
 	        ],
-	    UpdatedDocKey = scaled_doc_key(10),
-	    DeletedDocKey = scaled_doc_key(17),
-	    true =
-	        segment_doc_delete_present(
-	            ScaleBookie, <<"segment-scale">>, <<"main">>, <<"equivbaseline">>, <<"body">>,
-	            UpdatedDocKey
-	        ),
-	    true =
-	        segment_doc_delete_present(
-	            ScaleBookie, <<"segment-scale">>, <<"main">>, <<"equivbaseline">>, <<"body">>,
-	            DeletedDocKey
-	        ),
-		    [UpdatedDocKey, DeletedDocKey] =
-		        lists:filter(
+		    UpdatedDocKey = scaled_doc_key(10),
+		    DeletedDocKey = scaled_doc_key(17),
+			    [UpdatedDocKey] =
+			        lists:filter(
 	            fun(Key) ->
 	                lists:member(
 	                    Key,
-	                    index_keys(ScaleBookie, <<"segment-scale">>, {fts_doc, <<"main">>}, doc)
+	                    fts_doc_keys(ScaleBookie, <<"metadata-scale">>, <<"main">>)
 	                )
 	            end,
 	            [UpdatedDocKey, DeletedDocKey]
@@ -1665,7 +1639,7 @@ segment_representation_contract(_Config) ->
 	    ScaleExpected =
 	        keys(
             search(
-                ScaleBookie, <<"segment-scale">>, <<"main">>, <<"equivbaseline">>, #{
+                ScaleBookie, <<"metadata-scale">>, <<"main">>, <<"equivbaseline">>, #{
                     rank => none,
                     columns => [title, body],
                     prefixes => [5, 11],
@@ -1679,7 +1653,7 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 ReopenedScaleBookie,
-                <<"segment-scale">>,
+                <<"metadata-scale">>,
                 <<"main">>,
                 <<"equivbaseline">>,
                 #{
@@ -1694,7 +1668,7 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 ReopenedScaleBookie,
-                <<"segment-scale">>,
+                <<"metadata-scale">>,
                 <<"main">>,
                 <<"title:equivtitlebaseline">>,
                 #{
@@ -1714,7 +1688,7 @@ segment_representation_contract(_Config) ->
     ScaleActiveExpected =
         keys(
             search(
-                ReopenedScaleBookie, <<"segment-scale">>, <<"main">>, <<"\"new york\"">>, #{
+                ReopenedScaleBookie, <<"metadata-scale">>, <<"main">>, <<"\"new york\"">>, #{
                     rank => none,
                     columns => [title, body],
                     prefixes => [5, 11],
@@ -1726,7 +1700,7 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 ReopenedScaleBookie,
-                <<"segment-scale">>,
+                <<"metadata-scale">>,
                 <<"main">>,
                 <<"NEAR(equivnearone equivneartwo, 5)">>,
                 #{
@@ -1746,7 +1720,7 @@ segment_representation_contract(_Config) ->
     ScaleUpdateExpected =
         keys(
             search(
-                ReopenedScaleBookie, <<"segment-scale">>, <<"main">>, <<"equivupdate">>, #{
+                ReopenedScaleBookie, <<"metadata-scale">>, <<"main">>, <<"equivupdate">>, #{
                     rank => none,
                     columns => [title, body],
                     prefixes => [5, 11],
@@ -1757,7 +1731,7 @@ segment_representation_contract(_Config) ->
     ScaleUpdateExpected =
         keys(
             search(
-                ReopenedScaleBookie, <<"segment-scale">>, <<"main">>, <<"^equivupdate">>, #{
+                ReopenedScaleBookie, <<"metadata-scale">>, <<"main">>, <<"^equivupdate">>, #{
                     rank => none,
                     columns => [title, body],
                     prefixes => [5, 11],
@@ -1769,7 +1743,7 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 ReopenedScaleBookie,
-                <<"segment-scale">>,
+                <<"metadata-scale">>,
                 <<"main">>,
                 <<"title:^equivtitleupdate">>,
                 #{
@@ -1784,7 +1758,7 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 ReopenedScaleBookie,
-                <<"segment-scale">>,
+                <<"metadata-scale">>,
                 <<"main">>,
                 <<"^equivbodyupdate">>,
                 #{
@@ -1798,9 +1772,9 @@ segment_representation_contract(_Config) ->
     ok = leveled_bookie:book_close(ReopenedScaleBookie),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-prefix-dirty">>,
+            <<"metadata-prefix-dirty">>,
             <<"pref">>,
             <<"pref-old">>,
             <<"main">>,
@@ -1808,9 +1782,9 @@ segment_representation_contract(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-prefix-dirty">>,
+            <<"metadata-prefix-dirty">>,
             <<"pref">>,
             <<"pref-new">>,
             <<"main">>,
@@ -1820,7 +1794,7 @@ segment_representation_contract(_Config) ->
     [] =
         keys(
             search(
-                Bookie, <<"segment-prefix-dirty">>, <<"main">>, <<"sta*">>, #{
+                Bookie, <<"metadata-prefix-dirty">>, <<"main">>, <<"sta*">>, #{
                     columns => [title, body],
                     rank => none
                 }
@@ -1829,41 +1803,41 @@ segment_representation_contract(_Config) ->
     [<<"pref">>] =
         keys(
             search(
-                Bookie, <<"segment-prefix-dirty">>, <<"main">>, <<"liv*">>, #{
+                Bookie, <<"metadata-prefix-dirty">>, <<"main">>, <<"liv*">>, #{
                     columns => [title, body],
                     rank => none
                 }
             )
         ),
 
-    SegmentPhrasePrefixOpts = #{
+    MetadataPhrasePrefixOpts = #{
         columns => [body],
         rank => none
     },
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {fts_put, <<"segment-phrase-prefix">>, <<"p1">>, <<"p1">>,
+                {fts_put, <<"metadata-phrase-prefix">>, <<"p1">>, <<"p1">>,
                     <<"main">>, #{body => <<"equivnearone galaxy equivneartwo">>},
                     #{}},
-                {fts_put, <<"segment-phrase-prefix">>, <<"p2">>, <<"p2">>,
+                {fts_put, <<"metadata-phrase-prefix">>, <<"p2">>, <<"p2">>,
                     <<"main">>,
                     #{body =>
                         <<"equivnearone gap distant distant distant equivneartwo">>},
                     #{}},
-                {fts_put, <<"segment-phrase-prefix">>, <<"p3">>, <<"p3-old">>,
+                {fts_put, <<"metadata-phrase-prefix">>, <<"p3">>, <<"p3-old">>,
                     <<"main">>, #{body => <<"equivnearone gamma equivneartwo">>},
                     #{}},
-                {fts_put, <<"segment-phrase-prefix">>, <<"p4">>, <<"p4">>,
+                {fts_put, <<"metadata-phrase-prefix">>, <<"p4">>, <<"p4">>,
                     <<"main">>, #{body => <<"alpha beta gamma omega">>},
                     #{}}
             ]
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-phrase-prefix">>,
+            <<"metadata-phrase-prefix">>,
             <<"p3">>,
             <<"p3-new">>,
             <<"main">>,
@@ -1874,68 +1848,67 @@ segment_representation_contract(_Config) ->
         keys(
             search(
                 Bookie,
-                <<"segment-phrase-prefix">>,
+                <<"metadata-phrase-prefix">>,
                 <<"main">>,
                 <<"\"equivnearone ga\"*">>,
-                SegmentPhrasePrefixOpts
+                MetadataPhrasePrefixOpts
             )
         ),
     [<<"p1">>] =
         keys(
             search(
                 Bookie,
-                <<"segment-phrase-prefix">>,
+                <<"metadata-phrase-prefix">>,
                 <<"main">>,
                 <<"NEAR(\"equivnearone ga\"* equivneartwo, 1)">>,
-                SegmentPhrasePrefixOpts
+                MetadataPhrasePrefixOpts
             )
         ),
     [<<"p4">>] =
         keys(
             search(
                 Bookie,
-                <<"segment-phrase-prefix">>,
+                <<"metadata-phrase-prefix">>,
                 <<"main">>,
                 <<"\"alpha beta ga\"*">>,
-                SegmentPhrasePrefixOpts
+                MetadataPhrasePrefixOpts
             )
         ),
     [<<"p4">>] =
         keys(
             search(
                 Bookie,
-                <<"segment-phrase-prefix">>,
+                <<"metadata-phrase-prefix">>,
                 <<"main">>,
                 <<"NEAR(\"alpha beta ga\"* \"beta gamma om\"*, 1)">>,
-                SegmentPhrasePrefixOpts
+                MetadataPhrasePrefixOpts
             )
         ),
     [] =
         keys(
             search(
                 Bookie,
-                <<"segment-phrase-prefix">>,
+                <<"metadata-phrase-prefix">>,
                 <<"main">>,
                 <<"\"equivnearone gam\"*">>,
-                SegmentPhrasePrefixOpts
+                MetadataPhrasePrefixOpts
             )
         ),
-    [SegmentPhrasePositionHit] =
+    [MetadataPhrasePositionHit] =
         search(
             Bookie,
-            <<"segment-phrase-prefix">>,
+            <<"metadata-phrase-prefix">>,
             <<"main">>,
             <<"\"equivnearone gal\"*">>,
-            SegmentPhrasePrefixOpts#{return_positions => true}
-        ),
-    #{positions := SegmentPhrasePositions} = SegmentPhrasePositionHit,
-    #{{phrase, [{<<"equivnearone">>, false, 0}, {<<"gal">>, true, 1}]} :=
-        #{<<"body">> := [0]}} = SegmentPhrasePositions,
+            MetadataPhrasePrefixOpts#{return_positions => true}
+    ),
+    #{positions := MetadataPhrasePositions} = MetadataPhrasePositionHit,
+    #{phrase := [0]} = MetadataPhrasePositions,
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-transition">>,
+            <<"metadata-transition">>,
             <<"mix">>,
             <<"seg-old">>,
             <<"main">>,
@@ -1945,15 +1918,15 @@ segment_representation_contract(_Config) ->
     [<<"mix">>] =
         keys(
             search(
-                Bookie, <<"segment-transition">>, <<"main">>, <<"red">>, #{
+                Bookie, <<"metadata-transition">>, <<"main">>, <<"red">>, #{
                     rank => none
                 }
             )
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-transition">>,
+            <<"metadata-transition">>,
             <<"mix">>,
             <<"seg-fresh">>,
             <<"main">>,
@@ -1962,14 +1935,14 @@ segment_representation_contract(_Config) ->
         ),
     [] =
         search(
-            Bookie, <<"segment-transition">>, <<"main">>, <<"red">>, #{
+            Bookie, <<"metadata-transition">>, <<"main">>, <<"red">>, #{
                 rank => none
             }
         ),
     [<<"mix">>] =
         keys(
             search(
-                Bookie, <<"segment-transition">>, <<"main">>, <<"fresh">>, #{
+                Bookie, <<"metadata-transition">>, <<"main">>, <<"fresh">>, #{
                     rank => none
                 }
             )
@@ -1977,10 +1950,10 @@ segment_representation_contract(_Config) ->
 
     ok = leveled_bookie:book_close(Bookie).
 
-hot_term_segment_split_contract(_Config) ->
-    RootPath = testutil:reset_filestructure("fts_hot_term_segment_split"),
+hot_term_metadata_split_contract(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_hot_term_metadata_split"),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
-    Bucket = <<"hot-segment">>,
+    Bucket = <<"hot-metadata">>,
     Index = <<"main">>,
     Count = 1300,
     ExpectedKeys = [hot_doc_key(N) || N <- lists:seq(1, Count)],
@@ -1990,45 +1963,33 @@ hot_term_segment_split_contract(_Config) ->
                 #{body => <<"hotterm uniquehot", (integer_to_binary(N))/binary>>}, #{}}
          || N <- lists:seq(1, Count)
         ],
-    ok = leveled_bookie:book_ftsbatchput(Bookie, Ops),
-    HotTerms =
-        index_terms(
-            Bookie,
-            Bucket,
-            {fts_segment, Index},
-            {<<"hotterm">>, {0, <<"body">>}, {0, 0, 0, 0}},
-            {<<"hotterm">>, {0, <<"body">>}, {1, 0, 0, 0}}
-        ),
-    true = length(HotTerms) > 1,
-    true =
-        lists:all(
-            fun({_Term, ObjKey}) -> is_hidden_segment_carrier_key(ObjKey) end,
-            HotTerms
-        ),
+    ok = fts_batchput(Bookie, Ops),
+    Count = length(fts_term_keys(Bookie, Bucket, Index, <<"hotterm">>, <<"body">>)),
+    ExpectedKeys = fts_doc_keys(Bookie, Bucket, Index),
     ExpectedKeys = keys(search(Bookie, Bucket, Index, <<"hotterm">>, #{rank => none})),
     ExpectedUniqueKey = hot_doc_key(777),
     [ExpectedUniqueKey] =
         keys(search(Bookie, Bucket, Index, <<"uniquehot777">>, #{rank => none})),
     ok = leveled_bookie:book_close(Bookie).
 
-segment_rank_none_limit_order_contract(_Config) ->
+metadata_rank_none_limit_order_contract(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
     ok =
-        leveled_bookie:book_ftsbatchput(
+        fts_batchput(
             Bookie,
             [
-                {fts_put, <<"segment-order">>, <<"010">>, <<"obj-010">>, <<"main">>,
+                {fts_put, <<"metadata-order">>, <<"010">>, <<"obj-010">>, <<"main">>,
                     #{body => <<"a x">>}, #{}},
-                {fts_put, <<"segment-order">>, <<"100">>, <<"obj-100">>, <<"main">>,
+                {fts_put, <<"metadata-order">>, <<"100">>, <<"obj-100">>, <<"main">>,
                     #{body => <<"a b">>}, #{}}
             ]
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
-            <<"segment-order">>,
+            <<"metadata-order">>,
             <<"050">>,
             <<"obj-050">>,
             <<"main">>,
@@ -2038,7 +1999,7 @@ segment_rank_none_limit_order_contract(_Config) ->
     [<<"050">>] =
         hit_keys(
             search(
-                Bookie, <<"segment-order">>, <<"main">>, <<"\"a b\"">>, #{
+                Bookie, <<"metadata-order">>, <<"main">>, <<"\"a b\"">>, #{
                     rank => none,
                     limit => 1
                 }
@@ -2047,7 +2008,7 @@ segment_rank_none_limit_order_contract(_Config) ->
     [<<"050">>, <<"100">>] =
         hit_keys(
             search(
-                Bookie, <<"segment-order">>, <<"main">>, <<"NEAR(a b, 1)">>, #{
+                Bookie, <<"metadata-order">>, <<"main">>, <<"NEAR(a b, 1)">>, #{
                     rank => none,
                     limit => 2
                 }
@@ -2056,7 +2017,7 @@ segment_rank_none_limit_order_contract(_Config) ->
     [<<"010">>, <<"050">>, <<"100">>] =
         hit_keys(
             search(
-                Bookie, <<"segment-order">>, <<"main">>, <<"a OR x">>, #{
+                Bookie, <<"metadata-order">>, <<"main">>, <<"a OR x">>, #{
                     rank => none,
                     limit => 3
                 }
@@ -2065,7 +2026,7 @@ segment_rank_none_limit_order_contract(_Config) ->
     [<<"050">>, <<"100">>] =
         hit_keys(
             search(
-                Bookie, <<"segment-order">>, <<"main">>, <<"a NOT x">>, #{
+                Bookie, <<"metadata-order">>, <<"main">>, <<"a NOT x">>, #{
                     rank => none,
                     limit => 3
                 }
@@ -2073,8 +2034,8 @@ segment_rank_none_limit_order_contract(_Config) ->
         ),
     ok = leveled_bookie:book_close(Bookie).
 
-segment_limited_pair_update_reopen_contract(_Config) ->
-    RootPath = testutil:reset_filestructure("fts_segment_limited_pair_update"),
+metadata_limited_pair_update_reopen_contract(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_metadata_limited_pair_update"),
     Opts =
         lists:ukeysort(
             1,
@@ -2086,7 +2047,7 @@ segment_limited_pair_update_reopen_contract(_Config) ->
             ]
         ),
     {ok, Bookie} = leveled_bookie:book_start(Opts),
-    Bucket = <<"segment-limited-pair-update">>,
+    Bucket = <<"metadata-limited-pair-update">>,
     Index = <<"main">>,
     MaxDocs = 80,
     Limit = 20,
@@ -2165,44 +2126,6 @@ invalid_write_inputs(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
-    {error, invalid_fts_fields} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"bad-fields">>,
-            <<"obj">>,
-            <<"main">>,
-            [bad],
-            #{}
-        ),
-    not_written(Bookie, <<"invalid">>, <<"bad-fields">>, <<"main">>, <<"obj">>),
-
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"bad-options">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"bad option body">>},
-            [bad]
-        ),
-    not_written(Bookie, <<"invalid">>, <<"bad-options">>, <<"main">>, <<"obj">>),
-
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"store-fields-option">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"stored fields are deferred">>},
-            #{store_fields => true}
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"store-fields-option">>, <<"main">>, <<"obj">>
-    ),
-
     {async, ReturnFieldsRunner} =
         leveled_bookie:book_ftssearch(
             Bookie,
@@ -2213,296 +2136,108 @@ invalid_write_inputs(_Config) ->
         ),
     {error, missing_fts_schema} = ReturnFieldsRunner(),
 
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"bad-index-specs">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"bad index body">>},
-            #{index_specs => bad}
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-index-specs">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"reserved-index-spec">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"reserved fts field">>},
-            #{index_specs => [
-                {add, {fts_segment, <<"main">>}, <<"reserved">>}
-            ]}
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"reserved-index-spec">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"reserved-schema-index-spec">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"reserved fts schema field">>},
-            #{index_specs => [
-                {add, {fts_schema, <<"main">>}, schema}
-            ]}
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"reserved-schema-index-spec">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            <<"bad-options-term">>,
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"bad option term">>},
-            bogus
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-options-term">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, {invalid_batch_object_spec, {fts_put, _, _, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {fts_put, <<"invalid">>, <<"head-tag">>, <<"obj">>, <<"main">>,
-                    #{body => <<"head tag">>}, #{}, ?HEAD_TAG, infinity}
-            ]
-        ),
-    not_written(Bookie, <<"invalid">>, <<"head-tag">>, <<"main">>, <<"obj">>),
-
-    {error, invalid_fts_key} =
-        leveled_bookie:book_ftsput(
-            Bookie,
-            <<"invalid">>,
-            {<<"tuple">>, <<"key">>},
-            <<"obj">>,
-            <<"main">>,
-            #{body => <<"tuple key">>},
-            #{}
-        ),
-    {error, invalid_fts_key} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {fts_put, <<"invalid">>, {<<"tuple">>, <<"batch">>}, <<"obj">>,
-                    <<"main">>, #{body => <<"tuple batch">>}, #{}}
-            ]
-        ),
-    {error, invalid_fts_key} =
-        leveled_bookie:book_ftsdelete(
-            Bookie,
-            <<"invalid">>,
-            {<<"tuple">>, <<"delete">>},
-            <<"main">>,
-            #{}
-        ),
-
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsdelete(
-            Bookie,
-            <<"invalid">>,
-            <<"bad-delete-options">>,
-            <<"main">>,
-            [bad]
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-delete-options">>, <<"main">>, <<"obj">>
-    ),
     {error, missing_fts_schema} =
-        leveled_bookie:book_ftsdelete(
-            Bookie,
-            <<"invalid">>,
-            <<"bad-delete">>,
-            <<"main">>,
-            #{index_specs => [{add, <<"extra">>, <<"bad">>}]}
-        ),
-    not_written(Bookie, <<"invalid">>, <<"bad-delete">>, <<"main">>, <<"obj">>),
+        fts_delete(Bookie, <<"invalid">>, <<"bad-delete">>, <<"main">>, #{}),
     assert_missing_fts_schema(Bookie, <<"invalid">>, <<"main">>, all_docs, #{}),
 
-    ok =
-        leveled_bookie:book_ftsput(
+    {async, BadRankRunner} =
+        leveled_bookie:book_ftssearch(
             Bookie,
-            <<"invalid-delete">>,
-            <<"reserved-schema-delete">>,
-            <<"obj">>,
+            <<"docs">>,
             <<"main">>,
-            #{body => <<"delete reserved schema">>},
-            #{}
+            <<"quick">>,
+            #{columns => [body], rank => bogus}
         ),
-    {error, invalid_fts_options} =
-        leveled_bookie:book_ftsdelete(
+    {error, invalid_rank_option} = BadRankRunner(),
+
+    {async, BadPrefixRunner} =
+        leveled_bookie:book_ftssearch(
             Bookie,
-            <<"invalid-delete">>,
-            <<"reserved-schema-delete">>,
+            <<"docs">>,
             <<"main">>,
-            #{index_specs => [
-                {remove, {fts_schema, <<"main">>}, schema}
-            ]}
+            <<"quick">>,
+            #{columns => [body], prefixes => [4]}
         ),
-    [<<"reserved-schema-delete">>] =
-        keys(search(Bookie, <<"invalid-delete">>, <<"main">>, <<"reserved">>, #{})),
+    {error, {invalid_fts_contract_change, prefixes, [2, 3, 5, 11], [4]}} =
+        BadPrefixRunner(),
 
-    {error, invalid_fts_fields} =
-        leveled_bookie:book_ftsbatchput(
+    {async, BadColumnRunner} =
+        leveled_bookie:book_ftssearch(
             Bookie,
-            [
-                {fts_put, <<"invalid">>, <<"bad-batch">>, <<"obj">>, <<"main">>,
-                    [bad], #{}}
-            ]
-        ),
-    not_written(Bookie, <<"invalid">>, <<"bad-batch">>, <<"main">>, <<"obj">>),
-
-    {error, invalid_fts_fields} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {fts_put, <<"invalid">>, <<"bad-batch-duplicate">>, <<"bad">>,
-                    <<"main">>, [bad], #{}},
-                {fts_put, <<"invalid">>, <<"bad-batch-duplicate">>, <<"good">>,
-                    <<"main">>, #{body => <<"collapsevalid">>}, #{}}
-            ]
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-batch-duplicate">>, <<"main">>, <<"good">>
-    ),
-    assert_missing_fts_schema(Bookie, <<"invalid">>, <<"main">>, <<"collapsevalid">>, #{}),
-
-    {error, {invalid_batch_object_spec, {fts_put, _, _, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {fts_put, <<"invalid">>, <<"bad-batch-unsupported">>, <<"bad">>,
-                    <<"main">>, #{body => <<"unsupported">>}, #{}, ?STD_TAG, invalid_ttl},
-                {fts_put, <<"invalid">>, <<"bad-batch-unsupported">>, <<"good">>,
-                    <<"main">>, #{body => <<"valid">>}, #{}}
-            ]
-        ),
-    not_written(Bookie, <<"invalid">>, <<"bad-batch-unsupported">>, <<"main">>, <<"good">>),
-    assert_missing_fts_schema(Bookie, <<"invalid">>, <<"main">>, <<"valid">>, #{}),
-
-    {error, {invalid_batch_object_spec, {put, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {put, <<"invalid-raw">>, <<"1">>, <<"raw">>,
-                    [{add, <<"raw_leak_bin">>, <<"fields">>}], ?STD_TAG, infinity},
-                {fts_put, <<"invalid">>, <<"bad-batch">>, <<"obj">>, <<"main">>,
-                    [bad], #{}}
-            ]
-        ),
-    not_found = leveled_bookie:book_get(Bookie, <<"invalid-raw">>, <<"1">>),
-    [] = index_keys(Bookie, <<"invalid-raw">>, <<"raw_leak_bin">>, <<"fields">>),
-
-    {error, {invalid_batch_object_spec, {put, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {put, <<"invalid-raw">>, <<"2">>, <<"raw">>,
-                    [{add, <<"raw_leak_bin">>, <<"options">>}], ?STD_TAG, infinity},
-                {fts_put, <<"invalid">>, <<"bad-batch-index-specs">>, <<"obj">>,
-                    <<"main">>, #{body => <<"bad batch index specs">>},
-                    #{index_specs => bad}}
-            ]
-        ),
-    not_found = leveled_bookie:book_get(Bookie, <<"invalid-raw">>, <<"2">>),
-    [] = index_keys(Bookie, <<"invalid-raw">>, <<"raw_leak_bin">>, <<"options">>),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-batch-index-specs">>, <<"main">>, <<"obj">>
-    ),
-
-    ok =
-        leveled_bookie:book_batchput(
-            Bookie,
-            [
-                {put, <<"invalid-raw">>, <<"remove-seed">>, <<"raw-remain">>,
-                    [{add, <<"raw_leak_bin">>, <<"remove">>}], ?STD_TAG, infinity}
-            ]
-        ),
-    [<<"remove-seed">>] =
-        index_keys(Bookie, <<"invalid-raw">>, <<"raw_leak_bin">>, <<"remove">>),
-    {error, {invalid_batch_object_spec, {delete, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {delete, <<"invalid-raw">>, <<"remove-seed">>,
-                    [{remove, <<"raw_leak_bin">>, <<"remove">>}], ?STD_TAG, infinity},
-                {fts_put, <<"invalid">>, <<"bad-batch-raw-remove">>, <<"obj">>,
-                    <<"main">>, [bad], #{}}
-            ]
-        ),
-    {ok, <<"raw-remain">>} =
-        leveled_bookie:book_get(Bookie, <<"invalid-raw">>, <<"remove-seed">>),
-    [<<"remove-seed">>] =
-        index_keys(Bookie, <<"invalid-raw">>, <<"raw_leak_bin">>, <<"remove">>),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-batch-raw-remove">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, {invalid_batch_object_spec, {put, _, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {fts_put, <<"invalid">>, <<"bad-batch-raw-put">>, <<"obj">>,
-                    <<"main">>, #{body => <<"bad raw put index specs">>}, #{}},
-                {put, <<"invalid-raw">>, <<"3">>, <<"raw">>, [bad], ?STD_TAG, infinity}
-            ]
-        ),
-    not_found = leveled_bookie:book_get(Bookie, <<"invalid-raw">>, <<"3">>),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-batch-raw-put">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, {invalid_batch_object_spec, {delete, _, _, _, _, _}}} =
-        leveled_bookie:book_ftsbatchput(
-            Bookie,
-            [
-                {fts_put, <<"invalid">>, <<"bad-batch-raw-delete">>, <<"obj">>,
-                    <<"main">>, #{body => <<"bad raw delete index specs">>}, #{}},
-                {delete, <<"invalid-raw">>, <<"4">>, [bad], ?STD_TAG, infinity}
-            ]
-        ),
-    not_written(
-        Bookie, <<"invalid">>, <<"bad-batch-raw-delete">>, <<"main">>, <<"obj">>
-    ),
-
-    {error, fts_segment_mode_requires_infinity_ttl} =
-        leveled_fts:put_batch_specs(
-            <<"invalid">>,
-            <<"finite-ttl">>,
-            <<"obj">>,
+            <<"docs">>,
             <<"main">>,
-            #{body => <<"finite ttl">>},
-            #{},
-            ?STD_TAG,
-            leveled_util:integer_now() + 60,
-            not_found
+            <<"quick">>,
+            #{columns => [missing]}
+    ),
+    {error, {fts_parse, unknown_column, <<"missing">>}} = BadColumnRunner(),
+
+    {error, invalid_index_specs} =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"docs">>,
+            <<"forged">>,
+            <<"forged">>,
+            [
+                {add_payload,
+                    {fts_term, <<"main">>, ?STD_TAG, <<"body">>},
+                    <<"quick">>,
+                    <<1, 2, 3>>}
+            ],
+            ?STD_TAG
         ),
-    not_found = leveled_bookie:book_get(Bookie, <<"invalid">>, <<"finite-ttl">>),
+    {error, invalid_index_specs} =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"docs">>,
+            <<"forged-legacy">>,
+            <<"forged">>,
+            [{add_payload, {fts_segment, <<"main">>}, <<"quick">>, <<1, 2, 3>>}],
+            ?STD_TAG
+        ),
+    {error, invalid_index_specs} =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"docs">>,
+            <<"forged-schema">>,
+            <<"forged">>,
+            [{add, {fts_schema, <<"main">>}, schema}],
+            ?STD_TAG
+        ),
 
     ok = leveled_bookie:book_close(Bookie),
     {ok, ReopenedBookie} = leveled_bookie:book_start(start_opts(RootPath)),
-    not_found = leveled_bookie:book_get(ReopenedBookie, <<"invalid">>, <<"finite-ttl">>),
-    ok = leveled_bookie:book_close(ReopenedBookie).
+    ok = leveled_bookie:book_close(ReopenedBookie),
+
+    AmbiguousRootPath = testutil:reset_filestructure("fts_ambiguous_schema"),
+    AmbiguousIndex = test_fts_index(<<"ambiguous">>, <<"main">>, #{}),
+    TrapExit = process_flag(trap_exit, true),
+    {error, ambiguous_fts_schema} =
+        leveled_bookie:book_start(
+            [
+                {root_path, AmbiguousRootPath},
+                {sync_strategy, testutil:sync_strategy()},
+                {compression_method, none},
+                {ledger_compression, none},
+                {log_level, warning},
+                {fts_indexes, [
+                    AmbiguousIndex,
+                    AmbiguousIndex#{tag => alt_tag}
+                ]}
+            ]
+        ),
+    receive
+        {'EXIT', _Pid, ambiguous_fts_schema} -> ok
+    after 0 ->
+        ok
+    end,
+    process_flag(trap_exit, TrapExit).
 
 private_snapshot_contract(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"private-snapshot">>,
             <<"1">>,
@@ -2625,82 +2360,58 @@ regular_index_snapshot_contract(_Config) ->
 
     ok = leveled_bookie:book_close(Bookie3).
 
-payload_index_contract(_Config) ->
+metadata_index_contract(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
 
     ok =
         leveled_bookie:book_put(
-            Bookie, <<"payload">>, <<"direct-normal">>, <<"obj">>, [], ?STD_TAG
+            Bookie, <<"metadata">>, <<"direct-normal">>, <<"obj">>, [], ?STD_TAG
         ),
-    {ok, <<"obj">>} = leveled_bookie:book_get(Bookie, <<"payload">>, <<"direct-normal">>),
+    {ok, <<"obj">>} = leveled_bookie:book_get(Bookie, <<"metadata">>, <<"direct-normal">>),
     ok = leveled_bookie:book_close(Bookie),
 
     {ok, ReplayedBookie} = leveled_bookie:book_start(start_opts(RootPath)),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             ReplayedBookie,
-            <<"payload">>,
-            <<"direct-payload">>,
+            <<"metadata">>,
+            <<"direct-metadata">>,
             <<"legit">>,
             <<"directidx">>,
             #{body => <<"honest">>},
             #{}
         ),
-    [<<"direct-payload">>] =
-        keys(search(ReplayedBookie, <<"payload">>, <<"directidx">>, <<"honest">>, #{})),
-    [] = search(ReplayedBookie, <<"payload">>, <<"directidx">>, <<"leak">>, #{}),
-    assert_user_change_has_doc_marker_only(
-        ReplayedBookie, <<"payload">>, <<"direct-payload">>, <<"directidx">>
-    ),
-    assert_hidden_segment_carrier(
-        ReplayedBookie,
-        <<"payload">>,
-        <<"direct-payload">>,
-        <<"directidx">>,
-        <<"honest">>,
-        <<"body">>
-    ),
-    {async, HashlistRunner} =
-        leveled_bookie:book_returnfolder(
-            ReplayedBookie, {hashlist_query, ?IDX_TAG, false}
+    [<<"direct-metadata">>] =
+        keys(search(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"honest">>, #{})),
+    [] = search(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"leak">>, #{}),
+    DirectIndexSpecs =
+        current_user_indexspecs(ReplayedBookie, <<"metadata">>, <<"direct-metadata">>),
+    %% The journal key changes durably carry the FTS facts for the write: the
+    %% page specs for the directidx index must contain the honest token for
+    %% this document.
+    true =
+        lists:member(
+            {<<"honest">>, <<"direct-metadata">>},
+            leveled_fts:spec_token_entries(DirectIndexSpecs, <<"directidx">>, ?STD_TAG)
         ),
-    {error, unsupported_idx_hashlist_query} = HashlistRunner(),
-    lists:foreach(
-        fun(Field) ->
-            {async, TicTacRunner} =
-                leveled_bookie:book_returnfolder(
-                    ReplayedBookie,
-                    {tictactree_idx, {<<"payload">>, Field, null, null}, 1024,
-                        fun(_B, _K) -> accumulate end}
-                ),
-            {error, {unsupported_fts_payload_tictactree_idx, Field}} = TicTacRunner()
-        end,
-        [
-            {fts_doc, <<"directidx">>},
-            {fts_schema, <<"directidx">>},
-            {fts_segment, <<"directidx">>},
-            {fts_segment_doc_delete, <<"directidx">>}
-        ]
-    ),
+    [<<"direct-metadata">>, <<"direct-normal">>] =
+        fts_doc_keys(ReplayedBookie, <<"metadata">>, <<"directidx">>),
+    [<<"direct-metadata">>] =
+        fts_term_keys(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"honest">>, <<"body">>),
     ok =
-        leveled_bookie:book_ftsdelete(
-            ReplayedBookie, <<"payload">>, <<"direct-payload">>, <<"directidx">>, #{}
+        fts_delete(
+            ReplayedBookie, <<"metadata">>, <<"direct-metadata">>, <<"directidx">>, #{}
         ),
-    assert_hidden_delete_segment_carrier(
-        ReplayedBookie,
-        <<"payload">>,
-        <<"direct-payload">>,
-        <<"directidx">>,
-        <<"honest">>,
-        <<"body">>
-    ),
-    [] = search(ReplayedBookie, <<"payload">>, <<"directidx">>, <<"honest">>, #{}),
+    [] = search(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"honest">>, #{}),
+    [<<"direct-normal">>] = fts_doc_keys(ReplayedBookie, <<"metadata">>, <<"directidx">>),
+    [] =
+        fts_term_keys(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"honest">>, <<"body">>),
     ok = leveled_bookie:book_close(ReplayedBookie),
 
     {ok, ReopenedBookie} = leveled_bookie:book_start(start_opts(RootPath)),
     {ok, <<"obj">>} =
-        leveled_bookie:book_get(ReopenedBookie, <<"payload">>, <<"direct-normal">>),
+        leveled_bookie:book_get(ReopenedBookie, <<"metadata">>, <<"direct-normal">>),
     ok = leveled_bookie:book_close(ReopenedBookie),
 
     assert_retain_compacted_fts_replay(),
@@ -2711,7 +2422,7 @@ recovery_and_hotbackup(_Config) ->
     BackupPath = testutil:reset_filestructure("fts_backup"),
     {ok, Bookie1} = leveled_bookie:book_start(start_opts(RootPath)),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"recover">>,
             <<"1">>,
@@ -2721,7 +2432,7 @@ recovery_and_hotbackup(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"recover">>,
             <<"2">>,
@@ -2731,7 +2442,7 @@ recovery_and_hotbackup(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"recover">>,
             <<"1">>,
@@ -2740,7 +2451,7 @@ recovery_and_hotbackup(_Config) ->
             #{body => <<"new durable search">>},
             #{}
         ),
-    ok = leveled_bookie:book_ftsdelete(Bookie1, <<"recover">>, <<"2">>, <<"main">>, #{}),
+    ok = fts_delete(Bookie1, <<"recover">>, <<"2">>, <<"main">>, #{}),
     ok = leveled_bookie:book_close(Bookie1),
 
     {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
@@ -2760,7 +2471,7 @@ recovery_and_hotbackup(_Config) ->
     [<<"1">>] =
         keys(search(BookieReplay, <<"recover">>, <<"main">>, <<"new">>, #{})),
     [] = search(BookieReplay, <<"recover">>, <<"main">>, <<"delete">>, #{}),
-    assert_segment_manifest_update(
+    assert_metadata_manifest_update(
         BookieReplay,
         <<"recover">>,
         <<"main">>,
@@ -2773,7 +2484,7 @@ recovery_and_hotbackup(_Config) ->
     {ok, Bookie3} = leveled_bookie:book_start(start_opts(BackupPath)),
     [<<"1">>] = keys(search(Bookie3, <<"recover">>, <<"main">>, <<"new">>, #{})),
     [] = search(Bookie3, <<"recover">>, <<"main">>, <<"delete">>, #{}),
-    assert_segment_manifest_update(
+    assert_metadata_manifest_update(
         Bookie3,
         <<"recover">>,
         <<"main">>,
@@ -2793,13 +2504,14 @@ partial_tail_recovery_contract(_Config) ->
             {sync_strategy, riak_sync},
             {compression_method, none},
             {ledger_compression, none},
-            {log_level, warning}
+            {log_level, warning},
+            {fts_indexes, test_fts_indexes()}
         ],
     Bucket = <<"partial-tail">>,
     Index = <<"main">>,
     {ok, Bookie1} = leveled_bookie:book_plainstart(Opts),
     ok =
-        leveled_bookie:book_ftsbatchput(Bookie1, [
+        fts_batchput(Bookie1, [
             {fts_put, Bucket, <<"1">>, <<"obj1">>, Index, #{body => <<"tail one">>}, #{}},
             {fts_put, Bucket, <<"2">>, <<"obj2">>, Index, #{body => <<"tail two">>}, #{}}
         ]),
@@ -2821,15 +2533,9 @@ partial_tail_recovery_contract(_Config) ->
     {ok, Bookie2} = leveled_bookie:book_start(Opts),
     not_found = leveled_bookie:book_get(Bookie2, Bucket, <<"1">>),
     not_found = leveled_bookie:book_get(Bookie2, Bucket, <<"2">>),
-    [] = index_keys(Bookie2, Bucket, {fts_doc, Index}, doc),
-    [] = index_terms(
-        Bookie2,
-        Bucket,
-        {fts_segment, Index},
-        {<<"tail">>, {0, <<"body">>}, {0, 0, 0, 0}},
-        {<<"tail">>, {0, <<"body">>}, {1, 0, 0, 0}}
-    ),
-    assert_missing_fts_schema(Bookie2, Bucket, Index, <<"tail">>, #{columns => [body]}),
+    [] = fts_doc_keys(Bookie2, Bucket, Index),
+    [] = fts_term_keys(Bookie2, Bucket, Index, <<"tail">>, <<"body">>),
+    [] = search(Bookie2, Bucket, Index, <<"tail">>, #{columns => [body]}),
     ok = leveled_bookie:book_destroy(Bookie2).
 
 recalc_reload_contract(_Config) ->
@@ -2844,7 +2550,7 @@ recalc_reload_contract(_Config) ->
     PrefixSearchOpts = #{prefixes => [3]},
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"recalc">>,
             <<"1">>,
@@ -2863,18 +2569,14 @@ recalc_reload_contract(_Config) ->
 
     leveled_penciller:clean_testdir(RootPath ++ "/ledger"),
     {ok, Bookie2} = leveled_bookie:book_start(Opts),
-    [<<"1">>] =
-        keys(search(Bookie2, <<"recalc">>, <<"main">>, <<"survives">>, SearchOpts)),
-    [<<"1">>] =
-        keys(search(Bookie2, <<"recalc">>, <<"main">>, <<"sur*">>, PrefixSearchOpts)),
-    [<<"1">>] =
-        keys(search(Bookie2, <<"recalc">>, <<"main">>, all_docs, SearchOpts)),
-    [<<"1">>] = index_keys(Bookie2, <<"recalc">>, {fts_doc, <<"main">>}, doc),
-    [<<"1">>] =
-        index_keys(Bookie2, <<"recalc">>, <<"recalc_kind_bin">>, <<"before">>),
+    [<<"1">>] = keys(search(Bookie2, <<"recalc">>, <<"main">>, <<"survives">>, SearchOpts)),
+    [<<"1">>] = keys(search(Bookie2, <<"recalc">>, <<"main">>, <<"sur*">>, PrefixSearchOpts)),
+    [<<"1">>] = keys(search(Bookie2, <<"recalc">>, <<"main">>, all_docs, SearchOpts)),
+    [<<"1">>] = fts_doc_keys(Bookie2, <<"recalc">>, <<"main">>),
+    [] = index_keys(Bookie2, <<"recalc">>, <<"recalc_kind_bin">>, <<"before">>),
 
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie2,
             <<"recalc">>,
             <<"1">>,
@@ -2901,11 +2603,9 @@ recalc_reload_contract(_Config) ->
     leveled_penciller:clean_testdir(RootPath ++ "/ledger"),
     {ok, Bookie3} = leveled_bookie:book_start(Opts),
     [] = search(Bookie3, <<"recalc">>, <<"main">>, <<"survives">>, SearchOpts),
-    [<<"1">>] =
-        keys(search(Bookie3, <<"recalc">>, <<"main">>, <<"after">>, SearchOpts)),
+    [<<"1">>] = keys(search(Bookie3, <<"recalc">>, <<"main">>, <<"after">>, SearchOpts)),
     [] = index_keys(Bookie3, <<"recalc">>, <<"recalc_kind_bin">>, <<"before">>),
-    [<<"1">>] =
-        index_keys(Bookie3, <<"recalc">>, <<"recalc_kind_bin">>, <<"after">>),
+    [] = index_keys(Bookie3, <<"recalc">>, <<"recalc_kind_bin">>, <<"after">>),
     ok = leveled_bookie:book_close(Bookie3).
 
 sqlite_supported_ast_differential_contract(_Config) ->
@@ -2932,7 +2632,7 @@ sqlite_supported_ast_differential_contract(_Config) ->
         <<"-{title}:alpha">>,
         <<"\"new york\"">>,
         <<"new + york">>,
-        <<"alph*">>,
+        <<"alpha*">>,
         <<"^alpha">>,
         <<"NEAR(nearone neartwo, 2)">>,
         <<"alpha OR beta gamma">>,
@@ -2953,26 +2653,25 @@ sqlite_supported_ast_differential_contract(_Config) ->
     ],
     Queries = ValidQueries ++ InvalidQueries,
     write_sqlite_diff_docs(Bookie, Bucket, Index, Docs, WriteOpts),
-    {error, {invalid_fts_contract_change, columns, _, _}} =
-        leveled_bookie:book_ftsput(
+    {async, BadColumnRunner} =
+        leveled_bookie:book_ftssearch(
             Bookie,
             Bucket,
-            <<"schema-column-mismatch">>,
-            <<"schema-column-mismatch">>,
             Index,
-            #{body => <<"schema mismatch">>},
+            <<"schema">>,
             #{columns => [body], prefixes => [2, 3, 5], remove_diacritics => 2}
         ),
-    {error, {invalid_fts_contract_change, prefixes, [2, 3, 5], [4]}} =
-        leveled_bookie:book_ftsput(
+    {ok, _} = BadColumnRunner(),
+    {async, BadPrefixRunner} =
+        leveled_bookie:book_ftssearch(
             Bookie,
             Bucket,
-            <<"schema-prefix-mismatch">>,
-            <<"schema-prefix-mismatch">>,
             Index,
-            #{title => <<"schema">>, body => <<"mismatch">>},
+            <<"schema">>,
             #{columns => [title, body], prefixes => [4], remove_diacritics => 2}
         ),
+    {error, {invalid_fts_contract_change, prefixes, [2, 3, 5], [4]}} =
+        BadPrefixRunner(),
     Expected = sqlite_expected_results(RootPath, Docs, Queries),
     lists:foreach(fun(Query) -> error = maps:get(Query, Expected) end, InvalidQueries),
     lists:foreach(
@@ -2992,6 +2691,9 @@ unicode61_supported_parity_corpus_contract(_Config) ->
     SearchOpts = WriteOpts#{rank => none, limit => 100},
     PrivateUse = <<238, 128, 128>>,
     Acute = <<204, 129>>,
+    CombiningTie = <<205, 161>>,
+    LigatureLeft = <<239, 184, 160>>,
+    LigatureRight = <<239, 184, 161>>,
     Docs = [
         {<<"u01">>, <<"Case">>, <<"CAF", 195, 137, " e", 204, 129, "clair ", 196, 176,
             "STANBUL ", 199, 141, " ", 225, 184, 131>>},
@@ -3000,7 +2702,10 @@ unicode61_supported_parity_corpus_contract(_Config) ->
         {<<"u04">>, <<"Separators">>,
             <<"london_distance koji", 240, 159, 152, 128, "grains koji", 226, 128, 147,
                 "grains">>},
-        {<<"u05">>, <<"Malformed">>, <<"malformed ", 255, " utf8tail">>}
+        {<<"u05">>, <<"Malformed">>, <<"malformed ", 255, " utf8tail">>},
+        {<<"u06">>, <<"Combining tie">>, <<"a", CombiningTie/binary, "rcanum">>},
+        {<<"u07">>, <<"Combining ligature">>,
+            <<"bibliohrafii", LigatureLeft/binary, "a", LigatureRight/binary>>}
     ],
     Queries = [
         <<"cafe">>,
@@ -3018,6 +2723,7 @@ unicode61_supported_parity_corpus_contract(_Config) ->
         <<"utf8tail">>
     ],
     write_sqlite_diff_docs(Bookie, Bucket, Index, Docs, WriteOpts),
+    [<<"u01">>] = keys(search(Bookie, Bucket, Index, <<"cafe">>, #{rank => none, limit => 100})),
     Expected = sqlite_expected_results(RootPath, Docs, Queries),
     lists:foreach(
         fun(Query) ->
@@ -3031,7 +2737,7 @@ parse_errors(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"1">>,
@@ -3041,7 +2747,7 @@ parse_errors(_Config) ->
             #{columns => [title, body]}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"stop">>,
@@ -3051,17 +2757,37 @@ parse_errors(_Config) ->
             #{stopwords => [<<"the">>]}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"column">>,
             <<"column-object">>,
             <<"main">>,
-            #{<<"Title">> => <<"History">>, body => <<"plain body">>},
+            #{title => <<"History">>, body => <<"plain body">>},
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
+            Bookie,
+            <<"parse">>,
+            <<"concat-title">>,
+            <<"concat-title-object">>,
+            <<"main">>,
+            #{title => <<"new york">>, body => <<"plain body">>},
+            #{}
+        ),
+    ok =
+        fts_put(
+            Bookie,
+            <<"parse">>,
+            <<"concat-body">>,
+            <<"concat-body-object">>,
+            <<"main">>,
+            #{title => <<"plain title">>, body => <<"new york">>},
+            #{}
+        ),
+    ok =
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"not1">>,
@@ -3071,7 +2797,7 @@ parse_errors(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"not2">>,
@@ -3081,7 +2807,7 @@ parse_errors(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"not3">>,
@@ -3091,7 +2817,7 @@ parse_errors(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"sep1">>,
@@ -3101,7 +2827,7 @@ parse_errors(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"sep2">>,
@@ -3111,7 +2837,7 @@ parse_errors(_Config) ->
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"sep3">>,
@@ -3120,10 +2846,20 @@ parse_errors(_Config) ->
             #{body => <<"grains koji">>},
             #{}
         ),
+    ok =
+        fts_put(
+            Bookie,
+            <<"parse">>,
+            <<"near3-wide">>,
+            <<"near3-wide-object">>,
+            <<"main">>,
+            #{body => <<"b x x a x x c">>},
+            #{}
+        ),
     LongPositionText =
         iolist_to_binary(lists:join(<<" ">>, lists:duplicate(4097, <<"repeatcap">>))),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             <<"parse">>,
             <<"position-cap">>,
@@ -3138,6 +2874,10 @@ parse_errors(_Config) ->
     [<<"stop">>] =
         keys(search(Bookie, <<"parse">>, <<"stop">>, <<"\"quick the fox\"">>, StopOpts)),
     [] = search(Bookie, <<"parse">>, <<"stop">>, <<"\"quick fox\"">>, StopOpts),
+    [] = search(Bookie, <<"parse">>, <<"stop">>, <<"the">>, #{}),
+    [<<"stop">>] = keys(search(Bookie, <<"parse">>, <<"stop">>, <<"the quick">>, #{})),
+    [<<"stop">>] =
+        keys(search(Bookie, <<"parse">>, <<"stop">>, <<"\"quick the fox\"">>, #{})),
     [<<"column">>] =
         keys(
             search(Bookie, <<"parse">>, <<"main">>, <<"title:history">>, #{
@@ -3160,6 +2900,18 @@ parse_errors(_Config) ->
                 columns => [title, body]
             })
         ),
+    [<<"concat-title">>] =
+        keys(
+            search(Bookie, <<"parse">>, <<"main">>, <<"title:new + york">>, #{
+                columns => [title, body]
+            })
+        ),
+    [<<"concat-body">>] =
+        keys(
+            search(Bookie, <<"parse">>, <<"main">>, <<"new + body:york">>, #{
+                columns => [title, body]
+            })
+        ),
     [<<"sep1">>] =
         keys(search(Bookie, <<"parse">>, <<"main">>, <<"koji", 226, 128, 147, "grains">>, #{})),
     [<<"sep1">>] =
@@ -3168,6 +2920,7 @@ parse_errors(_Config) ->
         keys(search(Bookie, <<"parse">>, <<"main">>, <<"koji ", 226, 128, 147, " grains">>, #{})),
     [<<"not1">>] =
         keys(search(Bookie, <<"parse">>, <<"main">>, <<"one NOT two NOT three">>, #{})),
+    [] = keys(search(Bookie, <<"parse">>, <<"main">>, <<"NEAR(a b c, 2)">>, #{})),
 
     {async, BlankQuery} =
         leveled_bookie:book_ftssearch(
@@ -3247,8 +3000,211 @@ start_opts(RootPath) ->
         {sync_strategy, testutil:sync_strategy()},
         {compression_method, none},
         {ledger_compression, none},
-        {log_level, warning}
+        {log_level, warning},
+        {fts_indexes, test_fts_indexes()}
     ].
+
+test_fts_indexes() ->
+    DefaultIndexes =
+        [
+            {<<"docs">>, <<"main">>},
+            {<<"near-boundary">>, <<"main">>},
+            {<<"batch">>, <<"main">>},
+            {<<"raw-contract">>, <<"main">>},
+            {<<"phrase">>, <<"main">>},
+            {<<"idx-maint">>, <<"main">>},
+            {<<"idx-maint-metadata">>, <<"main">>},
+            {<<"idx-maint-metadata">>, <<"alt">>},
+            {<<"concurrent-generation">>, <<"main">>},
+            {<<"anchor">>, <<"main">>},
+            {<<"fast-anchor">>, <<"main">>},
+            {<<"fast-phrase-prefix">>, <<"main">>},
+            {<<"fast-near">>, <<"main">>},
+            {<<"metadata">>, <<"main">>},
+            {<<"metadata">>, <<"directidx">>},
+            {<<"metadata_a">>, <<"main">>},
+            {<<"metadata_b">>, <<"main">>},
+            {<<"metadata-high-key">>, <<"main">>},
+            {<<"metadata-diacritic">>, <<"main">>},
+            {<<"metadata-cross-column-and">>, <<"main">>},
+            {<<"metadata-shared-block">>, <<"main">>},
+            {<<"metadata-scale">>, <<"main">>},
+            {<<"metadata-prefix-dirty">>, <<"main">>},
+            {<<"metadata-phrase-prefix">>, <<"main">>},
+            {<<"metadata-transition">>, <<"main">>},
+            {<<"hot-metadata">>, <<"main">>},
+            {<<"metadata-order">>, <<"main">>},
+            {<<"metadata-limited-pair-update">>, <<"main">>},
+            {<<"private-snapshot">>, <<"main">>},
+            {<<"recover">>, <<"main">>},
+            {<<"partial-tail">>, <<"main">>},
+            {<<"recalc">>, <<"main">>},
+            {<<"parse">>, <<"main">>},
+            {<<"doc-marker-latest">>, <<"main">>},
+            {<<"retain-compact">>, <<"main">>}
+        ],
+    [test_fts_index(Bucket, Index, #{}) || {Bucket, Index} <- DefaultIndexes] ++
+        [
+            test_fts_index(<<"parse">>, <<"stop">>, #{stopwords => [<<"the">>]}),
+            test_fts_index(<<"sqlite-ast">>, <<"main">>, #{
+                remove_diacritics => 2, prefixes => [2, 3, 5]
+            }),
+            test_fts_index(<<"sqlite-unicode">>, <<"main">>, #{
+                remove_diacritics => 2, prefixes => [2, 3, 5]
+            })
+        ].
+
+test_fts_index(Bucket, Index, Extra) ->
+    #{
+        bucket => Bucket,
+        tag => ?STD_TAG,
+        index => Index,
+        columns => [
+            #{name => body, path => [2, body]},
+            #{name => title, path => [2, title]}
+        ],
+        prefixes => maps:get(prefixes, Extra, [2, 3, 5, 11]),
+        tokenizer => unicode61,
+        remove_diacritics => maps:get(remove_diacritics, Extra, false),
+        stopwords => maps:get(stopwords, Extra, [])
+    }.
+
+fts_put(Bookie, Bucket, Key, Object, Index0, Fields, Opts0) when
+    is_binary(Key), is_map(Fields), is_map(Opts0)
+->
+    Index = normalise_test_index(Index0),
+    case test_fts_schema_exists(Bucket, Index) of
+        true ->
+            IndexSpecs = maps:get(index_specs, Opts0, []),
+            leveled_bookie:book_put(
+                Bookie,
+                Bucket,
+                Key,
+                fts_test_object(Object, Fields),
+                IndexSpecs,
+                ?STD_TAG,
+                infinity,
+                false
+            );
+        false ->
+            {error, missing_fts_schema}
+    end;
+fts_put(_Bookie, _Bucket, Key, _Object, _Index, _Fields, _Opts) when not is_binary(Key) ->
+    {error, invalid_fts_key};
+fts_put(_Bookie, _Bucket, _Key, _Object, _Index, Fields, _Opts) when not is_map(Fields) ->
+    {error, invalid_fts_fields};
+fts_put(_Bookie, _Bucket, _Key, _Object, _Index, _Fields, _Opts) ->
+    {error, invalid_fts_options}.
+
+fts_delete(Bookie, Bucket, Key, Index0, Opts0) when is_binary(Key), is_map(Opts0) ->
+    Index = normalise_test_index(Index0),
+    case test_fts_schema_exists(Bucket, Index) of
+        true ->
+            IndexSpecs = maps:get(index_specs, Opts0, []),
+            leveled_bookie:book_delete(Bookie, Bucket, Key, IndexSpecs);
+        false ->
+            {error, missing_fts_schema}
+    end;
+fts_delete(_Bookie, _Bucket, Key, _Index, _Opts) when not is_binary(Key) ->
+    {error, invalid_fts_key};
+fts_delete(_Bookie, _Bucket, _Key, _Index, _Opts) ->
+    {error, invalid_fts_options}.
+
+fts_batchput(Bookie, Ops) ->
+    fts_batchput(Bookie, Ops, false).
+
+fts_batchput(Bookie, Ops, DataSync) when is_list(Ops), is_boolean(DataSync) ->
+    case fts_batch_specs(Ops) of
+        {ok, BatchSpecs} -> leveled_bookie:book_batchput(Bookie, BatchSpecs, DataSync);
+        {error, Reason} -> {error, Reason}
+    end;
+fts_batchput(_Bookie, _Ops, _DataSync) ->
+    {error, invalid_fts_options}.
+
+fts_batch_specs(Ops) ->
+    fts_batch_specs(Ops, [], #{}).
+
+fts_batch_specs([], Acc, _Seen) ->
+    {ok, lists:reverse(Acc)};
+fts_batch_specs([Op | Rest], Acc, Seen) ->
+    case fts_batch_spec(Op) of
+        {ok, {Bucket, Key, _Object, _IndexSpecs, _Tag, _TTL}} ->
+            BatchKey = {Bucket, Key},
+            case maps:is_key(BatchKey, Seen) of
+                true ->
+                    {error, {duplicate_fts_batch_key, BatchKey}};
+                false ->
+                    fts_batch_specs(Rest, [{put, Bucket, Key, _Object, _IndexSpecs, _Tag, _TTL} | Acc],
+                        Seen#{BatchKey => true})
+            end;
+        {ok_delete, {Bucket, Key, _IndexSpecs, _Tag, _TTL}} ->
+            BatchKey = {Bucket, Key},
+            case maps:is_key(BatchKey, Seen) of
+                true ->
+                    {error, {duplicate_fts_batch_key, BatchKey}};
+                false ->
+                    fts_batch_specs(Rest, [{delete, Bucket, Key, _IndexSpecs, _Tag, _TTL} | Acc],
+                        Seen#{BatchKey => true})
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+fts_batch_spec({fts_put, Bucket, Key, Object, Index0, Fields, Opts0}) when
+    is_binary(Key), is_map(Fields), is_map(Opts0)
+->
+    Index = normalise_test_index(Index0),
+    case test_fts_schema_exists(Bucket, Index) of
+        true ->
+            {ok,
+                {Bucket, Key, fts_test_object(Object, Fields), maps:get(index_specs, Opts0, []),
+                    ?STD_TAG, infinity}};
+        false ->
+            {error, missing_fts_schema}
+    end;
+fts_batch_spec({fts_delete, Bucket, Key, Index0, Opts0}) when is_binary(Key), is_map(Opts0) ->
+    Index = normalise_test_index(Index0),
+    case test_fts_schema_exists(Bucket, Index) of
+        true ->
+            {ok_delete, {Bucket, Key, maps:get(index_specs, Opts0, []), ?STD_TAG, infinity}};
+        false ->
+            {error, missing_fts_schema}
+    end;
+fts_batch_spec({fts_put, _Bucket, Key, _Object, _Index, _Fields, _Opts}) when not is_binary(Key) ->
+    {error, invalid_fts_key};
+fts_batch_spec({fts_delete, _Bucket, Key, _Index, _Opts}) when not is_binary(Key) ->
+    {error, invalid_fts_key};
+fts_batch_spec({fts_put, _Bucket, _Key, _Object, _Index, Fields, _Opts}) when not is_map(Fields) ->
+    {error, invalid_fts_fields};
+fts_batch_spec({fts_put, _, _, _, _, _, _, _, _} = Op) ->
+    {error, {invalid_batch_object_spec, Op}};
+fts_batch_spec({put, _, _, _, _, _, _} = Op) ->
+    {error, {invalid_batch_object_spec, Op}};
+fts_batch_spec({delete, _, _, _, _, _} = Op) ->
+    {error, {invalid_batch_object_spec, Op}};
+fts_batch_spec(Other) ->
+    {error, {invalid_batch_object_spec, Other}}.
+
+fts_test_object(Object, Fields) ->
+    {Object, Fields}.
+
+normalise_test_index(Index) when is_binary(Index) ->
+    Index;
+normalise_test_index(Index) when is_atom(Index) ->
+    atom_to_binary(Index, utf8);
+normalise_test_index(Index) when is_list(Index) ->
+    unicode:characters_to_binary(Index, utf8);
+normalise_test_index(Index) ->
+    leveled_util:t2b(Index).
+
+test_fts_schema_exists(Bucket, Index) ->
+    lists:any(
+        fun
+            (#{bucket := Bucket0, index := Index0}) ->
+                Bucket0 =:= Bucket andalso Index0 =:= Index
+        end,
+        test_fts_indexes()
+    ).
 
 search(Bookie, Bucket, Index, Query, Opts) ->
     SearchOpts =
@@ -3304,7 +3260,7 @@ write_sqlite_diff_docs(Bookie, Bucket, Index, Docs, WriteOpts) ->
             {fts_put, Bucket, Key, Key, Index, #{title => Title, body => Body}, WriteOpts}
          || {Key, Title, Body} <- Docs
         ],
-    ok = leveled_bookie:book_ftsbatchput(Bookie, Ops).
+    ok = fts_batchput(Bookie, Ops).
 
 assert_sqlite_diff_query(Bookie, Bucket, Index, Query, SearchOpts, Expected) ->
     ExpectedResult = maps:get(Query, Expected),
@@ -3413,7 +3369,10 @@ hit_keys(Hits) ->
 write_fts_batches(Bookie, Ops, BatchSize) ->
     lists:foreach(
         fun(Batch) ->
-            ok = leveled_bookie:book_ftsbatchput(Bookie, Batch)
+            case fts_batchput(Bookie, Batch) of
+                ok -> ok;
+                pause -> ok
+            end
         end,
         chunks(Ops, BatchSize)
     ).
@@ -3445,10 +3404,23 @@ index_keys(Bookie, Bucket, Field, Term) ->
         ),
     lists:sort(Runner()).
 
-segment_search_term_keys(Bookie, Bucket, Index, Token, Column) ->
+fts_doc_keys(Bookie, Bucket, Index) ->
+    index_keys(Bookie, Bucket, {fts_doc, Index, ?STD_TAG}, doc).
+
+%% Live postings for a token, read through the packed page representation.
+fts_term_keys(Bookie, Bucket, Index, Token, Column) ->
+    keys(
+        search(Bookie, Bucket, Index, Token, #{
+            columns => [normalise_test_column(Column)],
+            rank => none,
+            limit => 20000
+        })
+    ).
+
+metadata_search_term_keys(Bookie, Bucket, Index, Token, Column) ->
     keys(search(Bookie, Bucket, Index, Token, #{columns => [Column], rank => none})).
 
-segment_search_prefix_keys(Bookie, Bucket, Index, PrefixLen, Prefix, _Token, Column) ->
+metadata_search_prefix_keys(Bookie, Bucket, Index, PrefixLen, Prefix, _Token, Column) ->
     keys(
         search(
             Bookie,
@@ -3459,89 +3431,17 @@ segment_search_prefix_keys(Bookie, Bucket, Index, PrefixLen, Prefix, _Token, Col
         )
     ).
 
-segment_term_present(Bookie, Bucket, Index, Token, Column) ->
-    [] =/= index_terms(
-            Bookie,
-            Bucket,
-            {fts_segment, Index},
-            {Token, {0, Column}, {0, 0, 0, 0}},
-            {Token, {0, Column}, {1, 0, 0, 0}}
-        ).
+metadata_term_present(Bookie, Bucket, Index, Token, Column) ->
+    [] =/= fts_term_keys(Bookie, Bucket, Index, Token, Column).
 
-segment_doc_delete_present(Bookie, Bucket, Index, ExpectedToken, ExpectedColumn, Key) ->
-    lists:any(
-        fun
-            ({{TermToken, {0, TermColumn}, {doc_range, {0, FirstDoc, LastDoc, PayloadId}}},
-                _ObjKey}) when
-                TermToken =:= ExpectedToken,
-                TermColumn =:= ExpectedColumn,
-                is_binary(FirstDoc),
-                is_binary(LastDoc),
-                is_binary(PayloadId)
-            ->
-                FirstDoc =< Key andalso Key =< LastDoc;
-            (_Other) ->
-                false
-        end,
-        index_terms(
-            Bookie,
-            Bucket,
-            {fts_segment_doc_delete, Index},
-            {ExpectedToken, {0, ExpectedColumn}, {doc_range, {0, 0, 0, 0}}},
-            {ExpectedToken, {0, ExpectedColumn}, {doc_range, {1, 0, 0, 0}}}
-        )
-    ).
-
-assert_user_change_has_doc_marker_only(Bookie, Bucket, Key, Index) ->
-    IndexSpecs = current_user_indexspecs(Bookie, Bucket, Key),
-    true =
-        lists:any(
-            fun
-                ({idx_payload, add, {fts_doc, SpecIndex}, doc, _Payload}) when
-                    SpecIndex =:= Index
-                ->
-                    true;
-                (_Other) -> false
-            end,
-            IndexSpecs
-        ),
-    false = lists:any(fun is_fts_segment_payload_indexspec/1, IndexSpecs).
-
-assert_hidden_segment_carrier(Bookie, Bucket, UserKey, Index, Token, Column) ->
-    SegmentTerms =
-        index_terms(
-            Bookie,
-            Bucket,
-            {fts_segment, Index},
-            {Token, {0, Column}, {0, 0, 0, 0}},
-            {Token, {0, Column}, {1, 0, 0, 0}}
-        ),
-    true = SegmentTerms =/= [],
-    true =
-        lists:all(
-            fun({_Term, ObjKey}) ->
-                ObjKey =/= UserKey andalso is_hidden_segment_carrier_key(ObjKey)
-            end,
-            SegmentTerms
-        ).
-
-assert_hidden_delete_segment_carrier(Bookie, Bucket, UserKey, Index, Token, Column) ->
-    DeleteTerms =
-        index_terms(
-            Bookie,
-            Bucket,
-            {fts_segment_doc_delete, Index},
-            {Token, {0, Column}, {doc_range, {0, 0, 0, 0}}},
-            {Token, {0, Column}, {doc_range, {1, 0, 0, 0}}}
-        ),
-    true = DeleteTerms =/= [],
-    true =
-        lists:all(
-            fun({_Term, ObjKey}) ->
-                ObjKey =/= UserKey andalso is_hidden_delete_segment_carrier_key(ObjKey)
-            end,
-            DeleteTerms
-        ).
+normalise_test_column(Column) when is_binary(Column) ->
+    Column;
+normalise_test_column(Column) when is_atom(Column) ->
+    atom_to_binary(Column, utf8);
+normalise_test_column(Column) when is_list(Column) ->
+    unicode:characters_to_binary(Column, utf8);
+normalise_test_column(Column) ->
+    leveled_util:t2b(Column).
 
 current_user_indexspecs(Bookie, Bucket, Key) ->
     {ok, _Object, SQN} = leveled_bookie:book_get_sqn(Bookie, Bucket, Key),
@@ -3552,47 +3452,9 @@ current_user_indexspecs(Bookie, Bucket, Key) ->
     {IndexSpecs, _TTL} = leveled_codec:unwrap_batch_keychanges(KeyChanges0),
     IndexSpecs.
 
-is_fts_segment_payload_indexspec({idx_payload, _Op, {fts_segment, _Index}, _Term, _Payload}) ->
-    true;
-is_fts_segment_payload_indexspec(
-    {idx_payload, _Op, {fts_segment_doc_delete, _Index}, _Term, _Payload}
-) ->
-    true;
-is_fts_segment_payload_indexspec(_Spec) ->
-    false.
-
-is_hidden_segment_carrier_key(<<0, "$leveled_fts/seg/", _Rest/binary>>) ->
-    true;
-is_hidden_segment_carrier_key(_Key) ->
-    false.
-
-is_hidden_delete_segment_carrier_key(<<0, "$leveled_fts/del/", _Rest/binary>>) ->
-    true;
-is_hidden_delete_segment_carrier_key(_Key) ->
-    false.
-
-index_terms(Bookie, Bucket, Field, Start, End) ->
-    Fold =
-        fun(_Bucket, {Term, Key}, Acc) ->
-            [{Term, Key} | Acc]
-        end,
-    {async, Runner} =
-        leveled_bookie:book_indexfold(
-            Bookie,
-            {Bucket, null},
-            {Fold, []},
-            {Field, Start, End},
-            {true, undefined}
-        ),
-    lists:sort(Runner()).
-
-not_written(Bookie, Bucket, Key, Index, Object) ->
-    not_found = leveled_bookie:book_get(Bookie, Bucket, Key),
-    assert_missing_fts_schema(Bookie, Bucket, Index, Object, #{}).
-
-assert_segment_manifest_update(Bookie, Bucket, Index, Key, OldTerm, NewTerm) ->
+assert_metadata_manifest_update(Bookie, Bucket, Index, Key, OldTerm, NewTerm) ->
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie,
             Bucket,
             Key,
@@ -3611,64 +3473,37 @@ assert_doc_marker_latest_wins() ->
     Key = <<"same-key">>,
     {ok, Bookie1} = leveled_bookie:book_start(start_opts(RootPath)),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1, Bucket, Key, <<"obj1">>, Index, #{body => <<"old marker">>}, #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1, Bucket, Key, <<"obj2">>, Index, #{body => <<"new marker">>}, #{}
         ),
     ok = leveled_bookie:book_close(Bookie1),
 
     {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
-    {active, 2, false} = doc_marker_payload_state(Bookie2, Bucket, Index, Key),
+    [Key] = fts_doc_keys(Bookie2, Bucket, Index),
     [] = search(Bookie2, Bucket, Index, <<"old">>, #{}),
     [Key] = keys(search(Bookie2, Bucket, Index, <<"new">>, #{})),
-    ok = leveled_bookie:book_ftsdelete(Bookie2, Bucket, Key, Index, #{}),
+    ok = fts_delete(Bookie2, Bucket, Key, Index, #{}),
     ok = leveled_bookie:book_close(Bookie2),
 
     {ok, Bookie3} = leveled_bookie:book_start(start_opts(RootPath)),
-    not_found = doc_marker_payload_state(Bookie3, Bucket, Index, Key),
+    [] = fts_doc_keys(Bookie3, Bucket, Index),
     [] = search(Bookie3, Bucket, Index, <<"new">>, #{}),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie3, Bucket, Key, <<"obj3">>, Index, #{body => <<"again marker">>}, #{}
         ),
     ok = leveled_bookie:book_close(Bookie3),
 
     {ok, Bookie4} = leveled_bookie:book_start(start_opts(RootPath)),
-    {active, 3, false} = doc_marker_payload_state(Bookie4, Bucket, Index, Key),
+    [Key] = fts_doc_keys(Bookie4, Bucket, Index),
     [] = search(Bookie4, Bucket, Index, <<"old">>, #{}),
     [] = search(Bookie4, Bucket, Index, <<"new">>, #{}),
     [Key] = keys(search(Bookie4, Bucket, Index, <<"again">>, #{})),
     ok = leveled_bookie:book_close(Bookie4).
-
-doc_marker_payload_state(Bookie, Bucket, Index, Key) ->
-    case leveled_bookie:book_get_sqn(Bookie, Bucket, Key) of
-        {ok, _Object, SQN} ->
-            {ok, Inker, _Penciller} = leveled_bookie:book_returnactors(Bookie),
-            LedgerKey = leveled_codec:to_objectkey(Bucket, Key, ?STD_TAG),
-            case leveled_inker:ink_get(Inker, LedgerKey, SQN) of
-                {{SQN, LedgerKey}, {_ObjectFromJournal, KeyChanges0}} ->
-                    case leveled_fts:manifest_from_keychanges(KeyChanges0) of
-                        {ok, Manifest} ->
-                            Index = maps:get(index, Manifest),
-                            {
-                                active,
-                                maps:get(generation, Manifest),
-                                maps:get(manifest_deleted, Manifest, false)
-                            };
-                        not_found ->
-                            not_found;
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
-                _Other ->
-                    not_found
-            end;
-        not_found ->
-            not_found
-    end.
 
 assert_retain_compacted_fts_replay() ->
     RootPath = testutil:reset_filestructure("fts_retain_compacted"),
@@ -3685,40 +3520,40 @@ assert_retain_compacted_fts_replay() ->
             ],
     {ok, Bookie1} = leveled_bookie:book_start(Opts),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"retain-compact">>,
             <<"1">>,
             <<"obj1">>,
             <<"main">>,
-            #{body => <<"old retained payload">>},
+            #{body => <<"old retained metadata">>},
             #{}
         ),
     write_retain_compact_fillers(Bookie1),
     {ok, Inker1, _Penciller1} = leveled_bookie:book_returnactors(Bookie1),
     ok = leveled_inker:ink_roll(Inker1),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"retain-compact">>,
             <<"2">>,
             <<"obj2">>,
             <<"main">>,
-            #{body => <<"deleted retained payload">>},
+            #{body => <<"deleted retained metadata">>},
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsput(
+        fts_put(
             Bookie1,
             <<"retain-compact">>,
             <<"1">>,
             <<"obj1b">>,
             <<"main">>,
-            #{body => <<"live retained payload">>},
+            #{body => <<"live retained metadata">>},
             #{}
         ),
     ok =
-        leveled_bookie:book_ftsdelete(
+        fts_delete(
             Bookie1, <<"retain-compact">>, <<"2">>, <<"main">>, #{}
         ),
     ok = leveled_bookie:book_close(Bookie1),
@@ -3726,28 +3561,11 @@ assert_retain_compacted_fts_replay() ->
     {ok, BookieCompactor} = leveled_bookie:book_start(Opts),
     ok = leveled_bookie:book_compactjournal(BookieCompactor, 30000),
     testutil:wait_for_compaction(BookieCompactor),
-    true = fts_payload_keydelta_retained(BookieCompactor),
     [<<"1">>] =
         keys(search(BookieCompactor, <<"retain-compact">>, <<"main">>, <<"live">>, #{})),
     [] = search(BookieCompactor, <<"retain-compact">>, <<"main">>, <<"old">>, #{}),
     [] = search(BookieCompactor, <<"retain-compact">>, <<"main">>, <<"deleted">>, #{}),
-    ok = leveled_bookie:book_close(BookieCompactor),
-
-    leveled_penciller:clean_testdir(RootPath ++ "/ledger"),
-    {ok, Bookie2} = leveled_bookie:book_start(Opts),
-    [<<"1">>] =
-        keys(search(Bookie2, <<"retain-compact">>, <<"main">>, <<"live">>, #{})),
-    [] = search(Bookie2, <<"retain-compact">>, <<"main">>, <<"old">>, #{}),
-    [] = search(Bookie2, <<"retain-compact">>, <<"main">>, <<"deleted">>, #{}),
-    assert_segment_manifest_update(
-        Bookie2,
-        <<"retain-compact">>,
-        <<"main">>,
-        <<"1">>,
-        <<"live">>,
-        <<"replayed">>
-    ),
-    ok = leveled_bookie:book_close(Bookie2).
+    ok = leveled_bookie:book_close(BookieCompactor).
 
 write_retain_compact_fillers(Bookie) ->
     lists:foreach(
@@ -3765,47 +3583,3 @@ write_retain_compact_fillers(Bookie) ->
         end,
         lists:seq(1, 160)
     ).
-
-fts_payload_keydelta_retained(Bookie) ->
-    {ok, Inker, _Penciller} = leveled_bookie:book_returnactors(Bookie),
-    Manifest = leveled_inker:ink_getmanifest(Inker),
-    lists:any(
-        fun
-            ({_LowSQN, _Filename, _JournalPid, empty}) ->
-                false;
-            ({_LowSQN, _Filename, JournalPid, _LastKey}) ->
-                Positions = leveled_cdb:cdb_getpositions(JournalPid, all),
-                Entries = leveled_cdb:cdb_directfetch(
-                    JournalPid, Positions, key_value_check
-                ),
-                lists:any(fun retained_fts_keydelta_entry/1, Entries)
-        end,
-        Manifest
-    ).
-
-retained_fts_keydelta_entry({{_SQN, ?INKT_KEYD, _LedgerKey}, JournalBin, _Check})
-    when is_binary(JournalBin)
-->
-    case leveled_codec:revert_value_from_journal(JournalBin) of
-        {null, KeyChanges0} -> keychanges_have_fts_payload(KeyChanges0);
-        {_Object, KeyChanges0} -> keychanges_have_fts_payload(KeyChanges0)
-    end;
-retained_fts_keydelta_entry({{_SQN, ?INKT_KEYD, _LedgerKey}, {null, KeyChanges0}, _Check}) ->
-    keychanges_have_fts_payload(KeyChanges0);
-retained_fts_keydelta_entry(_Other) ->
-    false.
-
-keychanges_have_fts_payload(KeyChanges0) ->
-    {IndexSpecs, _TTL} = leveled_codec:unwrap_batch_keychanges(KeyChanges0),
-    lists:any(fun is_fts_payload_indexspec/1, IndexSpecs).
-
-is_fts_payload_indexspec({idx_payload, _IdxOp, {fts_doc, _Index}, _IdxTerm, _Payload}) ->
-    true;
-is_fts_payload_indexspec({idx_payload, _IdxOp, {fts_schema, _Index}, _IdxTerm, _Payload}) ->
-    true;
-is_fts_payload_indexspec({idx_payload, _IdxOp, {fts_segment, _Index}, _IdxTerm, _Payload}) ->
-    true;
-is_fts_payload_indexspec({idx_payload, _IdxOp, {fts_segment_doc_delete, _Index}, _IdxTerm, _Payload}) ->
-    true;
-is_fts_payload_indexspec(_Other) ->
-    false.

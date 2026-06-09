@@ -34,7 +34,9 @@ Configure FTS at `book_start/1` with `fts_indexes`.
 
 Each definition applies only to objects whose bucket and tag match. The `index`
 name is the query-time name. Columns are logical FTS columns; each column path
-extracts text from the original object.
+extracts text from the original object. Besides `tokenizer`,
+`remove_diacritics`, and `prefixes`, the definition accepts the SQLite-style
+tokenizer settings `tokenchars`, `separators`, and `stopwords`.
 
 Path elements currently select through maps, tuples, and lists:
 
@@ -80,47 +82,51 @@ ok = leveled_bookie:book_batchput(Bookie, [
 ]).
 ```
 
-On update or delete, Bookie reads the current object, derives its old FTS rows,
-and appends the needed `{remove, Field, Term}` specs. New or changed postings
-are appended as `{add_payload, Field, Term, Payload}` specs.
+Updates and deletes never read the previous object or its postings. An update
+writes the new postings as fresh pages and replaces the document's marker row;
+a delete writes a tombstone for the marker. Postings from earlier writes are
+filtered out at query time by the marker comparison described below, so no
+old rows need to be found or removed at write time.
 
 ## Storage Shape
 
-FTS postings are ordinary secondary index rows:
+FTS facts are ordinary payload-bearing secondary index rows attached to the
+documents of each write batch. Per configured index (`{Bucket, Index, Tag}`):
 
-```erlang
-{Field, Term, Key} -> Payload
-```
+- Every indexed document carries a marker row
+  `{{fts_doc, Index, Tag}, doc, Key} -> <<BatchSeq:64, DocLength:32>>`.
+- Each write batch's postings are packed, token-sorted, into pages of roughly
+  8KB per column:
+  `{{fts_term, Index, Tag}, <<1, BatchSeq:64, PageNo:16>>, CarrierKey} -> Page`.
+- A per-batch directory row lists each page's column and first/last token:
+  `{{fts_term, Index, Tag}, <<0, BatchSeq:64>>, CarrierKey} -> Directory`.
 
-The index field is:
+Page and directory rows are attached to the last matching document of the
+batch, so the object write and all of its index facts commit under one SQN.
+`BatchSeq` is seeded from the journal SQN and increases monotonically across
+restarts.
 
-```erlang
-{fts_term, Index, Column}
-```
+Updates and deletes never read or rewrite earlier postings: a new write simply
+stores new pages and replaces the document's marker (deletes remove it). A
+posting is live only if its page's `BatchSeq` equals the document's current
+marker `BatchSeq`, so superseded postings are invisible to queries. The
+current implementation never rewrites or collects pages, so superseded
+postings continue to occupy index space; on update-heavy buckets the index
+grows with cumulative write history, not with the live document count.
 
-For each `{Column, Token, Key}` row, the payload is a packed binary containing:
+## Query Execution
 
-```erlang
-#{
-    v => 1,
-    doc_len => DocLength,
-    col_len => ColumnLength,
-    tf => TermFrequency,
-    pos => DeltaEncodedPositions
-}
-```
+Queries locate terms through the page directories (binary search over
+fixed-width probe tables), point-read only the covering pages, and filter
+entries against the doc markers. Query terms are loaded rarest-leg first:
+phrase, NEAR, and AND legs beyond the driver only read pages in the candidate
+documents' batches, so hot tokens cost what the rarest leg costs. Terms in
+purely boolean context skip position decoding entirely.
 
-The logical map above is documentation only. The ledger metadata slot stores a
-binary payload, not an Erlang map.
-
-Each indexed object also has a standard doc marker row:
-
-```erlang
-{{fts_doc, Index}, doc, Key} -> Payload
-```
-
-That row is still an ordinary secondary index row attached to the canonical
-object. It is not a hidden object.
+Per store instance the engine keeps an ETS cache of decoded directories and
+pages (immutable per batch) and of query results keyed by the FTS write
+sequence, which changes on every FTS write -- cached results are therefore
+always exact.
 
 ## Query
 
@@ -154,11 +160,24 @@ Supported query features:
 - boolean operators: `AND`, `OR`, `NOT`
 - prefix terms: `comput*`
 - phrase prefix suffixes: `"new yo"*`
-- NEAR: `NEAR(history culture, 10)`
-- anchor: `^prompt:hello`
+- NEAR: `NEAR(history culture, 10)` (nesting NEAR inside NEAR is rejected)
+- anchor: `^hello`, or inside a column filter as `prompt:^hello`
+  (`^prompt:hello` is a parse error)
+- negated column filters: `-prompt:hello`, `-{prompt answer}:hello`
+
+Search options: `limit` (default 10000, max 20000), `offset` (window capped at
+20000), `return_positions`, `columns`, `rank => none` (the only supported
+value), and `result => summary` (returns `#{total_count, full_keys_sha256}`
+instead of the hit list). Query size is capped at 4096 bytes and 128 tokens.
 
 Phrase and NEAR evaluation uses posting payload positions. It does not load
 candidate objects just to compare positions.
+
+Prefix terms are capped at 64 bytes and answered by reading the pages whose
+directory token ranges cover the prefix. The schema `prefixes` setting is a
+contract declaration -- search options naming different `prefixes` are
+rejected as a contract change -- it is not required for prefix queries and
+does not create a separate prefix store.
 
 ## Retrieving Originals
 
@@ -198,6 +217,9 @@ This design keeps Leveled's storage model simple:
 - one Bookie commit for object and postings;
 - phrase and NEAR without object reads.
 
-It is not SQLite FTS5. SQLite stores packed cross-document doclists and skip
-structures. Leveled stores one secondary index row per `{column, token, object}`
-posting, so hot terms and broad boolean queries require more ledger iteration.
+Compared with SQLite FTS5: both pack postings into pages, but Leveled's pages
+are per write batch and there is no segment-merge process, so update-heavy
+buckets accumulate superseded postings indefinitely (reclaiming them would
+require re-deriving the index under a new index name), and very small cold
+point queries pay the store's snapshot cost where SQLite pays microseconds.
+Repeated queries are served from the result cache without a snapshot.

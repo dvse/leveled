@@ -373,7 +373,7 @@ maybe_accumulate(
     maybe_accumulate(T, Acc, Count, Filter, AccFun).
 
 -spec accumulate_index(
-    {boolean() | binary() | payload, term_expression()},
+    {boolean() | binary(), term_expression()},
     leveled_runner:fold_keys_fun()
 ) ->
     leveled_penciller:pclacc_fun().
@@ -385,14 +385,6 @@ accumulate_index({false, undefined}, FoldKeysFun) ->
     ->
         FoldKeysFun(Bucket, ObjKey, Acc)
     end;
-accumulate_index({true, undefined}, FoldKeysFun) ->
-    fun(
-        {?IDX_TAG, Bucket, {_IdxFld, IdxValue}, ObjKey}, _Value, Acc
-    ) when
-        IdxValue =/= null, ObjKey =/= null
-    ->
-        FoldKeysFun(Bucket, {IdxValue, ObjKey}, Acc)
-    end;
 accumulate_index({payload, undefined}, FoldKeysFun) ->
     fun(
         {?IDX_TAG, Bucket, {_IdxFld, IdxValue}, ObjKey}, Value, Acc
@@ -400,6 +392,14 @@ accumulate_index({payload, undefined}, FoldKeysFun) ->
         IdxValue =/= null, ObjKey =/= null
     ->
         FoldKeysFun(Bucket, {IdxValue, ObjKey, get_metadata(Value)}, Acc)
+    end;
+accumulate_index({true, undefined}, FoldKeysFun) ->
+    fun(
+        {?IDX_TAG, Bucket, {_IdxFld, IdxValue}, ObjKey}, _Value, Acc
+    ) when
+        IdxValue =/= null, ObjKey =/= null
+    ->
+        FoldKeysFun(Bucket, {IdxValue, ObjKey}, Acc)
     end;
 accumulate_index(
     {AddTerm, {query, EvalFun, FilterFun}}, FoldKeysFun
