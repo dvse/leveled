@@ -19,6 +19,7 @@
     private_snapshot_contract/1,
     regular_index_snapshot_contract/1,
     metadata_index_contract/1,
+    tenant_bucket_prefix_contract/1,
     recovery_and_hotbackup/1,
     partial_tail_recovery_contract/1,
     recalc_reload_contract/1,
@@ -44,6 +45,7 @@ all() ->
         private_snapshot_contract,
         regular_index_snapshot_contract,
         metadata_index_contract,
+        tenant_bucket_prefix_contract,
         recovery_and_hotbackup,
         partial_tail_recovery_contract,
         recalc_reload_contract,
@@ -2994,6 +2996,65 @@ parse_errors(_Config) ->
     {error, fts_query_positions_limit_exceeded} = PositionCapRunner(),
     ok = leveled_bookie:book_close(Bookie).
 
+tenant_bucket_prefix_contract(_Config) ->
+    RootPath = testutil:reset_filestructure(),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    ok =
+        fts_put(
+            Bookie,
+            <<"tenant-a">>,
+            <<"1">>,
+            <<"obj1">>,
+            <<"main">>,
+            #{body => <<"alpha quick fox">>, title => <<"A">>},
+            #{}
+        ),
+    ok =
+        fts_put(
+            Bookie,
+            <<"tenant-b">>,
+            <<"1">>,
+            <<"obj2">>,
+            <<"main">>,
+            #{body => <<"alpha slow hare">>, title => <<"B">>},
+            #{}
+        ),
+    %% One prefix schema serves every tenant bucket, with full isolation.
+    [<<"1">>] = keys(search(Bookie, <<"tenant-a">>, <<"main">>, <<"fox">>, #{})),
+    [] = keys(search(Bookie, <<"tenant-a">>, <<"main">>, <<"hare">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"tenant-b">>, <<"main">>, <<"hare">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"tenant-a">>, <<"main">>, <<"alpha">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"tenant-b">>, <<"main">>, <<"alpha">>, #{})),
+    assert_missing_fts_schema(
+        Bookie, <<"other">>, <<"main">>, <<"alpha">>, #{columns => [body]}
+    ),
+    %% An update in one tenant does not disturb another.
+    ok =
+        fts_put(
+            Bookie,
+            <<"tenant-a">>,
+            <<"1">>,
+            <<"obj1b">>,
+            <<"main">>,
+            #{body => <<"alpha quick wolf">>, title => <<"A">>},
+            #{}
+        ),
+    [] = keys(search(Bookie, <<"tenant-a">>, <<"main">>, <<"fox">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"tenant-a">>, <<"main">>, <<"wolf">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"tenant-b">>, <<"main">>, <<"hare">>, #{})),
+    %% Overlapping same-name schemas are rejected at startup.
+    {error, _Reason} =
+        leveled_fts:normalise_indexes([
+            maps:put(
+                bucket_prefix,
+                <<"tenant-">>,
+                maps:remove(bucket, test_fts_index(<<"unused">>, <<"main">>, #{}))
+            ),
+            test_fts_index(<<"tenant-a">>, <<"main">>, #{})
+        ]),
+    ok = leveled_bookie:book_close(Bookie),
+    testutil:reset_filestructure().
+
 start_opts(RootPath) ->
     [
         {root_path, RootPath},
@@ -3051,7 +3112,12 @@ test_fts_indexes() ->
             }),
             test_fts_index(<<"sqlite-unicode">>, <<"main">>, #{
                 remove_diacritics => 2, prefixes => [2, 3, 5]
-            })
+            }),
+            maps:put(
+                bucket_prefix,
+                <<"tenant-">>,
+                maps:remove(bucket, test_fts_index(<<"unused">>, <<"main">>, #{}))
+            )
         ].
 
 test_fts_index(Bucket, Index, Extra) ->
@@ -3200,6 +3266,13 @@ normalise_test_index(Index) ->
 test_fts_schema_exists(Bucket, Index) ->
     lists:any(
         fun
+            (#{bucket_prefix := Prefix, index := Index0}) ->
+                PSize = byte_size(Prefix),
+                Index0 =:= Index andalso
+                    case Bucket of
+                        <<Prefix:PSize/binary, _/binary>> -> true;
+                        _ -> false
+                    end;
             (#{bucket := Bucket0, index := Index0}) ->
                 Bucket0 =:= Bucket andalso Index0 =:= Index
         end,

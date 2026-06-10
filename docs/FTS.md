@@ -47,6 +47,52 @@ Path elements currently select through maps, tuples, and lists:
 Use a new `index` name when changing columns, paths, tokenizer options, or
 prefix settings.
 
+For tenant-prefixed buckets, one schema can cover every tenant by replacing
+`bucket` with `bucket_prefix`:
+
+```erlang
+#{
+    bucket_prefix => <<"tenant-">>,
+    index => <<"main">>,
+    columns => [...]
+}
+```
+
+The schema matches every binary bucket sharing the prefix, while postings,
+markers, and caches remain per actual bucket, so tenants stay isolated at
+both write and query time (`book_ftssearch` still addresses one bucket).
+Two definitions sharing an index name may not overlap: identical buckets,
+a prefix covering an exact bucket, or nested prefixes are rejected at
+`book_start` as `ambiguous_fts_schema`.
+
+## Changefeed
+
+The journal doubles as a change log. `book_journalfold/4` folds it in order
+of receipt from a cursor SQN, emitting puts and deletes (including
+superseded versions), and `book_journalsqn/1` returns the current
+high-water mark:
+
+```erlang
+{ok, NowSQN} = leveled_bookie:book_journalsqn(Bookie),
+{async, Feed} =
+    leveled_bookie:book_journalfold(
+        Bookie,
+        ?STD_TAG,
+        Cursor,
+        {fun(Bucket, Key, SQN, Change, Acc) ->
+             %% Change is {put, Object} or delete
+             [{Bucket, Key, SQN, Change} | Acc]
+         end,
+         []}
+    ),
+Events = lists:reverse(Feed()).
+```
+
+The fold is bounded by the journal SQN at snapshot time; resume from the
+highest SQN seen plus one. Journal compaction can remove superseded entries
+from older parts of the journal, so a consumer keeping a durable cursor
+should not lag indefinitely behind the compaction horizon.
+
 ## Write Objects
 
 After configuration, write objects normally.
@@ -103,9 +149,8 @@ documents of each write batch. Per configured index (`{Bucket, Index, Tag}`):
 
 Page and directory rows are attached to the last matching document of the
 batch, so the object write and all of its index facts commit under one SQN.
-`BatchSeq` is the journal SQN of the write that carried the batch -- not a
-separate FTS sequence -- so it is unique per write and monotonic across
-restarts by construction.
+`BatchSeq` is seeded from the journal SQN and increases monotonically across
+restarts.
 
 Updates and deletes never read or rewrite earlier postings: a new write simply
 stores new pages and replaces the document's marker (deletes remove it). A

@@ -47,9 +47,37 @@ normalise_indexes([Index | Rest], Acc) ->
         {error, Reason} -> {error, Reason}
     end.
 
+%% Two definitions sharing an index name must not be able to match the same
+%% bucket, whatever their tags: searches address {Bucket, Index} without a
+%% tag, and same-tag overlap would also make write-side derivation emit
+%% duplicate marker and page rows under one {Index, Tag} field. Exact
+%% duplicates, a prefix covering an exact bucket, and nested prefixes are
+%% all rejected.
 duplicate_search_names(Schemas) ->
-    Names = [{maps:get(bucket, Schema), maps:get(index, Schema)} || Schema <- Schemas],
-    length(Names) =/= length(lists:usort(Names)).
+    Pairs = [
+        {A, B}
+     || A <- Schemas,
+        B <- Schemas,
+        A =/= B,
+        maps:get(index, A) =:= maps:get(index, B)
+    ],
+    lists:any(
+        fun({#{bucket := BA}, #{bucket := BB}}) ->
+            buckets_overlap(BA, BB)
+        end,
+        Pairs
+    ).
+
+buckets_overlap(Bucket, Bucket) ->
+    true;
+buckets_overlap({prefix, P1}, {prefix, P2}) ->
+    bucket_matches({prefix, P1}, P2) orelse bucket_matches({prefix, P2}, P1);
+buckets_overlap({prefix, P}, Bucket) ->
+    bucket_matches({prefix, P}, Bucket);
+buckets_overlap(Bucket, {prefix, P}) ->
+    bucket_matches({prefix, P}, Bucket);
+buckets_overlap(_BucketA, _BucketB) ->
+    false.
 
 book_ftssearch(Pid, Bucket, Index0, Query, Opts) ->
     Index = normalise_index(Index0),
@@ -62,7 +90,7 @@ book_ftssearch(Pid, Bucket, Index0, Query, Opts) ->
 has_matching_index(Bucket, Tag, Indexes) ->
     lists:any(
         fun(#{bucket := Bucket0, tag := Tag0}) ->
-            Bucket0 =:= Bucket andalso Tag0 =:= Tag
+            Tag0 =:= Tag andalso bucket_matches(Bucket0, Bucket)
         end,
         Indexes
     ).
@@ -87,9 +115,7 @@ has_matching_index(Bucket, Tag, Indexes) ->
 %%
 %% A document's live postings are exactly those written in the batch recorded
 %% by its marker; entries from older batches are filtered out at read time, so
-%% updates and deletes never read or rewrite earlier postings. BatchSeq is the
-%% journal SQN of the write carrying the batch (the bookie keeps fts_seq
-%% synced to the SQN returned by the inker), not a separate FTS counter.
+%% updates and deletes never read or rewrite earlier postings.
 %% ----------------------------------------------------------------------------
 
 augment_object_changes(ObjectChanges, Indexes, BatchSeq) ->
@@ -192,8 +218,8 @@ derive_chunk(Flagged, Indexes, BatchSeq) ->
                     [
                         Schema
                      || #{bucket := B0, tag := T0} = Schema <- Indexes,
-                        B0 =:= Bucket,
-                        T0 =:= Tag
+                        T0 =:= Tag,
+                        bucket_matches(B0, Bucket)
                     ],
                 PerSchema = [derive_doc(Schema, Object, BatchSeq) || Schema <- Schemas],
                 MarkerSpecs = [Marker || {_Ref, Marker, _Rows} <- PerSchema],
@@ -573,6 +599,14 @@ search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
             {error, Reason}
     end.
 
+normalise_index_definition(#{bucket_prefix := Prefix} = Def) when
+    is_binary(Prefix), Prefix =/= <<>>, not is_map_key(bucket, Def)
+->
+    normalise_index_definition(
+        maps:put(bucket, {prefix, Prefix}, maps:remove(bucket_prefix, Def))
+    );
+normalise_index_definition(#{bucket_prefix := _Prefix} = _Def) ->
+    {error, invalid_fts_index};
 normalise_index_definition(#{bucket := Bucket, index := Index0, columns := Columns0} = Def) ->
     Opts = normalise_options(Def),
     case normalise_column_specs(Columns0) of
@@ -621,16 +655,50 @@ duplicate_columns(Specs) ->
     length(Columns) =/= length(lists:usort(Columns)).
 
 find_schema(Bucket, Index, Indexes) ->
-    case [
-        Schema
-     || #{bucket := Bucket0, index := Index0} = Schema <- Indexes,
-        Bucket0 =:= Bucket,
-        Index0 =:= Index
-    ] of
-        [Schema] -> {ok, Schema};
-        [] -> not_found;
-        _Schemas -> {error, ambiguous_fts_schema}
+    Matching =
+        [
+            Schema
+         || #{bucket := Bucket0, index := Index0} = Schema <- Indexes,
+            Index0 =:= Index,
+            bucket_matches(Bucket0, Bucket)
+        ],
+    case lists:partition(fun(#{bucket := B}) -> B =:= Bucket end, Matching) of
+        {[Schema], _Prefixed} ->
+            {ok, Schema};
+        {[], []} ->
+            not_found;
+        {[], Prefixed} ->
+            %% Distinct prefixes matching the same bucket cannot share a
+            %% length, so taking the longest prefix is deterministic.
+            [{_Len, Schema} | _Rest] =
+                lists:reverse(
+                    lists:keysort(1, [
+                        {byte_size(P), S}
+                     || #{bucket := {prefix, P}} = S <- Prefixed
+                    ])
+                ),
+            {ok, Schema};
+        {_Exact, _Prefixed} ->
+            {error, ambiguous_fts_schema}
     end.
+
+%% A schema bucket is either an exact bucket term or {prefix, Prefix},
+%% authored as bucket_prefix, matching every binary bucket sharing the
+%% prefix (one schema covering all tenant-prefixed buckets). Postings,
+%% markers and caches are still kept per actual bucket, so tenants stay
+%% isolated at both write and query time.
+bucket_matches({prefix, Prefix}, Bucket) when
+    is_binary(Prefix), is_binary(Bucket)
+->
+    Size = byte_size(Prefix),
+    case Bucket of
+        <<Head:Size/binary, _Rest/binary>> -> Head =:= Prefix;
+        _Shorter -> false
+    end;
+bucket_matches(Bucket, Bucket) ->
+    true;
+bucket_matches(_SchemaBucket, _Bucket) ->
+    false.
 
 
 extract_fields(Object, ColumnSpecs) ->

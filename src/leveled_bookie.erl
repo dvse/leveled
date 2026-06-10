@@ -92,6 +92,8 @@
 %% folding API
 -export([
     book_returnfolder/2,
+    book_journalfold/4,
+    book_journalsqn/1,
     book_indexfold/5,
     book_multiindexfold/5,
     book_bucketlist/4,
@@ -836,6 +838,30 @@ book_sqn(Pid, Bucket, Key, Tag) ->
 
 book_returnfolder(Pid, RunnerType) ->
     gen_server:call(Pid, {return_runner, RunnerType}, infinity).
+
+-spec book_journalfold(
+    pid(),
+    leveled_codec:tag(),
+    non_neg_integer(),
+    {fun((term(), term(), non_neg_integer(), {put, term()} | delete, term()) -> term()), term()}
+) ->
+    {async, fun(() -> dynamic())}.
+%% @doc
+%% Changefeed fold over the journal from FromSQN (inclusive), in order of
+%% receipt. FoldFun(Bucket, Key, SQN, {put, Object} | delete, Acc) is called
+%% for every standard put and tombstone of the Tag, including superseded
+%% versions. Bounded by the journal SQN at snapshot time; resume from the
+%% highest seen SQN + 1. Journal compaction can remove superseded entries,
+%% so consumers should not lag indefinitely behind the compaction horizon.
+book_journalfold(Pid, Tag, FromSQN, FoldAccT) ->
+    book_returnfolder(Pid, {foldobjects_journal, Tag, FromSQN, FoldAccT}).
+
+-spec book_journalsqn(pid()) -> {ok, non_neg_integer()}.
+%% @doc
+%% The current journal sequence number: the high-water mark for
+%% book_journalfold cursors ("start from now" is JournalSQN + 1).
+book_journalsqn(Pid) ->
+    gen_server:call(Pid, journal_sqn, infinity).
 
 %% Different runner types for async queries:
 %% - book_indexfold
@@ -1670,17 +1696,9 @@ handle_call(
                         )
                     of
                         {ok, Cache} ->
-                            {noreply, State0#state{
-                                slow_offer = false,
-                                ledger_cache = Cache,
-                                fts_seq = SQN
-                            }};
+                            {noreply, State0#state{slow_offer = false, ledger_cache = Cache}};
                         {returned, Cache} ->
-                            {noreply, State0#state{
-                                slow_offer = true,
-                                ledger_cache = Cache,
-                                fts_seq = SQN
-                            }}
+                            {noreply, State0#state{slow_offer = true, ledger_cache = Cache}}
                     end
     end;
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
@@ -2075,6 +2093,8 @@ handle_call(destroy, _From, State = #state{is_snapshot = Snp}) when
     {stop, normal, ok, State};
 handle_call(return_actors, _From, State) ->
     {reply, {ok, State#state.inker, State#state.penciller}, State};
+handle_call(journal_sqn, _From, State) ->
+    {reply, leveled_inker:ink_getjournalsqn(State#state.inker), State};
 handle_call(head_status, _From, State) ->
     {reply, {State#state.head_only, State#state.head_lookup}, State};
 handle_call(status, _From, State) ->
@@ -2702,6 +2722,9 @@ get_runner(State, {foldobjects_allkeys, Tag, FoldFun, SnapPreFold, Order}) ->
                 SnapFun, Tag, FoldFun, sqn_order
             )
     end;
+get_runner(State, {foldobjects_journal, Tag, FromSQN, FoldAccT}) ->
+    SnapFun = return_snapfun(State, store, undefined, true, false),
+    leveled_runner:foldobjects_journal(SnapFun, Tag, FromSQN, FoldAccT);
 get_runner(
     State,
     {foldheads_bybucket, Tag, BucketList, bucket_list, FoldFun, JournalCheck,
@@ -3135,15 +3158,11 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
             of
                 {ok, Cache} ->
                     {noreply, State#state{
-                        slow_offer = false,
-                        ledger_cache = Cache,
-                        fts_seq = SQN
+                        slow_offer = false, ledger_cache = Cache
                     }};
                 {returned, Cache} ->
                     {noreply, State#state{
-                        slow_offer = true,
-                        ledger_cache = Cache,
-                        fts_seq = SQN
+                        slow_offer = true, ledger_cache = Cache
                     }}
             end;
         {error, Reason} ->
@@ -3159,8 +3178,8 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
 %% FTS derivation never reads existing objects: documents in the write are
 %% tokenised and written as packed page/marker index specs by leveled_fts, and
 %% superseded postings are filtered against the doc marker at query time. The
-%% batch sequence is the journal SQN of the write (see
-%% augment_fts_object_changes), so it is monotonic across restarts for free.
+%% batch sequence is seeded from the journal SQN at startup so it stays
+%% monotonic across restarts.
 run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
     {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
     IndexFold =
@@ -3200,12 +3219,6 @@ maybe_new_fts_dir_cache([]) ->
 maybe_new_fts_dir_cache(_FtsIndexes) ->
     ets:new(fts_dir_cache, [set, public, {read_concurrency, true}]).
 
-%% fts_seq is not an independent counter: it mirrors the journal SQN. It is
-%% seeded from ink_getjournalsqn at startup and re-synced to the SQN returned
-%% by every successful put/batchput, and the bookie is the journal's only
-%% writer, so the predicted Seq here equals the journal SQN the write will
-%% receive. A batch's pages and markers are therefore stamped with the same
-%% SQN as their journal entries.
 augment_fts_object_changes(ObjectChanges, #state{fts_indexes = []} = State) ->
     {ObjectChanges, State};
 augment_fts_object_changes(ObjectChanges, State) ->
@@ -4806,6 +4819,52 @@ erase_journal_test() ->
     HeadsNotFound2 = lists:foldl(CheckHeadFun(Bookie2), 0, ObjL1),
     ?assertMatch(500, HeadsNotFound2),
     ok = book_destroy(Bookie2).
+
+journalfold_changefeed_test() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([
+            {root_path, RootPath},
+            {max_journalsize, 1000000},
+            {cache_size, 500},
+            {compression_method, none}
+        ]),
+    ok = book_put(Bookie1, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG),
+    {ok, MidSQN} = book_journalsqn(Bookie1),
+    ok =
+        book_batchput(Bookie1, [
+            {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [], ?STD_TAG, infinity},
+            {put, <<"B">>, <<"K1">>, {value, <<"V1b">>}, [], ?STD_TAG, infinity}
+        ]),
+    ok = book_delete(Bookie1, <<"B">>, <<"K2">>, []),
+    FoldAccT =
+        {fun(B, K, SQN, Change, Acc) -> [{B, K, SQN, Change} | Acc] end, []},
+    {async, FullFolder} = book_journalfold(Bookie1, ?STD_TAG, 0, FoldAccT),
+    Full = lists:reverse(FullFolder()),
+    ?assertMatch(
+        [
+            {<<"B">>, <<"K1">>, _, {put, {value, <<"V1">>}}},
+            {<<"B">>, <<"K2">>, _, {put, {value, <<"V2">>}}},
+            {<<"B">>, <<"K1">>, _, {put, {value, <<"V1b">>}}},
+            {<<"B">>, <<"K2">>, _, delete}
+        ],
+        Full
+    ),
+    %% SQNs are non-decreasing in fold order; both batch entries share one.
+    SQNs = [SQN || {_B, _K, SQN, _C} <- Full],
+    ?assertMatch(true, SQNs =:= lists:sort(SQNs)),
+    [_S1, S2, S3, _S4] = SQNs,
+    ?assertMatch(S2, S3),
+    %% Resume from a cursor: only entries after the first put.
+    {async, TailFolder} =
+        book_journalfold(Bookie1, ?STD_TAG, MidSQN + 1, FoldAccT),
+    Tail = lists:reverse(TailFolder()),
+    ?assertMatch(3, length(Tail)),
+    ?assertMatch(
+        [{<<"B">>, <<"K2">>, _, {put, _}} | _Rest],
+        Tail
+    ),
+    ok = book_destroy(Bookie1).
 
 batchput_standard_objects_test() ->
     RootPath = reset_filestructure(),
