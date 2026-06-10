@@ -20,6 +20,7 @@
     regular_index_snapshot_contract/1,
     metadata_index_contract/1,
     tenant_bucket_prefix_contract/1,
+    external_term_decode_contract/1,
     recovery_and_hotbackup/1,
     partial_tail_recovery_contract/1,
     recalc_reload_contract/1,
@@ -46,6 +47,7 @@ all() ->
         regular_index_snapshot_contract,
         metadata_index_contract,
         tenant_bucket_prefix_contract,
+        external_term_decode_contract,
         recovery_and_hotbackup,
         partial_tail_recovery_contract,
         recalc_reload_contract,
@@ -2996,6 +2998,61 @@ parse_errors(_Config) ->
     {error, fts_query_positions_limit_exceeded} = PositionCapRunner(),
     ok = leveled_bookie:book_close(Bookie).
 
+external_term_decode_contract(_Config) ->
+    RootPath = testutil:reset_filestructure(),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Envelope =
+        fun(Title, Body) ->
+            term_to_binary(#{
+                <<"__vsn">> => 1,
+                attributes => #{title => Title, body => Body}
+            })
+        end,
+    ok =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"ext-term">>,
+            <<"1">>,
+            Envelope(<<"Alpha">>, <<"quick brown fox">>),
+            [],
+            ?STD_TAG
+        ),
+    ok =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"ext-term">>,
+            <<"2">>,
+            Envelope(<<"Beta">>, <<"slow blue hare">>),
+            [],
+            ?STD_TAG
+        ),
+    [<<"1">>] = keys(search(Bookie, <<"ext-term">>, <<"main">>, <<"fox">>, #{})),
+    [<<"2">>] =
+        keys(
+            search(Bookie, <<"ext-term">>, <<"main">>, <<"title:beta">>, #{
+                columns => [title, body]
+            })
+        ),
+    %% Update through the same envelope encoding supersedes old postings.
+    ok =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"ext-term">>,
+            <<"1">>,
+            Envelope(<<"Alpha">>, <<"quick brown wolf">>),
+            [],
+            ?STD_TAG
+        ),
+    [] = keys(search(Bookie, <<"ext-term">>, <<"main">>, <<"fox">>, #{})),
+    [<<"1">>] = keys(search(Bookie, <<"ext-term">>, <<"main">>, <<"wolf">>, #{})),
+    %% Invalid decode option rejected at normalisation.
+    {error, invalid_fts_decode_option} =
+        leveled_fts:normalise_indexes([
+            maps:put(decode, junk, test_fts_index(<<"x">>, <<"main">>, #{}))
+        ]),
+    ok = leveled_bookie:book_close(Bookie),
+    testutil:reset_filestructure().
+
 tenant_bucket_prefix_contract(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
@@ -3117,7 +3174,19 @@ test_fts_indexes() ->
                 bucket_prefix,
                 <<"tenant-">>,
                 maps:remove(bucket, test_fts_index(<<"unused">>, <<"main">>, #{}))
-            )
+            ),
+            #{
+                bucket => <<"ext-term">>,
+                tag => ?STD_TAG,
+                index => <<"main">>,
+                decode => external_term,
+                columns => [
+                    #{name => body, path => [attributes, body]},
+                    #{name => title, path => [attributes, title]}
+                ],
+                prefixes => [3],
+                tokenizer => unicode61
+            }
         ].
 
 test_fts_index(Bucket, Index, Extra) ->

@@ -314,8 +314,9 @@ merge_chunk_rows(ChunkMaps) ->
 derive_doc(Schema, delete, _BatchSeq) ->
     Ref = index_ref(Schema),
     {Ref, {remove, doc_field(Ref), doc}, []};
-derive_doc(Schema, Object, BatchSeq) ->
+derive_doc(Schema, Object0, BatchSeq) ->
     Ref = index_ref(Schema),
+    Object = maybe_decode_object(Object0, Schema),
     Fields = extract_fields(Object, maps:get(column_specs, Schema)),
     ColTerms = build_column_terms(Fields, maps:get(options, Schema)),
     DocLength =
@@ -607,6 +608,10 @@ normalise_index_definition(#{bucket_prefix := Prefix} = Def) when
     );
 normalise_index_definition(#{bucket_prefix := _Prefix} = _Def) ->
     {error, invalid_fts_index};
+normalise_index_definition(#{decode := Decode} = _Def) when
+    Decode =/= external_term
+->
+    {error, invalid_fts_decode_option};
 normalise_index_definition(#{bucket := Bucket, index := Index0, columns := Columns0} = Def) ->
     Opts = normalise_options(Def),
     case normalise_column_specs(Columns0) of
@@ -706,6 +711,21 @@ extract_fields(Object, ColumnSpecs) ->
         {Column, normalise_text(extract_path(Object, Path))}
      || {Column, Path} <- ColumnSpecs
     ].
+
+%% Stores that journal externally-encoded terms (term_to_binary bodies)
+%% declare decode => external_term so column paths address the decoded
+%% term. Decoding happens only at write-time derivation; replay rebuilds
+%% from stored key changes and never re-derives.
+maybe_decode_object(Object, #{options := #{decode := external_term}}) when
+    is_binary(Object)
+->
+    try
+        binary_to_term(Object)
+    catch
+        _:_ -> Object
+    end;
+maybe_decode_object(Object, _Schema) ->
+    Object.
 
 extract_path(Value, []) ->
     Value;
