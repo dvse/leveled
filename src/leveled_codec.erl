@@ -668,9 +668,13 @@ to_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
 %% body. This is used by standard-mode batch writes, where puts and deletes
 %% must share the same SQN and normal fetch key shape.
 to_standard_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
+    %% Deletes must journal as tombstones on the batch path exactly as on
+    %% the single-put path, so compaction scoring and journal folds treat
+    %% them uniformly.
+    InkerType = check_forinkertype(LedgerKey, Object),
     Value =
         create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
-    {{SQN, ?INKT_STND, LedgerKey}, Value}.
+    {{SQN, InkerType, LedgerKey}, Value}.
 
 -spec to_batch_inkerkv(
     primary_key(),
@@ -1168,8 +1172,12 @@ standard_inkerkv_batch_delete_test() ->
     SQN = 42,
     {JournalKey, JournalBin} =
         to_standard_inkerkv(LedgerKey, SQN, delete, {[], infinity}, none, false),
-    ?assertMatch({SQN, ?INKT_STND, LedgerKey}, JournalKey),
-    ?assertMatch({delete, {[], infinity}}, revert_value_from_journal(JournalBin)).
+    %% Batch deletes journal as tombstones, matching the single-put path.
+    ?assertMatch({SQN, ?INKT_TOMB, LedgerKey}, JournalKey),
+    ?assertMatch({delete, {[], infinity}}, revert_value_from_journal(JournalBin)),
+    {PutKey, _PutBin} =
+        to_standard_inkerkv(LedgerKey, SQN, <<"object">>, {[], infinity}, none, false),
+    ?assertMatch({SQN, ?INKT_STND, LedgerKey}, PutKey).
 
 endkey_passed_test() ->
     TestKey = {i, null, null, null},
