@@ -102,6 +102,8 @@ has_matching_index(Bucket, Tag, Indexes) ->
 -define(FTS_PMAP_MIN, 8).
 -define(FTS_CHUNKS, 16).
 -define(FTS_PAGE_TARGET_BYTES, 8192).
+%% Persisted page entries carry a 16-bit doc count.
+-define(FTS_MAX_ENTRY_DOCS, 65535).
 -define(FTS_MARKER_SEEK_MAX, 64).
 -define(FTS_RESULT_CACHE_MAX, 1024).
 -define(FTS_CACHE_MAX_WORDS, 33554432).
@@ -263,7 +265,7 @@ derive_chunk(Flagged, Indexes, BatchSeq) ->
 %% input).
 %% Sorted flat rows -> #{{BucketRef, ColId} => RunBin} where RunBin is a
 %% sorted, framed sequence of token entries built in the chunk worker:
-%%   <<EntryLen:32, TokLen:16, Token, NDocs:16, Docs>>
+%%   <<EntryLen:32, TokLen:16, Token, NDocs:32, Docs>>
 %% with Docs as in page entries. Run binaries are large refc binaries, so
 %% returning them to the coordinator does not copy the row data.
 group_flat(SortedFlat) ->
@@ -292,9 +294,9 @@ group_flat([{BR, ColId, Token, Key, PosBin} | Rest], GKey, Tok, ND, Docs, Run, A
     end.
 
 flush_run_entry(Token, NDocs, Docs, Run) ->
-    EntryLen = 2 + byte_size(Token) + 2 + byte_size(Docs),
+    EntryLen = 2 + byte_size(Token) + 4 + byte_size(Docs),
     <<Run/binary, EntryLen:32/unsigned-big, (byte_size(Token)):16/unsigned-big,
-        Token/binary, NDocs:16/unsigned-big, Docs/binary>>.
+        Token/binary, NDocs:32/unsigned-big, Docs/binary>>.
 
 %% Gather the chunks' runs per (bucket, ref, column); merging happens during
 %% page packing.
@@ -395,7 +397,7 @@ merge_runs_to_pages(ColId, Runs) ->
 
 parse_run_head(<<EntryLen:32/unsigned-big, Rest/binary>>) ->
     <<Entry:EntryLen/binary, Tail/binary>> = Rest,
-    <<TokLen:16/unsigned-big, Token:TokLen/binary, NDocs:16/unsigned-big,
+    <<TokLen:16/unsigned-big, Token:TokLen/binary, NDocs:32/unsigned-big,
         Docs/binary>> = Entry,
     {Token, NDocs, Docs, Tail}.
 
@@ -419,28 +421,83 @@ merge_runs(Heads, ColId, First, Entries, Bytes, NTok, Pages) ->
             Heads
         ),
     {NDSum, DocsList, Heads1} = take_token(Heads, MinTok, 0, [], []),
-    EntryBin =
-        lists:foldl(
-            fun(Docs, Acc) -> <<Acc/binary, Docs/binary>> end,
-            <<(byte_size(MinTok)):16/unsigned-big, MinTok/binary,
-                NDSum:16/unsigned-big>>,
-            DocsList
-        ),
-    EntrySize = byte_size(EntryBin),
-    {First1, Entries1, Bytes1, NTok1, Pages1} =
-        case Bytes + EntrySize > ?FTS_PAGE_TARGET_BYTES andalso NTok > 0 of
+    %% The persisted page entry carries a 16-bit doc count, so a token with
+    %% more postings than that in one batch is split into several entries
+    %% (the reader collects every entry for a token across and within
+    %% pages, and split chunks partition the docs).
+    Chunks =
+        case NDSum =< ?FTS_MAX_ENTRY_DOCS of
             true ->
-                {MinTok, [{MinTok, EntryBin}], EntrySize, 1,
-                    [finish_run_page(ColId, First, Entries, NTok) | Pages]};
+                DocsBin =
+                    lists:foldl(
+                        fun(Docs, Acc) -> <<Acc/binary, Docs/binary>> end,
+                        <<>>,
+                        DocsList
+                    ),
+                [{NDSum, DocsBin}];
             false ->
-                F =
-                    case NTok of
-                        0 -> MinTok;
-                        _ -> First
-                    end,
-                {F, [{MinTok, EntryBin} | Entries], Bytes + EntrySize, NTok + 1, Pages}
+                split_docs(iolist_to_binary(DocsList), ?FTS_MAX_ENTRY_DOCS)
         end,
+    {First1, Entries1, Bytes1, NTok1, Pages1} =
+        lists:foldl(
+            fun({NDocs, DocsBin}, {FirstA, EntriesA, BytesA, NTokA, PagesA}) ->
+                EntryBin =
+                    <<(byte_size(MinTok)):16/unsigned-big, MinTok/binary,
+                        NDocs:16/unsigned-big, DocsBin/binary>>,
+                EntrySize = byte_size(EntryBin),
+                case
+                    BytesA + EntrySize > ?FTS_PAGE_TARGET_BYTES andalso NTokA > 0
+                of
+                    true ->
+                        {MinTok, [{MinTok, EntryBin}], EntrySize, 1, [
+                            finish_run_page(ColId, FirstA, EntriesA, NTokA)
+                            | PagesA
+                        ]};
+                    false ->
+                        F =
+                            case NTokA of
+                                0 -> MinTok;
+                                _ -> FirstA
+                            end,
+                        {F, [{MinTok, EntryBin} | EntriesA], BytesA + EntrySize,
+                            NTokA + 1, PagesA}
+                end
+            end,
+            {First, Entries, Bytes, NTok, Pages},
+            Chunks
+        ),
     merge_runs(Heads1, ColId, First1, Entries1, Bytes1, NTok1, Pages1).
+
+%% Cut a concatenated docs binary at doc boundaries into chunks of at most
+%% Cap docs each.
+split_docs(DocsBin, Cap) ->
+    split_docs(DocsBin, Cap, DocsBin, 0, 0, []).
+
+split_docs(<<>>, _Cap, ChunkStart, ChunkBytes, Count, Acc) ->
+    Tail =
+        case Count of
+            0 -> [];
+            _ -> [{Count, binary_part(ChunkStart, 0, ChunkBytes)}]
+        end,
+    lists:reverse(Tail ++ Acc);
+split_docs(
+    <<KeyLen:16/unsigned-big, _Key:KeyLen/binary, PosLen:16/unsigned-big,
+        _Pos:PosLen/binary, Rest/binary>> = Bin,
+    Cap,
+    ChunkStart,
+    ChunkBytes,
+    Count,
+    Acc
+) ->
+    DocSize = 4 + KeyLen + PosLen,
+    case Count + 1 of
+        Cap ->
+            Chunk = binary_part(ChunkStart, 0, ChunkBytes + DocSize),
+            split_docs(Rest, Cap, Rest, 0, 0, [{Cap, Chunk} | Acc]);
+        Count1 ->
+            _ = Bin,
+            split_docs(Rest, Cap, ChunkStart, ChunkBytes + DocSize, Count1, Acc)
+    end.
 
 take_token([], _Tok, NDSum, DocsList, HeadsAcc) ->
     {NDSum, lists:reverse(DocsList), lists:reverse(HeadsAcc)};
@@ -1033,10 +1090,9 @@ load_term(Ctx0, Col, Token, Prefix, Restrict, NeedPos, Raw0) ->
             TokenEntries =
                 case Prefix of
                     false ->
-                        case lists:keyfind(Token, 1, Entries) of
-                            false -> [];
-                            {_Token, DocsBin} -> [{Token, DocsBin}]
-                        end;
+                        %% Oversized tokens are split into several entries,
+                        %% possibly within one page; collect them all.
+                        [E || {T, _DocsBin} = E <- Entries, T =:= Token];
                     true ->
                         [E || {T, _DocsBin} = E <- Entries, binary_prefix(T, Token)]
                 end,
@@ -1308,16 +1364,19 @@ probe_size({Probe, _Str}) ->
     byte_size(Probe) div ?FTS_DIR_PROBE_BYTES.
 
 covering_pages(Dirs, ColId, Token) ->
+    %% A token split across entries spans a contiguous run of pages, so the
+    %% exact probe is the range [Token, Token ++ <<0>>) over the directory.
     lists:append(
         [
             case maps:get(ColId, ColMap, undefined) of
                 undefined ->
                     [];
                 PS ->
-                    case page_for_token(PS, Token) of
-                        none -> [];
-                        PageNo -> [{BatchSeq, PageNo}]
-                    end
+                    [
+                        {BatchSeq, PageNo}
+                     || PageNo <-
+                            pages_for_range(PS, Token, <<Token/binary, 0>>)
+                    ]
             end
          || {BatchSeq, ColMap} <- Dirs
         ]
@@ -1343,29 +1402,6 @@ covering_prefix_pages(Dirs, ColId, Prefix) ->
          || {BatchSeq, ColMap} <- Dirs
         ]
     ).
-
-%% Rightmost page with First =< Token, covering iff Token =< its Last.
-page_for_token(PS, Token) ->
-    case rightmost_first_leq(PS, Token, 1, probe_size(PS), none) of
-        none ->
-            none;
-        Idx ->
-            {_First, Last, PageNo} = probe_row(PS, Idx),
-            case Token =< Last of
-                true -> PageNo;
-                false -> none
-            end
-    end.
-
-rightmost_first_leq(_PS, _Token, Lo, Hi, Best) when Lo > Hi ->
-    Best;
-rightmost_first_leq(PS, Token, Lo, Hi, Best) ->
-    Mid = (Lo + Hi) div 2,
-    {First, _Last, _PageNo} = probe_row(PS, Mid),
-    case First =< Token of
-        true -> rightmost_first_leq(PS, Token, Mid + 1, Hi, Mid);
-        false -> rightmost_first_leq(PS, Token, Lo, Mid - 1, Best)
-    end.
 
 %% Pages overlapping [Start, End): both Firsts and Lasts ascend, so the run is
 %% from the first page with Last >= Start through the last page with

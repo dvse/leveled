@@ -22,6 +22,7 @@
     tenant_bucket_prefix_contract/1,
     external_term_decode_contract/1,
     failed_batch_sequence_contract/1,
+    oversized_token_contract/1,
     recovery_and_hotbackup/1,
     partial_tail_recovery_contract/1,
     recalc_reload_contract/1,
@@ -50,6 +51,7 @@ all() ->
         tenant_bucket_prefix_contract,
         external_term_decode_contract,
         failed_batch_sequence_contract,
+        oversized_token_contract,
         recovery_and_hotbackup,
         partial_tail_recovery_contract,
         recalc_reload_contract,
@@ -3127,6 +3129,51 @@ failed_batch_sequence_contract(_Config) ->
     Dup = test_fts_index(<<"dup">>, <<"main">>, #{}),
     {error, ambiguous_fts_schema} = leveled_fts:normalise_indexes([Dup, Dup]),
     ok = leveled_bookie:book_close(Bookie2),
+    testutil:reset_filestructure().
+
+%% A token appearing in more docs than a page entry's 16-bit count can
+%% express must be split across entries, not truncated modulo 2^16 (which
+%% corrupted the persisted page payload).
+oversized_token_contract(_Config) ->
+    Schemas =
+        case leveled_fts:normalise_indexes([test_fts_index(<<"docs">>, <<"main">>, #{})]) of
+            {ok, Normal} -> Normal
+        end,
+    N = 70000,
+    Changes =
+        [
+            {
+                {?STD_TAG, <<"docs">>, <<"k", (integer_to_binary(I))/binary>>, null},
+                fts_test_object(<<"o">>, #{body => <<"common">>}),
+                {[], infinity}
+            }
+         || I <- lists:seq(1, N)
+        ],
+    {ok, Augmented} = leveled_fts:augment_object_changes(Changes, Schemas, 1),
+    AllSpecs = lists:append([Specs || {_LK, _Obj, {Specs, _TTL}} <- Augmented]),
+    Entries = leveled_fts:spec_token_entries(AllSpecs, <<"main">>, ?STD_TAG),
+    CommonKeys = [K || {<<"common">>, K} <- Entries],
+    N = length(CommonKeys),
+    N = length(lists:usort(CommonKeys)),
+    %% End to end through the store: one batch, count and bounded search.
+    RootPath = testutil:reset_filestructure(),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    M = 66000,
+    BatchSpecs =
+        [
+            {put, <<"batch">>, <<"k", (integer_to_binary(I))/binary>>,
+                fts_test_object(<<"o">>, #{body => <<"common">>}), [], ?STD_TAG, infinity}
+         || I <- lists:seq(1, M)
+        ],
+    ok = leveled_bookie:book_batchput(Bookie, BatchSpecs),
+    {async, CountRunner} =
+        leveled_bookie:book_ftssearch(Bookie, <<"batch">>, <<"main">>, <<"common">>, #{
+            result => summary
+        }),
+    {ok, #{total_count := M}} = CountRunner(),
+    Limited = search(Bookie, <<"batch">>, <<"main">>, <<"common">>, #{limit => 20000}),
+    20000 = length(Limited),
+    ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
 tenant_bucket_prefix_contract(_Config) ->
