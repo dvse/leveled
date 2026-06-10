@@ -1658,65 +1658,28 @@ handle_call(
             gen_server:reply(From, {error, invalid_index_specs}),
             {noreply, State};
         true ->
-            {AugIndexSpecs, State0} =
-                augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State),
-            SWLR = os:timestamp(),
-                    SW0 = leveled_monitor:maybe_time(State#state.monitor),
-                    {ok, SQN, ObjSize} =
-                        leveled_inker:ink_put(
-                            State#state.inker,
-                            LedgerKey,
-                            Object,
-                            {AugIndexSpecs, TTL},
-                            DataSync
-                        ),
-                    {T0, SW1} = leveled_monitor:step_time(SW0),
-                    Changes =
-                        preparefor_ledgercache(
-                            null, LedgerKey, SQN, Object, ObjSize, {AugIndexSpecs, TTL}
-                        ),
-                    {T1, SW2} = leveled_monitor:step_time(SW1),
-                    Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
-                    {T2, _SW3} = leveled_monitor:step_time(SW2),
-                    case State#state.slow_offer of
-                        true ->
-                            gen_server:reply(From, pause);
-                        false ->
-                            gen_server:reply(From, ok)
-                    end,
-                    maybe_longrunning(SWLR, overall_put),
-                    maybelog_put_timing(State#state.monitor, T0, T1, T2, ObjSize),
-                    case
-                        maybepush_ledgercache(
-                            State#state.cache_size,
-                            State#state.cache_multiple,
-                            Cache0,
-                            State#state.penciller,
-                            State#state.monitor
-                        )
-                    of
-                        {ok, Cache} ->
-                            {noreply, State0#state{
-                                slow_offer = false,
-                                ledger_cache = Cache,
-                                fts_seq = SQN
-                            }};
-                        {returned, Cache} ->
-                            {noreply, State0#state{
-                                slow_offer = true,
-                                ledger_cache = Cache,
-                                fts_seq = SQN
-                            }}
-                    end
+            case augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) of
+                {error, FtsReason} ->
+                    gen_server:reply(From, {error, FtsReason}),
+                    {noreply, State};
+                {AugIndexSpecs, State0} ->
+                    do_augmented_put(
+                        LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0
+                    )
+            end
     end;
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
     State#state.head_only == false
 ->
     case normalise_batch_specs(BatchSpecs) of
         {ok, ObjectChanges} ->
-            {AugObjectChanges, State0} =
-                augment_fts_object_changes(ObjectChanges, State),
-            do_batchput(AugObjectChanges, DataSync, From, State0);
+            case augment_fts_object_changes(ObjectChanges, State) of
+                {error, FtsReason} ->
+                    gen_server:reply(From, {error, FtsReason}),
+                    {noreply, State};
+                {AugObjectChanges, State0} ->
+                    do_batchput(AugObjectChanges, DataSync, From, State0)
+            end;
         {error, Reason} ->
             gen_server:reply(From, {error, Reason}),
             {noreply, State}
@@ -1730,9 +1693,15 @@ handle_call({casbatchput, BatchSpecs, Conditions, DataSync}, From, State) when
                 {ok, CasConditions} ->
                     case check_cas_conditions(CasConditions, State) of
                         ok ->
-                            {AugObjectChanges, State0} =
-                                augment_fts_object_changes(ObjectChanges, State),
-                            do_batchput(AugObjectChanges, DataSync, From, State0);
+                            case augment_fts_object_changes(ObjectChanges, State) of
+                                {error, FtsReason} ->
+                                    gen_server:reply(From, {error, FtsReason}),
+                                    {noreply, State};
+                                {AugObjectChanges, State0} ->
+                                    do_batchput(
+                                        AugObjectChanges, DataSync, From, State0
+                                    )
+                            end;
                         {error, Failures} ->
                             gen_server:reply(
                                 From, {error, {precondition_failed, Failures}}
@@ -3108,6 +3077,56 @@ addto_ledgercache_batch(PreparedChanges, Cache) ->
         max_sqn = MaxSQN
     }.
 
+do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0) ->
+    SWLR = os:timestamp(),
+    SW0 = leveled_monitor:maybe_time(State0#state.monitor),
+    {ok, SQN, ObjSize} =
+        leveled_inker:ink_put(
+            State0#state.inker,
+            LedgerKey,
+            Object,
+            {AugIndexSpecs, TTL},
+            DataSync
+        ),
+    {T0, SW1} = leveled_monitor:step_time(SW0),
+    Changes =
+        preparefor_ledgercache(
+            null, LedgerKey, SQN, Object, ObjSize, {AugIndexSpecs, TTL}
+        ),
+    {T1, SW2} = leveled_monitor:step_time(SW1),
+    Cache0 = addto_ledgercache(Changes, State0#state.ledger_cache),
+    {T2, _SW3} = leveled_monitor:step_time(SW2),
+    case State0#state.slow_offer of
+        true ->
+            gen_server:reply(From, pause);
+        false ->
+            gen_server:reply(From, ok)
+    end,
+    maybe_longrunning(SWLR, overall_put),
+    maybelog_put_timing(State0#state.monitor, T0, T1, T2, ObjSize),
+    case
+        maybepush_ledgercache(
+            State0#state.cache_size,
+            State0#state.cache_multiple,
+            Cache0,
+            State0#state.penciller,
+            State0#state.monitor
+        )
+    of
+        {ok, Cache} ->
+            {noreply, State0#state{
+                slow_offer = false,
+                ledger_cache = Cache,
+                fts_seq = SQN
+            }};
+        {returned, Cache} ->
+            {noreply, State0#state{
+                slow_offer = true,
+                ledger_cache = Cache,
+                fts_seq = SQN
+            }}
+    end.
+
 -spec do_batchput(
     list({leveled_codec:ledger_key(), any(), leveled_codec:journal_keychanges()}),
     boolean(),
@@ -3241,21 +3260,31 @@ augment_fts_object_changes(ObjectChanges, #state{fts_indexes = []} = State) ->
     {ObjectChanges, State};
 augment_fts_object_changes(ObjectChanges, State) ->
     Seq = State#state.fts_seq + 1,
-    {ok, AugObjectChanges} =
+    case
         leveled_fts:augment_object_changes(
             ObjectChanges, State#state.fts_indexes, Seq
-        ),
-    {AugObjectChanges, State#state{fts_seq = Seq}}.
+        )
+    of
+        {ok, AugObjectChanges} ->
+            {AugObjectChanges, State#state{fts_seq = Seq}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 augment_fts_single(_LedgerKey, _Object, IndexSpecs, _TTL, #state{fts_indexes = []} = State) ->
     {IndexSpecs, State};
 augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) ->
     Seq = State#state.fts_seq + 1,
-    {ok, [{LedgerKey, Object, {AugIndexSpecs, TTL}}]} =
+    case
         leveled_fts:augment_object_changes(
             [{LedgerKey, Object, {IndexSpecs, TTL}}], State#state.fts_indexes, Seq
-        ),
-    {AugIndexSpecs, State#state{fts_seq = Seq}}.
+        )
+    of
+        {ok, [{LedgerKey, Object, {AugIndexSpecs, TTL}}]} ->
+            {AugIndexSpecs, State#state{fts_seq = Seq}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 current_head_state(LedgerKey, State) ->
     {Head, _CacheHit} =

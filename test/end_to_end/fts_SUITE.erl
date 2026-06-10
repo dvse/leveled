@@ -2212,6 +2212,55 @@ invalid_write_inputs(_Config) ->
             ?STD_TAG
         ),
 
+    %% Keys that cannot be framed by the packed page format are rejected
+    %% before any derivation worker is spawned; the bookie stays up.
+    {error, {invalid_fts_key, {<<"t">>, <<"k">>}}} =
+        leveled_bookie:book_put(
+            Bookie,
+            <<"docs">>,
+            {<<"t">>, <<"k">>},
+            <<"tuple-key">>,
+            [],
+            ?STD_TAG
+        ),
+    HugeKey = binary:copy(<<"k">>, 70000),
+    {error, {invalid_fts_key, HugeKey}} =
+        leveled_bookie:book_put(
+            Bookie, <<"docs">>, HugeKey, <<"huge-key">>, [], ?STD_TAG
+        ),
+    {error, {invalid_fts_key, {<<"t">>, <<"k">>}}} =
+        leveled_bookie:book_batchput(Bookie, [
+            {put, <<"docs">>, <<"good">>, fts_test_object(<<"o">>, #{body => <<"ok">>}),
+                [], ?STD_TAG, infinity},
+            {put, <<"docs">>, {<<"t">>, <<"k">>}, <<"bad">>, [], ?STD_TAG, infinity}
+        ]),
+    %% The rejected batch wrote nothing.
+    not_found = leveled_bookie:book_get(Bookie, <<"docs">>, <<"good">>, ?STD_TAG),
+    %% Tuple keys remain first-class for non-FTS buckets on the same store.
+    ok =
+        leveled_bookie:book_put(
+            Bookie, <<"plain">>, {<<"t">>, <<"k">>}, <<"v">>, [], ?STD_TAG
+        ),
+    {ok, <<"v">>} =
+        leveled_bookie:book_get(Bookie, <<"plain">>, {<<"t">>, <<"k">>}, ?STD_TAG),
+    %% Tokens beyond the page format's length frame are dropped, preserving
+    %% the positions of surrounding tokens; the write itself succeeds.
+    Monster = binary:copy(<<"a">>, 70000),
+    ok =
+        fts_put(
+            Bookie,
+            <<"docs">>,
+            <<"monster">>,
+            <<"obj">>,
+            <<"main">>,
+            #{body => <<"before ", Monster/binary, " after">>},
+            #{}
+        ),
+    [<<"monster">>] =
+        keys(search(Bookie, <<"docs">>, <<"main">>, <<"before AND after">>, #{})),
+    [] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"aaaaa*">>, #{})),
+    [] = keys(search(Bookie, <<"docs">>, <<"main">>, <<"\"before after\"">>, #{})),
+
     ok = leveled_bookie:book_close(Bookie),
     {ok, ReopenedBookie} = leveled_bookie:book_start(start_opts(RootPath)),
     ok = leveled_bookie:book_close(ReopenedBookie),

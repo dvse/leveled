@@ -125,6 +125,18 @@ has_matching_index(Bucket, Tag, Indexes) ->
 %% ----------------------------------------------------------------------------
 
 augment_object_changes(ObjectChanges, Indexes, BatchSeq) ->
+    %% The packed page format frames document keys with 16-bit lengths, so
+    %% only binary keys up to 65535 bytes can carry postings. Reject
+    %% unsupported keys with an error before any worker is spawned or
+    %% sequence consumed, rather than crashing the linked derivation path.
+    Invalid =
+        lists:search(
+            fun({{Tag, Bucket, Key, null}, _Obj, _SpecsTTL}) ->
+                has_matching_index(Bucket, Tag, Indexes) andalso
+                    not (is_binary(Key) andalso byte_size(Key) =< 65535)
+            end,
+            ObjectChanges
+        ),
     Matching =
         lists:any(
             fun({{Tag, Bucket, _Key, null}, _Obj, _SpecsTTL}) ->
@@ -132,10 +144,12 @@ augment_object_changes(ObjectChanges, Indexes, BatchSeq) ->
             end,
             ObjectChanges
         ),
-    case Matching of
-        false ->
+    case {Invalid, Matching} of
+        {{value, {{_Tag, _Bucket, BadKey, null}, _Obj, _SpecsTTL}}, _} ->
+            {error, {invalid_fts_key, BadKey}};
+        {false, false} ->
             {ok, ObjectChanges};
-        true ->
+        {false, true} ->
             %% Run the whole derivation in a short-lived coordinator process:
             %% tokenisation, merging, and page encoding allocate heavily, and
             %% doing that on the long-lived caller heap (the bookie) costs
@@ -869,8 +883,17 @@ validate_schema_tokenizer(#{tokenizer := Existing}, Opts) ->
     end.
 
 build_column_terms(Fields, Opts) ->
+    %% Tokens beyond the page format's 16-bit length frame are dropped after
+    %% position assignment: queries are capped at ?MAX_QUERY_BYTES, so no
+    %% exact query can ever name such a token, and surviving tokens keep
+    %% their positions so phrase and NEAR distances are unaffected.
     [
-        {Column, group_positions(tokenize(Text, Opts))}
+        {Column,
+            group_positions([
+                TP
+             || {Token, _Pos} = TP <- tokenize(Text, Opts),
+                byte_size(Token) =< 65535
+            ])}
      || {Column, Text} <- Fields
     ].
 
