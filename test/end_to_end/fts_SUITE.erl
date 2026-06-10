@@ -21,6 +21,7 @@
     metadata_index_contract/1,
     tenant_bucket_prefix_contract/1,
     external_term_decode_contract/1,
+    failed_batch_sequence_contract/1,
     recovery_and_hotbackup/1,
     partial_tail_recovery_contract/1,
     recalc_reload_contract/1,
@@ -48,6 +49,7 @@ all() ->
         metadata_index_contract,
         tenant_bucket_prefix_contract,
         external_term_decode_contract,
+        failed_batch_sequence_contract,
         recovery_and_hotbackup,
         partial_tail_recovery_contract,
         recalc_reload_contract,
@@ -2750,6 +2752,20 @@ parse_errors(_Config) ->
             #{body => <<"valid content">>},
             #{columns => [title, body]}
         ),
+    %% Nested negative column selectors compose by union instead of
+    %% crashing: excluding both schema columns matches nothing.
+    [] =
+        keys(
+            search(Bookie, <<"parse">>, <<"main">>, <<"-title:(-body:valid)">>, #{
+                columns => [title, body]
+            })
+        ),
+    [<<"1">>] =
+        keys(
+            search(Bookie, <<"parse">>, <<"main">>, <<"-title:valid">>, #{
+                columns => [title, body]
+            })
+        ),
     ok =
         fts_put(
             Bookie,
@@ -3051,6 +3067,66 @@ external_term_decode_contract(_Config) ->
             maps:put(decode, junk, test_fts_index(<<"x">>, <<"main">>, #{}))
         ]),
     ok = leveled_bookie:book_close(Bookie),
+    testutil:reset_filestructure().
+
+%% A failed batchput must not leave the FTS sequence ahead of the journal
+%% SQN: after a restart reseeds from the journal, a drifted sequence would
+%% be stamped twice, aliasing marker and page-directory terms across two
+%% write batches (resurrecting superseded postings).
+failed_batch_sequence_contract(_Config) ->
+    RootPath = testutil:reset_filestructure(),
+    StartOpts = [{max_journalsize, 100000} | start_opts(RootPath)],
+    {ok, Bookie1} = leveled_bookie:book_start(StartOpts),
+    ok =
+        fts_put(
+            Bookie1,
+            <<"docs">>,
+            <<"1">>,
+            <<"v1">>,
+            <<"main">>,
+            #{body => <<"alpha alpha">>, title => <<"T">>},
+            #{}
+        ),
+    %% A batch larger than the journal file cap fails without advancing
+    %% the journal SQN.
+    Huge = crypto:strong_rand_bytes(200000),
+    {error, batch_too_large} =
+        leveled_bookie:book_batchput(Bookie1, [
+            {put, <<"docs">>, <<"big">>, Huge, [], ?STD_TAG, infinity}
+        ]),
+    ok =
+        fts_put(
+            Bookie1,
+            <<"docs">>,
+            <<"2">>,
+            <<"v2">>,
+            <<"main">>,
+            #{body => <<"beta beta">>, title => <<"T">>},
+            #{}
+        ),
+    [<<"2">>] = keys(search(Bookie1, <<"docs">>, <<"main">>, <<"beta">>, #{})),
+    ok = leveled_bookie:book_close(Bookie1),
+    {ok, Bookie2} = leveled_bookie:book_start(StartOpts),
+    %% The post-restart write must stamp a fresh sequence. With drift it
+    %% reuses doc 2's batch sequence under a different carrier key, so
+    %% doc 2's page directory is shadowed and its postings disappear.
+    ok =
+        fts_put(
+            Bookie2,
+            <<"docs">>,
+            <<"3">>,
+            <<"v3">>,
+            <<"main">>,
+            #{body => <<"gamma gamma">>, title => <<"T">>},
+            #{}
+        ),
+    [<<"3">>] = keys(search(Bookie2, <<"docs">>, <<"main">>, <<"gamma">>, #{})),
+    [<<"2">>] = keys(search(Bookie2, <<"docs">>, <<"main">>, <<"beta">>, #{})),
+    [<<"1">>] = keys(search(Bookie2, <<"docs">>, <<"main">>, <<"alpha">>, #{})),
+    %% Exact duplicate schema definitions are rejected at normalisation.
+    Dup = test_fts_index(<<"dup">>, <<"main">>, #{}),
+    {error, ambiguous_fts_schema} = leveled_fts:normalise_indexes([Dup, Dup]),
+    ok = leveled_bookie:book_close(Bookie2),
     testutil:reset_filestructure().
 
 tenant_bucket_prefix_contract(_Config) ->

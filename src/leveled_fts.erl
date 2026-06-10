@@ -54,6 +54,10 @@ normalise_indexes([Index | Rest], Acc) ->
 %% duplicates, a prefix covering an exact bucket, and nested prefixes are
 %% all rejected.
 duplicate_search_names(Schemas) ->
+    length(Schemas) =/= length(lists:usort(Schemas)) orelse
+        overlapping_search_names(Schemas).
+
+overlapping_search_names(Schemas) ->
     Pairs = [
         {A, B}
      || A <- Schemas,
@@ -3037,6 +3041,13 @@ restrict_ast_columns(Other, _Cols) ->
 
 combine_columns(all, Cols) -> normalise_column_selector(Cols);
 combine_columns(Cols, all) -> normalise_column_selector(Cols);
+combine_columns({not_columns, ExcludedA}, {not_columns, ExcludedB}) ->
+    %% Nested negative selectors compose by union: the term must avoid
+    %% every excluded column from both levels.
+    {not_columns,
+        lists:usort(
+            schema_columns(ExcludedA) ++ schema_columns(ExcludedB)
+        )};
 combine_columns({not_columns, Excluded}, Cols) ->
     lists:subtract(normalise_column_selector(Cols), normalise_column_selector(Excluded));
 combine_columns(Cols, {not_columns, Excluded}) ->

@@ -1696,9 +1696,17 @@ handle_call(
                         )
                     of
                         {ok, Cache} ->
-                            {noreply, State0#state{slow_offer = false, ledger_cache = Cache}};
+                            {noreply, State0#state{
+                                slow_offer = false,
+                                ledger_cache = Cache,
+                                fts_seq = SQN
+                            }};
                         {returned, Cache} ->
-                            {noreply, State0#state{slow_offer = true, ledger_cache = Cache}}
+                            {noreply, State0#state{
+                                slow_offer = true,
+                                ledger_cache = Cache,
+                                fts_seq = SQN
+                            }}
                     end
     end;
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
@@ -3158,16 +3166,26 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
             of
                 {ok, Cache} ->
                     {noreply, State#state{
-                        slow_offer = false, ledger_cache = Cache
+                        slow_offer = false,
+                        ledger_cache = Cache,
+                        fts_seq = SQN
                     }};
                 {returned, Cache} ->
                     {noreply, State#state{
-                        slow_offer = true, ledger_cache = Cache
+                        slow_offer = true,
+                        ledger_cache = Cache,
+                        fts_seq = SQN
                     }}
             end;
         {error, Reason} ->
             gen_server:reply(From, {error, Reason}),
-            {noreply, State}
+            %% The FTS sequence was advanced at augmentation but the journal
+            %% did not move; resync so the next batch cannot stamp a sequence
+            %% that an earlier write already persisted (which would alias
+            %% marker and page-directory terms after a later reseed).
+            {ok, JournalSQN} =
+                leveled_inker:ink_getjournalsqn(State#state.inker),
+            {noreply, State#state{fts_seq = JournalSQN}}
     end.
 
 -spec current_head_state(leveled_codec:ledger_key(), #state{}) ->
