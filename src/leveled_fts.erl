@@ -2025,7 +2025,16 @@ json_key_items_sha256([Key | Rest], Count, Ctx0) ->
     json_key_items_sha256(Rest, Count + 1, Ctx1).
 
 json_key(Key) ->
-    [$", json_key_chars(unicode:characters_to_binary(Key), []), $"].
+    %% Keys that are not valid UTF-8 (e.g. order-preserving encoded
+    %% composite keys) cannot be JSON text; hash them as framed base64
+    %% instead. Valid UTF-8 keys keep the JSON form, preserving the
+    %% cross-engine summary hash for text-keyed corpora.
+    case unicode:characters_to_binary(Key) of
+        Bin when is_binary(Bin) ->
+            [$", json_key_chars(Bin, []), $"];
+        _NotUnicode ->
+            [<<"b64:">>, base64:encode(iolist_to_binary([Key]))]
+    end.
 
 json_key_chars(<<>>, Acc) ->
     lists:reverse(Acc);
