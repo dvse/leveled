@@ -1259,13 +1259,13 @@ get(Handle, Key, Cache, CacheFun, QuickCheck, BinaryMode, Monitor) ->
     SW0 = leveled_monitor:maybe_time(Monitor),
     Hash = hash(Key),
     Index = hash_to_index(Hash),
-    {HashTable, Count} = CacheFun(Handle, Index, Cache),
+    HashTableEntry = CacheFun(Handle, Index, Cache),
     {TS0, SW1} = leveled_monitor:step_time(SW0),
     % If the count is 0 for that index - key must be missing
-    case Count of
-        0 ->
+    case HashTableEntry of
+        {_, 0} ->
             missing;
-        _ ->
+        {HashTable, Count} when is_integer(HashTable), is_integer(Count) ->
             % Get starting slot in hashtable
             {ok, FirstHashPosition} =
                 file:position(Handle, {bof, HashTable}),
@@ -1281,7 +1281,9 @@ get(Handle, Key, Cache, CacheFun, QuickCheck, BinaryMode, Monitor) ->
                 ),
             {TS1, _SW2} = leveled_monitor:step_time(SW1),
             maybelog_get_timing(Monitor, TS0, TS1, CycleCount),
-            Result
+            Result;
+        _ ->
+            missing
     end.
 
 get_index(_Handle, Index, Cache) ->
@@ -1354,7 +1356,7 @@ load_index(Handle) ->
     LoadIndexFun =
         fun(X) ->
             file:position(Handle, {bof, ?DWORD_SIZE * X}),
-            read_next_2_integers(Handle)
+            read_next_2_integers_or_empty(Handle)
         end,
     list_to_tuple(lists:map(LoadIndexFun, Index)).
 
@@ -1377,8 +1379,12 @@ find_lastkey(Handle, IndexCache) ->
             empty;
         _ ->
             {ok, _} = file:position(Handle, LastPosition),
-            {KeyLength, _ValueLength} = read_next_2_integers(Handle),
-            safe_read_next(Handle, KeyLength, key)
+            case read_next_2_integers(Handle) of
+                {KeyLength, _ValueLength} when is_integer(KeyLength) ->
+                    safe_read_next(Handle, KeyLength, key);
+                _ ->
+                    empty
+            end
     end.
 
 scan_index_findlast(Handle, Position, Count, {LastPosition, TotalKeys}) ->
@@ -1437,21 +1443,37 @@ put_hashtree(Key, Position, HashTree) ->
 extract_kvpair(_H, [], _K, _BinaryMode) ->
     missing;
 extract_kvpair(Handle, [Position | Rest], Key, BinaryMode) ->
-    {ok, _} = file:position(Handle, Position),
-    {KeyLength, ValueLength} = read_next_2_integers(Handle),
-    case safe_read_next(Handle, KeyLength, keybin) of
-        % If same key as passed in, then found!
-        {Key, KeyBin} ->
-            case checkread_next_value(Handle, ValueLength, KeyBin) of
-                {false, _} ->
-                    crc_wonky;
-                {_, Value} ->
-                    case BinaryMode of
-                        true ->
-                            {Key, Value};
-                        false ->
-                            {Key, binary_to_term(Value)}
-                    end
+    case file:position(Handle, Position) of
+        {ok, _} ->
+            case read_next_2_integers(Handle) of
+                {KeyLength, ValueLength} when
+                    is_integer(KeyLength), is_integer(ValueLength)
+                ->
+                    case safe_read_next(Handle, KeyLength, keybin) of
+                        % If same key as passed in, then found!
+                        {Key, KeyBin} ->
+                            case checkread_next_value(
+                                Handle, ValueLength, KeyBin
+                            ) of
+                                {false, _} ->
+                                    crc_wonky;
+                                {_, Value} ->
+                                    case BinaryMode of
+                                        true ->
+                                            {Key, Value};
+                                        false ->
+                                            {Key, binary_to_term(Value)}
+                                    end;
+                                false ->
+                                    extract_kvpair(
+                                        Handle, Rest, Key, BinaryMode
+                                    )
+                            end;
+                        _ ->
+                            extract_kvpair(Handle, Rest, Key, BinaryMode)
+                    end;
+                _ ->
+                    extract_kvpair(Handle, Rest, Key, BinaryMode)
             end;
         _ ->
             extract_kvpair(Handle, Rest, Key, BinaryMode)
@@ -1650,17 +1672,21 @@ crccheck(_V, _KB) ->
 calc_crc(KeyBin, Value) -> erlang:crc32(<<KeyBin/binary, Value/binary>>).
 
 -spec checkread_next_value(file:io_device(), integer(), binary()) ->
-    {true, binary()} | {false, crc_wonky}.
+    false | {true, binary()} | {false, crc_wonky}.
 %% @doc
 %% Read next string where the string has a CRC prepended - stripping the crc
 %% and checking if requested
 checkread_next_value(Handle, Length, KeyBin) ->
-    {ok, <<CRC:32/integer, Value/binary>>} = file:read(Handle, Length),
-    case calc_crc(KeyBin, Value) of
-        CRC ->
-            {true, Value};
+    case file:read(Handle, Length) of
+        {ok, <<CRC:32/integer, Value/binary>>} ->
+            case calc_crc(KeyBin, Value) of
+                CRC ->
+                    {true, Value};
+                _ ->
+                    {false, crc_wonky}
+            end;
         _ ->
-            {false, crc_wonky}
+            false
     end.
 
 %% Extract value and size from binary containing CRC
@@ -1674,6 +1700,14 @@ read_next_2_integers(Handle) ->
             {Int1, Int2};
         ReadError ->
             ReadError
+    end.
+
+read_next_2_integers_or_empty(Handle) ->
+    case read_next_2_integers(Handle) of
+        {Int1, Int2} when is_integer(Int1), is_integer(Int2) ->
+            {Int1, Int2};
+        _ ->
+            {0, 0}
     end.
 
 read_next_n_integerpairs(Handle, NumberOfPairs) ->
@@ -3078,6 +3112,34 @@ get_positions_corruption_test() ->
     ?assertMatch(true, length(KVCL) < 1000),
     ok = cdb_close(P3),
     file:delete(F2).
+
+point_get_stale_position_beyond_eof_test() ->
+    F1 = "test/test_area/stalepos_test.cdb",
+    file:delete(F1),
+    Key = "Key1",
+    Value = "Value1",
+    ok = from_dict(F1, dict:from_list([{Key, Value}])),
+
+    {ok, Handle} = file:open(F1, [binary, raw, read, write]),
+    Hash = hash(Key),
+    Index = hash_to_index(Hash),
+    {ok, _} = file:position(Handle, {bof, ?DWORD_SIZE * Index}),
+    {HashTable, Count} = read_next_2_integers(Handle),
+    Slot = hash_to_slot(Hash, Count),
+    HashSlotPosition = HashTable + Slot * ?DWORD_SIZE,
+    {ok, EofPosition} = file:position(Handle, eof),
+    StalePosition = EofPosition + ?DWORD_SIZE,
+    ok = file:pwrite(
+        Handle,
+        HashSlotPosition,
+        <<Hash:32/little-integer, StalePosition:32/little-integer>>
+    ),
+    ok = file:close(Handle),
+
+    {ok, P1} = cdb_open_reader(F1, #cdb_options{binary_mode = false}),
+    ?assertMatch(missing, cdb_get(P1, Key)),
+    ok = cdb_close(P1),
+    file:delete(F1).
 
 badly_written_test() ->
     F1 = "test/test_area/badfirstwrite_test.pnd",
