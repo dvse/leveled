@@ -2801,6 +2801,7 @@ parse_primary(Tokens, Opts) ->
         Error -> Error
     end.
 
+parse_primary_base([], _Opts) -> {error, {fts_parse, unexpected_end}};
 parse_primary_base([near, lparen | Rest], Opts) -> parse_near(Rest, Opts);
 parse_primary_base([caret, {word, _Column}, colon | _Rest], _Opts) ->
     {error, {fts_parse, invalid_anchor}};
