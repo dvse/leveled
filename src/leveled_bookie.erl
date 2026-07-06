@@ -76,6 +76,7 @@
     book_snapshot/4,
     book_compactjournal/2,
     book_islastcompactionpending/1,
+    book_lastcompactionresult/1,
     book_trimjournal/1,
     book_hotbackup/1,
     book_close/1,
@@ -1401,6 +1402,21 @@ book_compactjournal(Pid, Timeout) ->
 book_islastcompactionpending(Pid) ->
     gen_server:call(Pid, confirm_compact, infinity).
 
+%% @doc Outcome of the most recent journal compaction cycle
+%%
+%% pending while a cycle is in flight; {done, RunLength} once complete,
+%% where RunLength is the number of journal files the cycle compacted
+%% (0 = the scorer found no run worth compacting, so an external
+%% compact-until-quiescent loop can stop; undefined = no compaction cycle
+%% has completed since startup). book_islastcompactionpending/1 cannot
+%% answer this - it only reports whether a cycle is running, which makes
+%% timing-based caller loops nondeterministic.
+
+-spec book_lastcompactionresult(pid()) ->
+    pending | {done, non_neg_integer() | undefined}.
+book_lastcompactionresult(Pid) ->
+    gen_server:call(Pid, last_compaction_result, infinity).
+
 %% @doc Trim the journal when in head_only mode
 %%
 %% In head_only mode the journlacna be trimmed of entries which are before the
@@ -2029,6 +2045,10 @@ handle_call(confirm_compact, _From, State) when
     State#state.head_only == false
 ->
     {reply, leveled_inker:ink_compactionpending(State#state.inker), State};
+handle_call(last_compaction_result, _From, State) when
+    State#state.head_only == false
+->
+    {reply, leveled_inker:ink_lastcompactionresult(State#state.inker), State};
 handle_call(trim, _From, State) when State#state.head_only == true ->
     PSQN = leveled_penciller:pcl_persistedsqn(State#state.penciller),
     {reply, leveled_inker:ink_trim(State#state.inker, PSQN), State};
@@ -5779,6 +5799,45 @@ casbatchput_partial_tail_test() ->
     not_found = book_get(Bookie2, <<"B">>, <<"K2">>),
     ?assertEqual([], indexfold_matches(Bookie2, <<"idx_bin">>, <<"CASTAIL">>)),
     ok = book_destroy(Bookie2).
+
+lastcompactionresult_test() ->
+    %% book_lastcompactionresult reports what the last cycle DID:
+    %% {done, N>0} when a run was compacted, {done, 0} when scoring found
+    %% nothing worth compacting - the signal an external
+    %% compact-until-quiescent loop needs (islastcompactionpending only
+    %% says whether a cycle is in flight, which is timing-dependent).
+    RootPath = reset_filestructure(),
+    Opts = cas_compaction_opts(RootPath, [{?STD_TAG, retain}]),
+    {ok, Bookie1} = book_start(Opts),
+    ?assertEqual({done, undefined}, book_lastcompactionresult(Bookie1)),
+    seed_cas_compaction_state(Bookie1),
+    {ok, Inker, _Penciller} = book_returnactors(Bookie1),
+    ok = leveled_inker:ink_roll(Inker),
+    %% compact-until-quiescent: trigger cycles until the last completed
+    %% cycle reports it compacted nothing. This loop is exactly what the
+    %% signal exists for and MUST terminate deterministically.
+    RunLengths = compact_until_quiescent(Bookie1, 10, []),
+    %% the loop observed a definitive terminal {done, 0}
+    ?assertEqual(0, hd(RunLengths)),
+    %% every completed cycle reported an integer outcome
+    ?assert(lists:all(fun is_integer/1, RunLengths)),
+    %% quiescence is stable: another cycle still reports {done, 0}
+    ok = book_compactjournal(Bookie1, 30000),
+    wait_for_batch_compaction(Bookie1),
+    ?assertEqual({done, 0}, book_lastcompactionresult(Bookie1)),
+    ok = book_destroy(Bookie1).
+
+compact_until_quiescent(_Bookie, 0, _Acc) ->
+    error(compaction_never_quiescent);
+compact_until_quiescent(Bookie, Remaining, Acc) ->
+    ok = book_compactjournal(Bookie, 30000),
+    wait_for_batch_compaction(Bookie),
+    case book_lastcompactionresult(Bookie) of
+        {done, 0} ->
+            [0 | Acc];
+        {done, N} when is_integer(N), N > 0 ->
+            compact_until_quiescent(Bookie, Remaining - 1, [N | Acc])
+    end.
 
 casbatchput_compaction_retain_test() ->
     RootPath = reset_filestructure(),

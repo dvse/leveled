@@ -107,6 +107,8 @@
     ink_confirmdelete/3,
     ink_compactjournal/3,
     ink_clerkcomplete/3,
+    ink_clerkcomplete/4,
+    ink_lastcompactionresult/1,
     ink_compactionpending/1,
     ink_trim/2,
     ink_getmanifest/1,
@@ -160,6 +162,7 @@
     cdb_options :: #cdb_options{} | undefined,
     clerk :: pid() | undefined,
     compaction_pending = false :: boolean(),
+    last_compaction_run_length = undefined :: non_neg_integer() | undefined,
     bookie_monref :: reference() | undefined,
     is_snapshot = false :: boolean(),
     compression_method = native :: lz4 | native | none,
@@ -460,7 +463,22 @@ ink_compactjournal(Pid, Bookie, _Timeout) ->
 %% Used by a clerk to state that a compaction process is over, only change
 %% is to unlock the Inker for further compactions.
 ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete) ->
-    gen_server:cast(Pid, {clerk_complete, ManifestSnippet, FilesToDelete}).
+    ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete, undefined).
+
+-spec ink_clerkcomplete(
+    pid(), list(), list(), non_neg_integer() | undefined
+) -> ok.
+%% @doc
+%% As ink_clerkcomplete/3, additionally recording how many journal files
+%% the completed compaction cycle actually compacted (0 when scoring found
+%% no run worth compacting; undefined when the completion did not come from
+%% a compaction cycle, e.g. journal trim). Callers polling for compaction
+%% quiescence need this: compaction_pending only says a cycle is in flight,
+%% not whether further cycles would find work.
+ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete, RunLength) ->
+    gen_server:cast(
+        Pid, {clerk_complete, ManifestSnippet, FilesToDelete, RunLength}
+    ).
 
 -spec ink_compactionpending(pid()) -> boolean().
 %% @doc
@@ -468,6 +486,18 @@ ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete) ->
 %% if there is already some compaction work ongoing.
 ink_compactionpending(Pid) ->
     gen_server:call(Pid, compaction_pending, infinity).
+
+-spec ink_lastcompactionresult(pid()) ->
+    pending | {done, non_neg_integer() | undefined}.
+%% @doc
+%% Outcome of the most recent compaction cycle: pending while one is in
+%% flight, otherwise {done, RunLength} where RunLength is the number of
+%% journal files compacted by the last completed cycle (0 = the scorer
+%% found nothing worth compacting - a caller loop can stop; undefined =
+%% no cycle has completed since startup, or the last completion was not a
+%% compaction cycle).
+ink_lastcompactionresult(Pid) ->
+    gen_server:call(Pid, last_compaction_result, infinity).
 
 -spec ink_trim(pid(), integer()) -> ok.
 %% @doc
@@ -681,6 +711,15 @@ handle_call(
     {reply, {ok, Clerk}, State#state{compaction_pending = true}};
 handle_call(compaction_pending, _From, State) ->
     {reply, State#state.compaction_pending, State};
+handle_call(last_compaction_result, _From, State) ->
+    Reply =
+        case State#state.compaction_pending of
+            true ->
+                pending;
+            false ->
+                {done, State#state.last_compaction_run_length}
+        end,
+    {reply, Reply, State};
 handle_call(
     {trim, PersistedSQN}, _From, State = #state{is_snapshot = Snap}
 ) when
@@ -821,7 +860,7 @@ handle_call(
     {noreply, State}.
 
 handle_cast(
-    {clerk_complete, ManifestSnippet, FilesToDelete},
+    {clerk_complete, ManifestSnippet, FilesToDelete, RunLength},
     State = #state{cdb_options = CDBOpts}
 ) when
     ?IS_DEF(CDBOpts)
@@ -854,7 +893,8 @@ handle_cast(
         manifest = Man1,
         manifest_sqn = NewManifestSQN,
         pending_removals = FilesToDelete,
-        compaction_pending = false
+        compaction_pending = false,
+        last_compaction_run_length = RunLength
     }};
 handle_cast({confirm_delete, ManSQN, CDB}, State) ->
     % Check there are no snapshots that may be aware of the file process that
