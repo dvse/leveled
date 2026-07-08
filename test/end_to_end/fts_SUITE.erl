@@ -2766,6 +2766,25 @@ unicode61_supported_parity_corpus_contract(_Config) ->
     CombiningTie = <<205, 161>>,
     LigatureLeft = <<239, 184, 160>>,
     LigatureRight = <<239, 184, 161>>,
+    %% CJK shapes from the 5GB gate-run dissection (docs/fts_sqlite_gate.md):
+    %% FTS5's unicode61 tokenizes Han runs and precomposed Hangul (they sit
+    %% in category-0 gaps of its data table, and category 0 is a token
+    %% category), keeps Hangul precomposed (no decomposition), and treats
+    %% combining marks outside its 0x300-0x331 mask as separators.
+    HanRun =
+        <<16#4E2D/utf8, 16#570B/utf8, 16#8F15/utf8, 16#5DE5/utf8, 16#696D/utf8, 16#51FA/utf8,
+            16#7248/utf8, 16#793E/utf8>>,
+    HanCite =
+        <<16#5357/utf8, 16#5F37/utf8, " ", 16#70CF/utf8, 16#9F8D/utf8, 16#8336/utf8, " ",
+            HanRun/binary>>,
+    Hangul = <<16#AD11/utf8, 16#C6B4/utf8, 16#B300/utf8, 16#D559/utf8, 16#AD50/utf8>>,
+    %% Decomposed Jamo input (NFD of Hangul syllables) stays decomposed in
+    %% both engines: byte-distinct from the precomposed query token.
+    HangulNfd = <<16#1100/utf8, 16#1161/utf8, 16#1102/utf8, 16#1161/utf8>>,
+    KanaVoiced =
+        <<16#30ED/utf8, 16#30DC/utf8, 16#30AB/utf8, 16#30C3/utf8, 16#30D5/utf8, 16#3099/utf8,
+            "2017 robot">>,
+    MixedRun = <<"abc", 16#4E2D/utf8, 16#6587/utf8, "def">>,
     Docs = [
         {<<"u01">>, <<"Case">>, <<"CAF", 195, 137, " e", 204, 129, "clair ", 196, 176,
             "STANBUL ", 199, 141, " ", 225, 184, 131>>},
@@ -2777,7 +2796,15 @@ unicode61_supported_parity_corpus_contract(_Config) ->
         {<<"u05">>, <<"Malformed">>, <<"malformed ", 255, " utf8tail">>},
         {<<"u06">>, <<"Combining tie">>, <<"a", CombiningTie/binary, "rcanum">>},
         {<<"u07">>, <<"Combining ligature">>,
-            <<"bibliohrafii", LigatureLeft/binary, "a", LigatureRight/binary>>}
+            <<"bibliohrafii", LigatureLeft/binary, "a", LigatureRight/binary>>},
+        %% The Gongfu-tea NEAR-window shape: three Han tokens between the
+        %% NEAR members widen the gap past the window in both engines only
+        %% when Han runs actually tokenize.
+        {<<"c01">>, <<"Han">>, <<"gongfu culture ", HanCite/binary, " history tea">>},
+        {<<"c02">>, <<"Hangul">>, <<Hangul/binary, " university seoul">>},
+        {<<"c03">>, <<"Hangul NFD">>, <<HangulNfd/binary, " jamo input">>},
+        {<<"c04">>, <<"Kana voiced">>, KanaVoiced},
+        {<<"c05">>, <<"Mixed">>, <<MixedRun/binary, " 123 tail">>}
     ],
     Queries = [
         <<"cafe">>,
@@ -2792,10 +2819,22 @@ unicode61_supported_parity_corpus_contract(_Config) ->
         <<"\"koji grains\"">>,
         <<"koji grains">>,
         <<"malformed">>,
-        <<"utf8tail">>
+        <<"utf8tail">>,
+        HanRun,
+        <<16#4E2D/utf8, 16#570B/utf8, "*">>,
+        <<"NEAR(culture history, 2)">>,
+        <<"NEAR(culture history, 4)">>,
+        Hangul,
+        <<Hangul/binary, " AND seoul">>,
+        <<"2017">>,
+        <<"robot">>,
+        MixedRun,
+        <<"jamo">>
     ],
     write_sqlite_diff_docs(Bookie, Bucket, Index, Docs, WriteOpts),
     [<<"u01">>] = keys(search(Bookie, Bucket, Index, <<"cafe">>, #{rank => none, limit => 100})),
+    [<<"c01">>] = keys(search(Bookie, Bucket, Index, HanRun, #{rank => none, limit => 100})),
+    [<<"c02">>] = keys(search(Bookie, Bucket, Index, Hangul, #{rank => none, limit => 100})),
     Expected = sqlite_expected_results(RootPath, Docs, Queries),
     lists:foreach(
         fun(Query) ->
