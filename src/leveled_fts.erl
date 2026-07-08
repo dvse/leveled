@@ -1874,11 +1874,15 @@ evaluate_ranked_candidates(Index, EvalAST, ScoreAST, Opts, Metas, {DocCount, Tot
 %% position — both AND/OR branches, NEAR members individually (FTS5
 %% scores each phrase of a NEAR group), and only the LEFT side of NOT.
 %% Duplicates are preserved: a term written twice in the query scores
-%% twice, as in FTS5.
+%% twice, as in FTS5. NEAR members keep their group context: FTS5 trims
+%% each member's position list to the instances that participate in a
+%% NEAR-satisfying configuration before counting tf (while df stays the
+%% member's standalone document frequency) — see the NEAR scoring
+%% dissection in docs/fts_sqlite_gate.md.
 scoring_phrases({term, _Token, _Prefix, _Cols} = Leaf) -> [Leaf];
 scoring_phrases({phrase, _Specs, _Cols} = Leaf) -> [Leaf];
-scoring_phrases({near, Items, _Distance, _Cols}) ->
-    lists:append([scoring_phrases(Item) || Item <- Items]);
+scoring_phrases({near, Items, Distance, Cols}) ->
+    [{near_member, Index, Items, Distance, Cols} || Index <- lists:seq(1, length(Items))];
 scoring_phrases({anchor, AST}) -> scoring_phrases(AST);
 scoring_phrases({'and', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
 scoring_phrases({'or', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
@@ -1888,7 +1892,41 @@ scoring_phrases(_Other) -> [].
 leaf_tf(Meta, {term, Token, Prefix, Cols}) ->
     length(term_positions(Meta, Token, Prefix, Cols));
 leaf_tf(Meta, {phrase, Specs, Cols}) ->
-    length(phrase_match_positions(Meta, Specs, Cols)).
+    length(phrase_match_positions(Meta, Specs, Cols));
+leaf_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
+    near_member_tf(Meta, Items, Index, Distance, Cols, filtered).
+
+%% Document frequency counts for a leaf use the member's STANDALONE
+%% matches (FTS5's xQueryPhrase runs each phrase alone for nHit), while
+%% per-document tf for NEAR members is NEAR-filtered above.
+leaf_df_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
+    near_member_tf(Meta, Items, Index, Distance, Cols, standalone);
+leaf_df_tf(Meta, Leaf) ->
+    leaf_tf(Meta, Leaf).
+
+near_member_tf(Meta, Items, Index, Distance, Cols, Mode) ->
+    Member = lists:nth(Index, Items),
+    lists:sum([
+        length(near_member_column_spans(Meta, Items, Index, Member, Distance, Column, Mode))
+     || Column <- concrete_columns(Cols)
+    ]).
+
+near_member_column_spans(Meta, _Items, _Index, Member, _Distance, Column, standalone) ->
+    item_spans_in_column(Meta, Member, Column);
+near_member_column_spans(Meta, Items, Index, _Member, Distance, Column, filtered) ->
+    SpanLists = [item_spans_in_column(Meta, Item, Column) || Item <- Items],
+    case lists:any(fun(Spans) -> Spans =:= [] end, SpanLists) of
+        true ->
+            [];
+        false ->
+            {Before, [MemberSpans | After]} = lists:split(Index - 1, SpanLists),
+            Others = Before ++ After,
+            [
+                Span
+             || Span <- MemberSpans,
+                near_position_matches([Span], Others, Distance)
+            ]
+    end.
 
 np_map(Leaves, MetaList) ->
     lists:foldl(
@@ -1897,7 +1935,7 @@ np_map(Leaves, MetaList) ->
                 true ->
                     Acc;
                 false ->
-                    N = length([ok || Meta <- MetaList, leaf_tf(Meta, Leaf) > 0]),
+                    N = length([ok || Meta <- MetaList, leaf_df_tf(Meta, Leaf) > 0]),
                     Acc#{Leaf => N}
             end
         end,

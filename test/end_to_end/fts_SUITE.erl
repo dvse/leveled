@@ -3359,7 +3359,15 @@ bm25_rank_sqlite_differential_contract(_Config) ->
         {<<"d05">>, <<"epsilon">>, <<"common word soup without the main players">>},
         {<<"d06">>, <<"alpha">>, <<"short common">>},
         {<<"d07">>, <<"zeta">>, <<"new york common alpha beta new york">>},
-        {<<"d08">>, <<"eta alpha">>, <<"common beta">>}
+        {<<"d08">>, <<"eta alpha">>, <<"common beta">>},
+        %% NEAR tf-trim discriminator (docs/fts_sqlite_gate.md dissection):
+        %% most alpha instances sit OUTSIDE the NEAR window, so FTS5's
+        %% NEAR-filtered member tf (2) differs from the standalone count
+        %% (4) — unfiltered scoring mis-ranks this document.
+        {<<"d09">>, <<"theta">>,
+            <<"alpha filler filler filler filler filler filler filler filler beta alpha",
+                " filler alpha filler filler filler filler filler filler filler alpha",
+                " common">>}
     ],
     Queries = [
         <<"alpha">>,
@@ -3374,6 +3382,9 @@ bm25_rank_sqlite_differential_contract(_Config) ->
         <<"alpha NOT beta">>,
         <<"alpha alpha">>,
         <<"NEAR(alpha beta, 3)">>,
+        <<"NEAR(alpha beta, 1)">>,
+        <<"NEAR(alpha beta, 3) OR gamma">>,
+        <<"NEAR(alpha beta common, 5)">>,
         <<"common NOT alpha">>
     ],
     write_sqlite_diff_docs(Bookie, Bucket, Index, Docs, WriteOpts),
