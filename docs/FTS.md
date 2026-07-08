@@ -270,6 +270,48 @@ require re-deriving the index under a new index name), and very small cold
 point queries pay the store's snapshot cost where SQLite pays microseconds.
 Repeated queries are served from the result cache without a snapshot.
 
+## Batch Compaction (design)
+
+Status: DESIGN — implement when a workload shows the batch-scatter cost
+after the 2026-07-09 fixes (page blooms already remove the absent-term
+floor; this removes the matching-term scatter and reclaims superseded
+postings).
+
+The residual O(#batches) cost is *matching* postings: a term present in
+k batches costs ~k page reads however small each posting run is (the
+gate run's `istanbul`: 686 hits ≈ 100 ms where SQLite pays 3 ms).
+Because a document's live postings live entirely in the single batch
+its marker references, batches can be merged without re-tokenisation:
+
+- **Operation.** `book_ftscompact(Bookie, Bucket, Index, Opts)` merges
+  the live postings of a bounded run of adjacent batches `[S1..Sk]`
+  into one new batch at the current write sequence, in ONE atomic
+  `batchput` carrying: the merged token-sorted page rows and directory
+  (reusing `merge_runs_to_pages` — per-batch page streams are exactly
+  its run inputs), re-stamped doc markers `{NewSeq, DocLength}` for
+  every doc whose marker referenced a compacted batch, and removal
+  specs for the old batch directory markers (which removes the batches
+  from discovery; their unreachable page rows are merged out of the
+  LSM later). Superseded postings — rows whose doc's marker points
+  elsewhere — are dropped during the merge: this is also the space
+  reclaim path the Tradeoffs section says is missing today.
+- **Bounded steps.** One step compacts at most k batches (tiered like
+  the LSM itself: many small batches -> one larger, repeatedly), so
+  batchput size, memory, and marker-rewrite volume are bounded; a full
+  store converges in O(log) passes. Full-corpus single-shot compaction
+  is rejected (multi-GB atomic batch).
+- **Consistency.** In-flight queries hold ledger snapshots and keep
+  seeing the old rows; new queries at the post-compaction sequence see
+  only the merged batch (their markers re-point atomically in the same
+  batch). The compaction batch advances the write sequence, so the
+  result cache invalidates naturally; the incremental batch-list cache
+  is reset (one rediscovery), and corpus stats are unchanged by
+  construction (same live docs, same lengths — a useful invariant to
+  assert in tests).
+- **Scheduling.** Administrative API first; callers (e.g. ash_leveled
+  via a scheduled action) decide policy such as "compact when batch
+  count exceeds N". No automatic background process inside the store.
+
 ## Benchmarks
 
 - **2026-07-09** — [Leveled FTS vs SQLite FTS5, equivalence + 5x latency gate
