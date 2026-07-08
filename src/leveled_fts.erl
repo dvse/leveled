@@ -408,7 +408,7 @@ pack_index_specs(Ref, ByCol, BatchSeq) ->
                 {add_payload, Field, dir_term(BatchSeq), encode_dir(Numbered)}
                 | [
                     {add_payload, Field, page_term(BatchSeq, PageNo), Payload}
-                 || {PageNo, {_ColId, _First, _Last, Payload}} <- Numbered
+                 || {PageNo, {_ColId, _First, _Last, Payload, _Bloom}} <- Numbered
                 ]
             ]
     end.
@@ -546,7 +546,61 @@ finish_run_page(ColId, First, EntriesRev, NTok) ->
             <<NTok:16/unsigned-big>>,
             lists:reverse(EntriesRev)
         ),
-    {ColId, First, Last, Payload}.
+    Bloom = page_bloom([Tok || {Tok, _EntryBin} <- EntriesRev]),
+    {ColId, First, Last, Payload, Bloom}.
+
+%% Per-page token bloom, persisted in the batch directory so exact-term
+%% probes can skip pages whose [first, last] range merely SPANS an absent
+%% token: without it every term probe reads one spanning page per batch
+%% per column — O(#batches) ledger reads that made the per-query floor
+%% 129ms at the 5GB gate-run scale (docs/fts_sqlite_gate.md). k=4 probes
+%% at ~10 bits/token gives ~1.2% false positives (a false positive just
+%% reads the page as before); false negatives are impossible.
+page_bloom(Tokens) ->
+    N = max(1, length(Tokens)),
+    Bits = bloom_bits(N * 10),
+    Positions =
+        lists:usort(
+            lists:append([bloom_positions(Token, Bits) || Token <- Tokens])
+        ),
+    build_bitset(Positions, Bits).
+
+bloom_bits(Target) ->
+    bloom_bits(64, Target).
+
+bloom_bits(Bits, Target) when Bits >= Target ->
+    Bits;
+bloom_bits(Bits, Target) ->
+    bloom_bits(Bits * 2, Target).
+
+bloom_positions(Token, Bits) ->
+    H1 = erlang:phash2(Token, 1 bsl 27),
+    H2 = erlang:phash2({bloom, Token}, 1 bsl 27),
+    [(H1 + K * H2) rem Bits || K <- [0, 1, 2, 3]].
+
+build_bitset(SortedPositions, Bits) ->
+    build_bitset(SortedPositions, 0, Bits, <<>>).
+
+build_bitset(_Positions, Bit, Bits, Acc) when Bit >= Bits ->
+    Acc;
+build_bitset(Positions, Bit, Bits, Acc) ->
+    {Byte, Rest} = take_byte(Positions, Bit, 0),
+    build_bitset(Rest, Bit + 8, Bits, <<Acc/binary, Byte:8>>).
+
+take_byte([P | Rest], Base, Byte) when P < Base + 8 ->
+    take_byte(Rest, Base, Byte bor (1 bsl (P - Base)));
+take_byte(Positions, _Base, Byte) ->
+    {Byte, Positions}.
+
+bloom_member(Bloom, Token) ->
+    Bits = byte_size(Bloom) * 8,
+    lists:all(
+        fun(P) ->
+            Byte = binary:at(Bloom, P div 8),
+            (Byte band (1 bsl (P rem 8))) =/= 0
+        end,
+        bloom_positions(Token, Bits)
+    ).
 
 fts_pmap(Fun, List) ->
     Ref = make_ref(),
@@ -1534,7 +1588,7 @@ resolve_dir(FoldSource, Bucket, Ref, BatchSeq, Cache) ->
                         #{};
                     Payload ->
                         case decode_dir(Payload) of
-                            {ok, Entries} -> dir_col_map(Entries);
+                            {ok, Entries, Blooms} -> dir_col_map(Entries, Blooms);
                             error -> throw({fts_error, invalid_fts_payload})
                         end
                 end,
@@ -1552,7 +1606,7 @@ resolve_dir(FoldSource, Bucket, Ref, BatchSeq, Cache) ->
 %% Probe row: <<FirstOff:32, FirstLen:16, LastOff:32, LastLen:16, PageNo:16>>.
 -define(FTS_DIR_PROBE_BYTES, 14).
 
-dir_col_map(Entries) ->
+dir_col_map(Entries, Blooms) ->
     Grouped =
         lists:foldl(
             fun({ColId, PageNo, First, Last}, Acc) ->
@@ -1568,7 +1622,8 @@ dir_col_map(Entries) ->
         ),
     maps:map(
         fun(_ColId, L) ->
-            build_dir_probe(lists:sort(L))
+            {Probe, Str} = build_dir_probe(lists:sort(L)),
+            {Probe, Str, Blooms}
         end,
         Grouped
     ).
@@ -1592,33 +1647,44 @@ build_dir_probe(Sorted) ->
         ),
     {Probe, Str}.
 
-probe_row({Probe, Str}, Idx) ->
+probe_row({Probe, Str, _Blooms}, Idx) ->
     <<FOff:32/unsigned-big, FLen:16/unsigned-big, LOff:32/unsigned-big,
         LLen:16/unsigned-big, PageNo:16/unsigned-big>> =
         binary:part(Probe, (Idx - 1) * ?FTS_DIR_PROBE_BYTES, ?FTS_DIR_PROBE_BYTES),
     {binary:part(Str, FOff, FLen), binary:part(Str, LOff, LLen), PageNo}.
 
-probe_size({Probe, _Str}) ->
+probe_size({Probe, _Str, _Blooms}) ->
     byte_size(Probe) div ?FTS_DIR_PROBE_BYTES.
 
 covering_pages(Dirs, ColId, Token) ->
     %% A token split across entries spans a contiguous run of pages, so the
     %% exact probe is the range [Token, Token ++ <<0>>) over the directory.
+    %% The page bloom then drops range-spanning pages that cannot contain
+    %% the token — without it an absent term reads one spanning page per
+    %% batch per column, O(#batches) ledger fetches per query.
     lists:append(
         [
             case maps:get(ColId, ColMap, undefined) of
                 undefined ->
                     [];
-                PS ->
+                {_Probe, _Str, Blooms} = PS ->
                     [
                         {BatchSeq, PageNo}
                      || PageNo <-
-                            pages_for_range(PS, Token, <<Token/binary, 0>>)
+                            pages_for_range(PS, Token, <<Token/binary, 0>>),
+                        bloom_pass(Blooms, PageNo, Token)
                     ]
             end
          || {BatchSeq, ColMap} <- Dirs
         ]
     ).
+
+bloom_pass(Blooms, PageNo, Token) ->
+    case maps:get(PageNo, Blooms, undefined) of
+        %% Pre-bloom directory: never skip.
+        undefined -> true;
+        Bloom -> bloom_member(Bloom, Token)
+    end.
 
 covering_prefix_pages(Dirs, ColId, Prefix) ->
     End =
@@ -2117,6 +2183,9 @@ dir_term(BatchSeq) ->
 page_term(BatchSeq, PageNo) ->
     <<1:8, BatchSeq:64/unsigned-big, PageNo:16/unsigned-big>>.
 
+%% Page blooms trail the classic entry section, so directories written
+%% before blooms existed decode with an empty bloom map (no skips, exact
+%% pre-bloom behavior) and mixed-era stores work unchanged.
 encode_dir(NumberedPages) ->
     iolist_to_binary([
         <<(length(NumberedPages)):16/unsigned-big>>,
@@ -2124,7 +2193,12 @@ encode_dir(NumberedPages) ->
             <<ColId:8/unsigned-big, PageNo:16/unsigned-big,
                 (byte_size(First)):16/unsigned-big, First/binary,
                 (byte_size(Last)):16/unsigned-big, Last/binary>>
-         || {PageNo, {ColId, First, Last, _Payload}} <- NumberedPages
+         || {PageNo, {ColId, First, Last, _Payload, _Bloom}} <- NumberedPages
+        ],
+        <<(length(NumberedPages)):16/unsigned-big>>,
+        [
+            <<PageNo:16/unsigned-big, (byte_size(Bloom)):16/unsigned-big, Bloom/binary>>
+         || {PageNo, {_ColId, _First, _Last, _Payload, Bloom}} <- NumberedPages
         ]
     ]).
 
@@ -2134,7 +2208,12 @@ decode_dir(_Payload) ->
     error.
 
 decode_dir_entries(0, <<>>, Acc) ->
-    {ok, lists:reverse(Acc)};
+    {ok, lists:reverse(Acc), #{}};
+decode_dir_entries(0, <<Count:16/unsigned-big, Rest/binary>>, Acc) ->
+    case decode_dir_blooms(Count, Rest, #{}) of
+        {ok, Blooms} -> {ok, lists:reverse(Acc), Blooms};
+        error -> error
+    end;
 decode_dir_entries(Count, Bin, Acc) when Count > 0 ->
     case Bin of
         <<ColId:8/unsigned-big, PageNo:16/unsigned-big, FirstLen:16/unsigned-big,
@@ -2145,6 +2224,18 @@ decode_dir_entries(Count, Bin, Acc) when Count > 0 ->
             error
     end;
 decode_dir_entries(_Count, _Bin, _Acc) ->
+    error.
+
+decode_dir_blooms(0, <<>>, Acc) ->
+    {ok, Acc};
+decode_dir_blooms(Count, Bin, Acc) when Count > 0 ->
+    case Bin of
+        <<PageNo:16/unsigned-big, Len:16/unsigned-big, Bloom:Len/binary, Rest/binary>> ->
+            decode_dir_blooms(Count - 1, Rest, Acc#{PageNo => Bloom});
+        _Other ->
+            error
+    end;
+decode_dir_blooms(_Count, _Bin, _Acc) ->
     error.
 
 %% Lazily parses a page payload to [{Token, DocsBin}] in token order: only
