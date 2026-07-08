@@ -13,6 +13,8 @@
     augment_object_changes/3,
     spec_token_entries/3,
     book_ftssearch/5,
+    split_include_docs/1,
+    index_tag/3,
     cached_search/5,
     search/6,
     search/7
@@ -86,6 +88,28 @@ buckets_overlap(_BucketA, _BucketB) ->
 book_ftssearch(Pid, Bucket, Index0, Query, Opts) ->
     Index = normalise_index(Index0),
     leveled_bookie:book_returnfolder(Pid, {fts_query, Bucket, Index, Query, Opts}).
+
+%% include_docs is a Bookie-side concern (the runner enriches the final
+%% hit page with objects fetched through the query's own store snapshot);
+%% it is stripped before the engine sees the options, so the result cache
+%% keys and stores hits (keys/ranks) only — bodies are fetched fresh on
+%% every call, cached or not.
+split_include_docs(Opts) when is_map(Opts) ->
+    {maps:get(include_docs, Opts, false) =:= true, maps:remove(include_docs, Opts)};
+split_include_docs(Opts) when is_list(Opts) ->
+    {
+        proplists:get_value(include_docs, Opts, false) =:= true,
+        proplists:delete(include_docs, Opts)
+    };
+split_include_docs(Opts) ->
+    {false, Opts}.
+
+%% The object tag for an index's documents, for the include_docs fetch.
+index_tag(Bucket, Index0, Indexes) ->
+    case find_schema(Bucket, normalise_index(Index0), Indexes) of
+        {ok, Schema} -> maps:get(tag, Schema);
+        _NotFound -> ?STD_TAG
+    end.
 
 %% Cheap membership check used by the Bookie write path to decide whether an
 %% object's bucket/tag has any configured FTS index. Writes to non-matching
