@@ -29,6 +29,9 @@ parse_args(Args) ->
         max_journalsize => 1000000000,
         max_mergebelow => default,
         max_sstslots => default,
+        rank => none,
+        uncached => false,
+        bust_mode => none,
         runs => 5,
         warmup => 1
     },
@@ -74,6 +77,15 @@ parse_args(["--ledger-compression", Method | Rest], Opts) ->
         {ok, Atom} -> parse_args(Rest, Opts#{ledger_compression => Atom});
         error -> {error, {invalid_ledger_compression, Method}}
     end;
+parse_args(["--rank", R | Rest], Opts) ->
+    case rank_mode(R) of
+        {ok, Atom} -> parse_args(Rest, Opts#{rank => Atom});
+        error -> {error, {invalid_rank, R}}
+    end;
+parse_args(["--uncached" | Rest], Opts) ->
+    parse_args(Rest, Opts#{uncached => true, bust_mode => always});
+parse_args(["--amortized" | Rest], Opts) ->
+    parse_args(Rest, Opts#{uncached => true, bust_mode => amortized});
 parse_args(["--limit", N | Rest], Opts) ->
     parse_args(Rest, Opts#{limit => list_to_integer(N)});
 parse_args(["--runs", N | Rest], Opts) ->
@@ -133,10 +145,15 @@ run(Opts) ->
                 ReopenEnd = erlang:monotonic_time(microsecond),
                 Queries = read_queries(maps:get(queries, Opts)),
                 QueryRowsPath = maps:get(result, Opts) ++ ".queries.tmp",
+                Sentinel =
+                    case maps:get(uncached, Opts, false) of
+                        true -> read_first_doc(Opts);
+                        false -> undefined
+                    end,
                 {ok, QueryStats} = run_queries_to_file(
                     QueryBookie,
                     Queries,
-                    Opts#{doc_count => DocCount},
+                    Opts#{doc_count => DocCount, sentinel => Sentinel},
                     QueryRowsPath
                 ),
                 QueryMemory = memory_snapshot(),
@@ -194,6 +211,10 @@ compression_method(_) -> error.
 
 ledger_compression("as_store") -> {ok, as_store};
 ledger_compression(Method) -> compression_method(Method).
+
+rank_mode("none") -> {ok, none};
+rank_mode("bm25") -> {ok, bm25};
+rank_mode(_) -> error.
 
 load_tsv(Bookie, Opts) ->
     Tsv = maps:get(tsv, Opts),
@@ -291,6 +312,37 @@ parse_doc(Line0, Opts) ->
         Other ->
             {error, {invalid_doc_line, Other}}
     end.
+
+%% Read the first TSV document as a sentinel for --uncached cache busting.
+%% Re-putting this exact object is idempotent for query results (same key,
+%% same content, same token count) but advances the FTS write sequence,
+%% invalidating the per-sequence result and corpus-stats caches.
+read_first_doc(Opts) ->
+    Tsv = maps:get(tsv, Opts),
+    {ok, File} = file:open(Tsv, [read, binary, {read_ahead, 1024 * 1024}]),
+    try
+        case file:read_line(File) of
+            {ok, Line} ->
+                case parse_doc(Line, Opts) of
+                    {ok, {put, Bucket, Key, Object, _Idx, Tag, TTL}, _Bytes} ->
+                        {Bucket, Key, Object, Tag, TTL};
+                    _Other ->
+                        undefined
+                end;
+            _Other ->
+                undefined
+        end
+    after
+        ok = file:close(File)
+    end.
+
+maybe_bust_cache(_Bookie, #{sentinel := undefined}) ->
+    ok;
+maybe_bust_cache(Bookie, #{sentinel := {Bucket, Key, Object, Tag, TTL}}) ->
+    _ = leveled_bookie:book_put(Bookie, Bucket, Key, Object, [], Tag, TTL, false),
+    ok;
+maybe_bust_cache(_Bookie, _Opts) ->
+    ok.
 
 trim_newline(Bin) ->
     case byte_size(Bin) of
@@ -432,6 +484,30 @@ run_query_1(Bookie, Query, Opts) ->
     Timed =
         [
             begin
+                %% Cache-bust regimes (see bench/README.md):
+                %%   always    (--uncached): bump the FTS write sequence (an
+                %%     idempotent re-put of an existing document) BEFORE the
+                %%     timer, so each timed query misses the per-sequence
+                %%     result, batch-list, and corpus-stats caches and does
+                %%     full posting work. Write-per-query worst case.
+                %%   amortized (--amortized): bump once, then run an untimed
+                %%     ABSORBER query (a distinct nomatch term) at the new
+                %%     sequence, which re-derives the per-sequence batch-list
+                %%     and (when ranked) corpus-stats caches. The timed query
+                %%     is then stats-warm but result-cache-cold: the
+                %%     steady-state cost of a NOVEL query between writes.
+                %% Page/directory caches (immutable per batch) stay warm in
+                %% both regimes, matching SQLite's warm page cache.
+                _ = maybe_bust_cache(Bookie, Opts),
+                _ =
+                    case maps:get(bust_mode, Opts, none) of
+                        amortized ->
+                            search_once(
+                                Bookie, Bucket, Index, <<"zzabsorberstatswarm">>, SearchOpts
+                            );
+                        _ ->
+                            ok
+                    end,
                 Start = erlang:monotonic_time(microsecond),
                 Result = search_once(Bookie, Bucket, Index, Query, SearchOpts),
                 Stop = erlang:monotonic_time(microsecond),
@@ -452,13 +528,20 @@ run_query_1(Bookie, Query, Opts) ->
     TotalCount = result_total_count(TotalResult),
     TotalError = result_error(total_count, TotalResult),
     Error = first_error([timed_error(Summaries), drift_error(Summaries), TotalError]),
+    RankMode = maps:get(rank, Opts, none),
+    EmitScores =
+        case RankMode of
+            bm25 -> summary_scores(LastSummary);
+            _ -> []
+        end,
     #{query => Query, count => summary_count(LastSummary), total_count => TotalCount,
         full_result_us => TotalStop - TotalStart, runs_us => Times, error => Error,
-        keys => summary_keys(LastSummary), full_keys_sha256 => result_full_keys_sha256(TotalResult)}.
+        keys => summary_keys(LastSummary), scores => EmitScores, rank_mode => RankMode,
+        full_keys_sha256 => result_full_keys_sha256(TotalResult)}.
 
 query_error_result(Query, Reason) ->
     #{query => Query, count => 0, total_count => 0, full_result_us => 0, runs_us => [],
-        error => {query_worker, Reason}, keys => [], full_keys => []}.
+        error => {query_worker, Reason}, keys => [], scores => [], full_keys => []}.
 
 result_count({ok, Hits}) ->
     length(Hits);
@@ -479,15 +562,21 @@ result_full_keys_sha256({error, _Reason}) ->
 
 result_summary({ok, Hits}) ->
     Keys = [maps:get(key, Hit) || Hit <- Hits],
-    #{count => length(Keys), keys => Keys, error => none, signature => {ok, Keys}};
+    Scores = [maps:get(rank, Hit, 0.0) || Hit <- Hits],
+    #{count => length(Keys), keys => Keys, scores => Scores, error => none,
+        signature => {ok, Keys}};
 result_summary({error, Reason}) ->
-    #{count => 0, keys => [], error => {query, Reason}, signature => {error, Reason}}.
+    #{count => 0, keys => [], scores => [], error => {query, Reason},
+        signature => {error, Reason}}.
 
 summary_count(Summary) ->
     maps:get(count, Summary).
 
 summary_keys(Summary) ->
     maps:get(keys, Summary).
+
+summary_scores(Summary) ->
+    maps:get(scores, Summary, []).
 
 result_error(_Stage, {ok, _Hits}) ->
     none;
@@ -520,9 +609,9 @@ search_once(Bookie, Bucket, Index, Query, SearchOpts) ->
     {async, Runner} = leveled_bookie:book_ftssearch(Bookie, Bucket, Index, Query, SearchOpts),
     Runner().
 
-search_opts(Limit, _Opts) ->
+search_opts(Limit, Opts) ->
     #{
-        rank => none,
+        rank => maps:get(rank, Opts, none),
         limit => Limit,
         columns => [title, body],
         prefixes => [5, 11],
@@ -673,8 +762,17 @@ write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryCount, QuerySha
     ok = io:format(File, "leveled\tsource_object_shape\t~s\t\t\t\t\t\t~n", [
         escape_cell(<<"{Title, Body}">>)
     ]),
+    ok = io:format(File, "leveled\trank_mode\t~p\t\t\t\t\t\t~n", [
+        maps:get(rank, Opts, none)
+    ]),
+    ok = io:format(File, "leveled\tuncached\t~p\t\t\t\t\t\t~n", [
+        maps:get(uncached, Opts, false)
+    ]),
+    ok = io:format(File, "leveled\tbust_mode\t~p\t\t\t\t\t\t~n", [
+        maps:get(bust_mode, Opts, none)
+    ]),
     ok = io:format(File, "leveled\tquery_order_contract\t~s\t\t\t\t\t\t~n", [
-        escape_cell(<<"rank_none_order_by_key">>)
+        escape_cell(query_order_contract(maps:get(rank, Opts, none)))
     ]),
     ok = io:format(File, "leveled\tsearch_opts\t~s\t\t\t\t\t\t~n", [
         escape_cell(list_to_binary(io_lib:format("~p", [
@@ -758,7 +856,7 @@ sst_start_opts(Opts) ->
 write_query_result(
     File,
     #{query := Query, count := Count, total_count := TotalCount, full_result_us := FullResultUs,
-        runs_us := Runs, error := Error, keys := Keys, full_keys_sha256 := FullKeysSha256}
+        runs_us := Runs, error := Error, keys := Keys, full_keys_sha256 := FullKeysSha256} = Result
 ) ->
     RunsBin = join_integer_list(Runs),
     KeysCell = json_binary_list(Keys),
@@ -776,7 +874,26 @@ write_query_result(
         File,
         "leveled\tquery_us\t\t~s\t~p\t~p\t~s\t~s\t~s~n",
         [escape_cell(Query), Count, TotalCount, RunsBin, term_cell(Error), escape_cell(KeysCell)]
-    ).
+    ),
+    case maps:get(rank_mode, Result, none) of
+        bm25 ->
+            ScoresCell = json_score_list(maps:get(scores, Result, [])),
+            ok = io:format(
+                File,
+                "leveled\tquery_scores\t\t~s\t~p\t~p\t\t~s\t~s~n",
+                [escape_cell(Query), Count, TotalCount, term_cell(Error), escape_cell(ScoresCell)]
+            );
+        _ ->
+            ok
+    end.
+
+json_score_list(Scores) ->
+    iolist_to_binary([$[, lists:join($,, [score_to_binary(S) || S <- Scores]), $]]).
+
+score_to_binary(S) when is_integer(S) ->
+    float_to_binary(float(S), [{scientific, 16}]);
+score_to_binary(S) when is_float(S) ->
+    float_to_binary(S, [{scientific, 16}]).
 
 term_cell(Term) ->
     escape_cell(iolist_to_binary(io_lib:format("~w", [Term]))).
@@ -802,6 +919,11 @@ payload_visibility_contract() ->
 
 rank_none_snapshot_contract() ->
     <<"rank_none_payload_key_order">>.
+
+query_order_contract(bm25) ->
+    <<"bm25_order_by_rank_key">>;
+query_order_contract(_) ->
+    <<"rank_none_order_by_key">>.
 
 query_list_sha256(Queries) ->
     sha256_hex(iolist_to_binary([[Query, <<"\n">>] || Query <- Queries])).

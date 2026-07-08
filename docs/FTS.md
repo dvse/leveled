@@ -269,3 +269,17 @@ buckets accumulate superseded postings indefinitely (reclaiming them would
 require re-deriving the index under a new index name), and very small cold
 point queries pay the store's snapshot cost where SQLite pays microseconds.
 Repeated queries are served from the result cache without a snapshot.
+
+## Benchmarks
+
+- **2026-07-09** — [Leveled FTS vs SQLite FTS5, equivalence + 5x latency gate
+  over a 5.3 GB Wikipedia corpus](fts_sqlite_gate.md). Summary: unranked match
+  sets are identical in 38/39 cells (the one exception is a NEAR match flipped
+  by CJK tokenizer position drift); ranked BM25 order/scores diverge on real
+  text — dissected to (1) unicode61 CJK tokenization differences (Han runs
+  dropped, Hangul decomposed) shifting `dl`/`avgdl` by ~2.5e-4, and (2) NEAR
+  members scored with all instances where FTS5 uses NEAR-filtered counts.
+  Write-adjacent (uncached) latency breaches the 5x gate on selective and
+  ranked queries via the per-query snapshot floor, the per-write batch-list
+  rediscovery, and the O(N) `corpus_stats` fold — while hot-term posting
+  traversal is 2–4x and BM25 scoring itself is nearly free.

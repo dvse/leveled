@@ -1,0 +1,19 @@
+# FTS gate query set — SQLite-FTS5 vs Leveled equivalence + 5x latency gate.
+# Every query is in the shared grammar the small-scale differential contracts
+# (leveled/test/end_to_end/fts_SUITE.erl) prove identical between engines:
+# plain terms (implicit AND), OR / NOT, "quoted phrases", column filters,
+# word* prefixes, and NEAR. Shapes are classified structurally by check_gate.py.
+# Kept small on purpose: ranked hot-term queries dominate wall-clock at 5 GB.
+history
+london
+research
+istanbul
+"new york"
+"united states"
+title:history
+science AND research
+war OR peace
+science NOT history
+comput*
+NEAR(history culture, 10)
+zzmissingfts0

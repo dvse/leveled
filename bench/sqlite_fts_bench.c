@@ -24,6 +24,7 @@ typedef struct {
     const char *cli_version;
     const char *queries_sha256;
     const char *tsv_sha256;
+    const char *rank;
     int batch;
     int limit;
     int runs;
@@ -46,9 +47,15 @@ typedef struct {
     char *error;
     char **keys;
     int key_count;
+    double *scores;
+    int score_count;
     char **full_keys;
     int full_key_count;
 } query_result_t;
+
+static int rank_is_bm25(const options_t *opts) {
+    return opts->rank && strcmp(opts->rank, "bm25") == 0;
+}
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -638,15 +645,21 @@ static int query_full_result(sqlite3 *db, const char *query, char ***keys, char 
     return count;
 }
 
-static int query_once(sqlite3 *db, const char *query, int limit, char ***keys, char **error) {
+static int query_once(
+    sqlite3 *db,
+    const char *query,
+    const options_t *opts,
+    char ***keys,
+    double **scores,
+    char **error
+) {
+    int bm25 = rank_is_bm25(opts);
+    int limit = opts->limit;
+    const char *sql = bm25
+        ? "SELECT key, rank FROM docs WHERE docs MATCH ? ORDER BY rank, key LIMIT ?"
+        : "SELECT key FROM docs WHERE docs MATCH ? ORDER BY key LIMIT ?";
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(
-        db,
-        "SELECT key FROM docs WHERE docs MATCH ? ORDER BY key LIMIT ?",
-        -1,
-        &stmt,
-        NULL
-    );
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         *error = xstrdup(sqlite3_errmsg(db));
         return 0;
@@ -655,10 +668,18 @@ static int query_once(sqlite3 *db, const char *query, int limit, char ***keys, c
     sqlite3_bind_int(stmt, 2, limit);
 
     char **out = xmalloc((size_t)(limit > 0 ? limit : 1) * sizeof(char *));
+    double *score_out = NULL;
+    if (bm25 && scores) {
+        score_out = xmalloc((size_t)(limit > 0 ? limit : 1) * sizeof(double));
+    }
     int count = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const unsigned char *key = sqlite3_column_text(stmt, 0);
-        out[count++] = xstrdup(key ? (const char *)key : "");
+        out[count] = xstrdup(key ? (const char *)key : "");
+        if (score_out) {
+            score_out[count] = sqlite3_column_double(stmt, 1);
+        }
+        count++;
     }
     if (rc != SQLITE_DONE) {
         *error = xstrdup(sqlite3_errmsg(db));
@@ -666,11 +687,15 @@ static int query_once(sqlite3 *db, const char *query, int limit, char ***keys, c
             free(out[i]);
         }
         free(out);
+        free(score_out);
         sqlite3_finalize(stmt);
         return 0;
     }
     sqlite3_finalize(stmt);
     *keys = out;
+    if (scores) {
+        *scores = score_out;
+    }
     return count;
 }
 
@@ -702,16 +727,17 @@ static query_result_t run_query(sqlite3 *db, const char *query, const options_t 
     for (int i = 0; i < opts->warmup; i++) {
         char **keys = NULL;
         char *error = NULL;
-        int count = query_once(db, query, opts->limit, &keys, &error);
+        int count = query_once(db, query, opts, &keys, NULL, &error);
         free_keys(keys, count);
         free(error);
     }
 
     for (int i = 0; i < opts->runs; i++) {
         char **keys = NULL;
+        double *scores = NULL;
         char *error = NULL;
         int64_t start = now_us();
-        int count = query_once(db, query, opts->limit, &keys, &error);
+        int count = query_once(db, query, opts, &keys, (i == 0 ? &scores : NULL), &error);
         int64_t elapsed = now_us() - start;
         out.runs_us[i] = (int)elapsed;
 
@@ -719,6 +745,7 @@ static query_result_t run_query(sqlite3 *db, const char *query, const options_t 
             free(out.error);
             out.error = error;
             free_keys(keys, count);
+            free(scores);
             continue;
         }
 
@@ -726,6 +753,8 @@ static query_result_t run_query(sqlite3 *db, const char *query, const options_t 
             out.keys = keys;
             out.key_count = count;
             out.count = count;
+            out.scores = scores;
+            out.score_count = (scores ? count : 0);
         } else {
             if (!keys_equal(out.keys, out.key_count, keys, count)) {
                 free(out.error);
@@ -876,6 +905,22 @@ static char *json_keys(char **keys, int count) {
     return out;
 }
 
+static char *json_scores(double *scores, int count) {
+    size_t cap = 128;
+    size_t len = 0;
+    char *out = xmalloc(cap);
+    out[0] = '\0';
+    append_char(&out, &len, &cap, '[');
+    for (int i = 0; i < count; i++) {
+        if (i) append_char(&out, &len, &cap, ',');
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.17g", scores[i]);
+        append_text(&out, &len, &cap, buf);
+    }
+    append_char(&out, &len, &cap, ']');
+    return out;
+}
+
 static void write_results(
     const options_t *opts,
     int docs,
@@ -950,7 +995,12 @@ static void write_results(
     write_metric(fh, "sqlite_source_checkout", opts->source_checkout);
     write_metric(fh, "sqlite_source_version", opts->source_version);
     write_metric(fh, "sqlite_cli_version", opts->cli_version);
-    write_metric(fh, "sqlite_query_order", "ORDER BY key");
+    write_metric(fh, "rank_mode", rank_is_bm25(opts) ? "bm25" : "none");
+    write_metric(
+        fh,
+        "sqlite_query_order",
+        rank_is_bm25(opts) ? "ORDER BY rank, key" : "ORDER BY key"
+    );
     write_metric(fh, "sqlite_ddl", SQLITE_FTS_DDL);
 
     for (size_t i = 0; i < result_count; i++) {
@@ -980,6 +1030,18 @@ static void write_results(
         write_escaped(fh, keys_json);
         free(keys_json);
         fputc('\n', fh);
+
+        if (rank_is_bm25(opts) && r->scores) {
+            fputs("sqlite\tquery_scores\t\t", fh);
+            write_escaped(fh, r->query);
+            fprintf(fh, "\t%d\t%d\t\t", r->count, r->total_count);
+            write_escaped(fh, r->error);
+            fputc('\t', fh);
+            char *scores_json = json_scores(r->scores, r->score_count);
+            write_escaped(fh, scores_json);
+            free(scores_json);
+            fputc('\n', fh);
+        }
     }
     fclose(fh);
 }
@@ -1000,6 +1062,7 @@ static options_t parse_args(int argc, char **argv) {
         .source_checkout = "/Users/dvse/repos/sqlite",
         .source_version = "unknown",
         .cli_version = "unknown",
+        .rank = "none",
     };
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tsv") == 0) {
@@ -1032,6 +1095,8 @@ static options_t parse_args(int argc, char **argv) {
             opts.queries_sha256 = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--tsv-sha256") == 0) {
             opts.tsv_sha256 = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--rank") == 0) {
+            opts.rank = arg_value(argc, argv, &i);
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
             exit(1);
@@ -1045,6 +1110,9 @@ static options_t parse_args(int argc, char **argv) {
     }
     if (opts.batch < 1 || opts.limit < 0 || opts.runs < 1 || opts.warmup < 0) {
         die("invalid batch/limit/runs/warmup");
+    }
+    if (strcmp(opts.rank, "none") != 0 && strcmp(opts.rank, "bm25") != 0) {
+        die("invalid --rank (expected none or bm25)");
     }
     return opts;
 }
