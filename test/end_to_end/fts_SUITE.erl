@@ -29,7 +29,8 @@
     sqlite_supported_ast_differential_contract/1,
     unicode61_supported_parity_corpus_contract/1,
     parse_errors/1,
-    filter_and_verbatim_contract/1
+    filter_and_verbatim_contract/1,
+    bm25_rank_sqlite_differential_contract/1
 ]).
 
 all() ->
@@ -59,7 +60,8 @@ all() ->
         sqlite_supported_ast_differential_contract,
         unicode61_supported_parity_corpus_contract,
         parse_errors,
-        filter_and_verbatim_contract
+        filter_and_verbatim_contract,
+        bm25_rank_sqlite_differential_contract
     ].
 
 init_per_suite(Config) ->
@@ -185,7 +187,18 @@ single_object_contract(_Config) ->
         leveled_bookie:book_ftssearch(
             Bookie, <<"docs">>, <<"main">>, <<"quick">>, #{columns => [body], rank => bm25}
         ),
-    {error, invalid_rank_option} = BM25Runner(),
+    %% bm25 rank: doc 1 carries "quick" twice, doc 2 once -> doc 1 first,
+    %% both with negative rank (FTS5 sign convention) and positive score.
+    {ok, [BM25First, BM25Second]} = BM25Runner(),
+    [<<"1">>, <<"2">>] = [maps:get(key, BM25First), maps:get(key, BM25Second)],
+    true = maps:get(rank, BM25First) < maps:get(rank, BM25Second),
+    true = maps:get(rank, BM25First) < 0.0,
+    true = maps:get(score, BM25First) > maps:get(score, BM25Second),
+    {async, BadRankRunner} =
+        leveled_bookie:book_ftssearch(
+            Bookie, <<"docs">>, <<"main">>, <<"quick">>, #{columns => [body], rank => tfidf}
+        ),
+    {error, invalid_rank_option} = BadRankRunner(),
     [<<"1">>, <<"2">>] =
         hit_keys(search(Bookie, <<"docs">>, <<"main">>, <<"quick">>, #{rank => none})),
     [<<"2">>] =
@@ -3286,6 +3299,176 @@ tenant_bucket_prefix_contract(_Config) ->
     ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
+bm25_rank_sqlite_differential_contract(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_bm25_rank_differential"),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Bucket = <<"rank-bm25">>,
+    Index = <<"main">>,
+    WriteOpts = #{columns => [title, body], prefixes => [2, 3, 5], remove_diacritics => 2},
+    SearchOpts = WriteOpts#{rank => bm25, limit => 100},
+    %% Corpus designed for score spread: varying document lengths, term
+    %% frequencies, document frequencies (idf spread), a term present in
+    %% every document ("common" -- exercises the non-positive-idf clamp),
+    %% title vs body hits, phrases and prefixes.
+    Docs = [
+        {<<"d01">>, <<"alpha guide">>, <<"alpha beta common words here alpha">>},
+        {<<"d02">>, <<"beta title">>, <<"alpha common new york city travel notes">>},
+        {<<"d03">>, <<"gamma">>,
+            <<"beta common alpha beta beta longer document with many extra words to change",
+                " the length ratio of this row">>},
+        {<<"d04">>, <<"delta notes">>, <<"common gamma unique treasure">>},
+        {<<"d05">>, <<"epsilon">>, <<"common word soup without the main players">>},
+        {<<"d06">>, <<"alpha">>, <<"short common">>},
+        {<<"d07">>, <<"zeta">>, <<"new york common alpha beta new york">>},
+        {<<"d08">>, <<"eta alpha">>, <<"common beta">>}
+    ],
+    Queries = [
+        <<"alpha">>,
+        <<"beta">>,
+        <<"common">>,
+        <<"alpha beta">>,
+        <<"alpha OR beta">>,
+        <<"title:alpha">>,
+        <<"{title body}:alpha">>,
+        <<"\"new york\"">>,
+        <<"alph*">>,
+        <<"alpha NOT beta">>,
+        <<"alpha alpha">>,
+        <<"NEAR(alpha beta, 3)">>,
+        <<"common NOT alpha">>
+    ],
+    write_sqlite_diff_docs(Bookie, Bucket, Index, Docs, WriteOpts),
+    Expected = sqlite_rank_results(RootPath, Docs, Queries),
+    lists:foreach(
+        fun(Query) ->
+            ExpectedRanks = maps:get(Query, Expected),
+            {async, Runner} =
+                leveled_bookie:book_ftssearch(Bookie, Bucket, Index, Query, SearchOpts),
+            {ok, Hits} = Runner(),
+            ActualRanks = [{maps:get(key, H), maps:get(rank, H)} || H <- Hits],
+            assert_rank_parity(Query, ExpectedRanks, ActualRanks)
+        end,
+        Queries
+    ),
+    ok = leveled_bookie:book_close(Bookie),
+    testutil:reset_filestructure().
+
+assert_rank_parity(Query, Expected, Actual) ->
+    ExpectedKeys = [K || {K, _R} <- Expected],
+    ActualKeys = [K || {K, _R} <- Actual],
+    case ExpectedKeys =:= ActualKeys of
+        true -> ok;
+        false -> erlang:error({bm25_order_mismatch, Query, ExpectedKeys, ActualKeys})
+    end,
+    lists:foreach(
+        fun({{Key, RankS}, {Key, RankE}}) ->
+            Tolerance = 1.0e-6 * max(1.0, abs(RankS)),
+            case abs(RankE - RankS) =< Tolerance of
+                true ->
+                    ok;
+                false ->
+                    erlang:error({bm25_score_mismatch, Query, Key, RankS, RankE})
+            end
+        end,
+        lists:zip(Expected, Actual)
+    ).
+
+sqlite_rank_results(RootPath, Docs, Queries) ->
+    ScriptPath = filename:join(RootPath, "sqlite_fts_rank_diff.py"),
+    ok = file:write_file(ScriptPath, sqlite_rank_script(Docs, Queries)),
+    parse_sqlite_rank_output(os:cmd("python3 " ++ ScriptPath)).
+
+sqlite_rank_script(Docs, Queries) ->
+    DocRows =
+        lists:join(
+            ",\n",
+            [
+                io_lib:format(
+                    "    (s('~s'), b('~s'), b('~s'))",
+                    [b64(Key), b64(Title), b64(Body)]
+                )
+             || {Key, Title, Body} <- Docs
+            ]
+        ),
+    QueryRows =
+        lists:join(
+            ",\n",
+            [io_lib:format("    s('~s')", [b64(Query)]) || Query <- Queries]
+        ),
+    iolist_to_binary([
+        "import base64\n"
+        "import sqlite3\n"
+        "\n"
+        "def s(value):\n"
+        "    return base64.b64decode(value).decode('utf-8')\n"
+        "\n"
+        "def b(value):\n"
+        "    return base64.b64decode(value)\n"
+        "\n"
+        "def enc(value):\n"
+        "    return base64.b64encode(value.encode('utf-8')).decode('ascii')\n"
+        "\n"
+        "docs = [\n",
+        DocRows,
+        "\n]\n"
+        "queries = [\n",
+        QueryRows,
+        "\n]\n"
+        "conn = sqlite3.connect(':memory:')\n"
+        "conn.execute(\"CREATE VIRTUAL TABLE docs USING fts5(key UNINDEXED, title, body, "
+        "tokenize='unicode61 remove_diacritics 2', prefix='2 3 5')\")\n"
+        "conn.executemany('INSERT INTO docs(key, title, body) VALUES(?, ?, ?)', docs)\n"
+        "for query in queries:\n"
+        "    try:\n"
+        "        rows = conn.execute("
+        "'SELECT key, rank FROM docs WHERE docs MATCH ? ORDER BY rank, key', "
+        "(query,)).fetchall()\n"
+        "        pairs = ','.join('%s:%.17g' % (enc(key), rank) for key, rank in rows)\n"
+        "        print('OK\\t%s\\t%s' % (enc(query), pairs))\n"
+        "    except Exception as exc:\n"
+        "        print('ERR\\t%s\\t%s' % (enc(query), enc(str(exc))))\n"
+    ]).
+
+parse_sqlite_rank_output(Output0) ->
+    Output = unicode:characters_to_binary(Output0, utf8),
+    Lines =
+        [
+            Line
+         || Line <- binary:split(Output, <<"\n">>, [global]),
+            Line =/= <<>>
+        ],
+    maps:from_list([parse_sqlite_rank_line(Line) || Line <- Lines]).
+
+parse_sqlite_rank_line(Line) ->
+    case binary:split(Line, <<"\t">>, [global]) of
+        [<<"OK">>, EncodedQuery, <<>>] ->
+            {base64:decode(EncodedQuery), []};
+        [<<"OK">>, EncodedQuery, EncodedPairs] ->
+            Pairs =
+                [
+                    begin
+                        [EncKey, Score] = binary:split(Pair, <<":">>),
+                        {base64:decode(EncKey), binary_to_float_lenient(Score)}
+                    end
+                 || Pair <- binary:split(EncodedPairs, <<",">>, [global])
+                ],
+            {base64:decode(EncodedQuery), Pairs};
+        [<<"ERR">>, EncodedQuery, EncodedError] ->
+            erlang:error(
+                {sqlite_rank_oracle_error, base64:decode(EncodedQuery),
+                    base64:decode(EncodedError)}
+            );
+        _Other ->
+            erlang:error({bad_sqlite_rank_output, Line})
+    end.
+
+binary_to_float_lenient(Bin) ->
+    try
+        binary_to_float(Bin)
+    catch
+        error:badarg -> binary_to_integer(Bin) * 1.0
+    end.
+
 filter_and_verbatim_contract(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
@@ -3466,6 +3649,9 @@ test_fts_indexes() ->
                 remove_diacritics => 2, prefixes => [2, 3, 5]
             }),
             test_fts_index(<<"sqlite-unicode">>, <<"main">>, #{
+                remove_diacritics => 2, prefixes => [2, 3, 5]
+            }),
+            test_fts_index(<<"rank-bm25">>, <<"main">>, #{
                 remove_diacritics => 2, prefixes => [2, 3, 5]
             }),
             maps:put(

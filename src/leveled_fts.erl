@@ -646,10 +646,10 @@ search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
                                             AST1, maps:get(filter, Opts, []), Schema
                                         )
                                     of
-                                        {ok, AST} ->
+                                        {ok, EvalAST, ScoreAST} ->
                                             search_evaluate(
-                                                FoldSource, Bucket, Schema, AST, Columns,
-                                                Cache, Opts
+                                                FoldSource, Bucket, Schema, EvalAST,
+                                                ScoreAST, Columns, Cache, Opts
                                             );
                                         {error, Reason} ->
                                             {error, Reason}
@@ -669,20 +669,33 @@ search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
             {error, Reason}
     end.
 
-search_evaluate(FoldSource, Bucket, Schema, AST, Columns, Cache, Opts) ->
+%% EvalAST decides matching (user query AND search filters); ScoreAST is
+%% the user query alone — injected filters must never contribute to BM25
+%% scores, or a tenant filter term would perturb ranking.
+search_evaluate(FoldSource, Bucket, Schema, EvalAST, ScoreAST, Columns, Cache, Opts) ->
     IndexRef = index_ref(Schema),
+    Ranked = maps:get(rank, Opts, none) =:= bm25,
     try
         Metas =
             collect_metas(
                 FoldSource,
                 Bucket,
                 Schema,
-                AST,
+                EvalAST,
                 Columns,
                 Cache,
-                maps:get(return_positions, Opts, false)
+                maps:get(return_positions, Opts, false) orelse Ranked,
+                Ranked
             ),
-        evaluate_payload_candidates(IndexRef, AST, Opts, Metas)
+        case Ranked of
+            false ->
+                evaluate_payload_candidates(IndexRef, EvalAST, Opts, Metas);
+            true ->
+                Stats = corpus_stats(FoldSource, Bucket, Schema, Cache),
+                evaluate_ranked_candidates(
+                    IndexRef, EvalAST, ScoreAST, Opts, Metas, Stats
+                )
+        end
     catch
         throw:{fts_error, Reason} ->
             {error, Reason}
@@ -700,10 +713,10 @@ search_evaluate(FoldSource, Bucket, Schema, AST, Columns, Cache, Opts) ->
 %% verbatim column matches the exact field value; a text column requires
 %% the value to normalise to exactly one token.
 apply_search_filter(AST, [], _Schema) ->
-    {ok, AST};
+    {ok, AST, AST};
 apply_search_filter(AST, Filter, Schema) ->
     case build_filter_ast(Filter, Schema) of
-        {ok, FilterAST} -> {ok, {'and', AST, FilterAST}};
+        {ok, FilterAST} -> {ok, {'and', AST, FilterAST}, AST};
         {error, Reason} -> {error, Reason}
     end.
 
@@ -1026,7 +1039,7 @@ group_positions([{Token, Pos} | Rest], Acc) ->
 %% from superseded writes are invisible.
 %% ----------------------------------------------------------------------------
 
-collect_metas(FoldSource, Bucket, Schema, AST, Columns, Cache, ReturnPositions) ->
+collect_metas(FoldSource, Bucket, Schema, AST, Columns, Cache, ReturnPositions, Ranked) ->
     Ctx0 = #{
         fold => FoldSource,
         bucket => Bucket,
@@ -1040,8 +1053,34 @@ collect_metas(FoldSource, Bucket, Schema, AST, Columns, Cache, ReturnPositions) 
     case AST of
         {all_docs} ->
             all_doc_metas(Ctx0);
+        _ when Ranked ->
+            ranked_term_metas(Ctx0, query_terms(AST, Columns));
         _ ->
             term_metas(Ctx0, AST, query_terms(AST, Columns))
+    end.
+
+%% Ranked queries need exact per-term document frequencies and term
+%% frequencies for every matching document, so the driver-term
+%% optimisation (loading non-driver terms only for driver candidates)
+%% does not apply: every query term is loaded in full, with positions,
+%% and metas are built for every document carrying a live posting.
+ranked_term_metas(_Ctx0, []) ->
+    #{};
+ranked_term_metas(Ctx0, Terms) ->
+    {Ctx1, RawAll} =
+        lists:foldl(
+            fun({Col, Token, Prefix}, {CtxA, RawA}) ->
+                load_term(CtxA, Col, Token, Prefix, all, true, RawA)
+            end,
+            {Ctx0, #{}},
+            lists:usort(Terms)
+        ),
+    case maps:size(RawAll) of
+        0 ->
+            #{};
+        _ ->
+            {Ctx2, Markers} = load_markers(Ctx1, maps:keys(RawAll)),
+            build_metas(RawAll, Markers, maps:get(ref, Ctx2))
     end.
 
 all_doc_metas(#{fold := FoldSource, bucket := Bucket, ref := Ref}) ->
@@ -1771,6 +1810,169 @@ evaluate_payload_candidates(Index, AST, Opts, Metas) ->
         throw:{fts_error, Reason} -> {error, Reason}
     end.
 
+%% ----------------------------------------------------------------------------
+%% BM25 ranking, matching SQLite FTS5's bm25() auxiliary function (the
+%% reference the differential suite checks against): k1 = 1.2, b = 0.75,
+%% idf = ln((N - n + 0.5) / (n + 0.5)) clamped to a small positive epsilon,
+%% score = sum over query phrases of idf * (tf * (k1+1)) / (tf + k1 * (1 -
+%% b + b * dl/avgdl)). tf is the phrase instance count in the document
+%% (respecting the phrase's column constraint), n the number of live
+%% documents matching the phrase, dl the document token count from its
+%% marker, N/avgdl the live corpus stats. The hit's rank is the negative
+%% score (FTS5's sign convention: ORDER BY rank ascending = best first).
+%% ----------------------------------------------------------------------------
+
+evaluate_ranked_candidates(Index, EvalAST, ScoreAST, Opts, Metas, {DocCount, TotalLen}) ->
+    Leaves = scoring_phrases(ScoreAST),
+    MetaList =
+        [
+            Meta
+         || {_Key, #{version := ?VERSION, index := MetaIndex} = Meta} <-
+                maps:to_list(Metas),
+            MetaIndex =:= Index
+        ],
+    Np = np_map(Leaves, MetaList),
+    AvgDl =
+        case DocCount of
+            0 -> 0.0;
+            _ -> TotalLen / DocCount
+        end,
+    try
+        Hits =
+            lists:foldl(
+                fun(Meta, Acc) ->
+                    case eval(EvalAST, Meta) of
+                        {true, Positions} ->
+                            Score = bm25_score(Meta, Leaves, Np, DocCount, AvgDl),
+                            case public_hit(Meta, Positions, Opts) of
+                                {ok, Hit} ->
+                                    [Hit#{rank => -Score, score => Score} | Acc];
+                                {error, Reason} ->
+                                    throw({fts_error, Reason})
+                            end;
+                        false ->
+                            Acc
+                    end
+                end,
+                [],
+                MetaList
+            ),
+        Sorted =
+            lists:sort(
+                fun(A, B) ->
+                    {maps:get(rank, A), maps:get(key, A)} =<
+                        {maps:get(rank, B), maps:get(key, B)}
+                end,
+                Hits
+            ),
+        {ok, hit_list_result(Sorted, Opts)}
+    catch
+        throw:{fts_error, Reason} -> {error, Reason}
+    end.
+
+%% The scoring phrases of a query: term and phrase leaves in match
+%% position — both AND/OR branches, NEAR members individually (FTS5
+%% scores each phrase of a NEAR group), and only the LEFT side of NOT.
+%% Duplicates are preserved: a term written twice in the query scores
+%% twice, as in FTS5.
+scoring_phrases({term, _Token, _Prefix, _Cols} = Leaf) -> [Leaf];
+scoring_phrases({phrase, _Specs, _Cols} = Leaf) -> [Leaf];
+scoring_phrases({near, Items, _Distance, _Cols}) ->
+    lists:append([scoring_phrases(Item) || Item <- Items]);
+scoring_phrases({anchor, AST}) -> scoring_phrases(AST);
+scoring_phrases({'and', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
+scoring_phrases({'or', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
+scoring_phrases({'not', A, _B}) -> scoring_phrases(A);
+scoring_phrases(_Other) -> [].
+
+leaf_tf(Meta, {term, Token, Prefix, Cols}) ->
+    length(term_positions(Meta, Token, Prefix, Cols));
+leaf_tf(Meta, {phrase, Specs, Cols}) ->
+    length(phrase_match_positions(Meta, Specs, Cols)).
+
+np_map(Leaves, MetaList) ->
+    lists:foldl(
+        fun(Leaf, Acc) ->
+            case maps:is_key(Leaf, Acc) of
+                true ->
+                    Acc;
+                false ->
+                    N = length([ok || Meta <- MetaList, leaf_tf(Meta, Leaf) > 0]),
+                    Acc#{Leaf => N}
+            end
+        end,
+        #{},
+        Leaves
+    ).
+
+bm25_score(Meta, Leaves, Np, DocCount, AvgDl) ->
+    K1 = 1.2,
+    B = 0.75,
+    Dl = maps:get(doc_length, Meta, 0),
+    lists:foldl(
+        fun(Leaf, Acc) ->
+            Tf = leaf_tf(Meta, Leaf),
+            case Tf > 0 of
+                false ->
+                    Acc;
+                true ->
+                    NHit = maps:get(Leaf, Np),
+                    Idf0 = math:log((DocCount - NHit + 0.5) / (NHit + 0.5)),
+                    Idf =
+                        case Idf0 > 0.0 of
+                            true -> Idf0;
+                            false -> 1.0e-6
+                        end,
+                    LenRatio =
+                        case AvgDl > 0.0 of
+                            true -> Dl / AvgDl;
+                            false -> 1.0
+                        end,
+                    Acc +
+                        Idf * (Tf * (K1 + 1)) /
+                            (Tf + K1 * (1 - B + B * LenRatio))
+            end
+        end,
+        0.0,
+        Leaves
+    ).
+
+%% Live corpus stats (document count and total token count) from the doc
+%% markers, cached per write sequence alongside the page directories: the
+%% stats are immutable per sequence, so the cache needs no invalidation.
+corpus_stats(FoldSource, Bucket, Schema, Cache) ->
+    Ref = index_ref(Schema),
+    case Cache of
+        {Ets, Seq} ->
+            StatsKey = {stats, Bucket, Ref, Seq},
+            case ets:lookup(Ets, StatsKey) of
+                [{_K, Stats}] ->
+                    Stats;
+                [] ->
+                    Stats = compute_corpus_stats(FoldSource, Bucket, Ref),
+                    ets:insert(Ets, {StatsKey, Stats}),
+                    Stats
+            end;
+        undefined ->
+            compute_corpus_stats(FoldSource, Bucket, Ref)
+    end.
+
+compute_corpus_stats(FoldSource, Bucket, Ref) ->
+    Fold =
+        fun(_B, {_Term, _Key, Payload}, {N, L} = Acc) ->
+            case decode_marker(Payload) of
+                {ok, _BatchSeq, DocLength} -> {N + 1, L + DocLength};
+                error -> Acc
+            end
+        end,
+    index_fold(
+        FoldSource,
+        {Bucket, null},
+        {Fold, {0, 0}},
+        {doc_field(Ref), doc, doc},
+        {payload, undefined}
+    ).
+
 query_terms({empty}, _Columns) ->
     [];
 query_terms({all_docs}, _Columns) ->
@@ -2326,6 +2528,8 @@ validate_search_option_list([{separators, Value} | Rest]) ->
 validate_search_option_list([{stopwords, Words} | Rest]) when is_list(Words) ->
     validate_search_option_list(Rest);
 validate_search_option_list([{rank, none} | Rest]) ->
+    validate_search_option_list(Rest);
+validate_search_option_list([{rank, bm25} | Rest]) ->
     validate_search_option_list(Rest);
 validate_search_option_list([{rank, _Other} | _Rest]) ->
     {error, invalid_rank_option};
