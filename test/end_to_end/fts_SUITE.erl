@@ -6,6 +6,7 @@
 -export([
     single_object_contract/1,
     incremental_batch_list_cache/1,
+    stats_staleness_window/1,
     batchput_contract/1,
     multi_token_phrase_contract/1,
     index_update_contract/1,
@@ -38,6 +39,7 @@ all() ->
     [
         single_object_contract,
         incremental_batch_list_cache,
+        stats_staleness_window,
         batchput_contract,
         multi_token_phrase_contract,
         index_update_contract,
@@ -2890,6 +2892,47 @@ incremental_batch_list_cache(_Config) ->
     [<<"k2">>] = keys(search(Bookie2, Bucket, Index, <<"alpha">>, Opts)),
     [<<"k1">>] = keys(search(Bookie2, Bucket, Index, <<"gamma">>, Opts)),
     ok = leveled_bookie:book_close(Bookie2),
+    testutil:reset_filestructure().
+
+%% stats_staleness lets a ranked query reuse corpus stats computed up to
+%% W write sequences earlier instead of refolding the doc markers per
+%% write (1.5s/write at the 5GB gate-run scale). Default 0 stays exact.
+stats_staleness_window(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_stats_staleness"),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Bucket = <<"batch">>,
+    Index = <<"main">>,
+    Exact = #{columns => [body], rank => bm25, limit => 10},
+    Windowed = Exact#{stats_staleness => 100},
+    ok = fts_put(Bookie, Bucket, <<"k1">>, <<"o1">>, Index, #{body => <<"alpha beta">>}, #{}),
+    ok = fts_put(Bookie, Bucket, <<"k2">>, <<"o2">>, Index, #{body => <<"beta gamma">>}, #{}),
+    %% Seed the stats entry with an exact ranked query.
+    [Hit0] = search(Bookie, Bucket, Index, <<"alpha">>, Exact),
+    RankBefore = maps:get(rank, Hit0),
+    %% A much longer document moves N and avgdl.
+    LongBody = list_to_binary(lists:duplicate(40, "filler ") ++ "omega"),
+    ok = fts_put(Bookie, Bucket, <<"k3">>, <<"o3">>, Index, #{body => LongBody}, #{}),
+    %% Windowed query reuses the pre-write stats: identical score.
+    [HitW] = search(Bookie, Bucket, Index, <<"alpha">>, Windowed),
+    RankBefore = maps:get(rank, HitW),
+    %% Exact query refolds: the score moves with the corpus.
+    [HitE] = search(Bookie, Bucket, Index, <<"alpha">>, Exact),
+    true = maps:get(rank, HitE) =/= RankBefore,
+    %% And the refold re-stamps the entry, so the window is now satisfied
+    %% at the current sequence: a fresh windowed query agrees with exact.
+    %% (A different limit sidesteps the per-sequence result cache, which
+    %% correctly still holds the stale-stats result for the earlier opts.)
+    [HitW2] = search(Bookie, Bucket, Index, <<"alpha">>, Windowed#{limit => 9}),
+    true = maps:get(rank, HitW2) =:= maps:get(rank, HitE),
+    {error, invalid_stats_staleness_option} =
+        (fun() ->
+            {async, Runner} =
+                leveled_bookie:book_ftssearch(
+                    Bookie, Bucket, Index, <<"alpha">>, Exact#{stats_staleness => -1}
+                ),
+            Runner()
+        end)(),
+    ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
 seqs_cache_entry(Bucket) ->

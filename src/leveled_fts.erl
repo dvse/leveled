@@ -704,7 +704,14 @@ search_evaluate(FoldSource, Bucket, Schema, EvalAST, ScoreAST, Columns, Cache, O
             false ->
                 evaluate_payload_candidates(IndexRef, EvalAST, Opts, Metas);
             true ->
-                Stats = corpus_stats(FoldSource, Bucket, Schema, Cache),
+                Stats =
+                    corpus_stats(
+                        FoldSource,
+                        Bucket,
+                        Schema,
+                        Cache,
+                        maps:get(stats_staleness, Opts, 0)
+                    ),
                 evaluate_ranked_candidates(
                     IndexRef, EvalAST, ScoreAST, Opts, Metas, Stats
                 )
@@ -2028,19 +2035,27 @@ bm25_score(Meta, Leaves, Np, DocCount, AvgDl) ->
     ).
 
 %% Live corpus stats (document count and total token count) from the doc
-%% markers, cached per write sequence alongside the page directories: the
-%% stats are immutable per sequence, so the cache needs no invalidation.
-corpus_stats(FoldSource, Bucket, Schema, Cache) ->
+%% markers. Exact incremental maintenance is impossible under blind
+%% writes (an update or delete cannot adjust N/TotalLen without the
+%% superseded marker, which only an LSM fold resolves), so the fold is
+%% the exact mechanism. The entry lives under a stable key stamped with
+%% the write sequence it was computed at; a ranked query may accept a
+%% stamp up to stats_staleness sequences behind its own (default 0 =
+%% exact per sequence). With a window, ranked queries on write-heavy
+%% stores skip the O(N) refold between nearby writes at a bounded,
+%% documented score staleness — BM25 corpus stats move slowly, exact
+%% scores return as soon as the window is exceeded or writes pause.
+corpus_stats(FoldSource, Bucket, Schema, Cache, Staleness) ->
     Ref = index_ref(Schema),
     case Cache of
         {Ets, Seq} ->
-            StatsKey = {stats, Bucket, Ref, Seq},
+            StatsKey = {stats, Bucket, Ref},
             case ets:lookup(Ets, StatsKey) of
-                [{_K, Stats}] ->
+                [{_K, {Stamp, Stats}}] when Stamp =< Seq, Seq - Stamp =< Staleness ->
                     Stats;
-                [] ->
+                _MissingOrOutsideWindow ->
                     Stats = compute_corpus_stats(FoldSource, Bucket, Ref),
-                    ets:insert(Ets, {StatsKey, Stats}),
+                    ets:insert(Ets, {StatsKey, {Seq, Stats}}),
                     Stats
             end;
         undefined ->
@@ -2623,6 +2638,10 @@ validate_search_option_list([{rank, bm25} | Rest]) ->
     validate_search_option_list(Rest);
 validate_search_option_list([{rank, _Other} | _Rest]) ->
     {error, invalid_rank_option};
+validate_search_option_list([{stats_staleness, W} | Rest]) when is_integer(W), W >= 0 ->
+    validate_search_option_list(Rest);
+validate_search_option_list([{stats_staleness, _Other} | _Rest]) ->
+    {error, invalid_stats_staleness_option};
 validate_search_option_list([{limit, Limit} | Rest]) when is_integer(Limit), Limit >= 0 ->
     validate_search_option_list(Rest);
 validate_search_option_list([{offset, Offset} | Rest]) when is_integer(Offset), Offset >= 0 ->
