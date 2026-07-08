@@ -633,7 +633,6 @@ cache_result(Ets, ResKey, Result) ->
 search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
     case find_schema(Bucket, Index, Indexes) of
         {ok, Schema} ->
-            IndexRef = index_ref(Schema),
             case normalise_search_options(Opts0, Schema) of
                 {ok, Opts} ->
                     case parse(Query, Opts) of
@@ -641,23 +640,18 @@ search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
                             Columns = option_columns(Opts, Schema),
                             case validate_ast_columns(AST0, Columns) of
                                 ok ->
-                                    AST = restrict_ast_columns(AST0, Columns),
-                                    try
-                                        Metas =
-                                            collect_metas(
-                                                FoldSource,
-                                                Bucket,
-                                                Schema,
-                                                AST,
-                                                Columns,
-                                                Cache,
-                                                maps:get(return_positions, Opts, false)
-                                            ),
-                                        evaluate_payload_candidates(
-                                            IndexRef, AST, Opts, Metas
+                                    AST1 = restrict_ast_columns(AST0, Columns),
+                                    case
+                                        apply_search_filter(
+                                            AST1, maps:get(filter, Opts, []), Schema
                                         )
-                                    catch
-                                        throw:{fts_error, Reason} ->
+                                    of
+                                        {ok, AST} ->
+                                            search_evaluate(
+                                                FoldSource, Bucket, Schema, AST, Columns,
+                                                Cache, Opts
+                                            );
+                                        {error, Reason} ->
                                             {error, Reason}
                                     end;
                                 {error, Reason} ->
@@ -675,6 +669,95 @@ search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
             {error, Reason}
     end.
 
+search_evaluate(FoldSource, Bucket, Schema, AST, Columns, Cache, Opts) ->
+    IndexRef = index_ref(Schema),
+    try
+        Metas =
+            collect_metas(
+                FoldSource,
+                Bucket,
+                Schema,
+                AST,
+                Columns,
+                Cache,
+                maps:get(return_positions, Opts, false)
+            ),
+        evaluate_payload_candidates(IndexRef, AST, Opts, Metas)
+    catch
+        throw:{fts_error, Reason} ->
+            {error, Reason}
+    end.
+
+%% A search-time filter is a list of {Column, Values} requirements ANDed
+%% into the query plan after user-column restriction: a document matches a
+%% requirement when Column posts any of Values, and must match every
+%% requirement. Filter terms are composed directly into the AST (never
+%% through the query parser), so a caller can restrict the user query to
+%% content columns via the columns option while filtering on columns the
+%% user cannot reference. Because filter terms are ordinary AND legs, a
+%% selective filter becomes the rarest-leg driver term and the limit
+%% window applies after filtering. Values match as single tokens: a
+%% verbatim column matches the exact field value; a text column requires
+%% the value to normalise to exactly one token.
+apply_search_filter(AST, [], _Schema) ->
+    {ok, AST};
+apply_search_filter(AST, Filter, Schema) ->
+    case build_filter_ast(Filter, Schema) of
+        {ok, FilterAST} -> {ok, {'and', AST, FilterAST}};
+        {error, Reason} -> {error, Reason}
+    end.
+
+build_filter_ast([{Col0, Values} | Rest], Schema) ->
+    Column = normalise_column(Col0),
+    case lists:member(Column, maps:get(columns, Schema)) of
+        false ->
+            {error, {invalid_fts_filter, unknown_column, Column}};
+        true ->
+            case filter_value_tokens(Column, Values, Schema, []) of
+                {ok, Tokens} ->
+                    ColAST = filter_or_terms(Tokens, Column),
+                    case Rest of
+                        [] ->
+                            {ok, ColAST};
+                        _ ->
+                            case build_filter_ast(Rest, Schema) of
+                                {ok, RestAST} -> {ok, {'and', ColAST, RestAST}};
+                                {error, _Reason} = Error -> Error
+                            end
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end
+    end.
+
+filter_value_tokens(_Column, [], _Schema, Acc) ->
+    {ok, lists:reverse(Acc)};
+filter_value_tokens(Column, [Value | Rest], Schema, Acc) ->
+    case filter_value_token(Column, Value, Schema) of
+        {ok, Token} -> filter_value_tokens(Column, Rest, Schema, [Token | Acc]);
+        {error, _Reason} = Error -> Error
+    end.
+
+filter_value_token(Column, Value, Schema) when is_binary(Value) ->
+    case maps:get(Column, maps:get(column_modes, Schema, #{}), text) of
+        verbatim when Value =/= <<>>, byte_size(Value) =< 65535 ->
+            {ok, Value};
+        verbatim ->
+            {error, {invalid_fts_filter, invalid_value, Column}};
+        text ->
+            case tokenize(Value, maps:get(options, Schema)) of
+                [{Token, _Pos}] -> {ok, Token};
+                _ZeroOrMany -> {error, {invalid_fts_filter, not_single_token, Column}}
+            end
+    end;
+filter_value_token(Column, _Value, _Schema) ->
+    {error, {invalid_fts_filter, invalid_value, Column}}.
+
+filter_or_terms([Token], Column) ->
+    {term, Token, false, [Column]};
+filter_or_terms([Token | Rest], Column) ->
+    {'or', {term, Token, false, [Column]}, filter_or_terms(Rest, Column)}.
+
 normalise_index_definition(#{bucket_prefix := Prefix} = Def) when
     is_binary(Prefix), Prefix =/= <<>>, not is_map_key(bucket, Def)
 ->
@@ -691,7 +774,7 @@ normalise_index_definition(#{bucket := Bucket, index := Index0, columns := Colum
     Opts = normalise_options(Def),
     case normalise_column_specs(Columns0) of
         {ok, ColumnSpecs} ->
-            Columns = [Column || {Column, _Path} <- ColumnSpecs],
+            Columns = [Column || {Column, _Path, _Mode} <- ColumnSpecs],
             Index = normalise_index(Index0),
             {ok, #{
                 bucket => Bucket,
@@ -699,6 +782,8 @@ normalise_index_definition(#{bucket := Bucket, index := Index0, columns := Colum
                 index => Index,
                 columns => Columns,
                 column_specs => ColumnSpecs,
+                column_modes =>
+                    maps:from_list([{C, M} || {C, _P, M} <- ColumnSpecs]),
                 prefixes => maps:get(prefixes, Opts, []),
                 tokenizer => tokenizer_description(Opts),
                 options => Opts
@@ -722,16 +807,30 @@ normalise_column_specs(Columns) when is_list(Columns), Columns =/= [] ->
 normalise_column_specs(_Columns) ->
     {error, invalid_fts_columns}.
 
-normalise_column_spec(#{name := Name, path := Path}) when is_list(Path) ->
-    {normalise_column(Name), Path};
+%% A column spec may carry a mode: text (default -- tokenised through the
+%% schema tokenizer) or verbatim (the field value posts as one exact token
+%% at position 0; no tokenisation, case folding, or diacritic removal).
+%% Verbatim columns exist for filter facts such as tenant ids, where
+%% partial or case-folded matches would be wrong. Changing a column's mode
+%% changes what is posted at write time, so it requires a reindex, exactly
+%% like any other schema change.
+normalise_column_spec(#{name := Name, path := Path} = Spec) when is_list(Path) ->
+    {normalise_column(Name), Path, normalise_column_mode(maps:get(mode, Spec, text))};
+normalise_column_spec({Name, Path, Mode}) when is_list(Path) ->
+    {normalise_column(Name), Path, normalise_column_mode(Mode)};
 normalise_column_spec({Name, Path}) when is_list(Path) ->
-    {normalise_column(Name), Path};
+    {normalise_column(Name), Path, text};
 normalise_column_spec(Name) ->
     Column = normalise_column(Name),
-    {Column, [Name]}.
+    {Column, [Name], text}.
+
+normalise_column_mode(text) -> text;
+normalise_column_mode(verbatim) -> verbatim;
+normalise_column_mode(<<"text">>) -> text;
+normalise_column_mode(<<"verbatim">>) -> verbatim.
 
 duplicate_columns(Specs) ->
-    Columns = [Column || {Column, _Path} <- Specs],
+    Columns = [Column || {Column, _Path, _Mode} <- Specs],
     length(Columns) =/= length(lists:usort(Columns)).
 
 find_schema(Bucket, Index, Indexes) ->
@@ -783,8 +882,8 @@ bucket_matches(_SchemaBucket, _Bucket) ->
 
 extract_fields(Object, ColumnSpecs) ->
     [
-        {Column, normalise_text(extract_path(Object, Path))}
-     || {Column, Path} <- ColumnSpecs
+        {Column, Mode, normalise_text(extract_path(Object, Path))}
+     || {Column, Path, Mode} <- ColumnSpecs
     ].
 
 %% Stores that journal externally-encoded terms (term_to_binary bodies)
@@ -883,19 +982,30 @@ validate_schema_tokenizer(#{tokenizer := Existing}, Opts) ->
     end.
 
 build_column_terms(Fields, Opts) ->
-    %% Tokens beyond the page format's 16-bit length frame are dropped after
-    %% position assignment: queries are capped at ?MAX_QUERY_BYTES, so no
-    %% exact query can ever name such a token, and surviving tokens keep
-    %% their positions so phrase and NEAR distances are unaffected.
     [
-        {Column,
-            group_positions([
-                TP
-             || {Token, _Pos} = TP <- tokenize(Text, Opts),
-                byte_size(Token) =< 65535
-            ])}
-     || {Column, Text} <- Fields
+        {Column, column_token_positions(Mode, Text, Opts)}
+     || {Column, Mode, Text} <- Fields
     ].
+
+%% Verbatim columns post the exact field value as one token at position 0;
+%% an empty or over-frame value posts nothing. Text columns tokenise
+%% through the schema tokenizer; tokens beyond the page format's 16-bit
+%% length frame are dropped after position assignment: queries are capped
+%% at ?MAX_QUERY_BYTES, so no exact query can ever name such a token, and
+%% surviving tokens keep their positions so phrase and NEAR distances are
+%% unaffected.
+column_token_positions(verbatim, <<>>, _Opts) ->
+    [];
+column_token_positions(verbatim, Token, _Opts) when byte_size(Token) =< 65535 ->
+    [{Token, [0]}];
+column_token_positions(verbatim, _Oversized, _Opts) ->
+    [];
+column_token_positions(text, Text, Opts) ->
+    group_positions([
+        TP
+     || {Token, _Pos} = TP <- tokenize(Text, Opts),
+        byte_size(Token) =< 65535
+    ]).
 
 group_positions(Tokens) ->
     group_positions(Tokens, #{}).
@@ -1045,7 +1155,14 @@ driver_terms({near, Items, _Distance, _Cols}, Cost) ->
 driver_terms({anchor, AST}, Cost) ->
     driver_terms(AST, Cost);
 driver_terms({'and', A, B}, Cost) ->
-    cheapest_leg([driver_terms(A, Cost), driver_terms(B, Cost)], Cost);
+    %% A leg with no driver terms (e.g. an all_docs leg under a search
+    %% filter) cannot drive candidate loading; every match of the
+    %% conjunction still satisfies the other leg's drivers, so drive from
+    %% the non-empty legs only.
+    cheapest_leg(
+        [Leg || Leg <- [driver_terms(A, Cost), driver_terms(B, Cost)], Leg =/= []],
+        Cost
+    );
 driver_terms({'or', A, B}, Cost) ->
     driver_terms(A, Cost) ++ driver_terms(B, Cost);
 driver_terms({'not', A, _B}, Cost) ->
@@ -2220,6 +2337,11 @@ validate_search_option_list([{return_positions, Bool} | Rest]) when is_boolean(B
     validate_search_option_list(Rest);
 validate_search_option_list([{result, summary} | Rest]) ->
     validate_search_option_list(Rest);
+validate_search_option_list([{filter, Filter} | Rest]) ->
+    case valid_filter_option(Filter) of
+        true -> validate_search_option_list(Rest);
+        false -> error
+    end;
 validate_search_option_list([{_Other, _Value} | _Rest]) ->
     error.
 
@@ -2255,6 +2377,21 @@ normalise_text(T) ->
 valid_columns(Columns) when is_list(Columns), Columns =/= [] ->
     true;
 valid_columns(_Columns) ->
+    false.
+
+valid_filter_option([]) ->
+    true;
+valid_filter_option(Filter) when is_list(Filter) ->
+    lists:all(
+        fun
+            ({_Col, Values}) when is_list(Values), Values =/= [] ->
+                lists:all(fun is_binary/1, Values);
+            (_Other) ->
+                false
+        end,
+        Filter
+    );
+valid_filter_option(_Filter) ->
     false.
 
 valid_prefixes(Prefixes) when is_list(Prefixes) ->

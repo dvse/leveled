@@ -28,7 +28,8 @@
     recalc_reload_contract/1,
     sqlite_supported_ast_differential_contract/1,
     unicode61_supported_parity_corpus_contract/1,
-    parse_errors/1
+    parse_errors/1,
+    filter_and_verbatim_contract/1
 ]).
 
 all() ->
@@ -57,7 +58,8 @@ all() ->
         recalc_reload_contract,
         sqlite_supported_ast_differential_contract,
         unicode61_supported_parity_corpus_contract,
-        parse_errors
+        parse_errors,
+        filter_and_verbatim_contract
     ].
 
 init_per_suite(Config) ->
@@ -3284,6 +3286,130 @@ tenant_bucket_prefix_contract(_Config) ->
     ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
+filter_and_verbatim_contract(_Config) ->
+    RootPath = testutil:reset_filestructure(),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    B = <<"filter">>,
+    I = <<"main">>,
+    Put =
+        fun(Key, Tenant, Root, Body, Title) ->
+            ok =
+                fts_put(Bookie, B, Key, <<"obj-", Key/binary>>, I, #{
+                    body => Body, title => Title, tenant => Tenant, root => Root
+                }, #{})
+        end,
+    Put(<<"a1">>, <<"acme-corp">>, <<"r1">>, <<"shared quick target">>, <<"Alpha">>),
+    Put(<<"a2">>, <<"acme-corp">>, <<"r2">>, <<"shared quick target">>, <<"Aleph">>),
+    Put(<<"b1">>, <<"beta-inc">>, <<"r1">>, <<"shared quick target">>, <<"Bravo">>),
+    Put(<<"b2">>, <<"beta-inc">>, <<"r1">>, <<"shared quick target beta">>, <<"Brome">>),
+    Put(<<"c0">>, <<"acme">>, <<"r1">>, <<"shared quick target">>, <<"Charlie">>),
+
+    %% Unfiltered baseline.
+    [<<"a1">>, <<"a2">>, <<"b1">>, <<"b2">>, <<"c0">>] =
+        keys(search(Bookie, B, I, <<"quick">>, #{})),
+
+    %% Verbatim single-tenant filter: exact match only -- neither the
+    %% <<"acme">> tenant nor the tokenized halves of "acme-corp" match.
+    [<<"a1">>, <<"a2">>] =
+        keys(
+            search(Bookie, B, I, <<"quick">>, #{filter => [{tenant, [<<"acme-corp">>]}]})
+        ),
+    [<<"c0">>] =
+        keys(search(Bookie, B, I, <<"quick">>, #{filter => [{tenant, [<<"acme">>]}]})),
+    [] = keys(search(Bookie, B, I, <<"quick">>, #{filter => [{tenant, [<<"corp">>]}]})),
+
+    %% Multi-value OR within a column; AND across columns.
+    [<<"a1">>, <<"a2">>, <<"b1">>, <<"b2">>] =
+        keys(
+            search(Bookie, B, I, <<"quick">>, #{
+                filter => [{tenant, [<<"acme-corp">>, <<"beta-inc">>]}]
+            })
+        ),
+    [<<"a1">>] =
+        keys(
+            search(Bookie, B, I, <<"quick">>, #{
+                filter => [{tenant, [<<"acme-corp">>]}, {root, [<<"r1">>]}]
+            })
+        ),
+
+    %% Pre-limit semantics: the beta docs sort after both acme docs, so an
+    %% unfiltered limit-2 window can never contain them; a filtered
+    %% limit-2 window is entirely beta.
+    [<<"a1">>, <<"a2">>] = keys(search(Bookie, B, I, <<"quick">>, #{limit => 2})),
+    [<<"b1">>, <<"b2">>] =
+        keys(
+            search(Bookie, B, I, <<"quick">>, #{
+                limit => 2, filter => [{tenant, [<<"beta-inc">>]}]
+            })
+        ),
+
+    %% Summary counts respect the filter.
+    {async, SummaryRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, <<"quick">>, #{
+            columns => [body],
+            result => summary,
+            filter => [{tenant, [<<"beta-inc">>]}]
+        }),
+    {ok, #{total_count := 2}} = SummaryRunner(),
+
+    %% Filter-only browsing: all_docs AND filter.
+    {async, AllDocsRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, all_docs, #{
+            columns => [body], filter => [{tenant, [<<"beta-inc">>]}]
+        }),
+    {ok, AllDocsHits} = AllDocsRunner(),
+    [<<"b1">>, <<"b2">>] = keys(AllDocsHits),
+
+    %% The user query cannot address the filter column when the caller
+    %% restricts searchable columns (the production posture). A hyphenated
+    %% value would fail at parse (hyphen is the NOT operator); a plain
+    %% token reaches column validation and is rejected there.
+    {async, SpoofRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, <<"tenant:acme">>, #{
+            columns => [body]
+        }),
+    {error, {fts_parse, unknown_column, <<"tenant">>}} = SpoofRunner(),
+
+    %% Text columns accept single-token filter values (tokenised, so case
+    %% folds) and reject multi-token values.
+    [<<"a1">>] =
+        keys(search(Bookie, B, I, <<"quick">>, #{filter => [{title, [<<"Alpha">>]}]})),
+    {async, MultiTokRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, <<"quick">>, #{
+            columns => [body], filter => [{title, [<<"two words">>]}]
+        }),
+    {error, {invalid_fts_filter, not_single_token, <<"title">>}} = MultiTokRunner(),
+
+    %% Unknown filter column and malformed filter options.
+    {async, UnknownColRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, <<"quick">>, #{
+            columns => [body], filter => [{nope, [<<"x">>]}]
+        }),
+    {error, {invalid_fts_filter, unknown_column, <<"nope">>}} = UnknownColRunner(),
+    {async, EmptyValuesRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, <<"quick">>, #{
+            columns => [body], filter => [{tenant, []}]
+        }),
+    {error, invalid_fts_options} = EmptyValuesRunner(),
+    {async, NonBinaryRunner} =
+        leveled_bookie:book_ftssearch(Bookie, B, I, <<"quick">>, #{
+            columns => [body], filter => [{tenant, [tenant_atom]}]
+        }),
+    {error, invalid_fts_options} = NonBinaryRunner(),
+
+    %% Updates supersede verbatim postings like any other posting: after
+    %% b2 moves tenants, the beta filter no longer sees it.
+    Put(<<"b2">>, <<"acme-corp">>, <<"r1">>, <<"shared quick target beta">>, <<"Brome">>),
+    [<<"b1">>] =
+        keys(search(Bookie, B, I, <<"quick">>, #{filter => [{tenant, [<<"beta-inc">>]}]})),
+    [<<"a1">>, <<"a2">>, <<"b2">>] =
+        keys(
+            search(Bookie, B, I, <<"quick">>, #{filter => [{tenant, [<<"acme-corp">>]}]})
+        ),
+
+    ok = leveled_bookie:book_close(Bookie),
+    testutil:reset_filestructure().
+
 start_opts(RootPath) ->
     [
         {root_path, RootPath},
@@ -3355,6 +3481,19 @@ test_fts_indexes() ->
                 columns => [
                     #{name => body, path => [attributes, body]},
                     #{name => title, path => [attributes, title]}
+                ],
+                prefixes => [3],
+                tokenizer => unicode61
+            },
+            #{
+                bucket => <<"filter">>,
+                tag => ?STD_TAG,
+                index => <<"main">>,
+                columns => [
+                    #{name => body, path => [2, body]},
+                    #{name => title, path => [2, title]},
+                    #{name => tenant, path => [2, tenant], mode => verbatim},
+                    #{name => root, path => [2, root], mode => verbatim}
                 ],
                 prefixes => [3],
                 tokenizer => unicode61
