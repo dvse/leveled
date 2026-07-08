@@ -56,7 +56,6 @@
     book_batchput/2,
     book_batchput/3,
     book_ftssearch/5,
-    book_multiget/4,
     book_casput/9,
     book_casbatchput/3,
     book_casbatchput/4,
@@ -621,21 +620,6 @@ book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
     {async, fun(() -> {ok, list(map())} | {error, term()})}.
 book_ftssearch(Pid, Bucket, Index, Query, Opts) ->
     leveled_fts:book_ftssearch(Pid, Bucket, Index, Query, Opts).
-
--spec book_multiget(
-    pid(), leveled_codec:key(), list(leveled_codec:key()), leveled_codec:tag()
-) ->
-    {async, fun(() -> list({leveled_codec:key(), {ok, any()} | not_found}))}.
-%% @doc
-%% Fetch many objects by key through ONE store snapshot: a single call to
-%% the Bookie constructs the runner; the runner (executing in the caller)
-%% resolves every key against the same point-in-time ledger + journal
-%% view, with book_get's liveness semantics per key (tombstones and
-%% expired TTLs are not_found). Results are returned in input key order,
-%% each as {Key, {ok, Object} | not_found}. Not supported for head_only
-%% stores.
-book_multiget(Pid, Bucket, Keys, Tag) when is_list(Keys), is_atom(Tag) ->
-    book_returnfolder(Pid, {object_multiget, Tag, Bucket, Keys}).
 
 -spec book_casput(
     pid(),
@@ -2627,23 +2611,8 @@ get_runner(State, {index_query, Constraint, FoldAccT, Range, TermHandling}) ->
     leveled_runner:index_query(
         SnapFun, {StartKey, EndKey, TermHandling}, FoldAccT
     );
-get_runner(State, {fts_query, Bucket, Index, Query, Opts0}) ->
-    %% include_docs upgrades the snapshot from a fold-only ledger snapshot
-    %% to a lookup-capable store snapshot, so the SAME snapshot serves the
-    %% postings fold and the per-hit object fetches: hits and documents
-    %% are mutually consistent by construction. The engine never sees the
-    %% option, so the result cache stores hits (keys/ranks) only and the
-    %% documents are fetched fresh on every call.
-    %% Doc fetches use the SAME fold-shaped ledger snapshot as the query
-    %% (point-in-time hit set and SQNs; UseL0Index=false fetches, so no
-    %% per-query L0 index build) with journal values read through the LIVE
-    %% inker — exactly book_get's split, avoiding a per-query inker clone.
-    %% Journal values are immutable per SQN; a value compacted away
-    %% between snapshot and fetch (a book_get-class race) drops the hit.
-    {IncludeDocs, Opts} = leveled_fts:split_include_docs(Opts0),
+get_runner(State, {fts_query, Bucket, Index, Query, Opts}) ->
     SnapFun = return_snapfun(State, ledger, no_lookup, false, false),
-    Inker = State#state.inker,
-    Tag = leveled_fts:index_tag(Bucket, Index, State#state.fts_indexes),
     FtsCache =
         case State#state.fts_dir_cache of
             undefined -> undefined;
@@ -2651,34 +2620,10 @@ get_runner(State, {fts_query, Bucket, Index, Query, Opts0}) ->
         end,
     {async, fun() ->
         case leveled_fts:cached_search(FtsCache, Bucket, Index, Query, Opts) of
-            {ok, CachedResult} when IncludeDocs ->
-                attach_fts_documents(CachedResult, SnapFun, Inker, Bucket, Tag);
             {ok, CachedResult} ->
                 CachedResult;
             miss ->
-                run_fts_query(
-                    SnapFun, Bucket, Index, Query, Opts, State, FtsCache,
-                    IncludeDocs, Inker, Tag
-                )
-        end
-    end};
-get_runner(State, {object_multiget, Tag, Bucket, Keys}) ->
-    %% Ledger snapshot for SQN pinning + live-inker journal reads: see the
-    %% fts_query runner note.
-    SnapFun = return_snapfun(State, ledger, no_lookup, false, true),
-    Inker = State#state.inker,
-    {async, fun() ->
-        {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
-        try
-            [
-                {Key,
-                    fetch_object_snapshot(
-                        LedgerSnapshot, Inker, Bucket, Key, Tag
-                    )}
-             || Key <- Keys
-            ]
-        after
-            AfterFun()
+                run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache)
         end
     end};
 get_runner(
@@ -3292,7 +3237,7 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
 %% superseded postings are filtered against the doc marker at query time. The
 %% batch sequence is seeded from the journal SQN at startup so it stays
 %% monotonic across restarts.
-run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache, IncludeDocs, Inker, Tag) ->
+run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
     {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
     IndexFold =
         fun(FoldBucketKey, FoldAccT, Range, TermHandling) ->
@@ -3311,89 +3256,17 @@ run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache, IncludeDocs,
             Folder()
         end,
     try
-        Result =
-            leveled_fts:search(
-                IndexFold,
-                Bucket,
-                Index,
-                Query,
-                Opts,
-                State#state.fts_indexes,
-                FtsCache
-            ),
-        case {IncludeDocs, Result} of
-            {true, {ok, Hits}} when is_list(Hits) ->
-                {ok,
-                    attach_documents(
-                        Hits, LedgerSnapshot, Inker, Bucket, Tag
-                    )};
-            _NoDocs ->
-                Result
-        end
+        leveled_fts:search(
+            IndexFold,
+            Bucket,
+            Index,
+            Query,
+            Opts,
+            State#state.fts_indexes,
+            FtsCache
+        )
     after
         AfterFun()
-    end.
-
-%% Enrich a cached hit list with documents through a fresh ledger snapshot
-%% (cache hits are keyed by the write sequence, so the current ledger view
-%% is the view the cached hits were computed against).
-attach_fts_documents({ok, Hits}, SnapFun, Inker, Bucket, Tag) when is_list(Hits) ->
-    {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
-    try
-        {ok, attach_documents(Hits, LedgerSnapshot, Inker, Bucket, Tag)}
-    after
-        AfterFun()
-    end;
-attach_fts_documents(Result, _SnapFun, _Inker, _Bucket, _Tag) ->
-    Result.
-
-%% A hit whose object is missing under the same snapshot can only mean
-%% the index and the store disagree (which liveness markers prevent) or a
-%% TTL expired between write and query — drop the hit rather than emit a
-%% document-less result.
-attach_documents(Hits, LedgerSnapshot, Inker, Bucket, Tag) ->
-    lists:filtermap(
-        fun(Hit) ->
-            case
-                fetch_object_snapshot(
-                    LedgerSnapshot, Inker, Bucket, maps:get(key, Hit), Tag
-                )
-            of
-                {ok, Object} -> {true, Hit#{document => Object}};
-                not_found -> false
-            end
-        end,
-        Hits
-    ).
-
-%% book_get's liveness semantics (tombstone and TTL handling, journal
-%% fetch by SQN): heads from an explicit ledger snapshot (index-less L0
-%% fetch — fold-shaped snapshots carry no L0 index), values through the
-%% live inker exactly as book_get reads them. The shared core of
-%% book_multiget and the fts include_docs enrichment.
-fetch_object_snapshot(LedgerSnapshot, Inker, Bucket, Key, Tag) ->
-    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
-    Hash = leveled_codec:segment_hash(LedgerKey),
-    case leveled_penciller:pcl_fetch(LedgerSnapshot, LedgerKey, Hash, false) of
-        not_present ->
-            not_found;
-        {_LedgerKey, Head} ->
-            {SQN, Status, _MH, _MD} =
-                leveled_codec:striphead_to_v1details(Head),
-            case Status of
-                tomb ->
-                    not_found;
-                {active, TS} ->
-                    case TS >= leveled_util:integer_now() of
-                        false ->
-                            not_found;
-                        true ->
-                            case fetch_value(Inker, {LedgerKey, SQN}) of
-                                not_present -> not_found;
-                                Object -> {ok, Object}
-                            end
-                    end
-            end
     end.
 
 %% Decoded page directories are immutable per batch sequence within a store

@@ -30,8 +30,7 @@
     unicode61_supported_parity_corpus_contract/1,
     parse_errors/1,
     filter_and_verbatim_contract/1,
-    bm25_rank_sqlite_differential_contract/1,
-    multiget_and_include_docs_contract/1
+    bm25_rank_sqlite_differential_contract/1
 ]).
 
 all() ->
@@ -62,8 +61,7 @@ all() ->
         unicode61_supported_parity_corpus_contract,
         parse_errors,
         filter_and_verbatim_contract,
-        bm25_rank_sqlite_differential_contract,
-        multiget_and_include_docs_contract
+        bm25_rank_sqlite_differential_contract
     ].
 
 init_per_suite(Config) ->
@@ -3298,76 +3296,6 @@ tenant_bucket_prefix_contract(_Config) ->
             ),
             test_fts_index(<<"tenant-a">>, <<"main">>, #{})
         ]),
-    ok = leveled_bookie:book_close(Bookie),
-    testutil:reset_filestructure().
-
-multiget_and_include_docs_contract(_Config) ->
-    RootPath = testutil:reset_filestructure("fts_multiget_include_docs"),
-    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
-    B = <<"docs">>,
-    I = <<"main">>,
-    ok =
-        fts_put(Bookie, B, <<"1">>, <<"obj1">>, I, #{
-            body => <<"shared target one">>, title => <<"Alpha">>
-        }, #{}),
-    ok =
-        fts_put(Bookie, B, <<"2">>, <<"obj2">>, I, #{
-            body => <<"shared target target two">>, title => <<"Beta">>
-        }, #{}),
-    ok =
-        fts_put(Bookie, B, <<"3">>, <<"obj3">>, I, #{
-            body => <<"unrelated words">>, title => <<"Gamma">>
-        }, #{}),
-
-    %% multiget: input order, explicit not_found, book_get value parity.
-    {async, MultiRunner} =
-        leveled_bookie:book_multiget(Bookie, B, [<<"2">>, <<"missing">>, <<"1">>], ?STD_TAG),
-    [
-        {<<"2">>, {ok, {<<"obj2">>, _F2}}},
-        {<<"missing">>, not_found},
-        {<<"1">>, {ok, {<<"obj1">>, _F1}} = GetShaped}
-    ] = MultiRunner(),
-    GetShaped = leveled_bookie:book_get(Bookie, B, <<"1">>, ?STD_TAG),
-
-    %% multiget reflects updates and deletes.
-    ok =
-        fts_put(Bookie, B, <<"1">>, <<"obj1-v2">>, I, #{
-            body => <<"shared target one">>, title => <<"Alpha">>
-        }, #{}),
-    ok = fts_delete(Bookie, B, <<"3">>, I, #{}),
-    {async, MultiRunner2} =
-        leveled_bookie:book_multiget(Bookie, B, [<<"1">>, <<"3">>], ?STD_TAG),
-    [{<<"1">>, {ok, {<<"obj1-v2">>, _F3}}}, {<<"3">>, not_found}] = MultiRunner2(),
-
-    %% include_docs: every hit carries the stored object; works with rank,
-    %% limit, and (second call) through the result-cache hit path.
-    IncOpts = #{columns => [body], include_docs => true},
-    {async, DocRunner} =
-        leveled_bookie:book_ftssearch(Bookie, B, I, <<"shared">>, IncOpts),
-    {ok, DocHits} = DocRunner(),
-    [<<"1">>, <<"2">>] = [maps:get(key, H) || H <- DocHits],
-    [{<<"obj1-v2">>, _}, {<<"obj2">>, _}] = [maps:get(document, H) || H <- DocHits],
-    {async, CachedDocRunner} =
-        leveled_bookie:book_ftssearch(Bookie, B, I, <<"shared">>, IncOpts),
-    {ok, CachedDocHits} = CachedDocRunner(),
-    [{<<"obj1-v2">>, _}, {<<"obj2">>, _}] =
-        [maps:get(document, H) || H <- CachedDocHits],
-    {async, RankedDocRunner} =
-        leveled_bookie:book_ftssearch(
-            Bookie, B, I, <<"target">>, IncOpts#{rank => bm25, limit => 1}
-        ),
-    {ok, [RankedHit]} = RankedDocRunner(),
-    %% "target" appears twice in doc 2 -> best hit, with its document.
-    <<"2">> = maps:get(key, RankedHit),
-    {<<"obj2">>, _} = maps:get(document, RankedHit),
-    true = maps:get(rank, RankedHit) < 0.0,
-
-    %% Without include_docs, hits carry no document field.
-    {async, PlainRunner} =
-        leveled_bookie:book_ftssearch(Bookie, B, I, <<"shared">>, #{columns => [body]}),
-    {ok, PlainHits} = PlainRunner(),
-    false = lists:any(fun(H) -> maps:is_key(document, H) end, PlainHits),
-
     ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
