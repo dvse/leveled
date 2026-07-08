@@ -11,6 +11,8 @@
     normalise_indexes/1,
     has_matching_index/3,
     augment_object_changes/3,
+    advance_seqs_cache/5,
+    reset_seqs_cache/1,
     spec_token_entries/3,
     book_ftssearch/5,
     cached_search/5,
@@ -148,7 +150,7 @@ augment_object_changes(ObjectChanges, Indexes, BatchSeq) ->
         {{value, {{_Tag, _Bucket, BadKey, null}, _Obj, _SpecsTTL}}, _} ->
             {error, {invalid_fts_key, BadKey}};
         {false, false} ->
-            {ok, ObjectChanges};
+            {ok, ObjectChanges, []};
         {false, true} ->
             %% Run the whole derivation in a short-lived coordinator process:
             %% tokenisation, merging, and page encoding allocate heavily, and
@@ -176,18 +178,29 @@ augment_matching(ObjectChanges, Indexes, BatchSeq) ->
                 end,
             Changes1 = lists:append([Cs || {Cs, _Rows} <- Results]),
             MergedRows = merge_chunk_rows([Rows || {_Cs, Rows} <- Results]),
-            PageSpecsByBucket =
+            %% Touched tracks exactly the (bucket, ref) pairs that emit a
+            %% batch directory marker row (pack_index_specs returns [] for
+            %% empty page sets), so the incremental batch-list cache stays
+            %% aligned with what discover_seqs/3 would find.
+            {PageSpecsByBucket, Touched} =
                 maps:fold(
-                    fun({Bucket, Ref}, ByCol, Acc) ->
-                        Specs = pack_index_specs(Ref, ByCol, BatchSeq),
-                        maps:update_with(
-                            Bucket, fun(S) -> S ++ Specs end, Specs, Acc
-                        )
+                    fun({Bucket, Ref}, ByCol, {SpecAcc, TouchedAcc}) ->
+                        case pack_index_specs(Ref, ByCol, BatchSeq) of
+                            [] ->
+                                {SpecAcc, TouchedAcc};
+                            Specs ->
+                                {
+                                    maps:update_with(
+                                        Bucket, fun(S) -> S ++ Specs end, Specs, SpecAcc
+                                    ),
+                                    [{Bucket, Ref} | TouchedAcc]
+                                }
+                        end
                     end,
-                    #{},
+                    {#{}, []},
                     MergedRows
                 ),
-            {ok, attach_page_specs(Changes1, PageSpecsByBucket)}.
+            {ok, attach_page_specs(Changes1, PageSpecsByBucket), Touched}.
 
 %% Within one batch, a later write to the same key supersedes earlier ones.
 %% Earlier occurrences must not contribute page rows: they share the batch
@@ -1397,21 +1410,25 @@ column_id([], _Col, _N) -> -1.
 load_dirs(#{dirs := Dirs} = Ctx) when Dirs =/= undefined ->
     {Ctx, Dirs};
 load_dirs(#{fold := FoldSource, bucket := Bucket, ref := Ref, cache := Cache} = Ctx) ->
-    %% The batch list is keyed by the write sequence (exact invalidation);
-    %% decoded directories are immutable per batch sequence, so they are
-    %% cached without invalidation. On a cold cache one term-only fold
-    %% discovers the batches and one point fold per batch fetches each
-    %% directory payload.
+    %% The batch list lives under a stable {seqs, Bucket, Ref} key stamped
+    %% with the write sequence it is valid at. The bookie ADVANCES the
+    %% stamp (appending the new batch) on every successful FTS write —
+    %% advance_seqs_cache/5 — so steady queries never pay a rediscovery
+    %% fold per write sequence. A stamp mismatch (old snapshot, missed
+    %% advance, reset) falls back to discovery; insert_new keeps a
+    %% concurrent old-snapshot query from regressing an advanced entry.
+    %% Decoded directories are immutable per batch sequence and cached
+    %% without invalidation.
     Seqs =
         case Cache of
             {Ets, Seq} ->
-                SeqsKey = {seqs, Bucket, Ref, Seq},
+                SeqsKey = {seqs, Bucket, Ref},
                 case ets:lookup(Ets, SeqsKey) of
-                    [{_K, CachedSeqs}] ->
+                    [{_K, {Seq, CachedSeqs}}] ->
                         CachedSeqs;
-                    [] ->
+                    _MissingOrOtherStamp ->
                         Discovered = discover_seqs(FoldSource, Bucket, Ref),
-                        ets:insert(Ets, {SeqsKey, Discovered}),
+                        ets:insert_new(Ets, {SeqsKey, {Seq, Discovered}}),
                         Discovered
                 end;
             undefined ->
@@ -1423,6 +1440,41 @@ load_dirs(#{fold := FoldSource, bucket := Bucket, ref := Ref, cache := Cache} = 
          || BatchSeq <- Seqs
         ],
     {Ctx#{dirs := Dirs}, Dirs}.
+
+%% Advance the cached batch lists after a successful FTS write: entries
+%% stamped with the pre-write sequence move to the new sequence, gaining
+%% the new batch when their (bucket, ref) derived rows in this write;
+%% entries with any other stamp are dropped (the next query rediscovers).
+%% Only existing entries advance — a store nobody has queried yet keeps
+%% an empty cache until the first query seeds it.
+advance_seqs_cache(undefined, _Touched, _BatchSeq, _PrevSeq, _NewSeq) ->
+    ok;
+advance_seqs_cache(Ets, Touched, BatchSeq, PrevSeq, NewSeq) ->
+    lists:foreach(
+        fun({{seqs, Bucket, Ref} = Key, {Stamp, SeqList}}) ->
+            case Stamp of
+                PrevSeq ->
+                    SeqList1 =
+                        case lists:member({Bucket, Ref}, Touched) of
+                            true -> SeqList ++ [BatchSeq];
+                            false -> SeqList
+                        end,
+                    ets:insert(Ets, {Key, {NewSeq, SeqList1}});
+                _Stale ->
+                    ets:delete(Ets, Key)
+            end
+        end,
+        ets:match_object(Ets, {{seqs, '_', '_'}, '_'})
+    ),
+    ok.
+
+%% Drop every cached batch list (write failed after the sequence
+%% advanced, or the sequence was resynced): queries rediscover.
+reset_seqs_cache(undefined) ->
+    ok;
+reset_seqs_cache(Ets) ->
+    ets:match_delete(Ets, {{seqs, '_', '_'}, '_'}),
+    ok.
 
 discover_seqs(FoldSource, Bucket, Ref) ->
     Fold =

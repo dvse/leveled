@@ -5,6 +5,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([
     single_object_contract/1,
+    incremental_batch_list_cache/1,
     batchput_contract/1,
     multi_token_phrase_contract/1,
     index_update_contract/1,
@@ -36,6 +37,7 @@
 all() ->
     [
         single_object_contract,
+        incremental_batch_list_cache,
         batchput_contract,
         multi_token_phrase_contract,
         index_update_contract,
@@ -2844,6 +2846,62 @@ unicode61_supported_parity_corpus_contract(_Config) ->
     ),
     ok = leveled_bookie:book_close(Bookie).
 
+%% The cached batch list advances incrementally on the write path
+%% (advance_seqs_cache): after the first query seeds it, writes append
+%% their batch (or just re-stamp, when the write does not touch the
+%% index) without a per-write rediscovery fold. Observed directly in
+%% the bookie's public fts_dir_cache table.
+incremental_batch_list_cache(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_incremental_seqs"),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Bucket = <<"batch">>,
+    Index = <<"main">>,
+    Opts = #{columns => [body]},
+    ok = fts_put(Bookie, Bucket, <<"k1">>, <<"o1">>, Index, #{body => <<"alpha one">>}, #{}),
+    [<<"k1">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
+    {S1, Batches1} = seqs_cache_entry(Bucket),
+    1 = length(Batches1),
+    %% A matching write advances the stamp AND appends its batch with no
+    %% query in between: the entry moved without a rediscovery fold.
+    ok = fts_put(Bookie, Bucket, <<"k2">>, <<"o2">>, Index, #{body => <<"alpha two">>}, #{}),
+    {S2, Batches2} = seqs_cache_entry(Bucket),
+    true = S2 > S1,
+    2 = length(Batches2),
+    Batches1 = lists:sublist(Batches2, 1),
+    [<<"k1">>, <<"k2">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
+    {S2, Batches2} = seqs_cache_entry(Bucket),
+    %% A write that does not touch this index re-stamps without append.
+    ok =
+        leveled_bookie:book_put(
+            Bookie, <<"no-fts-bucket">>, <<"n1">>, <<"raw">>, [], ?STD_TAG, infinity, false
+        ),
+    {S3, Batches2} = seqs_cache_entry(Bucket),
+    true = S3 > S2,
+    [<<"k1">>, <<"k2">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
+    %% An update supersedes through the incrementally appended batch.
+    ok = fts_put(Bookie, Bucket, <<"k1">>, <<"o1b">>, Index, #{body => <<"gamma one">>}, #{}),
+    {_S4, Batches4} = seqs_cache_entry(Bucket),
+    3 = length(Batches4),
+    [<<"k2">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
+    [<<"k1">>] = keys(search(Bookie, Bucket, Index, <<"gamma">>, Opts)),
+    ok = leveled_bookie:book_close(Bookie),
+    %% Cold restart: the cache is empty, discovery still serves queries.
+    {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
+    [<<"k2">>] = keys(search(Bookie2, Bucket, Index, <<"alpha">>, Opts)),
+    [<<"k1">>] = keys(search(Bookie2, Bucket, Index, <<"gamma">>, Opts)),
+    ok = leveled_bookie:book_close(Bookie2),
+    testutil:reset_filestructure().
+
+seqs_cache_entry(Bucket) ->
+    Entries =
+        lists:append([
+            ets:match_object(T, {{seqs, Bucket, '_'}, '_'})
+         || T <- ets:all(),
+            ets:info(T, name) =:= fts_dir_cache
+        ]),
+    [{_Key, Entry}] = Entries,
+    Entry.
+
 parse_errors(_Config) ->
     RootPath = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
@@ -3252,7 +3310,7 @@ oversized_token_contract(_Config) ->
             }
          || I <- lists:seq(1, N)
         ],
-    {ok, Augmented} = leveled_fts:augment_object_changes(Changes, Schemas, 1),
+    {ok, Augmented, _Touched} = leveled_fts:augment_object_changes(Changes, Schemas, 1),
     AllSpecs = lists:append([Specs || {_LK, _Obj, {Specs, _TTL}} <- Augmented]),
     Entries = leveled_fts:spec_token_entries(AllSpecs, <<"main">>, ?STD_TAG),
     CommonKeys = [K || {<<"common">>, K} <- Entries],

@@ -1678,9 +1678,10 @@ handle_call(
                 {error, FtsReason} ->
                     gen_server:reply(From, {error, FtsReason}),
                     {noreply, State};
-                {AugIndexSpecs, State0} ->
+                {AugIndexSpecs, State0, FtsAdvance} ->
                     do_augmented_put(
-                        LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0
+                        LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0,
+                        FtsAdvance
                     )
             end
     end;
@@ -1693,8 +1694,8 @@ handle_call({batchput, BatchSpecs, DataSync}, From, State) when
                 {error, FtsReason} ->
                     gen_server:reply(From, {error, FtsReason}),
                     {noreply, State};
-                {AugObjectChanges, State0} ->
-                    do_batchput(AugObjectChanges, DataSync, From, State0)
+                {AugObjectChanges, State0, FtsAdvance} ->
+                    do_batchput(AugObjectChanges, DataSync, From, State0, FtsAdvance)
             end;
         {error, Reason} ->
             gen_server:reply(From, {error, Reason}),
@@ -1713,9 +1714,10 @@ handle_call({casbatchput, BatchSpecs, Conditions, DataSync}, From, State) when
                                 {error, FtsReason} ->
                                     gen_server:reply(From, {error, FtsReason}),
                                     {noreply, State};
-                                {AugObjectChanges, State0} ->
+                                {AugObjectChanges, State0, FtsAdvance} ->
                                     do_batchput(
-                                        AugObjectChanges, DataSync, From, State0
+                                        AugObjectChanges, DataSync, From, State0,
+                                        FtsAdvance
                                     )
                             end;
                         {error, Failures} ->
@@ -3097,7 +3099,7 @@ addto_ledgercache_batch(PreparedChanges, Cache) ->
         max_sqn = MaxSQN
     }.
 
-do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0) ->
+do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0, FtsAdvance) ->
     SWLR = os:timestamp(),
     SW0 = leveled_monitor:maybe_time(State0#state.monitor),
     {ok, SQN, ObjSize} =
@@ -3108,6 +3110,7 @@ do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0) 
             {AugIndexSpecs, TTL},
             DataSync
         ),
+    ok = advance_fts_seqs_cache(State0#state.fts_dir_cache, SQN, FtsAdvance),
     {T0, SW1} = leveled_monitor:step_time(SW0),
     Changes =
         preparefor_ledgercache(
@@ -3151,10 +3154,11 @@ do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0) 
     list({leveled_codec:ledger_key(), any(), leveled_codec:journal_keychanges()}),
     boolean(),
     gen_server:from(),
-    #state{}
+    #state{},
+    {list(), non_neg_integer(), non_neg_integer()}
 ) ->
     {noreply, #state{}}.
-do_batchput(ObjectChanges, DataSync, From, State) ->
+do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
     SWLR = os:timestamp(),
     SW0 = leveled_monitor:maybe_time(State#state.monitor),
     case
@@ -3165,6 +3169,7 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
         )
     of
         {ok, SQN, ObjectWriteInfos} ->
+            ok = advance_fts_seqs_cache(State#state.fts_dir_cache, SQN, FtsAdvance),
             {T0, SW1} = leveled_monitor:step_time(SW0),
             %% The batch is durable in the journal, and no read can be served
             %% before this callback completes (the bookie is process-serial),
@@ -3221,7 +3226,10 @@ do_batchput(ObjectChanges, DataSync, From, State) ->
             %% The FTS sequence was advanced at augmentation but the journal
             %% did not move; resync so the next batch cannot stamp a sequence
             %% that an earlier write already persisted (which would alias
-            %% marker and page-directory terms after a later reseed).
+            %% marker and page-directory terms after a later reseed). Cached
+            %% batch lists are stamped with pre-resync sequences: drop them
+            %% and let the next query rediscover.
+            ok = leveled_fts:reset_seqs_cache(State#state.fts_dir_cache),
             {ok, JournalSQN} =
                 leveled_inker:ink_getjournalsqn(State#state.inker),
             {noreply, State#state{fts_seq = JournalSQN}}
@@ -3276,35 +3284,47 @@ maybe_new_fts_dir_cache([]) ->
 maybe_new_fts_dir_cache(_FtsIndexes) ->
     ets:new(fts_dir_cache, [set, public, {read_concurrency, true}]).
 
+%% Both augment paths return an fts_advance() alongside the changes: the
+%% touched (bucket, ref) pairs, the batch sequence stamped into the rows,
+%% and the pre-write sequence. The success path hands it to
+%% leveled_fts:advance_seqs_cache/5 so cached batch lists move forward
+%% incrementally instead of forcing a rediscovery fold per write.
 augment_fts_object_changes(ObjectChanges, #state{fts_indexes = []} = State) ->
-    {ObjectChanges, State};
+    {ObjectChanges, State, {[], 0, 0}};
 augment_fts_object_changes(ObjectChanges, State) ->
-    Seq = State#state.fts_seq + 1,
+    PrevSeq = State#state.fts_seq,
+    Seq = PrevSeq + 1,
     case
         leveled_fts:augment_object_changes(
             ObjectChanges, State#state.fts_indexes, Seq
         )
     of
-        {ok, AugObjectChanges} ->
-            {AugObjectChanges, State#state{fts_seq = Seq}};
+        {ok, AugObjectChanges, Touched} ->
+            {AugObjectChanges, State#state{fts_seq = Seq}, {Touched, Seq, PrevSeq}};
         {error, Reason} ->
             {error, Reason}
     end.
 
 augment_fts_single(_LedgerKey, _Object, IndexSpecs, _TTL, #state{fts_indexes = []} = State) ->
-    {IndexSpecs, State};
+    {IndexSpecs, State, {[], 0, 0}};
 augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) ->
-    Seq = State#state.fts_seq + 1,
+    PrevSeq = State#state.fts_seq,
+    Seq = PrevSeq + 1,
     case
         leveled_fts:augment_object_changes(
             [{LedgerKey, Object, {IndexSpecs, TTL}}], State#state.fts_indexes, Seq
         )
     of
-        {ok, [{LedgerKey, Object, {AugIndexSpecs, TTL}}]} ->
-            {AugIndexSpecs, State#state{fts_seq = Seq}};
+        {ok, [{LedgerKey, Object, {AugIndexSpecs, TTL}}], Touched} ->
+            {AugIndexSpecs, State#state{fts_seq = Seq}, {Touched, Seq, PrevSeq}};
         {error, Reason} ->
             {error, Reason}
     end.
+
+advance_fts_seqs_cache(_DirCache, _NewSeq, {[], 0, 0}) ->
+    ok;
+advance_fts_seqs_cache(DirCache, NewSeq, {Touched, BatchSeq, PrevSeq}) ->
+    leveled_fts:advance_seqs_cache(DirCache, Touched, BatchSeq, PrevSeq, NewSeq).
 
 current_head_state(LedgerKey, State) ->
     {Head, _CacheHit} =
