@@ -364,26 +364,15 @@ read_first_doc(Opts) ->
 maybe_compact(Bookie, #{compact := true} = Opts) ->
     Bucket = maps:get(bucket, Opts),
     Index = maps:get(index, Opts),
+    Limits = #{max_batches => 256, max_bytes => 512 * 1024 * 1024},
     Start = erlang:monotonic_time(microsecond),
-    Passes = compact_loop(Bookie, Bucket, Index, 0),
+    {async, Run} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, Limits),
+    Result = Run(),
     Elapsed = erlang:monotonic_time(microsecond) - Start,
-    io:format("compacted in ~p passes (~.1f s)~n", [Passes, Elapsed / 1000000]),
+    io:format("compacted (~p) in ~.1f s~n", [Result, Elapsed / 1000000]),
     ok;
 maybe_compact(_Bookie, _Opts) ->
     ok.
-
-compact_loop(Bookie, Bucket, Index, N) ->
-    Limits = #{max_batches => 256, max_bytes => 512 * 1024 * 1024},
-    {async, Run} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, Limits),
-    PassStart = erlang:monotonic_time(microsecond),
-    case Run() of
-        ok ->
-            PassUs = erlang:monotonic_time(microsecond) - PassStart,
-            io:format("compaction pass ~p: ~.1f s~n", [N + 1, PassUs / 1000000]),
-            compact_loop(Bookie, Bucket, Index, N + 1);
-        noop ->
-            N
-    end.
 
 maybe_bust_cache(_Bookie, #{sentinel := undefined}) ->
     ok;

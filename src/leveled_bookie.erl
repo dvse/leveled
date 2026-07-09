@@ -1713,39 +1713,29 @@ handle_call({ftscompact, Bucket, Index, Limits}, _From, State) when
                 fun() ->
                     {ok, LedgerSnapshot, _J, AfterFun} = SnapFun(),
                     IndexFold = fts_index_fold_fun(LedgerSnapshot),
-                    %% Derivation stamps a placeholder sequence: the real
-                    %% one is only known at apply time (fts_seq must stay
-                    %% equal to the journal SQN — reserving a sequence
-                    %% here without a journal write would let a later
-                    %% write re-issue the same batch sequence after the
-                    %% SQN resync). Spec payloads never embed the new
-                    %% sequence, so apply re-stamps terms only.
-                    Derived =
+                    %% Phase 1 (one snapshot): plan every group plus the
+                    %% single liveness fold. Phase 2 (parallel, one
+                    %% snapshot per group): derive merged specs with a
+                    %% placeholder sequence — the real one is only known
+                    %% at apply time (fts_seq must stay equal to the
+                    %% journal SQN). Phase 3 (sequential): apply each
+                    %% group atomically; a failure mid-way leaves a
+                    %% partially compacted, consistent store.
+                    Plan =
                         try
-                            leveled_fts:compact_index_specs(
-                                IndexFold, Bucket, Ref, 0, Limits
-                            )
+                            leveled_fts:compact_plan(IndexFold, Bucket, Ref, Limits)
                         catch
                             throw:{fts_error, Reason} -> {error, Reason}
                         after
                             AfterFun()
                         end,
-                    case Derived of
+                    case Plan of
                         noop ->
                             noop;
                         {error, _Reason} = Error ->
                             Error;
-                        {ok, ChosenSeqs, Specs} ->
-                            case
-                                gen_server:call(
-                                    Self,
-                                    {ftscompact_apply, Bucket, Ref, ChosenSeqs, Specs},
-                                    infinity
-                                )
-                            of
-                                pause -> ok;
-                                Reply -> Reply
-                            end
+                        {ok, Groups, LiveByBatch} ->
+                            run_fts_compaction(Self, Bucket, Ref, Groups, LiveByBatch)
                     end
                 end,
             {reply, {async, Runner}, State};
@@ -3347,6 +3337,61 @@ run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
         )
     after
         AfterFun()
+    end.
+
+%% Compaction orchestration, run in the caller's process: groups derive
+%% in parallel (one ledger snapshot each), then apply sequentially
+%% through the bookie. Derivation reads immutable batches, so parallel
+%% workers never conflict; group applies are independent by design.
+run_fts_compaction(Bookie, Bucket, Ref, Groups, LiveByBatch) ->
+    DeriveOne =
+        fun(Group) ->
+            {ok, LS, _JS} = book_snapshot(Bookie, ledger, no_lookup, false),
+            try
+                leveled_fts:compact_group_specs(
+                    fts_index_fold_fun(LS), Bucket, Ref, Group, LiveByBatch
+                )
+            catch
+                throw:{fts_error, Reason} -> {error, Reason}
+            after
+                ok = leveled_penciller:pcl_close(LS)
+            end
+        end,
+    Parent = self(),
+    Refs =
+        [
+            begin
+                MRef = make_ref(),
+                spawn_link(fun() -> Parent ! {MRef, DeriveOne(Group)} end),
+                MRef
+            end
+         || Group <- Groups
+        ],
+    Results =
+        [
+            receive
+                {MRef, R} -> R
+            end
+         || MRef <- Refs
+        ],
+    case [E || {error, _} = E <- Results] of
+        [FirstError | _] ->
+            FirstError;
+        [] ->
+            apply_fts_compaction(Bookie, Bucket, Ref, lists:append(Results))
+    end.
+
+apply_fts_compaction(_Bookie, _Bucket, _Ref, []) ->
+    ok;
+apply_fts_compaction(Bookie, Bucket, Ref, [{ChosenSeqs, Specs} | Rest]) ->
+    case
+        gen_server:call(
+            Bookie, {ftscompact_apply, Bucket, Ref, ChosenSeqs, Specs}, infinity
+        )
+    of
+        ok -> apply_fts_compaction(Bookie, Bucket, Ref, Rest);
+        pause -> apply_fts_compaction(Bookie, Bucket, Ref, Rest);
+        {error, _Reason} = Error -> Error
     end.
 
 %% The fold source handed to leveled_fts: index folds against one ledger

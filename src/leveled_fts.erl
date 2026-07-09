@@ -15,7 +15,8 @@
     reset_seqs_cache/1,
     marker_cache_updates/2,
     advance_marker_cache/3,
-    compact_index_specs/5,
+    compact_plan/4,
+    compact_group_specs/5,
     compact_seqs_cache/7,
     restamp_compact_specs/2,
     find_schema/3,
@@ -439,8 +440,25 @@ pack_index_specs(Ref, ByCol, BatchSeq, Aliases) ->
 %% ?FTS_PAGE_TARGET_BYTES. Only binaries are appended; row data is never
 %% reconstructed as terms.
 merge_runs_to_pages(ColId, Runs) ->
-    Heads = [parse_run_head(Run) || Run <- Runs, Run =/= <<>>],
-    merge_runs(Heads, ColId, none, [], 0, 0, []).
+    %% Heap-based k-way merge: O(log k) per token emission. The heap
+    %% orders {Token, RunIdx} so same-token entries pop in run order,
+    %% preserving the byte-identical output of the old linear scan.
+    {Heap, Tails} =
+        lists:foldl(
+            fun(Run, {H, T}) ->
+                case Run of
+                    <<>> ->
+                        {H, T};
+                    _ ->
+                        Idx = maps:size(T) + 1,
+                        {Tok, ND, Docs, Tail} = parse_run_head(Run),
+                        {gb_sets:add({Tok, Idx}, H), T#{Idx => {ND, Docs, Tail}}}
+                end
+            end,
+            {gb_sets:empty(), #{}},
+            Runs
+        ),
+    merge_runs({Heap, Tails}, ColId, none, [], 0, 0, []).
 
 parse_run_head(<<EntryLen:32/unsigned-big, Rest/binary>>) ->
     <<Entry:EntryLen/binary, Tail/binary>> = Rest,
@@ -448,26 +466,22 @@ parse_run_head(<<EntryLen:32/unsigned-big, Rest/binary>>) ->
         Docs/binary>> = Entry,
     {Token, NDocs, Docs, Tail}.
 
-merge_runs([], ColId, First, Entries, _Bytes, NTok, Pages) ->
-    FinalPages =
-        case NTok of
-            0 -> Pages;
-            _ -> [finish_run_page(ColId, First, Entries, NTok) | Pages]
-        end,
-    lists:reverse(FinalPages);
-merge_runs(Heads, ColId, First, Entries, Bytes, NTok, Pages) ->
-    MinTok =
-        lists:foldl(
-            fun({Token, _ND, _Docs, _Tail}, Min) ->
-                case Min =:= none orelse Token < Min of
-                    true -> Token;
-                    false -> Min
-                end
-            end,
-            none,
-            Heads
-        ),
-    {NDSum, DocsList, Heads1} = take_token(Heads, MinTok, 0, [], []),
+merge_runs({Heap, _Tails} = HT, ColId, First, Entries, Bytes, NTok, Pages) ->
+    case gb_sets:is_empty(Heap) of
+        true ->
+            FinalPages =
+                case NTok of
+                    0 -> Pages;
+                    _ -> [finish_run_page(ColId, First, Entries, NTok) | Pages]
+                end,
+            lists:reverse(FinalPages);
+        false ->
+            merge_runs_next(HT, ColId, First, Entries, Bytes, NTok, Pages)
+    end.
+
+merge_runs_next({Heap0, Tails0}, ColId, First, Entries, Bytes, NTok, Pages) ->
+    {{MinTok, _Idx0}, _} = gb_sets:take_smallest(Heap0),
+    {NDSum, DocsList, Heads1} = heap_take_token(Heap0, Tails0, MinTok, 0, []),
     %% The persisted page entry carries a 16-bit doc count, so a token with
     %% more postings than that in one batch is split into several entries
     %% (the reader collects every entry for a token across and within
@@ -546,17 +560,32 @@ split_docs(
             split_docs(Rest, Cap, ChunkStart, ChunkBytes + DocSize, Count1, Acc)
     end.
 
-take_token([], _Tok, NDSum, DocsList, HeadsAcc) ->
-    {NDSum, lists:reverse(DocsList), lists:reverse(HeadsAcc)};
-take_token([{Tok, ND, Docs, Tail} | Rest], Tok, NDSum, DocsList, HeadsAcc) ->
-    HeadsAcc1 =
-        case Tail of
-            <<>> -> HeadsAcc;
-            _ -> [parse_run_head(Tail) | HeadsAcc]
-        end,
-    take_token(Rest, Tok, NDSum + ND, [Docs | DocsList], HeadsAcc1);
-take_token([Head | Rest], Tok, NDSum, DocsList, HeadsAcc) ->
-    take_token(Rest, Tok, NDSum, DocsList, [Head | HeadsAcc]).
+%% Pop every heap element carrying MinTok (they order by run index, so
+%% docs concatenate in run order exactly as the old linear scan did),
+%% advancing each popped run's tail back into the heap.
+heap_take_token(Heap0, Tails0, MinTok, NDSum, DocsList) ->
+    case gb_sets:is_empty(Heap0) of
+        true ->
+            {NDSum, lists:reverse(DocsList), {Heap0, Tails0}};
+        false ->
+            case gb_sets:smallest(Heap0) of
+                {MinTok, Idx} ->
+                    Heap1 = gb_sets:del_element({MinTok, Idx}, Heap0),
+                    {ND, Docs, Tail} = maps:get(Idx, Tails0),
+                    {Heap2, Tails1} =
+                        case Tail of
+                            <<>> ->
+                                {Heap1, maps:remove(Idx, Tails0)};
+                            _ ->
+                                {NTok2, ND2, Docs2, Tail2} = parse_run_head(Tail),
+                                {gb_sets:add({NTok2, Idx}, Heap1),
+                                    Tails0#{Idx => {ND2, Docs2, Tail2}}}
+                        end,
+                    heap_take_token(Heap2, Tails1, MinTok, NDSum + ND, [Docs | DocsList]);
+                _OtherToken ->
+                    {NDSum, lists:reverse(DocsList), {Heap0, Tails0}}
+            end
+    end.
 
 finish_run_page(ColId, First, EntriesRev, NTok) ->
     {Last, _LastBin} = hd(EntriesRev),
@@ -1628,7 +1657,13 @@ ctx_alias_map(Ctx) ->
 %% liveness resolves marker sequences through the alias map, so a doc
 %% updated or deleted after derivation simply makes the merged copy of
 %% its old postings dead — concurrent writes are safe by construction.
-compact_index_specs(FoldSource, Bucket, Ref, NewSeq, Limits0) ->
+%% Plan a whole-store compaction: ALL live batches partitioned
+%% oldest-first into groups bounded by the per-group limits, plus ONE
+%% liveness fold covering every planned batch. Each group merges into
+%% one output batch whose aliases are exactly that group, so group
+%% applies are independent: a crash mid-operation leaves a partially
+%% compacted, fully consistent store.
+compact_plan(FoldSource, Bucket, Ref, Limits0) ->
     Limits = compact_limits(Limits0),
     Seqs = discover_seqs(FoldSource, Bucket, Ref),
     Resolved =
@@ -1642,38 +1677,161 @@ compact_index_specs(FoldSource, Bucket, Ref, NewSeq, Limits0) ->
         ),
     LiveDirs =
         [SD || {S, _Dir} = SD <- Resolved, not maps:is_key(S, AliasMap)],
-    Chosen = choose_compact_batches(LiveDirs, Limits),
-    compact_chosen(FoldSource, Bucket, Ref, NewSeq, AliasMap, Chosen).
+    Groups =
+        [G || G <- partition_compact_groups(LiveDirs, Limits), length(G) >= 2],
+    case Groups of
+        [] ->
+            noop;
+        _ ->
+            AllSeqs = [S || G <- Groups, {S, _Dir} <- G],
+            LiveByBatch =
+                compact_live_docs(
+                    FoldSource, Bucket, Ref, AliasMap, sets:from_list(AllSeqs)
+                ),
+            {ok, Groups, LiveByBatch}
+    end.
 
-%% The page-count estimate bounds selection, but merged output has been
-%% observed at ~2x the input page estimate; if packing still trips the
-%% 16-bit page limit, halve the selection and retry — a single batch
-%% always fits (originals are small; merged batches passed this guard).
-compact_chosen(_FoldSource, _Bucket, _Ref, _NewSeq, _AliasMap, Chosen) when
-    length(Chosen) < 2
+partition_compact_groups([], _Limits) ->
+    [];
+partition_compact_groups(LiveDirs, Limits) ->
+    {Group, Rest} = take_compact_group(LiveDirs, Limits),
+    [Group | partition_compact_groups(Rest, Limits)].
+
+take_compact_group(LiveDirs, #{
+    max_batches := MaxN, max_bytes := MaxBytes, max_pages := MaxPages
+}) ->
+    take_compact_group(LiveDirs, MaxN, MaxBytes, MaxPages, 0, 0, []).
+
+take_compact_group([], _MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) ->
+    {lists:reverse(Acc), []};
+take_compact_group(Rest, MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) when
+    length(Acc) >= MaxN
 ->
-    noop;
-compact_chosen(FoldSource, Bucket, Ref, NewSeq, AliasMap, Chosen) ->
-    ChosenSeqs = [S || {S, _Dir} <- Chosen],
-    NewAliases =
-        lists:usort(
-            lists:append([[S | Aliases] || {S, {_CM, Aliases}} <- Chosen])
-        ),
-    LiveByBatch =
-        compact_live_docs(
-            FoldSource, Bucket, Ref, AliasMap, sets:from_list(ChosenSeqs)
-        ),
-    ByCol = compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch),
-    try pack_index_specs(Ref, ByCol, NewSeq, NewAliases) of
-        Specs ->
-            {ok, ChosenSeqs, Specs}
-    catch
-        throw:{fts_error, {batch_page_limit_exceeded, _N}} ->
-            compact_chosen(
-                FoldSource, Bucket, Ref, NewSeq, AliasMap,
-                lists:sublist(Chosen, max(1, length(Chosen) div 2))
+    {lists:reverse(Acc), Rest};
+take_compact_group(
+    [{_S, {ColMap, _A}} = SD | Rest] = All, MaxN, MaxBytes, MaxPages, Bytes, Pages, Acc
+) ->
+    BatchPages = maps:fold(fun(_ColId, PS, N) -> N + probe_size(PS) end, 0, ColMap),
+    Estimate = BatchPages * ?FTS_PAGE_TARGET_BYTES,
+    Over =
+        (Bytes + Estimate > MaxBytes orelse Pages + BatchPages > MaxPages) andalso
+            Acc =/= [],
+    case Over of
+        true ->
+            {lists:reverse(Acc), All};
+        false ->
+            take_compact_group(
+                Rest, MaxN, MaxBytes, MaxPages, Bytes + Estimate, Pages + BatchPages,
+                [SD | Acc]
             )
     end.
+
+%% Derive one group's merged output: ONE range fold streams the group's
+%% pages in (batch, page) order (batch boundaries on seq transitions,
+%% page column resolved through the batch's directory), doc frames are
+%% liveness-filtered in stream, and the per-batch runs heap-merge into
+%% token-sorted pages. If packing trips the 16-bit page limit the group
+%% splits in half and both halves derive recursively (each half is an
+%% independent output batch).
+compact_group_specs(_FoldSource, _Bucket, _Ref, Group, _LiveByBatch) when
+    length(Group) < 2
+->
+    [];
+compact_group_specs(FoldSource, Bucket, Ref, Group, LiveByBatch) ->
+    Seqs = [S || {S, _Dir} <- Group],
+    FirstSeq = hd(Seqs),
+    LastSeq = lists:last(Seqs),
+    PageCols =
+        maps:from_list([
+            {S, batch_page_columns(ColMap)}
+         || {S, {ColMap, _A}} <- Group
+        ]),
+    Fold =
+        fun(_B, {<<1:8, S:64/unsigned-big, PageNo:16/unsigned-big>>, _Key, Payload}, Acc) ->
+            case {maps:get(S, LiveByBatch, undefined), maps:get(S, PageCols, undefined)} of
+                {undefined, _NoLive} ->
+                    %% an aliased (subsumed) batch inside the seq range:
+                    %% its rows are dead weight, skip.
+                    Acc;
+                {_Live, undefined} ->
+                    Acc;
+                {LiveSet, Cols} ->
+                    ColId = maps:get(PageNo, Cols, 0),
+                    Filtered =
+                        [
+                            begin
+                                Entry =
+                                    <<(byte_size(Token)):16/unsigned-big, Token/binary,
+                                        Kept:32/unsigned-big, KeptBin/binary>>,
+                                [<<(byte_size(Entry)):32/unsigned-big>>, Entry]
+                            end
+                         || {Token, DocsBin} <- page_entries(Payload),
+                            {Kept, KeptBin} <- [filter_doc_frames(DocsBin, LiveSet)],
+                            Kept > 0
+                        ],
+                    case Filtered of
+                        [] ->
+                            Acc;
+                        _ ->
+                            maps:update_with(
+                                {ColId, S},
+                                fun(IoAcc) -> [IoAcc | Filtered] end,
+                                Filtered,
+                                Acc
+                            )
+                    end
+            end
+        end,
+    RunMap =
+        index_fold(
+            FoldSource,
+            {Bucket, null},
+            {Fold, #{}},
+            {seg_field(Ref), page_term(FirstSeq, 0), page_term(LastSeq, 65535)},
+            {payload, undefined}
+        ),
+    ByCol =
+        maps:fold(
+            fun({ColId, S}, Io, Acc) ->
+                Run = iolist_to_binary(Io),
+                maps:update_with(
+                    ColId, fun(Rs) -> [{S, Run} | Rs] end, [{S, Run}], Acc
+                )
+            end,
+            #{},
+            RunMap
+        ),
+    %% runs merge in ascending batch order for byte-deterministic output
+    ByColSorted =
+        maps:map(
+            fun(_ColId, Rs) -> [Run || {_S, Run} <- lists:keysort(1, Rs)] end,
+            ByCol
+        ),
+    NewAliases =
+        lists:usort(lists:append([[S | Aliases] || {S, {_CM, Aliases}} <- Group])),
+    try pack_index_specs(Ref, ByColSorted, 0, NewAliases) of
+        Specs ->
+            [{Seqs, Specs}]
+    catch
+        throw:{fts_error, {batch_page_limit_exceeded, _N}} ->
+            {GA, GB} = lists:split(length(Group) div 2, Group),
+            compact_group_specs(FoldSource, Bucket, Ref, GA, LiveByBatch) ++
+                compact_group_specs(FoldSource, Bucket, Ref, GB, LiveByBatch)
+    end.
+
+%% PageNo -> ColId from a batch's directory probes.
+batch_page_columns(ColMap) ->
+    maps:fold(
+        fun(ColId, PS, Acc) ->
+            lists:foldl(
+                fun(I, A) -> A#{element(3, probe_row(PS, I)) => ColId} end,
+                Acc,
+                lists:seq(1, probe_size(PS))
+            )
+        end,
+        #{},
+        ColMap
+    ).
 
 %% A count cap alone lets convergence culminate in one mega-merge of
 %% everything (a multi-GB atomic write and an hour of CPU at the 5GB
@@ -1694,35 +1852,6 @@ compact_limits(#{} = Limits) ->
         %% from the directory probes are exact, so this bound is hard.
         max_pages => maps:get(max_pages, Limits, 60000)
     }.
-
-choose_compact_batches(LiveDirs, #{
-    max_batches := MaxN, max_bytes := MaxBytes, max_pages := MaxPages
-}) ->
-    choose_compact_batches(LiveDirs, MaxN, MaxBytes, MaxPages, 0, 0, []).
-
-choose_compact_batches([], _MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) ->
-    lists:reverse(Acc);
-choose_compact_batches(_Rest, MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) when
-    length(Acc) >= MaxN
-->
-    lists:reverse(Acc);
-choose_compact_batches(
-    [{_S, {ColMap, _A}} = SD | Rest], MaxN, MaxBytes, MaxPages, Bytes, Pages, Acc
-) ->
-    BatchPages = maps:fold(fun(_ColId, PS, N) -> N + probe_size(PS) end, 0, ColMap),
-    Estimate = BatchPages * ?FTS_PAGE_TARGET_BYTES,
-    Over =
-        (Bytes + Estimate > MaxBytes orelse Pages + BatchPages > MaxPages) andalso
-            Acc =/= [],
-    case Over of
-        true ->
-            lists:reverse(Acc);
-        false ->
-            choose_compact_batches(
-                Rest, MaxN, MaxBytes, MaxPages, Bytes + Estimate, Pages + BatchPages,
-                [SD | Acc]
-            )
-    end.
 
 %% One marker fold: doc key -> live batch (alias-resolved), restricted to
 %% the batches being compacted.
@@ -1754,67 +1883,6 @@ compact_live_docs(FoldSource, Bucket, Ref, AliasMap, ChosenSet) ->
         {doc_field(Ref), doc, doc},
         {payload, undefined}
     ).
-
-%% Per column, one run per chosen batch: the batch's pages walked in
-%% token order with each entry's doc frames filtered to that batch's
-%% live docs, re-framed in run format for merge_runs_to_pages/2.
-compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch) ->
-    lists:foldl(
-        fun({S, {ColMap, _Aliases}}, ByColAcc) ->
-            LiveSet = maps:get(S, LiveByBatch, sets:new()),
-            maps:fold(
-                fun(ColId, PS, Acc) ->
-                    Run = compact_batch_run(FoldSource, Bucket, Ref, S, PS, LiveSet),
-                    case Run of
-                        <<>> ->
-                            Acc;
-                        _ ->
-                            maps:update_with(
-                                ColId, fun(Rs) -> [Run | Rs] end, [Run], Acc
-                            )
-                    end
-                end,
-                ByColAcc,
-                ColMap
-            )
-        end,
-        #{},
-        Chosen
-    ).
-
-compact_batch_run(FoldSource, Bucket, Ref, BatchSeq, _PS, LiveSet) ->
-    %% ONE range fold per batch: page terms are contiguous
-    %% (<<1, BatchSeq, PageNo>>) and ascend in page order, so the whole
-    %% batch reads in a single LSM descent. Per-page unit folds cost a
-    %% full fold setup each (~tens of ms on a deep store) — thousands
-    %% per pass made convergence passes slow down as earlier passes
-    %% deepened the store.
-    Fold =
-        fun(_B, {_Term, _Key, Payload}, Acc) ->
-            [
-                [
-                    begin
-                        Entry =
-                            <<(byte_size(Token)):16/unsigned-big, Token/binary,
-                                Kept:32/unsigned-big, KeptBin/binary>>,
-                        <<(byte_size(Entry)):32/unsigned-big, Entry/binary>>
-                    end
-                 || {Token, DocsBin} <- page_entries(Payload),
-                    {Kept, KeptBin} <- [filter_doc_frames(DocsBin, LiveSet)],
-                    Kept > 0
-                ]
-                | Acc
-            ]
-        end,
-    Runs =
-        index_fold(
-            FoldSource,
-            {Bucket, null},
-            {Fold, []},
-            {seg_field(Ref), page_term(BatchSeq, 0), page_term(BatchSeq, 65535)},
-            {payload, undefined}
-        ),
-    iolist_to_binary(lists:reverse(Runs)).
 
 %% Re-stamp derivation-time placeholder terms with the batch sequence
 %% assigned at apply time. Only the index TERMS embed the sequence —
@@ -2773,9 +2841,6 @@ page_term(BatchSeq, PageNo) ->
 %% directories written before either existed decode with an empty bloom
 %% map and no aliases (exact prior behavior) and mixed-era stores work
 %% unchanged.
-encode_dir(NumberedPages) ->
-    encode_dir(NumberedPages, []).
-
 encode_dir(NumberedPages, Aliases) ->
     iolist_to_binary([
         <<(length(NumberedPages)):16/unsigned-big>>,
