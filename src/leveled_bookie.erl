@@ -3498,11 +3498,8 @@ run_fts_consolidation(Bookie, Bucket, Ref, Schema, Shards, Inker) ->
 apply_fts_consolidation(_Bookie, _Bucket, _Ref, []) ->
     ok;
 apply_fts_consolidation(Bookie, Bucket, Ref, Derived) ->
-    {Chunk, Rest} =
-        case length(Derived) > 64 of
-            true -> lists:split(64, Derived);
-            false -> {Derived, []}
-        end,
+    %% a chunk must fit one journal file: bound by bytes, not count.
+    {Chunk, Rest} = take_consolidation_chunk(Derived, 64 * 1024 * 1024, []),
     case
         gen_server:call(
             Bookie, {ftsconsolidate_apply, Bucket, Ref, Chunk}, infinity
@@ -3511,6 +3508,15 @@ apply_fts_consolidation(Bookie, Bucket, Ref, Derived) ->
         ok -> apply_fts_consolidation(Bookie, Bucket, Ref, Rest);
         pause -> apply_fts_consolidation(Bookie, Bucket, Ref, Rest);
         {error, _Reason} = Error -> Error
+    end.
+
+take_consolidation_chunk([], _Budget, Acc) ->
+    {lists:reverse(Acc), []};
+take_consolidation_chunk([#{base := Base} = D | Rest], Budget, Acc) ->
+    Size = byte_size(Base),
+    case Size > Budget andalso Acc =/= [] of
+        true -> {lists:reverse(Acc), [D | Rest]};
+        false -> take_consolidation_chunk(Rest, Budget - Size, [D | Acc])
     end.
 
 %% The fold source handed to leveled_fts: index folds against one ledger
