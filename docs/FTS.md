@@ -136,43 +136,72 @@ old rows need to be found or removed at write time.
 
 ## Storage Shape
 
-FTS facts are ordinary payload-bearing secondary index rows attached to the
-documents of each write batch. Per configured index (`{Bucket, Index, Tag}`):
+Postings live in a fixed, order-preserving TOKEN GRID: token space is
+partitioned into shards by token prefix (1,024 ranges over the first two
+token bytes), and every posting fact belongs to exactly one shard
+regardless of when it was written. Per configured index
+(`{Bucket, Index, Tag}`):
 
 - Every indexed document carries a marker row
-  `{{fts_doc, Index, Tag}, doc, Key} -> <<BatchSeq:64, DocLength:32>>`.
-- Each write batch's postings are packed, token-sorted, into pages of roughly
-  8KB per column:
-  `{{fts_term, Index, Tag}, <<1, BatchSeq:64, PageNo:16>>, CarrierKey} -> Page`.
-- A per-batch directory row lists each page's column and first/last token:
-  `{{fts_term, Index, Tag}, <<0, BatchSeq:64>>, CarrierKey} -> Directory`.
+  `{{fts_doc, Index, Tag}, doc, Key} -> <<WriteSeq:64, DocLength:32>>`
+  (unchanged from the first design: liveness is a join against markers).
+- Each write batch emits, per touched shard, one small DELTA row —
+  token-sorted entries whose doc frames are stamped with the write
+  sequence:
+  `{{fts_term, Index, Tag}, <<1, ShardId:16, WriteSeq:64>>, DeltaCarrier}`.
+  Delta rows ride a per-shard reserved carrier key (`$fts_d$...`), so
+  their exact row identity is known later.
+- Each shard has at most one BASE: the consolidated posting set for the
+  shard's token range, stored as an ordinary OBJECT under a reserved key
+  (`$fts$<Index><ShardId>`) — the value lives in the journal (sequential
+  writes, fetched by SQN, reclaimed natively by journal compaction when
+  superseded). The base binary carries an internal probe directory for
+  token binary search.
+- Each shard has one SUMMARY row
+  `{{fts_term, Index, Tag}, <<0, ShardId:16>>, BaseKey}` holding the
+  consolidated-through sequence and a token bloom for the whole shard.
+  Summaries supersede in place (same key), so the LSM collects old ones
+  natively.
 
-Page and directory rows are attached to the last matching document of the
-batch, so the object write and all of its index facts commit under one SQN.
-`BatchSeq` is seeded from the journal SQN and increases monotonically across
-restarts.
+Reserved `$fts`-prefixed keys are engine-internal: the write path never
+derives postings from them, and application folds should skip them.
 
-Updates and deletes never read or rewrite earlier postings: a new write simply
-stores new pages and replaces the document's marker (deletes remove it). A
-posting is live only if its page's `BatchSeq` equals the document's current
-marker `BatchSeq`, so superseded postings are invisible to queries. The
-current implementation never rewrites or collects pages, so superseded
-postings continue to occupy index space; on update-heavy buckets the index
-grows with cumulative write history, not with the live document count.
+Updates and deletes never read or rewrite earlier postings: a new write
+stores fresh delta entries and replaces the document's marker (deletes
+remove it). A posting frame is live only if its stamped sequence equals
+the document's current marker sequence, so superseded postings are
+invisible to queries wherever they sit — in deltas or in a base.
+
+## Consolidation
+
+`book_ftsconsolidate/4` folds a shard's deltas into its base: read base
+plus deltas, heap-merge token-sorted streams, drop dead frames against
+the markers (the only cross-key join, done here and at query time), and
+commit — new base object, new summary, and REMOVALS of the consumed
+delta rows — in one atomic batch per shard group. Everything the
+operation supersedes is collected by machinery that already exists: the
+journal compactor reclaims old base values, the LSM merge collects
+replaced summaries and removed delta rows. There are no batch
+directories, alias lists, batch discovery, or compaction sequences: a
+shard is self-contained, ~megabytes, consolidates in milliseconds,
+independently and in parallel — maintenance is continuous and
+incremental rather than an operation with a size.
 
 ## Query Execution
 
-Queries locate terms through the page directories (binary search over
-fixed-width probe tables), point-read only the covering pages, and filter
-entries against the doc markers. Query terms are loaded rarest-leg first:
-phrase, NEAR, and AND legs beyond the driver only read pages in the candidate
-documents' batches, so hot tokens cost what the rarest leg costs. Terms in
-purely boolean context skip position decoding entirely.
+A token maps to exactly one shard, so a term read is: shard summary
+(bloom answers absent tokens without touching postings), base entry by
+binary search, plus a scan of the shard's deltas — one contiguous key
+neighbourhood per term BY CONSTRUCTION, regardless of write history.
+The scatter that motivated batch compaction in the first design cannot
+occur. Prefix terms cover a contiguous shard range. Doc frames filter
+against the markers (write-through cached), then evaluation, ranking,
+and the per-sequence result cache proceed exactly as before.
 
-Per store instance the engine keeps an ETS cache of decoded directories and
-pages (immutable per batch) and of query results keyed by the FTS write
-sequence, which changes on every FTS write -- cached results are therefore
-always exact.
+Per store instance the engine keeps write-through ETS caches of shard
+state (summary + pending deltas, advanced by the write path under the
+same stamp discipline as the marker cache) and decoded bases
+(invalidated by consolidation), so warm reads touch no folds at all.
 
 ## Query
 
@@ -263,62 +292,13 @@ This design keeps Leveled's storage model simple:
 - one Bookie commit for object and postings;
 - phrase and NEAR without object reads.
 
-Compared with SQLite FTS5: both pack postings into pages, but Leveled's pages
-are per write batch and there is no segment-merge process, so update-heavy
-buckets accumulate superseded postings indefinitely (reclaiming them would
-require re-deriving the index under a new index name), and very small cold
-point queries pay the store's snapshot cost where SQLite pays microseconds.
-Repeated queries are served from the result cache without a snapshot.
-
-## Batch Compaction
-
-Status: IMPLEMENTED (`book_ftscompact/4`) — page blooms remove the
-absent-term floor; compaction removes the matching-term scatter and
-drops superseded postings from the merged pages. One deviation from the
-original sketch below: doc markers are NOT rewritten and old rows are
-not removed. The merged directory carries the subsumed sequences as an
-ALIAS list; query liveness resolves marker sequences through the alias
-map, discovery filters subsumed batches out of the walk, and the merged
-batch's sequence is assigned at apply time (derivation stamps a
-placeholder — reserving a sequence without a journal write would let a
-later write re-issue it after the SQN resync). Old batches' physical
-rows remain as unreachable dead weight (space, not time); full reclaim
-still goes through reindex-under-a-new-name.
-
-The residual O(#batches) cost is *matching* postings: a term present in
-k batches costs ~k page reads however small each posting run is (the
-gate run's `istanbul`: 686 hits ≈ 100 ms where SQLite pays 3 ms).
-Because a document's live postings live entirely in the single batch
-its marker references, batches can be merged without re-tokenisation:
-
-- **Operation.** `book_ftscompact(Bookie, Bucket, Index, Opts)` merges
-  the live postings of a bounded run of adjacent batches `[S1..Sk]`
-  into one new batch at the current write sequence, in ONE atomic
-  `batchput` carrying: the merged token-sorted page rows and directory
-  (reusing `merge_runs_to_pages` — per-batch page streams are exactly
-  its run inputs), re-stamped doc markers `{NewSeq, DocLength}` for
-  every doc whose marker referenced a compacted batch, and removal
-  specs for the old batch directory markers (which removes the batches
-  from discovery; their unreachable page rows are merged out of the
-  LSM later). Superseded postings — rows whose doc's marker points
-  elsewhere — are dropped during the merge: this is also the space
-  reclaim path the Tradeoffs section says is missing today.
-- **Bounded steps.** One step compacts at most k batches (tiered like
-  the LSM itself: many small batches -> one larger, repeatedly), so
-  batchput size, memory, and marker-rewrite volume are bounded; a full
-  store converges in O(log) passes. Full-corpus single-shot compaction
-  is rejected (multi-GB atomic batch).
-- **Consistency.** In-flight queries hold ledger snapshots and keep
-  seeing the old rows; new queries at the post-compaction sequence see
-  only the merged batch (their markers re-point atomically in the same
-  batch). The compaction batch advances the write sequence, so the
-  result cache invalidates naturally; the incremental batch-list cache
-  is reset (one rediscovery), and corpus stats are unchanged by
-  construction (same live docs, same lengths — a useful invariant to
-  assert in tests).
-- **Scheduling.** Administrative API first; callers (e.g. ash_leveled
-  via a scheduled action) decide policy such as "compact when batch
-  count exceeds N". No automatic background process inside the store.
+Compared with SQLite FTS5: both pack postings and both run their own
+segment maintenance above the host storage engine, but Leveled's grid
+delegates the heavy mechanics to native machinery — journal compaction
+reclaims superseded bases, LSM merge collects summaries and removed
+deltas, and same-key supersession replaces alias bookkeeping. The
+remaining engine-specific work is the marker join (per-document
+liveness) and the shard consolidation merge itself.
 
 ## Benchmarks
 
