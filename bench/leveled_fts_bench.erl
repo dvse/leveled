@@ -359,10 +359,16 @@ maybe_compact(_Bookie, _Opts) ->
     ok.
 
 compact_loop(Bookie, Bucket, Index, N) ->
-    {async, Run} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 256),
+    Limits = #{max_batches => 256, max_bytes => 512 * 1024 * 1024},
+    {async, Run} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, Limits),
+    PassStart = erlang:monotonic_time(microsecond),
     case Run() of
-        ok -> compact_loop(Bookie, Bucket, Index, N + 1);
-        noop -> N
+        ok ->
+            PassUs = erlang:monotonic_time(microsecond) - PassStart,
+            io:format("compaction pass ~p: ~.1f s~n", [N + 1, PassUs / 1000000]),
+            compact_loop(Bookie, Bucket, Index, N + 1);
+        noop ->
+            N
     end.
 
 maybe_bust_cache(_Bookie, #{sentinel := undefined}) ->

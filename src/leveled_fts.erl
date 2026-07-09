@@ -1585,7 +1585,8 @@ ctx_alias_map(Ctx) ->
 %% liveness resolves marker sequences through the alias map, so a doc
 %% updated or deleted after derivation simply makes the merged copy of
 %% its old postings dead — concurrent writes are safe by construction.
-compact_index_specs(FoldSource, Bucket, Ref, NewSeq, MaxBatches) ->
+compact_index_specs(FoldSource, Bucket, Ref, NewSeq, Limits0) ->
+    Limits = compact_limits(Limits0),
     Seqs = discover_seqs(FoldSource, Bucket, Ref),
     Resolved =
         [{S, resolve_dir(FoldSource, Bucket, Ref, S, undefined)} || S <- Seqs],
@@ -1598,11 +1599,11 @@ compact_index_specs(FoldSource, Bucket, Ref, NewSeq, MaxBatches) ->
         ),
     LiveDirs =
         [SD || {S, _Dir} = SD <- Resolved, not maps:is_key(S, AliasMap)],
-    case length(LiveDirs) < 2 of
+    Chosen = choose_compact_batches(LiveDirs, Limits),
+    case length(Chosen) < 2 of
         true ->
             noop;
         false ->
-            Chosen = lists:sublist(LiveDirs, MaxBatches),
             ChosenSeqs = [S || {S, _Dir} <- Chosen],
             NewAliases =
                 lists:usort(
@@ -1615,6 +1616,39 @@ compact_index_specs(FoldSource, Bucket, Ref, NewSeq, MaxBatches) ->
             ByCol = compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch),
             Specs = pack_index_specs(Ref, ByCol, NewSeq, NewAliases),
             {ok, ChosenSeqs, Specs}
+    end.
+
+%% A count cap alone lets convergence culminate in one mega-merge of
+%% everything (a multi-GB atomic write and an hour of CPU at the 5GB
+%% gate-run scale — observed). The byte budget bounds every pass: steady
+%% state is several budget-sized batches whose pairwise merges would
+%% exceed the budget, which reads in microseconds and never mega-merges.
+%% Batch size is estimated from the directory (pages x page target).
+compact_limits(MaxBatches) when is_integer(MaxBatches) ->
+    #{max_batches => MaxBatches, max_bytes => 512 * 1024 * 1024};
+compact_limits(#{} = Limits) ->
+    #{
+        max_batches => maps:get(max_batches, Limits, 256),
+        max_bytes => maps:get(max_bytes, Limits, 512 * 1024 * 1024)
+    }.
+
+choose_compact_batches(LiveDirs, #{max_batches := MaxN, max_bytes := MaxBytes}) ->
+    choose_compact_batches(LiveDirs, MaxN, MaxBytes, 0, []).
+
+choose_compact_batches([], _MaxN, _MaxBytes, _Bytes, Acc) ->
+    lists:reverse(Acc);
+choose_compact_batches(_Rest, MaxN, _MaxBytes, _Bytes, Acc) when length(Acc) >= MaxN ->
+    lists:reverse(Acc);
+choose_compact_batches([{_S, {ColMap, _A}} = SD | Rest], MaxN, MaxBytes, Bytes, Acc) ->
+    Estimate =
+        maps:fold(
+            fun(_ColId, PS, B) -> B + probe_size(PS) * ?FTS_PAGE_TARGET_BYTES end,
+            0,
+            ColMap
+        ),
+    case Bytes + Estimate > MaxBytes andalso Acc =/= [] of
+        true -> lists:reverse(Acc);
+        false -> choose_compact_batches(Rest, MaxN, MaxBytes, Bytes + Estimate, [SD | Acc])
     end.
 
 %% One marker fold: doc key -> live batch (alias-resolved), restricted to

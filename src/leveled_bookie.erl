@@ -631,11 +631,11 @@ book_ftssearch(Pid, Bucket, Index, Query, Opts) ->
 %% applied as one atomic write. Concurrent reads and writes are safe;
 %% run repeatedly to converge a store with many batches. Administrative —
 %% callers serialise their own compaction schedule (one at a time).
-book_ftscompact(Pid, Bucket, Index0, MaxBatches)
-    when is_integer(MaxBatches), MaxBatches >= 2
+book_ftscompact(Pid, Bucket, Index0, Limits) when
+    (is_integer(Limits) andalso Limits >= 2) orelse is_map(Limits)
 ->
     Index = leveled_fts:normalise_index(Index0),
-    gen_server:call(Pid, {ftscompact, Bucket, Index, MaxBatches}, infinity).
+    gen_server:call(Pid, {ftscompact, Bucket, Index, Limits}, infinity).
 
 -spec book_casput(
     pid(),
@@ -1701,7 +1701,7 @@ handle_call(
                     )
             end
     end;
-handle_call({ftscompact, Bucket, Index, MaxBatches}, _From, State) when
+handle_call({ftscompact, Bucket, Index, Limits}, _From, State) when
     State#state.head_only == false
 ->
     case leveled_fts:find_schema(Bucket, Index, State#state.fts_indexes) of
@@ -1723,7 +1723,7 @@ handle_call({ftscompact, Bucket, Index, MaxBatches}, _From, State) when
                     Derived =
                         try
                             leveled_fts:compact_index_specs(
-                                IndexFold, Bucket, Ref, 0, MaxBatches
+                                IndexFold, Bucket, Ref, 0, Limits
                             )
                         catch
                             throw:{fts_error, Reason} -> {error, Reason}
