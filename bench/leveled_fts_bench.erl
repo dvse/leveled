@@ -364,12 +364,11 @@ read_first_doc(Opts) ->
 maybe_compact(Bookie, #{compact := true} = Opts) ->
     Bucket = maps:get(bucket, Opts),
     Index = maps:get(index, Opts),
-    Limits = #{max_batches => 256, max_bytes => 512 * 1024 * 1024},
     Start = erlang:monotonic_time(microsecond),
-    {async, Run} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, Limits),
+    {async, Run} = leveled_bookie:book_ftsconsolidate(Bookie, Bucket, Index, #{}),
     Result = Run(),
     Elapsed = erlang:monotonic_time(microsecond) - Start,
-    io:format("compacted (~p) in ~.1f s~n", [Result, Elapsed / 1000000]),
+    io:format("consolidated (~p) in ~.1f s~n", [Result, Elapsed / 1000000]),
     ok;
 maybe_compact(_Bookie, _Opts) ->
     ok.

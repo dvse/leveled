@@ -6,6 +6,7 @@
 -export([
     single_object_contract/1,
     fts_shard_cache/1,
+    fts_include_docs/1,
     stats_staleness_window/1,
     fts_consolidation/1,
     batchput_contract/1,
@@ -40,6 +41,7 @@ all() ->
     [
         single_object_contract,
         fts_shard_cache,
+        fts_include_docs,
         stats_staleness_window,
         fts_consolidation,
         batchput_contract,
@@ -3010,6 +3012,29 @@ fts_consolidation(_Config) ->
     {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
     PostWrites = Snap(Bookie2, Queries),
     ok = leveled_bookie:book_close(Bookie2),
+    testutil:reset_filestructure().
+
+%% include_docs attaches the stored object to each hit from the same
+%% snapshot the hits were computed against.
+fts_include_docs(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_include_docs"),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Bucket = <<"batch">>,
+    Index = <<"main">>,
+    ok = fts_put(Bookie, Bucket, <<"k1">>, <<"o1">>, Index, #{body => <<"needle one">>}, #{}),
+    ok = fts_put(Bookie, Bucket, <<"k2">>, <<"o2">>, Index, #{body => <<"needle two">>}, #{}),
+    Opts = #{columns => [body], limit => 10, include_docs => true},
+    Hits = search(Bookie, Bucket, Index, <<"needle">>, Opts),
+    [<<"k1">>, <<"k2">>] = keys(Hits),
+    true = lists:all(fun(H) -> is_map_key(document, H) end, Hits),
+    %% cached-result path attaches documents too
+    Hits2 = search(Bookie, Bucket, Index, <<"needle">>, Opts),
+    true = lists:all(fun(H) -> is_map_key(document, H) end, Hits2),
+    %% deleted docs drop from hydrated hits at the next sequence
+    ok = leveled_bookie:book_put(Bookie, Bucket, <<"k2">>, delete, [], o, infinity, false),
+    Hits3 = search(Bookie, Bucket, Index, <<"needle">>, Opts),
+    [<<"k1">>] = keys(Hits3),
+    ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
 shard_cache_entry(Bucket, Shard) ->
