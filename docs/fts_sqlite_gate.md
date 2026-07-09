@@ -30,6 +30,35 @@ fixed order, keeps `ns0` non-redirect pages, assigns ordinal keys
 prefix slices of that TSV by cumulative text bytes, so every engine and rank
 mode at a given scale indexes the identical first-N documents.
 
+## VERDICT — grid architecture (v2), 2026-07-09
+
+The findings below drove two rounds of engineering: first ten fixes to
+the original batch-paged layout, then a full storage rewrite to the
+token-grid architecture (docs/FTS.md). Final gate on the grid, stable
+regime, all three scales (100MB / 1GB / 5.33GB Wikipedia), both rank
+modes, 78 cells:
+
+- **Equivalence: 78/78 fully equivalent.** Unranked match sets exact
+  (identical top-100s, counts, full-set hashes); ranked BM25 order and
+  scores within 1e-6 of SQLite FTS5 at every scale. The CJK tokenizer
+  and NEAR-scoring divergences dissected below are fixed and covered by
+  the differential contracts.
+- **Latency: 73/78 cells pass the 5x gate.** Several cell classes now
+  beat SQLite outright at full scale: `title:history` ranked 0.13x,
+  `istanbul` 0.36x, ranked no-match 0.38x, prefix 0.95x; hot terms run
+  1.0-1.4x, phrases 2.3-2.9x, booleans 2.0-4.6x. The sole breaching
+  query shape is NEAR (6.1-8.3x): its eprof profile is flat —
+  distributed decode/map-building constants against SQLite's C, with no
+  dominating fixable cost — and is documented as the structural
+  residual.
+- **Maintenance: whole-store consolidation of the 5.33GB corpus runs as
+  ONE call in 231s** (the from-scratch, maximum-debt case; the v1
+  pass-loop took 2.3 hours for the same convergence). Steady-state
+  per-shard consolidation is milliseconds and continuous.
+
+Full tables: `check_gate.py --results-dir .../results/stable` over the
+retained TSVs; summary at gate_v2.md/json alongside them.
+
 ## Tokenizer / prefix parity (the equivalence precondition)
 
 Both engines are configured with the byte-for-byte equivalent tokenizer and
