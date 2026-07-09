@@ -86,6 +86,8 @@ parse_args(["--uncached" | Rest], Opts) ->
     parse_args(Rest, Opts#{uncached => true, bust_mode => always});
 parse_args(["--amortized" | Rest], Opts) ->
     parse_args(Rest, Opts#{uncached => true, bust_mode => amortized});
+parse_args(["--compact" | Rest], Opts) ->
+    parse_args(Rest, Opts#{compact => true});
 parse_args(["--limit", N | Rest], Opts) ->
     parse_args(Rest, Opts#{limit => list_to_integer(N)});
 parse_args(["--runs", N | Rest], Opts) ->
@@ -133,6 +135,13 @@ run(Opts) ->
     Result =
         case LoadResult of
             {ok, DocCount, TextBytes, LoadStats} ->
+                %% --compact: converge the store to few posting batches
+                %% before measuring, the steady state a maintained store
+                %% runs at (SQLite's index is likewise fully merged after
+                %% its build). Oldest-first selection makes merged
+                %% batches (newest sequences) accumulate at the tail, so
+                %% convergence rewrites each posting about twice.
+                ok = maybe_compact(Bookie, Opts),
                 LoadStatus = leveled_bookie:book_status(Bookie),
                 LoadMemory = memory_snapshot(),
                 CloseStart = erlang:monotonic_time(microsecond),
@@ -334,6 +343,24 @@ read_first_doc(Opts) ->
         end
     after
         ok = file:close(File)
+    end.
+
+maybe_compact(Bookie, #{compact := true} = Opts) ->
+    Bucket = maps:get(bucket, Opts),
+    Index = maps:get(index, Opts),
+    Start = erlang:monotonic_time(microsecond),
+    Passes = compact_loop(Bookie, Bucket, Index, 0),
+    Elapsed = erlang:monotonic_time(microsecond) - Start,
+    io:format("compacted in ~p passes (~.1f s)~n", [Passes, Elapsed / 1000000]),
+    ok;
+maybe_compact(_Bookie, _Opts) ->
+    ok.
+
+compact_loop(Bookie, Bucket, Index, N) ->
+    {async, Run} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 256),
+    case Run() of
+        ok -> compact_loop(Bookie, Bucket, Index, N + 1);
+        noop -> N
     end.
 
 maybe_bust_cache(_Bookie, #{sentinel := undefined}) ->

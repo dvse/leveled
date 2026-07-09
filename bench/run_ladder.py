@@ -79,7 +79,7 @@ def run_sqlite(helper, tsv, db, queries, result, rank, limit, runs, warmup, batc
 
 
 def run_leveled(ebin, tsv, root, queries, result, rank, limit, runs, warmup, batch,
-                log, regime="warm"):
+                log, regime="warm", compact=False):
     eval_src = (
         "Args=init:get_plain_arguments(), "
         "case leveled_fts_bench:main(Args) of "
@@ -99,6 +99,8 @@ def run_leveled(ebin, tsv, root, queries, result, rank, limit, runs, warmup, bat
         cmd.append("--uncached")
     elif regime == "amortized":
         cmd.append("--amortized")
+    if compact:
+        cmd.append("--compact")
     with open(log, "ab") as lg:
         lg.write(f"\n$ {' '.join(cmd)}\n".encode())
         lg.flush()
@@ -148,6 +150,10 @@ def main() -> int:
                          "steady-state novel-query cost)")
     ap.add_argument("--reuse-sqlite", action="store_true",
                     help="skip the SQLite run when its result TSV already exists")
+    ap.add_argument("--compact", action="store_true",
+                    help="run FTS batch compaction to convergence after the leveled "
+                         "build, before measuring (the steady state of a maintained "
+                         "store; SQLite's index is likewise fully merged post-build)")
     args = ap.parse_args()
 
     tsv = pathlib.Path(args.tsv).resolve()
@@ -219,7 +225,8 @@ def main() -> int:
             llog = logs / f"leveled-{label}-{rank}-{regime}.log"
             t0 = time.time()
             rc = run_leveled(ebin, rung_tsv, root, args.queries, lres, rank, args.limit,
-                             rung["runs"], rung["warmup"], args.batch, llog, regime=regime)
+                             rung["runs"], rung["warmup"], args.batch, llog, regime=regime,
+                             compact=args.compact)
             print(f"  leveled {label} {rank} [{regime}]: rc={rc} ({time.time()-t0:.0f}s) -> {lres.name}",
                   flush=True)
             if rc != 0:
