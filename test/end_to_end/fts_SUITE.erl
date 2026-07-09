@@ -7,6 +7,7 @@
     single_object_contract/1,
     incremental_batch_list_cache/1,
     stats_staleness_window/1,
+    fts_batch_compaction/1,
     batchput_contract/1,
     multi_token_phrase_contract/1,
     index_update_contract/1,
@@ -40,6 +41,7 @@ all() ->
         single_object_contract,
         incremental_batch_list_cache,
         stats_staleness_window,
+        fts_batch_compaction,
         batchput_contract,
         multi_token_phrase_contract,
         index_update_contract,
@@ -2933,6 +2935,88 @@ stats_staleness_window(_Config) ->
             Runner()
         end)(),
     ok = leveled_bookie:book_close(Bookie),
+    testutil:reset_filestructure().
+
+%% Batch compaction merges live postings of many batches into one and
+%% hides the subsumed batches behind the merged directory's alias list.
+%% Every result — keys, order, and exact bm25 ranks — must be identical
+%% before and after (same live docs, same tf/df/dl/avgdl), across
+%% supersession, post-compaction writes, re-compaction, and restart.
+fts_batch_compaction(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_batch_compaction"),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Bucket = <<"batch">>,
+    Index = <<"main">>,
+    Opts = #{columns => [body], limit => 100},
+    RankOpts = Opts#{rank => bm25},
+    Put =
+        fun(B, K, Text) ->
+            ok = fts_put(B, Bucket, K, <<"o">>, Index, #{body => Text}, #{})
+        end,
+    Snap =
+        fun(B, Queries) ->
+            [
+                {Q,
+                    [
+                        {maps:get(key, H), maps:get(rank, H, none)}
+                     || H <- search(B, Bucket, Index, Q, O)
+                    ]}
+             || {Q, O} <- Queries
+            ]
+        end,
+    %% Six single-put batches, including an update that supersedes k1's
+    %% first postings (the merge must drop them).
+    Put(Bookie, <<"k1">>, <<"alpha beta gamma">>),
+    Put(Bookie, <<"k2">>, <<"alpha delta epsilon words">>),
+    Put(Bookie, <<"k3">>, <<"beta gamma delta phrase target here">>),
+    Put(Bookie, <<"k4">>, <<"rare unicorn alpha">>),
+    Put(Bookie, <<"k5">>, <<"gamma gamma gamma long document with many words here indeed">>),
+    Put(Bookie, <<"k1">>, <<"alpha beta rewritten">>),
+    Queries = [
+        {<<"alpha">>, Opts},
+        {<<"gamma">>, Opts},
+        {<<"unicorn">>, Opts},
+        {<<"rewritten">>, Opts},
+        {<<"alpha beta">>, Opts},
+        {<<"\"beta gamma\"">>, Opts},
+        {<<"NEAR(gamma delta, 3)">>, Opts},
+        {<<"alp*">>, Opts},
+        {<<"gamma NOT delta">>, Opts},
+        {<<"alpha">>, RankOpts},
+        {<<"gamma">>, RankOpts}
+    ],
+    Before = Snap(Bookie, Queries),
+    {_S0, BatchesBefore} = seqs_cache_entry(Bucket),
+    true = length(BatchesBefore) >= 6,
+    {async, Compact} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 100),
+    ok = Compact(),
+    Before = Snap(Bookie, Queries),
+    {_S1, BatchesAfter} = seqs_cache_entry(Bucket),
+    1 = length(BatchesAfter),
+    %% Nothing left to merge: a second pass is a noop.
+    {async, Compact2} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 100),
+    noop = Compact2(),
+    %% Post-compaction writes supersede merged postings and add new ones.
+    Put(Bookie, <<"k4">>, <<"replaced text entirely">>),
+    [] = keys(search(Bookie, Bucket, Index, <<"unicorn">>, Opts)),
+    [<<"k4">>] = keys(search(Bookie, Bucket, Index, <<"replaced">>, Opts)),
+    Put(Bookie, <<"k6">>, <<"unicorn returns">>),
+    [<<"k6">>] = keys(search(Bookie, Bucket, Index, <<"unicorn">>, Opts)),
+    %% Re-compaction folds the merged batch and the new batches together
+    %% (alias lists compose).
+    {async, Compact3} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 100),
+    ok = Compact3(),
+    [<<"k6">>] = keys(search(Bookie, Bucket, Index, <<"unicorn">>, Opts)),
+    [<<"k4">>] = keys(search(Bookie, Bucket, Index, <<"replaced">>, Opts)),
+    [<<"k1">>] = keys(search(Bookie, Bucket, Index, <<"rewritten">>, Opts)),
+    PostWrites = Snap(Bookie, Queries),
+    ok = leveled_bookie:book_close(Bookie),
+    %% Cold restart: discovery + alias filtering serve the same results.
+    {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
+    PostWrites = Snap(Bookie2, Queries),
+    {_S2, BatchesCold} = seqs_cache_entry(Bucket),
+    1 = length(BatchesCold),
+    ok = leveled_bookie:book_close(Bookie2),
     testutil:reset_filestructure().
 
 seqs_cache_entry(Bucket) ->

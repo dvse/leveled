@@ -270,12 +270,20 @@ require re-deriving the index under a new index name), and very small cold
 point queries pay the store's snapshot cost where SQLite pays microseconds.
 Repeated queries are served from the result cache without a snapshot.
 
-## Batch Compaction (design)
+## Batch Compaction
 
-Status: DESIGN — implement when a workload shows the batch-scatter cost
-after the 2026-07-09 fixes (page blooms already remove the absent-term
-floor; this removes the matching-term scatter and reclaims superseded
-postings).
+Status: IMPLEMENTED (`book_ftscompact/4`) — page blooms remove the
+absent-term floor; compaction removes the matching-term scatter and
+drops superseded postings from the merged pages. One deviation from the
+original sketch below: doc markers are NOT rewritten and old rows are
+not removed. The merged directory carries the subsumed sequences as an
+ALIAS list; query liveness resolves marker sequences through the alias
+map, discovery filters subsumed batches out of the walk, and the merged
+batch's sequence is assigned at apply time (derivation stamps a
+placeholder — reserving a sequence without a journal write would let a
+later write re-issue it after the SQN resync). Old batches' physical
+rows remain as unreachable dead weight (space, not time); full reclaim
+still goes through reindex-under-a-new-name.
 
 The residual O(#batches) cost is *matching* postings: a term present in
 k batches costs ~k page reads however small each posting run is (the

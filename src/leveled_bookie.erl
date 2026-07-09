@@ -56,6 +56,7 @@
     book_batchput/2,
     book_batchput/3,
     book_ftssearch/5,
+    book_ftscompact/4,
     book_casput/9,
     book_casbatchput/3,
     book_casbatchput/4,
@@ -620,6 +621,21 @@ book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
     {async, fun(() -> {ok, list(map())} | {error, term()})}.
 book_ftssearch(Pid, Bucket, Index, Query, Opts) ->
     leveled_fts:book_ftssearch(Pid, Bucket, Index, Query, Opts).
+
+-spec book_ftscompact(pid(), leveled_codec:key(), binary() | atom(), pos_integer()) ->
+    {async, fun(() -> ok | noop | {error, term()})} | {error, term()}.
+%% @doc
+%% Merge the oldest MaxBatches live posting batches of an FTS index into
+%% one (docs/FTS.md "Batch Compaction"). Returns a runner: derivation
+%% reads from a snapshot in the calling process; the merged batch is then
+%% applied as one atomic write. Concurrent reads and writes are safe;
+%% run repeatedly to converge a store with many batches. Administrative —
+%% callers serialise their own compaction schedule (one at a time).
+book_ftscompact(Pid, Bucket, Index0, MaxBatches)
+    when is_integer(MaxBatches), MaxBatches >= 2
+->
+    Index = leveled_fts:normalise_index(Index0),
+    gen_server:call(Pid, {ftscompact, Bucket, Index, MaxBatches}, infinity).
 
 -spec book_casput(
     pid(),
@@ -1685,6 +1701,77 @@ handle_call(
                     )
             end
     end;
+handle_call({ftscompact, Bucket, Index, MaxBatches}, _From, State) when
+    State#state.head_only == false
+->
+    case leveled_fts:find_schema(Bucket, Index, State#state.fts_indexes) of
+        {ok, Schema} ->
+            Ref = leveled_fts:index_ref(Schema),
+            SnapFun = return_snapfun(State, ledger, no_lookup, false, true),
+            Self = self(),
+            Runner =
+                fun() ->
+                    {ok, LedgerSnapshot, _J, AfterFun} = SnapFun(),
+                    IndexFold = fts_index_fold_fun(LedgerSnapshot),
+                    %% Derivation stamps a placeholder sequence: the real
+                    %% one is only known at apply time (fts_seq must stay
+                    %% equal to the journal SQN — reserving a sequence
+                    %% here without a journal write would let a later
+                    %% write re-issue the same batch sequence after the
+                    %% SQN resync). Spec payloads never embed the new
+                    %% sequence, so apply re-stamps terms only.
+                    Derived =
+                        try
+                            leveled_fts:compact_index_specs(
+                                IndexFold, Bucket, Ref, 0, MaxBatches
+                            )
+                        catch
+                            throw:{fts_error, Reason} -> {error, Reason}
+                        after
+                            AfterFun()
+                        end,
+                    case Derived of
+                        noop ->
+                            noop;
+                        {error, _Reason} = Error ->
+                            Error;
+                        {ok, ChosenSeqs, Specs} ->
+                            case
+                                gen_server:call(
+                                    Self,
+                                    {ftscompact_apply, Bucket, Ref, ChosenSeqs, Specs},
+                                    infinity
+                                )
+                            of
+                                pause -> ok;
+                                Reply -> Reply
+                            end
+                    end
+                end,
+            {reply, {async, Runner}, State};
+        _NotFound ->
+            {reply, {error, missing_fts_schema}, State}
+    end;
+handle_call({ftscompact_apply, Bucket, Ref, ChosenSeqs, Specs0}, From, State) when
+    State#state.head_only == false
+->
+    PrevSeq = State#state.fts_seq,
+    NewSeq = PrevSeq + 1,
+    Specs = leveled_fts:restamp_compact_specs(Specs0, NewSeq),
+    {Index, Tag} = Ref,
+    SentinelKey = <<"$fts_compact$", Index/binary>>,
+    LedgerKey = leveled_codec:to_objectkey(Bucket, SentinelKey, Tag),
+    Object = term_to_binary({fts_compaction, NewSeq, ChosenSeqs}),
+    do_augmented_put(
+        LedgerKey,
+        Object,
+        Specs,
+        infinity,
+        false,
+        From,
+        State#state{fts_seq = NewSeq},
+        {compact, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq}
+    );
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
     State#state.head_only == false
 ->
@@ -3247,22 +3334,7 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
 %% monotonic across restarts.
 run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
     {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
-    IndexFold =
-        fun(FoldBucketKey, FoldAccT, Range, TermHandling) ->
-            {StartKey, EndKey} =
-                index_range(FoldBucketKey, Range),
-            {FoldKeysFun, InitAcc} = FoldAccT,
-            Folder =
-                leveled_penciller:pcl_fetchkeys(
-                    LedgerSnapshot,
-                    StartKey,
-                    EndKey,
-                    leveled_codec:accumulate_index(TermHandling, FoldKeysFun),
-                    InitAcc,
-                    by_runner
-                ),
-            Folder()
-        end,
+    IndexFold = fts_index_fold_fun(LedgerSnapshot),
     try
         leveled_fts:search(
             IndexFold,
@@ -3275,6 +3347,25 @@ run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
         )
     after
         AfterFun()
+    end.
+
+%% The fold source handed to leveled_fts: index folds against one ledger
+%% snapshot, executed in the calling process.
+fts_index_fold_fun(LedgerSnapshot) ->
+    fun(FoldBucketKey, FoldAccT, Range, TermHandling) ->
+        {StartKey, EndKey} =
+            index_range(FoldBucketKey, Range),
+        {FoldKeysFun, InitAcc} = FoldAccT,
+        Folder =
+            leveled_penciller:pcl_fetchkeys(
+                LedgerSnapshot,
+                StartKey,
+                EndKey,
+                leveled_codec:accumulate_index(TermHandling, FoldKeysFun),
+                InitAcc,
+                by_runner
+            ),
+        Folder()
     end.
 
 %% Decoded page directories are immutable per batch sequence within a store
@@ -3323,6 +3414,10 @@ augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) ->
 
 advance_fts_seqs_cache(_DirCache, _NewSeq, {[], 0, 0}) ->
     ok;
+advance_fts_seqs_cache(DirCache, NewFtsSeq, {compact, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq}) ->
+    leveled_fts:compact_seqs_cache(
+        DirCache, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq, NewFtsSeq
+    );
 advance_fts_seqs_cache(DirCache, NewSeq, {Touched, BatchSeq, PrevSeq}) ->
     leveled_fts:advance_seqs_cache(DirCache, Touched, BatchSeq, PrevSeq, NewSeq).
 

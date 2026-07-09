@@ -13,6 +13,12 @@
     augment_object_changes/3,
     advance_seqs_cache/5,
     reset_seqs_cache/1,
+    compact_index_specs/5,
+    compact_seqs_cache/7,
+    restamp_compact_specs/2,
+    find_schema/3,
+    index_ref/1,
+    normalise_index/1,
     spec_token_entries/3,
     book_ftssearch/5,
     cached_search/5,
@@ -390,6 +396,12 @@ attach_page_specs_rev([{Change, _Bucket, _HasMatch} | Rest], PageSpecsByBucket, 
     attach_page_specs_rev(Rest, PageSpecsByBucket, [Change | Acc]).
 
 pack_index_specs(Ref, ByCol, BatchSeq) ->
+    pack_index_specs(Ref, ByCol, BatchSeq, []).
+
+%% With aliases (compaction) the directory row is emitted even when the
+%% merged batch has no pages left: the alias list is what hides the
+%% subsumed batches from the walk.
+pack_index_specs(Ref, ByCol, BatchSeq, Aliases) ->
     Pages =
         lists:append(
             [
@@ -398,14 +410,14 @@ pack_index_specs(Ref, ByCol, BatchSeq) ->
                 Runs =/= []
             ]
         ),
-    case Pages of
-        [] ->
+    case {Pages, Aliases} of
+        {[], []} ->
             [];
         _ ->
             Numbered = lists:zip(lists:seq(0, length(Pages) - 1), Pages),
             Field = seg_field(Ref),
             [
-                {add_payload, Field, dir_term(BatchSeq), encode_dir(Numbered)}
+                {add_payload, Field, dir_term(BatchSeq), encode_dir(Numbered, Aliases)}
                 | [
                     {add_payload, Field, page_term(BatchSeq, PageNo), Payload}
                  || {PageNo, {_ColId, _First, _Last, Payload, _Bloom}} <- Numbered
@@ -1154,7 +1166,7 @@ ranked_term_metas(Ctx0, Terms) ->
             #{};
         _ ->
             {Ctx2, Markers} = load_markers(Ctx1, maps:keys(RawAll)),
-            build_metas(RawAll, Markers, maps:get(ref, Ctx2))
+            build_metas(RawAll, Markers, maps:get(ref, Ctx2), ctx_alias_map(Ctx2))
     end.
 
 all_doc_metas(#{fold := FoldSource, bucket := Bucket, ref := Ref}) ->
@@ -1215,15 +1227,22 @@ term_metas(Ctx0, AST, Terms) ->
             #{};
         _ ->
             {Ctx3, Markers} = load_markers(Ctx2, maps:keys(RawDrivers)),
-            DriverMetas = build_metas(RawDrivers, Markers, maps:get(ref, Ctx3)),
+            AliasMap = ctx_alias_map(Ctx3),
+            DriverMetas = build_metas(RawDrivers, Markers, maps:get(ref, Ctx3), AliasMap),
             case maps:size(DriverMetas) of
                 0 ->
                     #{};
                 _ ->
                     CandKeys = sets:from_list(maps:keys(DriverMetas)),
+                    %% Candidate batches resolve through the alias map: a
+                    %% doc whose marker references a compacted batch has
+                    %% its live postings in the batch that subsumed it.
                     CandSeqs =
                         sets:from_list([
-                            element(1, maps:get(Key, Markers))
+                            begin
+                                S0 = element(1, maps:get(Key, Markers)),
+                                maps:get(S0, AliasMap, S0)
+                            end
                          || Key <- maps:keys(DriverMetas)
                         ]),
                     {_Ctx4, RawAll} =
@@ -1245,7 +1264,8 @@ term_metas(Ctx0, AST, Terms) ->
                     build_metas(
                         maps:with(sets:to_list(CandKeys), RawAll),
                         Markers,
-                        maps:get(ref, Ctx3)
+                        maps:get(ref, Ctx3),
+                        AliasMap
                     )
             end
     end.
@@ -1419,13 +1439,18 @@ add_raw_entries(Raw, Col, BatchSeq, TokenEntries) ->
         TokenEntries
     ).
 
-build_metas(Raw, Markers, Ref) ->
+%% A posting is live when its batch is the one the doc's marker
+%% references — or, after compaction, the batch that SUBSUMED it: the
+%% alias map re-points marker sequences at the batch now carrying their
+%% postings, so unchanged docs stay live without marker rewrites.
+build_metas(Raw, Markers, Ref, AliasMap) ->
     maps:fold(
         fun(Key, ByCol, Acc) ->
             case maps:get(Key, Markers, undefined) of
                 undefined ->
                     Acc;
-                {MarkerSeq, DocLength} ->
+                {MarkerSeq0, DocLength} ->
+                    MarkerSeq = maps:get(MarkerSeq0, AliasMap, MarkerSeq0),
                     Positions =
                         maps:filtermap(
                             fun(_Col, ByTok) ->
@@ -1480,27 +1505,254 @@ load_dirs(#{fold := FoldSource, bucket := Bucket, ref := Ref, cache := Cache} = 
     %% concurrent old-snapshot query from regressing an advanced entry.
     %% Decoded directories are immutable per batch sequence and cached
     %% without invalidation.
-    Seqs =
+    {Seqs, CacheState} =
         case Cache of
             {Ets, Seq} ->
                 SeqsKey = {seqs, Bucket, Ref},
                 case ets:lookup(Ets, SeqsKey) of
                     [{_K, {Seq, CachedSeqs}}] ->
-                        CachedSeqs;
+                        {CachedSeqs, hit};
                     _MissingOrOtherStamp ->
-                        Discovered = discover_seqs(FoldSource, Bucket, Ref),
-                        ets:insert_new(Ets, {SeqsKey, {Seq, Discovered}}),
-                        Discovered
+                        {discover_seqs(FoldSource, Bucket, Ref), miss}
                 end;
             undefined ->
-                discover_seqs(FoldSource, Bucket, Ref)
+                {discover_seqs(FoldSource, Bucket, Ref), uncached}
         end,
-    Dirs =
+    Resolved =
         [
             {BatchSeq, resolve_dir(FoldSource, Bucket, Ref, BatchSeq, Cache)}
          || BatchSeq <- Seqs
         ],
-    {Ctx#{dirs := Dirs}, Dirs}.
+    %% A compacted batch's directory lists the batches it subsumed:
+    %% subsumed batches leave the walk (their rows are dead weight kept
+    %% only for in-flight snapshots), and the alias map re-points marker
+    %% sequences at the subsuming batch for liveness checks. The FILTERED
+    %% list is what gets cached, so subsumed batches leave the walk for
+    %% good (cache hits and the write-path advance keep it filtered).
+    AliasMap =
+        maps:from_list(
+            lists:append([
+                [{Old, BatchSeq} || Old <- Aliases]
+             || {BatchSeq, {_ColMap, Aliases}} <- Resolved
+            ])
+        ),
+    Dirs =
+        [
+            {BatchSeq, ColMap}
+         || {BatchSeq, {ColMap, _Aliases}} <- Resolved,
+            not maps:is_key(BatchSeq, AliasMap)
+        ],
+    case {CacheState, Cache} of
+        {miss, {Ets1, Seq1}} ->
+            ets:insert_new(
+                Ets1,
+                {{seqs, Bucket, Ref}, {Seq1, [S || {S, _ColMap1} <- Dirs]}}
+            );
+        _HitOrUncached ->
+            ok
+    end,
+    {Ctx#{dirs := Dirs, alias_map => AliasMap}, Dirs}.
+
+ctx_alias_map(Ctx) ->
+    maps:get(alias_map, Ctx, #{}).
+
+%% ---------------------------------------------------------------------------
+%% Batch compaction (docs/FTS.md "Batch Compaction"): derive, from a
+%% snapshot, one merged batch subsuming the oldest MaxBatches live
+%% batches. Live postings are re-paged token-sorted; superseded postings
+%% are dropped during the merge; the merged directory carries the
+%% subsumed sequences as ALIASES. Doc markers are never rewritten: query
+%% liveness resolves marker sequences through the alias map, so a doc
+%% updated or deleted after derivation simply makes the merged copy of
+%% its old postings dead — concurrent writes are safe by construction.
+compact_index_specs(FoldSource, Bucket, Ref, NewSeq, MaxBatches) ->
+    Seqs = discover_seqs(FoldSource, Bucket, Ref),
+    Resolved =
+        [{S, resolve_dir(FoldSource, Bucket, Ref, S, undefined)} || S <- Seqs],
+    AliasMap =
+        maps:from_list(
+            lists:append([
+                [{Old, S} || Old <- Aliases]
+             || {S, {_ColMap, Aliases}} <- Resolved
+            ])
+        ),
+    LiveDirs =
+        [SD || {S, _Dir} = SD <- Resolved, not maps:is_key(S, AliasMap)],
+    case length(LiveDirs) < 2 of
+        true ->
+            noop;
+        false ->
+            Chosen = lists:sublist(LiveDirs, MaxBatches),
+            ChosenSeqs = [S || {S, _Dir} <- Chosen],
+            NewAliases =
+                lists:usort(
+                    lists:append([[S | Aliases] || {S, {_CM, Aliases}} <- Chosen])
+                ),
+            LiveByBatch =
+                compact_live_docs(
+                    FoldSource, Bucket, Ref, AliasMap, sets:from_list(ChosenSeqs)
+                ),
+            ByCol = compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch),
+            Specs = pack_index_specs(Ref, ByCol, NewSeq, NewAliases),
+            {ok, ChosenSeqs, Specs}
+    end.
+
+%% One marker fold: doc key -> live batch (alias-resolved), restricted to
+%% the batches being compacted.
+compact_live_docs(FoldSource, Bucket, Ref, AliasMap, ChosenSet) ->
+    Fold =
+        fun(_B, {_Term, Key, Payload}, Acc) ->
+            case decode_marker(Payload) of
+                {ok, MarkerSeq0, _DocLength} ->
+                    MarkerSeq = maps:get(MarkerSeq0, AliasMap, MarkerSeq0),
+                    case sets:is_element(MarkerSeq, ChosenSet) of
+                        true ->
+                            maps:update_with(
+                                MarkerSeq,
+                                fun(Set) -> sets:add_element(Key, Set) end,
+                                sets:from_list([Key]),
+                                Acc
+                            );
+                        false ->
+                            Acc
+                    end;
+                error ->
+                    Acc
+            end
+        end,
+    index_fold(
+        FoldSource,
+        {Bucket, null},
+        {Fold, #{}},
+        {doc_field(Ref), doc, doc},
+        {payload, undefined}
+    ).
+
+%% Per column, one run per chosen batch: the batch's pages walked in
+%% token order with each entry's doc frames filtered to that batch's
+%% live docs, re-framed in run format for merge_runs_to_pages/2.
+compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch) ->
+    lists:foldl(
+        fun({S, {ColMap, _Aliases}}, ByColAcc) ->
+            LiveSet = maps:get(S, LiveByBatch, sets:new()),
+            maps:fold(
+                fun(ColId, PS, Acc) ->
+                    Run = compact_batch_run(FoldSource, Bucket, Ref, S, PS, LiveSet),
+                    case Run of
+                        <<>> ->
+                            Acc;
+                        _ ->
+                            maps:update_with(
+                                ColId, fun(Rs) -> [Run | Rs] end, [Run], Acc
+                            )
+                    end
+                end,
+                ByColAcc,
+                ColMap
+            )
+        end,
+        #{},
+        Chosen
+    ).
+
+compact_batch_run(FoldSource, Bucket, Ref, BatchSeq, PS, LiveSet) ->
+    PageNos =
+        [element(3, probe_row(PS, I)) || I <- lists:seq(1, probe_size(PS))],
+    iolist_to_binary([
+        compact_page_run(FoldSource, Bucket, Ref, BatchSeq, PageNo, LiveSet)
+     || PageNo <- PageNos
+    ]).
+
+compact_page_run(FoldSource, Bucket, Ref, BatchSeq, PageNo, LiveSet) ->
+    Term = page_term(BatchSeq, PageNo),
+    Fold = fun(_B, {_Term, _Key, Payload}, _Acc) -> Payload end,
+    case
+        index_fold(
+            FoldSource,
+            {Bucket, null},
+            {Fold, not_found},
+            {seg_field(Ref), Term, Term},
+            {payload, undefined}
+        )
+    of
+        not_found ->
+            <<>>;
+        Payload ->
+            [
+                begin
+                    Entry =
+                        <<(byte_size(Token)):16/unsigned-big, Token/binary,
+                            Kept:32/unsigned-big, KeptBin/binary>>,
+                    <<(byte_size(Entry)):32/unsigned-big, Entry/binary>>
+                end
+             || {Token, DocsBin} <- page_entries(Payload),
+                {Kept, KeptBin} <- [filter_doc_frames(DocsBin, LiveSet)],
+                Kept > 0
+            ]
+    end.
+
+%% Re-stamp derivation-time placeholder terms with the batch sequence
+%% assigned at apply time. Only the index TERMS embed the sequence —
+%% directory and page payloads never do (aliases are the old sequences).
+restamp_compact_specs(Specs, NewSeq) ->
+    [
+        case Term of
+            <<0:8, _P:64/unsigned-big>> ->
+                {add_payload, Field, dir_term(NewSeq), Payload};
+            <<1:8, _P:64/unsigned-big, PageNo:16/unsigned-big>> ->
+                {add_payload, Field, page_term(NewSeq, PageNo), Payload}
+        end
+     || {add_payload, Field, Term, Payload} <- Specs
+    ].
+
+%% Walk doc frames verbatim, keeping only live docs (no position decode).
+filter_doc_frames(DocsBin, LiveSet) ->
+    filter_doc_frames(DocsBin, LiveSet, 0, <<>>).
+
+filter_doc_frames(<<>>, _LiveSet, Kept, Acc) ->
+    {Kept, Acc};
+filter_doc_frames(
+    <<KeyLen:16/unsigned-big, Key:KeyLen/binary, PosLen:16/unsigned-big,
+        PosBin:PosLen/binary, Rest/binary>> = Bin,
+    LiveSet,
+    Kept,
+    Acc
+) ->
+    FrameLen = 2 + KeyLen + 2 + PosLen,
+    <<Frame:FrameLen/binary, _/binary>> = Bin,
+    _ = PosBin,
+    case sets:is_element(Key, LiveSet) of
+        true ->
+            filter_doc_frames(Rest, LiveSet, Kept + 1, <<Acc/binary, Frame/binary>>);
+        false ->
+            filter_doc_frames(Rest, LiveSet, Kept, Acc)
+    end;
+filter_doc_frames(_Bad, _LiveSet, _Kept, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% Replace the compacted sequences with the merged batch in the
+%% compacted index's stamped cache entry; other indexes just re-stamp
+%% (mirror of advance_seqs_cache/5 for compaction).
+compact_seqs_cache(undefined, _Bucket, _Ref, _ChosenSeqs, _NewSeq, _PrevSeq, _NewFtsSeq) ->
+    ok;
+compact_seqs_cache(Ets, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq, NewFtsSeq) ->
+    lists:foreach(
+        fun({{seqs, B, R} = Key, {Stamp, SeqList}}) ->
+            case Stamp of
+                PrevSeq ->
+                    SeqList1 =
+                        case {B, R} of
+                            {Bucket, Ref} -> (SeqList -- ChosenSeqs) ++ [NewSeq];
+                            _OtherIndex -> SeqList
+                        end,
+                    ets:insert(Ets, {Key, {NewFtsSeq, SeqList1}});
+                _Stale ->
+                    ets:delete(Ets, Key)
+            end
+        end,
+        ets:match_object(Ets, {{seqs, '_', '_'}, '_'})
+    ),
+    ok.
 
 %% Advance the cached batch lists after a successful FTS write: entries
 %% stamped with the pre-write sequence move to the new sequence, gaining
@@ -1585,11 +1837,13 @@ resolve_dir(FoldSource, Bucket, Ref, BatchSeq, Cache) ->
                     )
                 of
                     not_found ->
-                        #{};
+                        {#{}, []};
                     Payload ->
                         case decode_dir(Payload) of
-                            {ok, Entries, Blooms} -> dir_col_map(Entries, Blooms);
-                            error -> throw({fts_error, invalid_fts_payload})
+                            {ok, Entries, Blooms, Aliases} ->
+                                {dir_col_map(Entries, Blooms), Aliases};
+                            error ->
+                                throw({fts_error, invalid_fts_payload})
                         end
                 end,
             case Ets of
@@ -2183,10 +2437,14 @@ dir_term(BatchSeq) ->
 page_term(BatchSeq, PageNo) ->
     <<1:8, BatchSeq:64/unsigned-big, PageNo:16/unsigned-big>>.
 
-%% Page blooms trail the classic entry section, so directories written
-%% before blooms existed decode with an empty bloom map (no skips, exact
-%% pre-bloom behavior) and mixed-era stores work unchanged.
+%% Page blooms and the alias section trail the classic entry section, so
+%% directories written before either existed decode with an empty bloom
+%% map and no aliases (exact prior behavior) and mixed-era stores work
+%% unchanged.
 encode_dir(NumberedPages) ->
+    encode_dir(NumberedPages, []).
+
+encode_dir(NumberedPages, Aliases) ->
     iolist_to_binary([
         <<(length(NumberedPages)):16/unsigned-big>>,
         [
@@ -2199,7 +2457,11 @@ encode_dir(NumberedPages) ->
         [
             <<PageNo:16/unsigned-big, (byte_size(Bloom)):16/unsigned-big, Bloom/binary>>
          || {PageNo, {_ColId, _First, _Last, _Payload, Bloom}} <- NumberedPages
-        ]
+        ],
+        case Aliases of
+            [] -> <<>>;
+            _ -> [<<(length(Aliases)):16/unsigned-big>>, [<<S:64/unsigned-big>> || S <- Aliases]]
+        end
     ]).
 
 decode_dir(<<Count:16/unsigned-big, Rest/binary>>) ->
@@ -2208,10 +2470,10 @@ decode_dir(_Payload) ->
     error.
 
 decode_dir_entries(0, <<>>, Acc) ->
-    {ok, lists:reverse(Acc), #{}};
+    {ok, lists:reverse(Acc), #{}, []};
 decode_dir_entries(0, <<Count:16/unsigned-big, Rest/binary>>, Acc) ->
     case decode_dir_blooms(Count, Rest, #{}) of
-        {ok, Blooms} -> {ok, lists:reverse(Acc), Blooms};
+        {ok, Blooms, Aliases} -> {ok, lists:reverse(Acc), Blooms, Aliases};
         error -> error
     end;
 decode_dir_entries(Count, Bin, Acc) when Count > 0 ->
@@ -2227,7 +2489,12 @@ decode_dir_entries(_Count, _Bin, _Acc) ->
     error.
 
 decode_dir_blooms(0, <<>>, Acc) ->
-    {ok, Acc};
+    {ok, Acc, []};
+decode_dir_blooms(0, <<AliasCount:16/unsigned-big, Rest/binary>>, Acc) ->
+    case decode_dir_aliases(AliasCount, Rest, []) of
+        {ok, Aliases} -> {ok, Acc, Aliases};
+        error -> error
+    end;
 decode_dir_blooms(Count, Bin, Acc) when Count > 0 ->
     case Bin of
         <<PageNo:16/unsigned-big, Len:16/unsigned-big, Bloom:Len/binary, Rest/binary>> ->
@@ -2236,6 +2503,19 @@ decode_dir_blooms(Count, Bin, Acc) when Count > 0 ->
             error
     end;
 decode_dir_blooms(_Count, _Bin, _Acc) ->
+    error.
+
+%% Alias section: the batch sequences this (compacted) batch subsumes.
+decode_dir_aliases(0, <<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_dir_aliases(Count, Bin, Acc) when Count > 0 ->
+    case Bin of
+        <<Seq:64/unsigned-big, Rest/binary>> ->
+            decode_dir_aliases(Count - 1, Rest, [Seq | Acc]);
+        _Other ->
+            error
+    end;
+decode_dir_aliases(_Count, _Bin, _Acc) ->
     error.
 
 %% Lazily parses a page payload to [{Token, DocsBin}] in token order: only
