@@ -99,6 +99,8 @@ def run_leveled(ebin, tsv, root, queries, result, rank, limit, runs, warmup, bat
         cmd.append("--uncached")
     elif regime == "amortized":
         cmd.append("--amortized")
+    elif regime == "stable":
+        cmd.append("--stable")
     if compact:
         cmd.append("--compact")
     with open(log, "ab") as lg:
@@ -143,7 +145,7 @@ def main() -> int:
     ap.add_argument("--min-free-gb", type=float, default=40.0)
     ap.add_argument("--uncached", action="store_true",
                     help="alias for --regime uncached")
-    ap.add_argument("--regime", choices=["warm", "uncached", "amortized"], default=None,
+    ap.add_argument("--regime", choices=["warm", "uncached", "amortized", "stable"], default=None,
                     help="leveled measurement regime: warm (result-cache hits), "
                          "uncached (write-seq bump per timed run; write-per-query worst "
                          "case), amortized (bump once + untimed absorber per run; "

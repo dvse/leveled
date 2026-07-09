@@ -659,11 +659,22 @@ search(FoldSource, Bucket, Index, Query, Opts0, Indexes) ->
 cached_search(undefined, _Bucket, _Index, _Query, _Opts0) ->
     miss;
 cached_search({Ets, Seq}, Bucket, Index, Query, Opts0) ->
-    ResKey = {res, Bucket, Index, result_query_key(Query), Opts0, Seq},
-    case ets:lookup(Ets, ResKey) of
-        [{_K, Result}] -> {ok, Result};
-        [] -> miss
+    case result_cache_enabled(Opts0) of
+        false ->
+            miss;
+        true ->
+            ResKey = {res, Bucket, Index, result_query_key(Query), Opts0, Seq},
+            case ets:lookup(Ets, ResKey) of
+                [{_K, Result}] -> {ok, Result};
+                [] -> miss
+            end
     end.
+
+%% result_cache => false skips both the read and the write of the query
+%% result cache: the honest cost of a novel query, for one-off queries
+%% and for benchmarking a stable store.
+result_cache_enabled(Opts) ->
+    maps:get(result_cache, Opts, true) =/= false.
 
 %% Cache is undefined or {EtsTable, WriteSeq}. All cached artefacts are either
 %% immutable for the lifetime of the store instance (page directories, page
@@ -672,16 +683,25 @@ cached_search({Ets, Seq}, Bucket, Index, Query, Opts0) ->
 search(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
     case Cache of
         {Ets, Seq} ->
-            ResKey = {res, Bucket, Index, result_query_key(Query), Opts0, Seq},
-            case ets:lookup(Ets, ResKey) of
-                [{_K, Result}] ->
-                    Result;
-                [] ->
-                    Result = search_uncached(
+            case result_cache_enabled(Opts0) of
+                false ->
+                    search_uncached(
                         FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache
-                    ),
-                    cache_result(Ets, ResKey, Result),
-                    Result
+                    );
+                true ->
+                    ResKey =
+                        {res, Bucket, Index, result_query_key(Query), Opts0, Seq},
+                    case ets:lookup(Ets, ResKey) of
+                        [{_K, Result}] ->
+                            Result;
+                        [] ->
+                            Result = search_uncached(
+                                FoldSource, Bucket, Index, Query, Opts0, Indexes,
+                                Cache
+                            ),
+                            cache_result(Ets, ResKey, Result),
+                            Result
+                    end
             end;
         undefined ->
             search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache)
@@ -3009,6 +3029,8 @@ validate_search_option_list([{rank, bm25} | Rest]) ->
     validate_search_option_list(Rest);
 validate_search_option_list([{rank, _Other} | _Rest]) ->
     {error, invalid_rank_option};
+validate_search_option_list([{result_cache, B} | Rest]) when is_boolean(B) ->
+    validate_search_option_list(Rest);
 validate_search_option_list([{stats_staleness, W} | Rest]) when is_integer(W), W >= 0 ->
     validate_search_option_list(Rest);
 validate_search_option_list([{stats_staleness, _Other} | _Rest]) ->

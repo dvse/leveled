@@ -88,6 +88,8 @@ parse_args(["--amortized" | Rest], Opts) ->
     parse_args(Rest, Opts#{uncached => true, bust_mode => amortized});
 parse_args(["--compact" | Rest], Opts) ->
     parse_args(Rest, Opts#{compact => true});
+parse_args(["--stable" | Rest], Opts) ->
+    parse_args(Rest, Opts#{bust_mode => stable});
 parse_args(["--limit", N | Rest], Opts) ->
     parse_args(Rest, Opts#{limit => list_to_integer(N)});
 parse_args(["--runs", N | Rest], Opts) ->
@@ -525,9 +527,15 @@ run_query_1(Bookie, Query, Opts) ->
                 %%     steady-state cost of a NOVEL query between writes.
                 %% Page/directory caches (immutable per batch) stay warm in
                 %% both regimes, matching SQLite's warm page cache.
+                %%   stable (--stable): NO writes — novel-query cost against
+                %%     a write-quiescent store, with the per-sequence result
+                %%     cache disabled for the timed query (result_cache =>
+                %%     false); batch-list, stats, directory, and page caches
+                %%     stay warm exactly as a stable store would hold them.
                 _ = maybe_bust_cache(Bookie, Opts),
+                BustMode = maps:get(bust_mode, Opts, none),
                 _ =
-                    case maps:get(bust_mode, Opts, none) of
+                    case BustMode of
                         amortized ->
                             search_once(
                                 Bookie, Bucket, Index, <<"zzabsorberstatswarm">>, SearchOpts
@@ -535,8 +543,13 @@ run_query_1(Bookie, Query, Opts) ->
                         _ ->
                             ok
                     end,
+                TimedOpts =
+                    case BustMode of
+                        stable -> SearchOpts#{result_cache => false};
+                        _ -> SearchOpts
+                    end,
                 Start = erlang:monotonic_time(microsecond),
-                Result = search_once(Bookie, Bucket, Index, Query, SearchOpts),
+                Result = search_once(Bookie, Bucket, Index, Query, TimedOpts),
                 Stop = erlang:monotonic_time(microsecond),
                 {Stop - Start, result_summary(Result)}
             end
