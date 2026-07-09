@@ -373,6 +373,10 @@ maybe_compact(Bookie, #{compact := true} = Opts) ->
     Result = Run(),
     Elapsed = erlang:monotonic_time(microsecond) - Start,
     io:format("consolidated (~p) in ~.1f s~n", [Result, Elapsed / 1000000]),
+    %% let the LSM digest the maintenance burst before the timed window:
+    %% queries measured seconds after a bulk write measure the settling,
+    %% not the store (observed as 10x floor noise on selective cells).
+    timer:sleep(30000),
     ok;
 maybe_compact(_Bookie, _Opts) ->
     ok.
