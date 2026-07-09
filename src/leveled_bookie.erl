@@ -1716,11 +1716,6 @@ handle_call({ftsconsolidate, Bucket, Index, _Opts}, _From, State) when
             Ref = leveled_fts:index_ref(Schema),
             SnapFun = return_snapfun(State, ledger, no_lookup, false, true),
             Inker = State#state.inker,
-            FtsCache =
-                case State#state.fts_dir_cache of
-                    undefined -> undefined;
-                    Cache -> {Cache, State#state.fts_seq}
-                end,
             Self = self(),
             Runner =
                 fun() ->
@@ -1740,7 +1735,7 @@ handle_call({ftsconsolidate, Bucket, Index, _Opts}, _From, State) when
                         [] -> noop;
                         Shards ->
                             run_fts_consolidation(
-                                Self, Bucket, Ref, Schema, Shards, Inker, FtsCache
+                                Self, Bucket, Ref, Schema, Shards, Inker
                             )
                     end
                 end,
@@ -3458,13 +3453,16 @@ fetch_object_snapshot(LedgerSnapshot, Inker, Bucket, Key, Tag) ->
 %% Consolidation orchestration, run in the caller's process: shards
 %% derive in parallel (one snapshot each), then apply in chunks through
 %% the bookie. Shard applies are independent by design.
-run_fts_consolidation(Bookie, Bucket, Ref, Schema, Shards, Inker, FtsCache) ->
+run_fts_consolidation(Bookie, Bucket, Ref, Schema, Shards, Inker) ->
     DeriveOne =
         fun(Shard) ->
             {ok, LS, _JS} = book_snapshot(Bookie, ledger, no_lookup, false),
             try
+                %% one-shot reads: never pollute the query cache (a full
+                %% consolidation would blow its budget and leave every
+                %% later query folding cold).
                 leveled_fts:consolidate_shard(
-                    fts_fold_source(LS, Inker), Bucket, Schema, FtsCache, Shard
+                    fts_fold_source(LS, Inker), Bucket, Schema, undefined, Shard
                 )
             catch
                 throw:{fts_error, Reason} -> {error, Reason}
