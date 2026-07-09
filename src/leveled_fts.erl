@@ -1643,22 +1643,36 @@ compact_index_specs(FoldSource, Bucket, Ref, NewSeq, Limits0) ->
     LiveDirs =
         [SD || {S, _Dir} = SD <- Resolved, not maps:is_key(S, AliasMap)],
     Chosen = choose_compact_batches(LiveDirs, Limits),
-    case length(Chosen) < 2 of
-        true ->
-            noop;
-        false ->
-            ChosenSeqs = [S || {S, _Dir} <- Chosen],
-            NewAliases =
-                lists:usort(
-                    lists:append([[S | Aliases] || {S, {_CM, Aliases}} <- Chosen])
-                ),
-            LiveByBatch =
-                compact_live_docs(
-                    FoldSource, Bucket, Ref, AliasMap, sets:from_list(ChosenSeqs)
-                ),
-            ByCol = compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch),
-            Specs = pack_index_specs(Ref, ByCol, NewSeq, NewAliases),
+    compact_chosen(FoldSource, Bucket, Ref, NewSeq, AliasMap, Chosen).
+
+%% The page-count estimate bounds selection, but merged output has been
+%% observed at ~2x the input page estimate; if packing still trips the
+%% 16-bit page limit, halve the selection and retry — a single batch
+%% always fits (originals are small; merged batches passed this guard).
+compact_chosen(_FoldSource, _Bucket, _Ref, _NewSeq, _AliasMap, Chosen) when
+    length(Chosen) < 2
+->
+    noop;
+compact_chosen(FoldSource, Bucket, Ref, NewSeq, AliasMap, Chosen) ->
+    ChosenSeqs = [S || {S, _Dir} <- Chosen],
+    NewAliases =
+        lists:usort(
+            lists:append([[S | Aliases] || {S, {_CM, Aliases}} <- Chosen])
+        ),
+    LiveByBatch =
+        compact_live_docs(
+            FoldSource, Bucket, Ref, AliasMap, sets:from_list(ChosenSeqs)
+        ),
+    ByCol = compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch),
+    try pack_index_specs(Ref, ByCol, NewSeq, NewAliases) of
+        Specs ->
             {ok, ChosenSeqs, Specs}
+    catch
+        throw:{fts_error, {batch_page_limit_exceeded, _N}} ->
+            compact_chosen(
+                FoldSource, Bucket, Ref, NewSeq, AliasMap,
+                lists:sublist(Chosen, max(1, length(Chosen) div 2))
+            )
     end.
 
 %% A count cap alone lets convergence culminate in one mega-merge of
