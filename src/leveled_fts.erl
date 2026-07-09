@@ -11,14 +11,19 @@
     normalise_indexes/1,
     has_matching_index/3,
     augment_object_changes/3,
-    advance_seqs_cache/5,
-    reset_seqs_cache/1,
     marker_cache_updates/2,
     advance_marker_cache/3,
-    compact_plan/4,
-    compact_group_specs/5,
-    compact_seqs_cache/7,
-    restamp_compact_specs/2,
+    advance_shard_cache/3,
+    consolidate_shard_cache/5,
+    reset_fts_caches/1,
+    split_include_docs/1,
+    consolidate_plan/3,
+    consolidate_shard/5,
+    base_object_key/2,
+    delta_carrier_key/2,
+    shard_id/1,
+    summary_term/1,
+    delta_term/2,
     find_schema/3,
     index_ref/1,
     normalise_index/1,
@@ -117,6 +122,9 @@ has_matching_index(Bucket, Tag, Indexes) ->
 -define(FTS_MAX_ENTRY_DOCS, 65535).
 -define(FTS_MARKER_SEEK_MAX, 64).
 -define(FTS_RESULT_CACHE_MAX, 1024).
+-define(FTS_GRID_BITS, 10).
+-define(FTS_SHARDS, 1024).
+-define(FTS_BASE_PROBE_BYTES, 10).
 -define(FTS_CACHE_MAX_WORDS, 33554432).
 
 %% ----------------------------------------------------------------------------
@@ -187,29 +195,46 @@ augment_matching(ObjectChanges, Indexes, BatchSeq) ->
                 end,
             Changes1 = lists:append([Cs || {Cs, _Rows} <- Results]),
             MergedRows = merge_chunk_rows([Rows || {_Cs, Rows} <- Results]),
-            %% Touched tracks exactly the (bucket, ref) pairs that emit a
-            %% batch directory marker row (pack_index_specs returns [] for
-            %% empty page sets), so the incremental batch-list cache stays
-            %% aligned with what discover_seqs/3 would find.
-            {PageSpecsByBucket, Touched} =
+            %% One injected change per touched (bucket, ref, shard): the
+            %% shard's delta row rides its reserved carrier key, so its
+            %% exact row identity is known to consolidation later.
+            %% Touched carries the delta payloads for the write-through
+            %% shard-state cache.
+            {InjectedRev, TouchedRev} =
                 maps:fold(
-                    fun({Bucket, Ref}, ByCol, {SpecAcc, TouchedAcc}) ->
-                        case pack_index_specs(Ref, ByCol, BatchSeq) of
-                            [] ->
-                                {SpecAcc, TouchedAcc};
-                            Specs ->
-                                {
-                                    maps:update_with(
-                                        Bucket, fun(S) -> S ++ Specs end, Specs, SpecAcc
+                    fun({Bucket, {Index, Tag} = Ref}, ByShard, Acc0) ->
+                        maps:fold(
+                            fun(Shard, ByCol, {InjAcc, TouchAcc}) ->
+                                ColStreams =
+                                    [
+                                        {ColId,
+                                            merge_streams_to_stream(
+                                                lists:reverse(Streams)
+                                            )}
+                                     || {ColId, Streams} <-
+                                            lists:sort(maps:to_list(ByCol))
+                                    ],
+                                Delta = encode_delta(ColStreams),
+                                CarrierLK =
+                                    leveled_codec:to_objectkey(
+                                        Bucket, delta_carrier_key(Index, Shard), Tag
                                     ),
-                                    [{Bucket, Ref} | TouchedAcc]
-                                }
-                        end
+                                Spec =
+                                    {add_payload, seg_field(Ref),
+                                        delta_term(Shard, BatchSeq), Delta},
+                                Change =
+                                    {CarrierLK, <<0>>, {[Spec], infinity}},
+                                {[Change | InjAcc],
+                                    [{Bucket, Ref, Shard, BatchSeq, Delta} | TouchAcc]}
+                            end,
+                            Acc0,
+                            ByShard
+                        )
                     end,
-                    {#{}, []},
+                    {[], []},
                     MergedRows
                 ),
-            {ok, attach_page_specs(Changes1, PageSpecsByBucket), Touched}.
+            {ok, Changes1 ++ lists:reverse(InjectedRev), lists:reverse(TouchedRev)}.
 
 %% Within one batch, a later write to the same key supersedes earlier ones.
 %% Earlier occurrences must not contribute page rows: they share the batch
@@ -257,16 +282,22 @@ derive_chunk(Flagged, Indexes, BatchSeq) ->
             fun({Change, Skip}, {CsAcc, FlatAcc}) ->
                 {{Tag, Bucket, Key, null} = LK, Object, {Specs, TTL}} = Change,
                 Schemas =
-                    [
-                        Schema
-                     || #{bucket := B0, tag := T0} = Schema <- Indexes,
-                        T0 =:= Tag,
-                        bucket_matches(B0, Bucket)
-                    ],
+                    case reserved_fts_key(Key) of
+                        true ->
+                            %% engine-internal rows (bases, delta carriers)
+                            %% never derive postings.
+                            [];
+                        false ->
+                            [
+                                Schema
+                             || #{bucket := B0, tag := T0} = Schema <- Indexes,
+                                T0 =:= Tag,
+                                bucket_matches(B0, Bucket)
+                            ]
+                    end,
                 PerSchema = [derive_doc(Schema, Object, BatchSeq) || Schema <- Schemas],
                 MarkerSpecs = [Marker || {_Ref, Marker, _Rows} <- PerSchema],
-                HasMatch = Schemas =/= [],
-                Change1 = {{LK, Object, {Specs ++ MarkerSpecs, TTL}}, Bucket, HasMatch},
+                Change1 = {LK, Object, {Specs ++ MarkerSpecs, TTL}},
                 FlatAcc1 =
                     case Skip of
                         true ->
@@ -277,7 +308,11 @@ derive_chunk(Flagged, Indexes, BatchSeq) ->
                                     BR = {Bucket, Ref},
                                     lists:foldl(
                                         fun({ColId, Token, PosBin}, A1) ->
-                                            [{BR, ColId, Token, Key, PosBin} | A1]
+                                            [
+                                                {BR, shard_id(Token), ColId, Token,
+                                                    Key, PosBin}
+                                                | A1
+                                            ]
                                         end,
                                         A,
                                         RowList
@@ -292,58 +327,57 @@ derive_chunk(Flagged, Indexes, BatchSeq) ->
             {[], []},
             Flagged
         ),
-    %% One sort orders by {Bucket, Ref}, column, token, key -- giving both the
-    %% per-(bucket, ref, column) grouping and the token order pages need.
-    {lists:reverse(ChangesRev), group_flat(lists:sort(Flat))}.
+    %% One sort orders by {Bucket, Ref}, shard, column, token, key: the
+    %% per-(bucket, ref, shard, column) grouping and token order the
+    %% delta entry streams need.
+    {lists:reverse(ChangesRev), group_flat(lists:sort(Flat), BatchSeq)}.
 
-%% Sorted flat rows -> #{{BucketRef, ColId} => [{Token, Key, PosBin}]} with the
-%% group lists in ascending order (built by prepending over the reversed
-%% input).
-%% Sorted flat rows -> #{{BucketRef, ColId} => RunBin} where RunBin is a
-%% sorted, framed sequence of token entries built in the chunk worker:
-%%   <<EntryLen:32, TokLen:16, Token, NDocs:32, Docs>>
-%% with Docs as in page entries. Run binaries are large refc binaries, so
-%% returning them to the coordinator does not copy the row data.
-group_flat(SortedFlat) ->
-    group_flat(SortedFlat, none, none, 0, <<>>, <<>>, #{}).
+%% Sorted flat rows -> #{{BucketRef, Shard, ColId} => EntryStream}: a
+%% sorted v2 entry stream (frames stamped with the write sequence) built
+%% in the chunk worker. Streams are refc binaries, so returning them to
+%% the coordinator does not copy row data.
+group_flat(SortedFlat, Seq) ->
+    group_flat(SortedFlat, Seq, none, none, 0, <<>>, <<>>, #{}).
 
-group_flat([], none, _Tok, _ND, _Docs, _Run, Acc) ->
+group_flat([], _Seq, none, _Tok, _ND, _Frames, _Run, Acc) ->
     Acc;
-group_flat([], GKey, Tok, ND, Docs, Run, Acc) ->
-    Acc#{GKey => flush_run_entry(Tok, ND, Docs, Run)};
-group_flat([{BR, ColId, Token, Key, PosBin} | Rest], GKey, Tok, ND, Docs, Run, Acc) ->
-    RowKey = {BR, ColId},
-    DocBin =
-        <<(byte_size(Key)):16/unsigned-big, Key/binary,
-            (byte_size(PosBin)):16/unsigned-big, PosBin/binary>>,
+group_flat([], _Seq, GKey, Tok, ND, Frames, Run, Acc) ->
+    Acc#{GKey => <<Run/binary, (encode_entry(Tok, ND, Frames))/binary>>};
+group_flat(
+    [{BR, Shard, ColId, Token, Key, PosBin} | Rest], Seq, GKey, Tok, ND, Frames, Run,
+    Acc
+) ->
+    RowKey = {BR, Shard, ColId},
+    Frame = encode_frame(Seq, Key, PosBin),
     case {RowKey, Token} of
         {GKey, Tok} ->
-            group_flat(Rest, GKey, Tok, ND + 1, <<Docs/binary, DocBin/binary>>, Run, Acc);
+            group_flat(
+                Rest, Seq, GKey, Tok, ND + 1, <<Frames/binary, Frame/binary>>, Run, Acc
+            );
         {GKey, _NewTok} ->
-            Run1 = flush_run_entry(Tok, ND, Docs, Run),
-            group_flat(Rest, GKey, Token, 1, DocBin, Run1, Acc);
+            Run1 = <<Run/binary, (encode_entry(Tok, ND, Frames))/binary>>,
+            group_flat(Rest, Seq, GKey, Token, 1, Frame, Run1, Acc);
         {_NewKey, _} when GKey =:= none ->
-            group_flat(Rest, RowKey, Token, 1, DocBin, <<>>, Acc);
+            group_flat(Rest, Seq, RowKey, Token, 1, Frame, <<>>, Acc);
         {_NewKey, _} ->
-            Acc1 = Acc#{GKey => flush_run_entry(Tok, ND, Docs, Run)},
-            group_flat(Rest, RowKey, Token, 1, DocBin, <<>>, Acc1)
+            Acc1 = Acc#{GKey => <<Run/binary, (encode_entry(Tok, ND, Frames))/binary>>},
+            group_flat(Rest, Seq, RowKey, Token, 1, Frame, <<>>, Acc1)
     end.
 
-flush_run_entry(Token, NDocs, Docs, Run) ->
-    EntryLen = 2 + byte_size(Token) + 4 + byte_size(Docs),
-    <<Run/binary, EntryLen:32/unsigned-big, (byte_size(Token)):16/unsigned-big,
-        Token/binary, NDocs:32/unsigned-big, Docs/binary>>.
-
-%% Gather the chunks' runs per (bucket, ref, column); merging happens during
-%% page packing.
+%% Gather the chunks' streams per (bucket, ref, shard, column); same-key
+%% streams from different chunks merge when the delta is assembled.
 merge_chunk_rows(ChunkMaps) ->
     lists:foldl(
         fun(ChunkMap, Acc) ->
             maps:fold(
-                fun({BucketRef, ColId}, RunBin, A) ->
-                    ByCol = maps:get(BucketRef, A, #{}),
-                    Runs = maps:get(ColId, ByCol, []),
-                    A#{BucketRef => ByCol#{ColId => [RunBin | Runs]}}
+                fun({BucketRef, Shard, ColId}, Stream, A) ->
+                    ByShard = maps:get(BucketRef, A, #{}),
+                    ByCol = maps:get(Shard, ByShard, #{}),
+                    Streams = maps:get(ColId, ByCol, []),
+                    A#{
+                        BucketRef =>
+                            ByShard#{Shard => ByCol#{ColId => [Stream | Streams]}}
+                    }
                 end,
                 Acc,
                 ChunkMap
@@ -379,232 +413,6 @@ derive_doc(Schema, Object0, BatchSeq) ->
         ],
     {Ref, Marker, Rows}.
 
-%% Each bucket's page and directory specs are attached to that bucket's last
-%% matching change, since index rows are scoped by the carrier's bucket.
-attach_page_specs(Changes, PageSpecsByBucket) ->
-    attach_page_specs_rev(lists:reverse(Changes), PageSpecsByBucket, []).
-
-attach_page_specs_rev([], _PageSpecsByBucket, Acc) ->
-    Acc;
-attach_page_specs_rev(
-    [{{LK, Obj, {Specs, TTL}}, Bucket, true} | Rest], PageSpecsByBucket, Acc
-) when is_map_key(Bucket, PageSpecsByBucket) ->
-    PageSpecs = maps:get(Bucket, PageSpecsByBucket),
-    attach_page_specs_rev(
-        Rest,
-        maps:remove(Bucket, PageSpecsByBucket),
-        [{LK, Obj, {Specs ++ PageSpecs, TTL}} | Acc]
-    );
-attach_page_specs_rev([{Change, _Bucket, _HasMatch} | Rest], PageSpecsByBucket, Acc) ->
-    attach_page_specs_rev(Rest, PageSpecsByBucket, [Change | Acc]).
-
-pack_index_specs(Ref, ByCol, BatchSeq) ->
-    pack_index_specs(Ref, ByCol, BatchSeq, []).
-
-%% With aliases (compaction) the directory row is emitted even when the
-%% merged batch has no pages left: the alias list is what hides the
-%% subsumed batches from the walk.
-pack_index_specs(Ref, ByCol, BatchSeq, Aliases) ->
-    Pages =
-        lists:append(
-            [
-                merge_runs_to_pages(ColId, Runs)
-             || {ColId, Runs} <- lists:sort(maps:to_list(ByCol)),
-                Runs =/= []
-            ]
-        ),
-    %% Page terms carry 16-bit page numbers: beyond 65,536 pages the
-    %% terms wrap and overwrite each other. Refuse rather than corrupt.
-    case length(Pages) > 65535 of
-        true -> throw({fts_error, {batch_page_limit_exceeded, length(Pages)}});
-        false -> ok
-    end,
-    case {Pages, Aliases} of
-        {[], []} ->
-            [];
-        _ ->
-            Numbered = lists:zip(lists:seq(0, length(Pages) - 1), Pages),
-            Field = seg_field(Ref),
-            [
-                {add_payload, Field, dir_term(BatchSeq), encode_dir(Numbered, Aliases)}
-                | [
-                    {add_payload, Field, page_term(BatchSeq, PageNo), Payload}
-                 || {PageNo, {_ColId, _First, _Last, Payload, _Bloom}} <- Numbered
-                ]
-            ]
-    end.
-
-%% Fused k-way merge and page pack over the chunks' sorted run binaries. Each
-%% step takes the minimum head token across runs, concatenates those runs'
-%% doc fragments into one page entry, and flushes a page at roughly
-%% ?FTS_PAGE_TARGET_BYTES. Only binaries are appended; row data is never
-%% reconstructed as terms.
-merge_runs_to_pages(ColId, Runs) ->
-    %% Heap-based k-way merge: O(log k) per token emission. The heap
-    %% orders {Token, RunIdx} so same-token entries pop in run order,
-    %% preserving the byte-identical output of the old linear scan.
-    {Heap, Tails} =
-        lists:foldl(
-            fun(Run, {H, T}) ->
-                case Run of
-                    <<>> ->
-                        {H, T};
-                    _ ->
-                        Idx = maps:size(T) + 1,
-                        {Tok, ND, Docs, Tail} = parse_run_head(Run),
-                        {gb_sets:add({Tok, Idx}, H), T#{Idx => {ND, Docs, Tail}}}
-                end
-            end,
-            {gb_sets:empty(), #{}},
-            Runs
-        ),
-    merge_runs({Heap, Tails}, ColId, none, [], 0, 0, []).
-
-parse_run_head(<<EntryLen:32/unsigned-big, Rest/binary>>) ->
-    <<Entry:EntryLen/binary, Tail/binary>> = Rest,
-    <<TokLen:16/unsigned-big, Token:TokLen/binary, NDocs:32/unsigned-big,
-        Docs/binary>> = Entry,
-    {Token, NDocs, Docs, Tail}.
-
-merge_runs({Heap, _Tails} = HT, ColId, First, Entries, Bytes, NTok, Pages) ->
-    case gb_sets:is_empty(Heap) of
-        true ->
-            FinalPages =
-                case NTok of
-                    0 -> Pages;
-                    _ -> [finish_run_page(ColId, First, Entries, NTok) | Pages]
-                end,
-            lists:reverse(FinalPages);
-        false ->
-            merge_runs_next(HT, ColId, First, Entries, Bytes, NTok, Pages)
-    end.
-
-merge_runs_next({Heap0, Tails0}, ColId, First, Entries, Bytes, NTok, Pages) ->
-    {{MinTok, _Idx0}, _} = gb_sets:take_smallest(Heap0),
-    {NDSum, DocsList, Heads1} = heap_take_token(Heap0, Tails0, MinTok, 0, []),
-    %% The persisted page entry carries a 16-bit doc count, so a token with
-    %% more postings than that in one batch is split into several entries
-    %% (the reader collects every entry for a token across and within
-    %% pages, and split chunks partition the docs).
-    Chunks =
-        case NDSum =< ?FTS_MAX_ENTRY_DOCS of
-            true ->
-                DocsBin =
-                    lists:foldl(
-                        fun(Docs, Acc) -> <<Acc/binary, Docs/binary>> end,
-                        <<>>,
-                        DocsList
-                    ),
-                [{NDSum, DocsBin}];
-            false ->
-                split_docs(iolist_to_binary(DocsList), ?FTS_MAX_ENTRY_DOCS)
-        end,
-    {First1, Entries1, Bytes1, NTok1, Pages1} =
-        lists:foldl(
-            fun({NDocs, DocsBin}, {FirstA, EntriesA, BytesA, NTokA, PagesA}) ->
-                EntryBin =
-                    <<(byte_size(MinTok)):16/unsigned-big, MinTok/binary,
-                        NDocs:16/unsigned-big, DocsBin/binary>>,
-                EntrySize = byte_size(EntryBin),
-                case
-                    BytesA + EntrySize > ?FTS_PAGE_TARGET_BYTES andalso NTokA > 0
-                of
-                    true ->
-                        {MinTok, [{MinTok, EntryBin}], EntrySize, 1, [
-                            finish_run_page(ColId, FirstA, EntriesA, NTokA)
-                            | PagesA
-                        ]};
-                    false ->
-                        F =
-                            case NTokA of
-                                0 -> MinTok;
-                                _ -> FirstA
-                            end,
-                        {F, [{MinTok, EntryBin} | EntriesA], BytesA + EntrySize,
-                            NTokA + 1, PagesA}
-                end
-            end,
-            {First, Entries, Bytes, NTok, Pages},
-            Chunks
-        ),
-    merge_runs(Heads1, ColId, First1, Entries1, Bytes1, NTok1, Pages1).
-
-%% Cut a concatenated docs binary at doc boundaries into chunks of at most
-%% Cap docs each.
-split_docs(DocsBin, Cap) ->
-    split_docs(DocsBin, Cap, DocsBin, 0, 0, []).
-
-split_docs(<<>>, _Cap, ChunkStart, ChunkBytes, Count, Acc) ->
-    Tail =
-        case Count of
-            0 -> [];
-            _ -> [{Count, binary_part(ChunkStart, 0, ChunkBytes)}]
-        end,
-    lists:reverse(Tail ++ Acc);
-split_docs(
-    <<KeyLen:16/unsigned-big, _Key:KeyLen/binary, PosLen:16/unsigned-big,
-        _Pos:PosLen/binary, Rest/binary>> = Bin,
-    Cap,
-    ChunkStart,
-    ChunkBytes,
-    Count,
-    Acc
-) ->
-    DocSize = 4 + KeyLen + PosLen,
-    case Count + 1 of
-        Cap ->
-            Chunk = binary_part(ChunkStart, 0, ChunkBytes + DocSize),
-            split_docs(Rest, Cap, Rest, 0, 0, [{Cap, Chunk} | Acc]);
-        Count1 ->
-            _ = Bin,
-            split_docs(Rest, Cap, ChunkStart, ChunkBytes + DocSize, Count1, Acc)
-    end.
-
-%% Pop every heap element carrying MinTok (they order by run index, so
-%% docs concatenate in run order exactly as the old linear scan did),
-%% advancing each popped run's tail back into the heap.
-heap_take_token(Heap0, Tails0, MinTok, NDSum, DocsList) ->
-    case gb_sets:is_empty(Heap0) of
-        true ->
-            {NDSum, lists:reverse(DocsList), {Heap0, Tails0}};
-        false ->
-            case gb_sets:smallest(Heap0) of
-                {MinTok, Idx} ->
-                    Heap1 = gb_sets:del_element({MinTok, Idx}, Heap0),
-                    {ND, Docs, Tail} = maps:get(Idx, Tails0),
-                    {Heap2, Tails1} =
-                        case Tail of
-                            <<>> ->
-                                {Heap1, maps:remove(Idx, Tails0)};
-                            _ ->
-                                {NTok2, ND2, Docs2, Tail2} = parse_run_head(Tail),
-                                {gb_sets:add({NTok2, Idx}, Heap1),
-                                    Tails0#{Idx => {ND2, Docs2, Tail2}}}
-                        end,
-                    heap_take_token(Heap2, Tails1, MinTok, NDSum + ND, [Docs | DocsList]);
-                _OtherToken ->
-                    {NDSum, lists:reverse(DocsList), {Heap0, Tails0}}
-            end
-    end.
-
-finish_run_page(ColId, First, EntriesRev, NTok) ->
-    {Last, _LastBin} = hd(EntriesRev),
-    Payload =
-        lists:foldl(
-            fun({_Tok, EntryBin}, Acc) -> <<Acc/binary, EntryBin/binary>> end,
-            <<NTok:16/unsigned-big>>,
-            lists:reverse(EntriesRev)
-        ),
-    Bloom = page_bloom([Tok || {Tok, _EntryBin} <- EntriesRev]),
-    {ColId, First, Last, Payload, Bloom}.
-
-%% Per-page token bloom, persisted in the batch directory so exact-term
-%% probes can skip pages whose [first, last] range merely SPANS an absent
-%% token: without it every term probe reads one spanning page per batch
-%% per column — O(#batches) ledger reads that made the per-query floor
-%% 129ms at the 5GB gate-run scale (docs/fts_sqlite_gate.md). k=4 probes
-%% at ~10 bits/token gives ~1.2% false positives (a false positive just
-%% reads the page as before); false negatives are impossible.
 page_bloom(Tokens) ->
     N = max(1, length(Tokens)),
     Bits = bloom_bits(N * 10),
@@ -673,15 +481,27 @@ fts_pmap(Fun, List) ->
 
 %% Test/debug introspection: extract {Token, Key} pairs carried by page specs
 %% for the given index name and tag (e.g. from journal key changes).
+%% Test helper: the {Token, DocKey} pairs a batch's delta specs carry.
 spec_token_entries(Specs, Index, Tag) ->
     Field = {fts_term, Index, Tag},
     lists:append(
         [
             [
                 {Token, Key}
-             || {Token, Docs} <- decode_page(Payload), {Key, _Positions} <- Docs
+             || {ColId_, Stream} <- decode_delta(Payload),
+                is_integer(ColId_),
+                {Token, Frames} <-
+                    lists:reverse(
+                        fold_entries(
+                            Stream,
+                            fun(T, _ND, F, A) -> [{T, F} | A] end,
+                            []
+                        )
+                    ),
+                Key <- lists:reverse(frame_keys(Frames, []))
             ]
-         || {add_payload, Field0, <<1:8, _Rest/binary>>, Payload} <- Specs,
+         || {add_payload, Field0, <<_Shard:16/unsigned-big, 1:8, _Seq:64/unsigned-big>>,
+                Payload} <- Specs,
             Field0 =:= Field
         ]
     ).
@@ -1211,16 +1031,7 @@ group_positions([{Token, Pos} | Rest], Acc) ->
 %% ----------------------------------------------------------------------------
 
 collect_metas(FoldSource, Bucket, Schema, AST, Columns, Cache, ReturnPositions, Ranked) ->
-    Ctx0 = #{
-        fold => FoldSource,
-        bucket => Bucket,
-        ref => index_ref(Schema),
-        columns => maps:get(columns, Schema),
-        dirs => undefined,
-        cache => Cache,
-        return_positions_opt => ReturnPositions,
-        pages => #{}
-    },
+    Ctx0 = query_ctx(FoldSource, Bucket, Schema, Cache, ReturnPositions),
     case AST of
         {all_docs} ->
             all_doc_metas(Ctx0);
@@ -1258,7 +1069,7 @@ ranked_term_metas(Ctx0, Terms) ->
             #{};
         _ ->
             {Ctx2, Markers} = load_markers(Ctx1, maps:keys(RawAll)),
-            build_metas(RawAll, Markers, maps:get(ref, Ctx2), ctx_alias_map(Ctx2))
+            build_metas(RawAll, Markers, maps:get(ref, Ctx2))
     end.
 
 all_doc_metas(#{fold := FoldSource, bucket := Bucket, ref := Ref}) ->
@@ -1286,6 +1097,57 @@ all_doc_metas(#{fold := FoldSource, bucket := Bucket, ref := Ref}) ->
 %% are restricted to the batches named by the candidates' markers. This gives
 %% phrase, NEAR, and AND queries over hot tokens a cost proportional to the
 %% rarest leg rather than the hottest.
+%% Cheap per-term cardinality for driver selection: base entry doc
+%% counts through the shard probe plus pending delta counts — no frame
+%% decodes. Loading shard state and bases here pre-warms exactly what
+%% the query reads next.
+term_costs(Ctx0, Terms) ->
+    lists:foldl(
+        fun({Col, Token, Prefix} = T, {CtxA, Acc}) ->
+            ColId = column_id(maps:get(columns, CtxA), Col, 0),
+            Shards =
+                case Prefix of
+                    false ->
+                        [shard_id(Token)];
+                    true ->
+                        {Lo, Hi} = prefix_shard_range(Token),
+                        lists:seq(Lo, Hi)
+                end,
+            {CtxB, N} =
+                lists:foldl(
+                    fun(Shard, {CtxI, NAcc}) ->
+                        {CtxI1, Entries} =
+                            shard_token_counts(CtxI, Shard, ColId, Token, Prefix),
+                        {CtxI1, NAcc + Entries}
+                    end,
+                    {CtxA, 0},
+                    Shards
+                ),
+            {CtxB, Acc#{T => N}}
+        end,
+        {Ctx0, #{}},
+        lists:usort(Terms)
+    ).
+
+shard_token_counts(Ctx0, Shard, ColId, Token, Prefix) ->
+    {Ctx1, Entries} = shard_token_entries(Ctx0, Shard, ColId, Token, Prefix),
+    {Ctx1,
+        lists:sum([count_frames(Frames) || {_Tok, Frames} <- Entries])}.
+
+count_frames(FramesBin) ->
+    count_frames(FramesBin, 0).
+
+count_frames(<<>>, N) ->
+    N;
+count_frames(
+    <<_Seq:64/unsigned-big, KeyLen:16/unsigned-big, _K:KeyLen/binary,
+        PosLen:16/unsigned-big, _P:PosLen/binary, Rest/binary>>,
+    N
+) ->
+    count_frames(Rest, N + 1);
+count_frames(_Bad, _N) ->
+    throw({fts_error, invalid_fts_payload}).
+
 term_metas(_Ctx, _AST, []) ->
     #{};
 term_metas(Ctx0, AST, Terms) ->
@@ -1294,16 +1156,8 @@ term_metas(Ctx0, AST, Terms) ->
             true -> all;
             false -> positional_terms(AST, Ctx0)
         end,
-    {Ctx1, Dirs} = load_dirs(Ctx0),
-    Columns = maps:get(columns, Ctx1),
-    Cost =
-        fun({Col, Token, Prefix}) ->
-            ColId = column_id(Columns, Col, 0),
-            case Prefix of
-                false -> length(covering_pages(Dirs, ColId, Token));
-                true -> length(covering_prefix_pages(Dirs, ColId, Token))
-            end
-        end,
+    {Ctx1, CostMap} = term_costs(Ctx0, Terms),
+    Cost = fun(T) -> maps:get(T, CostMap, 0) end,
     Drivers = lists:usort(driver_terms(AST, Cost)),
     Rest = [T || T <- Terms, not lists:member(T, Drivers)],
     {Ctx2, RawDrivers} =
@@ -1319,24 +1173,12 @@ term_metas(Ctx0, AST, Terms) ->
             #{};
         _ ->
             {Ctx3, Markers} = load_markers(Ctx2, maps:keys(RawDrivers)),
-            AliasMap = ctx_alias_map(Ctx3),
-            DriverMetas = build_metas(RawDrivers, Markers, maps:get(ref, Ctx3), AliasMap),
+            DriverMetas = build_metas(RawDrivers, Markers, maps:get(ref, Ctx3)),
             case maps:size(DriverMetas) of
                 0 ->
                     #{};
                 _ ->
                     CandKeys = sets:from_list(maps:keys(DriverMetas)),
-                    %% Candidate batches resolve through the alias map: a
-                    %% doc whose marker references a compacted batch has
-                    %% its live postings in the batch that subsumed it.
-                    CandSeqs =
-                        sets:from_list([
-                            begin
-                                S0 = element(1, maps:get(Key, Markers)),
-                                maps:get(S0, AliasMap, S0)
-                            end
-                         || Key <- maps:keys(DriverMetas)
-                        ]),
                     {_Ctx4, RawAll} =
                         lists:foldl(
                             fun({Col, Token, Prefix} = T, {CtxA, RawA}) ->
@@ -1345,7 +1187,7 @@ term_metas(Ctx0, AST, Terms) ->
                                     Col,
                                     Token,
                                     Prefix,
-                                    {CandSeqs, CandKeys},
+                                    {candidates, CandKeys},
                                     need_pos(T, PosNeeded),
                                     RawA
                                 )
@@ -1356,8 +1198,7 @@ term_metas(Ctx0, AST, Terms) ->
                     build_metas(
                         maps:with(sets:to_list(CandKeys), RawAll),
                         Markers,
-                        maps:get(ref, Ctx3),
-                        AliasMap
+                        maps:get(ref, Ctx3)
                     )
             end
     end.
@@ -1430,119 +1271,71 @@ need_pos(Term, PosNeeded) -> sets:is_element(Term, PosNeeded).
 %% Restrict is `all` or {CandSeqs, CandKeys}: when restricted, only pages in
 %% candidate batches are read and only candidate keys are accumulated.
 load_term(Ctx0, Col, Token, Prefix, Restrict, NeedPos, Raw0) ->
-    {Ctx1, Dirs} = load_dirs(Ctx0),
-    ColId = column_id(maps:get(columns, Ctx1), Col, 0),
-    Pages0 =
-        case Prefix of
-            false -> covering_pages(Dirs, ColId, Token);
-            true -> covering_prefix_pages(Dirs, ColId, Token)
-        end,
-    Pages =
-        case Restrict of
-            all ->
-                Pages0;
-            {CandSeqs, _CandKeys} ->
-                [P || {BS, _PN} = P <- Pages0, sets:is_element(BS, CandSeqs)]
-        end,
+    ColId = column_id(maps:get(columns, Ctx0), Col, 0),
     KeyFilter =
         case Restrict of
             all -> all;
-            {_Seqs, CandKeys} -> CandKeys
+            {candidates, CandKeys} -> CandKeys
+        end,
+    Shards =
+        case Prefix of
+            false ->
+                [shard_id(Token)];
+            true ->
+                {Lo, Hi} = prefix_shard_range(Token),
+                lists:seq(Lo, Hi)
         end,
     lists:foldl(
-        fun({BatchSeq, PageNo}, {CtxA, RawA}) ->
-            {CtxB, Entries} = read_page(CtxA, BatchSeq, PageNo),
-            TokenEntries =
-                case Prefix of
-                    false ->
-                        %% Oversized tokens are split into several entries,
-                        %% possibly within one page; collect them all.
-                        [E || {T, _DocsBin} = E <- Entries, T =:= Token];
-                    true ->
-                        [E || {T, _DocsBin} = E <- Entries, binary_prefix(T, Token)]
-                end,
+        fun(Shard, {CtxA, RawA}) ->
+            {CtxB, TokenEntries} =
+                shard_token_entries(CtxA, Shard, ColId, Token, Prefix),
             Wanted =
                 [
-                    {T, extract_docs(DocsBin, KeyFilter, NeedPos)}
-                 || {T, DocsBin} <- TokenEntries
+                    {T, extract_frames(Frames, KeyFilter, NeedPos)}
+                 || {T, Frames} <- TokenEntries
                 ],
-            {CtxB, add_raw_entries(RawA, Col, BatchSeq, Wanted)}
+            {CtxB, add_raw_entries(RawA, Col, Wanted)}
         end,
-        {Ctx1, Raw0},
-        Pages
+        {Ctx0, Raw0},
+        Shards
     ).
 
-%% Walk a raw docs binary, decoding positions only for wanted keys and only
-%% when the term is positional; other docs are skipped without decoding.
-extract_docs(DocsBin, KeyFilter, NeedPos) ->
-    extract_docs(DocsBin, KeyFilter, NeedPos, []).
 
-extract_docs(<<>>, _KeyFilter, _NeedPos, Acc) ->
-    lists:reverse(Acc);
-extract_docs(
-    <<KeyLen:16/unsigned-big, Key:KeyLen/binary, PosLen:16/unsigned-big,
-        PosBin:PosLen/binary, Rest/binary>>,
-    KeyFilter,
-    NeedPos,
-    Acc
-) ->
-    Wanted = KeyFilter =:= all orelse sets:is_element(Key, KeyFilter),
-    case Wanted of
-        false ->
-            extract_docs(Rest, KeyFilter, NeedPos, Acc);
-        true ->
-            Value =
-                case NeedPos of
-                    true ->
-                        case decode_positions(PosBin, 0, []) of
-                            {ok, Positions} -> Positions;
-                            error -> throw({fts_error, invalid_fts_payload})
-                        end;
-                    false ->
-                        present
-                end,
-            extract_docs(Rest, KeyFilter, NeedPos, [{Key, Value} | Acc])
-    end;
-extract_docs(_Bad, _KeyFilter, _NeedPos, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
-
-add_raw_entries(Raw, Col, BatchSeq, TokenEntries) ->
+add_raw_entries(Raw, Col, TokenEntries) ->
     lists:foldl(
-        fun({Token, Docs}, RawA) ->
+        fun({Token, Frames}, RawA) ->
             lists:foldl(
-                fun({Key, Positions}, RawB) ->
+                fun({Key, Seq, Positions}, RawB) ->
                     ByCol = maps:get(Key, RawB, #{}),
                     ByTok = maps:get(Col, ByCol, #{}),
                     case maps:get(Token, ByTok, undefined) of
-                        {BatchSeq0, _P} when BatchSeq0 >= BatchSeq ->
+                        {Seq0, _P} when Seq0 >= Seq ->
                             RawB;
                         _Stale ->
                             RawB#{
                                 Key =>
-                                    ByCol#{Col => ByTok#{Token => {BatchSeq, Positions}}}
+                                    ByCol#{Col => ByTok#{Token => {Seq, Positions}}}
                             }
                     end
                 end,
                 RawA,
-                Docs
+                Frames
             )
         end,
         Raw,
         TokenEntries
     ).
 
-%% A posting is live when its batch is the one the doc's marker
-%% references — or, after compaction, the batch that SUBSUMED it: the
-%% alias map re-points marker sequences at the batch now carrying their
-%% postings, so unchanged docs stay live without marker rewrites.
-build_metas(Raw, Markers, Ref, AliasMap) ->
+%% A posting frame is live when its stamped sequence is the one the
+%% doc's marker references — the stamp travels with the frame wherever
+%% consolidation copies it, so no alias indirection exists.
+build_metas(Raw, Markers, Ref) ->
     maps:fold(
         fun(Key, ByCol, Acc) ->
             case maps:get(Key, Markers, undefined) of
                 undefined ->
                     Acc;
-                {MarkerSeq0, DocLength} ->
-                    MarkerSeq = maps:get(MarkerSeq0, AliasMap, MarkerSeq0),
+                {MarkerSeq, DocLength} ->
                     Positions =
                         maps:filtermap(
                             fun(_Col, ByTok) ->
@@ -1585,367 +1378,80 @@ column_id([Col | _Rest], Col, N) -> N;
 column_id([_Other | Rest], Col, N) -> column_id(Rest, Col, N + 1);
 column_id([], _Col, _N) -> -1.
 
-load_dirs(#{dirs := Dirs} = Ctx) when Dirs =/= undefined ->
-    {Ctx, Dirs};
-load_dirs(#{fold := FoldSource, bucket := Bucket, ref := Ref, cache := Cache} = Ctx) ->
-    %% The batch list lives under a stable {seqs, Bucket, Ref} key stamped
-    %% with the write sequence it is valid at. The bookie ADVANCES the
-    %% stamp (appending the new batch) on every successful FTS write —
-    %% advance_seqs_cache/5 — so steady queries never pay a rediscovery
-    %% fold per write sequence. A stamp mismatch (old snapshot, missed
-    %% advance, reset) falls back to discovery; insert_new keeps a
-    %% concurrent old-snapshot query from regressing an advanced entry.
-    %% Decoded directories are immutable per batch sequence and cached
-    %% without invalidation.
-    {Seqs, CacheState} =
-        case Cache of
-            {Ets, Seq} ->
-                SeqsKey = {seqs, Bucket, Ref},
-                case ets:lookup(Ets, SeqsKey) of
-                    [{_K, {Seq, CachedSeqs}}] ->
-                        {CachedSeqs, hit};
-                    _MissingOrOtherStamp ->
-                        {discover_seqs(FoldSource, Bucket, Ref), miss}
-                end;
-            undefined ->
-                {discover_seqs(FoldSource, Bucket, Ref), uncached}
-        end,
-    Resolved =
-        [
-            {BatchSeq, resolve_dir(FoldSource, Bucket, Ref, BatchSeq, Cache)}
-         || BatchSeq <- Seqs
-        ],
-    %% A compacted batch's directory lists the batches it subsumed:
-    %% subsumed batches leave the walk (their rows are dead weight kept
-    %% only for in-flight snapshots), and the alias map re-points marker
-    %% sequences at the subsuming batch for liveness checks. The FILTERED
-    %% list is what gets cached, so subsumed batches leave the walk for
-    %% good (cache hits and the write-path advance keep it filtered).
-    AliasMap =
-        maps:from_list(
-            lists:append([
-                [{Old, BatchSeq} || Old <- Aliases]
-             || {BatchSeq, {_ColMap, Aliases}} <- Resolved
-            ])
-        ),
-    Dirs =
-        [
-            {BatchSeq, ColMap}
-         || {BatchSeq, {ColMap, _Aliases}} <- Resolved,
-            not maps:is_key(BatchSeq, AliasMap)
-        ],
-    case {CacheState, Cache} of
-        {miss, {Ets1, Seq1}} ->
-            ets:insert_new(
-                Ets1,
-                {{seqs, Bucket, Ref}, {Seq1, [S || {S, _ColMap1} <- Dirs]}}
-            );
-        _HitOrUncached ->
-            ok
-    end,
-    {Ctx#{dirs := Dirs, alias_map => AliasMap}, Dirs}.
-
-ctx_alias_map(Ctx) ->
-    maps:get(alias_map, Ctx, #{}).
-
-%% ---------------------------------------------------------------------------
-%% Batch compaction (docs/FTS.md "Batch Compaction"): derive, from a
-%% snapshot, one merged batch subsuming the oldest MaxBatches live
-%% batches. Live postings are re-paged token-sorted; superseded postings
-%% are dropped during the merge; the merged directory carries the
-%% subsumed sequences as ALIASES. Doc markers are never rewritten: query
-%% liveness resolves marker sequences through the alias map, so a doc
-%% updated or deleted after derivation simply makes the merged copy of
-%% its old postings dead — concurrent writes are safe by construction.
-%% Plan a whole-store compaction: ALL live batches partitioned
-%% oldest-first into groups bounded by the per-group limits, plus ONE
-%% liveness fold covering every planned batch. Each group merges into
-%% one output batch whose aliases are exactly that group, so group
-%% applies are independent: a crash mid-operation leaves a partially
-%% compacted, fully consistent store.
-compact_plan(FoldSource, Bucket, Ref, Limits0) ->
-    Limits = compact_limits(Limits0),
-    Seqs = discover_seqs(FoldSource, Bucket, Ref),
-    Resolved =
-        [{S, resolve_dir(FoldSource, Bucket, Ref, S, undefined)} || S <- Seqs],
-    AliasMap =
-        maps:from_list(
-            lists:append([
-                [{Old, S} || Old <- Aliases]
-             || {S, {_ColMap, Aliases}} <- Resolved
-            ])
-        ),
-    LiveDirs =
-        [SD || {S, _Dir} = SD <- Resolved, not maps:is_key(S, AliasMap)],
-    Groups =
-        [G || G <- partition_compact_groups(LiveDirs, Limits), length(G) >= 2],
-    case Groups of
-        [] ->
-            noop;
-        _ ->
-            AllSeqs = [S || G <- Groups, {S, _Dir} <- G],
-            LiveByBatch =
-                compact_live_docs(
-                    FoldSource, Bucket, Ref, AliasMap, sets:from_list(AllSeqs)
-                ),
-            {ok, Groups, LiveByBatch}
-    end.
-
-partition_compact_groups([], _Limits) ->
-    [];
-partition_compact_groups(LiveDirs, Limits) ->
-    {Group, Rest} = take_compact_group(LiveDirs, Limits),
-    [Group | partition_compact_groups(Rest, Limits)].
-
-take_compact_group(LiveDirs, #{
-    max_batches := MaxN, max_bytes := MaxBytes, max_pages := MaxPages
-}) ->
-    take_compact_group(LiveDirs, MaxN, MaxBytes, MaxPages, 0, 0, []).
-
-take_compact_group([], _MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) ->
-    {lists:reverse(Acc), []};
-take_compact_group(Rest, MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) when
-    length(Acc) >= MaxN
-->
-    {lists:reverse(Acc), Rest};
-take_compact_group(
-    [{_S, {ColMap, _A}} = SD | Rest] = All, MaxN, MaxBytes, MaxPages, Bytes, Pages, Acc
-) ->
-    BatchPages = maps:fold(fun(_ColId, PS, N) -> N + probe_size(PS) end, 0, ColMap),
-    Estimate = BatchPages * ?FTS_PAGE_TARGET_BYTES,
-    Over =
-        (Bytes + Estimate > MaxBytes orelse Pages + BatchPages > MaxPages) andalso
-            Acc =/= [],
-    case Over of
-        true ->
-            {lists:reverse(Acc), All};
-        false ->
-            take_compact_group(
-                Rest, MaxN, MaxBytes, MaxPages, Bytes + Estimate, Pages + BatchPages,
-                [SD | Acc]
-            )
-    end.
-
-%% Derive one group's merged output: ONE range fold streams the group's
-%% pages in (batch, page) order (batch boundaries on seq transitions,
-%% page column resolved through the batch's directory), doc frames are
-%% liveness-filtered in stream, and the per-batch runs heap-merge into
-%% token-sorted pages. If packing trips the 16-bit page limit the group
-%% splits in half and both halves derive recursively (each half is an
-%% independent output batch).
-compact_group_specs(_FoldSource, _Bucket, _Ref, Group, _LiveByBatch) when
-    length(Group) < 2
-->
-    [];
-compact_group_specs(FoldSource, Bucket, Ref, Group, LiveByBatch) ->
-    Seqs = [S || {S, _Dir} <- Group],
-    FirstSeq = hd(Seqs),
-    LastSeq = lists:last(Seqs),
-    PageCols =
-        maps:from_list([
-            {S, batch_page_columns(ColMap)}
-         || {S, {ColMap, _A}} <- Group
-        ]),
-    Fold =
-        fun(_B, {<<1:8, S:64/unsigned-big, PageNo:16/unsigned-big>>, _Key, Payload}, Acc) ->
-            case {maps:get(S, LiveByBatch, undefined), maps:get(S, PageCols, undefined)} of
-                {undefined, _NoLive} ->
-                    %% an aliased (subsumed) batch inside the seq range:
-                    %% its rows are dead weight, skip.
-                    Acc;
-                {_Live, undefined} ->
-                    Acc;
-                {LiveSet, Cols} ->
-                    ColId = maps:get(PageNo, Cols, 0),
-                    Filtered =
-                        [
-                            begin
-                                Entry =
-                                    <<(byte_size(Token)):16/unsigned-big, Token/binary,
-                                        Kept:32/unsigned-big, KeptBin/binary>>,
-                                [<<(byte_size(Entry)):32/unsigned-big>>, Entry]
-                            end
-                         || {Token, DocsBin} <- page_entries(Payload),
-                            {Kept, KeptBin} <- [filter_doc_frames(DocsBin, LiveSet)],
-                            Kept > 0
-                        ],
-                    case Filtered of
-                        [] ->
-                            Acc;
-                        _ ->
-                            maps:update_with(
-                                {ColId, S},
-                                fun(IoAcc) -> [IoAcc | Filtered] end,
-                                Filtered,
-                                Acc
-                            )
-                    end
-            end
-        end,
-    RunMap =
-        index_fold(
-            FoldSource,
-            {Bucket, null},
-            {Fold, #{}},
-            {seg_field(Ref), page_term(FirstSeq, 0), page_term(LastSeq, 65535)},
-            {payload, undefined}
-        ),
-    ByCol =
-        maps:fold(
-            fun({ColId, S}, Io, Acc) ->
-                Run = iolist_to_binary(Io),
-                maps:update_with(
-                    ColId, fun(Rs) -> [{S, Run} | Rs] end, [{S, Run}], Acc
-                )
-            end,
-            #{},
-            RunMap
-        ),
-    %% runs merge in ascending batch order for byte-deterministic output
-    ByColSorted =
-        maps:map(
-            fun(_ColId, Rs) -> [Run || {_S, Run} <- lists:keysort(1, Rs)] end,
-            ByCol
-        ),
-    NewAliases =
-        lists:usort(lists:append([[S | Aliases] || {S, {_CM, Aliases}} <- Group])),
-    try pack_index_specs(Ref, ByColSorted, 0, NewAliases) of
-        Specs ->
-            [{Seqs, Specs}]
-    catch
-        throw:{fts_error, {batch_page_limit_exceeded, _N}} ->
-            {GA, GB} = lists:split(length(Group) div 2, Group),
-            compact_group_specs(FoldSource, Bucket, Ref, GA, LiveByBatch) ++
-                compact_group_specs(FoldSource, Bucket, Ref, GB, LiveByBatch)
-    end.
-
-%% PageNo -> ColId from a batch's directory probes.
-batch_page_columns(ColMap) ->
-    maps:fold(
-        fun(ColId, PS, Acc) ->
-            lists:foldl(
-                fun(I, A) -> A#{element(3, probe_row(PS, I)) => ColId} end,
-                Acc,
-                lists:seq(1, probe_size(PS))
-            )
-        end,
-        #{},
-        ColMap
-    ).
-
-%% A count cap alone lets convergence culminate in one mega-merge of
-%% everything (a multi-GB atomic write and an hour of CPU at the 5GB
-%% gate-run scale — observed). The byte budget bounds every pass: steady
-%% state is several budget-sized batches whose pairwise merges would
-%% exceed the budget, which reads in microseconds and never mega-merges.
-%% Batch size is estimated from the directory (pages x page target).
-compact_limits(MaxBatches) when is_integer(MaxBatches) ->
-    compact_limits(#{max_batches => MaxBatches});
-compact_limits(#{} = Limits) ->
-    #{
-        max_batches => maps:get(max_batches, Limits, 256),
-        max_bytes => maps:get(max_bytes, Limits, 512 * 1024 * 1024),
-        %% Page numbers are 16-bit in page terms: a merged batch beyond
-        %% 65,536 pages would WRAP and silently overwrite its own pages
-        %% (same ledger key, last write wins) — the byte budget alone
-        %% crossed that boundary at the 5GB gate-run scale. Page counts
-        %% from the directory probes are exact, so this bound is hard.
-        max_pages => maps:get(max_pages, Limits, 60000)
-    }.
-
-%% One marker fold: doc key -> live batch (alias-resolved), restricted to
-%% the batches being compacted.
-compact_live_docs(FoldSource, Bucket, Ref, AliasMap, ChosenSet) ->
-    Fold =
-        fun(_B, {_Term, Key, Payload}, Acc) ->
-            case decode_marker(Payload) of
-                {ok, MarkerSeq0, _DocLength} ->
-                    MarkerSeq = maps:get(MarkerSeq0, AliasMap, MarkerSeq0),
-                    case sets:is_element(MarkerSeq, ChosenSet) of
-                        true ->
-                            maps:update_with(
-                                MarkerSeq,
-                                fun(Set) -> sets:add_element(Key, Set) end,
-                                sets:from_list([Key]),
-                                Acc
-                            );
-                        false ->
-                            Acc
-                    end;
-                error ->
-                    Acc
-            end
-        end,
-    index_fold(
-        FoldSource,
-        {Bucket, null},
-        {Fold, #{}},
-        {doc_field(Ref), doc, doc},
-        {payload, undefined}
-    ).
-
-%% Re-stamp derivation-time placeholder terms with the batch sequence
-%% assigned at apply time. Only the index TERMS embed the sequence —
-%% directory and page payloads never do (aliases are the old sequences).
-restamp_compact_specs(Specs, NewSeq) ->
-    [
-        case Term of
-            <<0:8, _P:64/unsigned-big>> ->
-                {add_payload, Field, dir_term(NewSeq), Payload};
-            <<1:8, _P:64/unsigned-big, PageNo:16/unsigned-big>> ->
-                {add_payload, Field, page_term(NewSeq, PageNo), Payload}
-        end
-     || {add_payload, Field, Term, Payload} <- Specs
-    ].
-
-%% Walk doc frames verbatim, keeping only live docs (no position decode).
-filter_doc_frames(DocsBin, LiveSet) ->
-    filter_doc_frames(DocsBin, LiveSet, 0, <<>>).
-
-filter_doc_frames(<<>>, _LiveSet, Kept, Acc) ->
-    {Kept, Acc};
-filter_doc_frames(
-    <<KeyLen:16/unsigned-big, Key:KeyLen/binary, PosLen:16/unsigned-big,
-        PosBin:PosLen/binary, Rest/binary>> = Bin,
-    LiveSet,
-    Kept,
-    Acc
-) ->
-    FrameLen = 2 + KeyLen + 2 + PosLen,
-    <<Frame:FrameLen/binary, _/binary>> = Bin,
-    _ = PosBin,
-    case sets:is_element(Key, LiveSet) of
-        true ->
-            filter_doc_frames(Rest, LiveSet, Kept + 1, <<Acc/binary, Frame/binary>>);
-        false ->
-            filter_doc_frames(Rest, LiveSet, Kept, Acc)
-    end;
-filter_doc_frames(_Bad, _LiveSet, _Kept, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
-
-%% Replace the compacted sequences with the merged batch in the
-%% compacted index's stamped cache entry; other indexes just re-stamp
-%% (mirror of advance_seqs_cache/5 for compaction).
-compact_seqs_cache(undefined, _Bucket, _Ref, _ChosenSeqs, _NewSeq, _PrevSeq, _NewFtsSeq) ->
+%% Write-through shard-state cache advance: append the write's delta to
+%% every touched shard's cached entry. Entries are "true as of" their
+%% stamp — a shard untouched by later writes stays valid, so only
+%% written shards are touched (marker-cache discipline, not the equality
+%% stamping of the old batch-list cache).
+advance_shard_cache(undefined, _Touched, _NewSeq) ->
     ok;
-compact_seqs_cache(Ets, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq, NewFtsSeq) ->
+advance_shard_cache(_Ets, [], _NewSeq) ->
+    ok;
+advance_shard_cache(Ets, Touched, NewSeq) ->
+    UnderCap = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
     lists:foreach(
-        fun({{seqs, B, R} = Key, {Stamp, SeqList}}) ->
-            case Stamp of
-                PrevSeq ->
-                    SeqList1 =
-                        case {B, R} of
-                            {Bucket, Ref} -> (SeqList -- ChosenSeqs) ++ [NewSeq];
-                            _OtherIndex -> SeqList
-                        end,
-                    ets:insert(Ets, {Key, {NewFtsSeq, SeqList1}});
-                _Stale ->
-                    ets:delete(Ets, Key)
+        fun({Bucket, Ref, Shard, Seq, Delta}) ->
+            CKey = {shard, Bucket, Ref, Shard},
+            case {UnderCap, ets:lookup(Ets, CKey)} of
+                {true, [{_K, {_Stamp, ConsSeq, Bloom, Deltas}}]} ->
+                    ets:insert(
+                        Ets,
+                        {CKey, {NewSeq, ConsSeq, Bloom, Deltas ++ [{Seq, Delta}]}}
+                    );
+                {true, []} ->
+                    %% never queried: the first query seeds from a fold.
+                    ok;
+                {false, _} ->
+                    ets:delete(Ets, CKey)
             end
         end,
-        ets:match_object(Ets, {{seqs, '_', '_'}, '_'})
+        Touched
     ),
     ok.
+
+%% Consolidation cache application: consumed deltas leave the cached
+%% entry, the new consolidated sequence and bloom install, and the
+%% decoded base drops (refetched lazily).
+consolidate_shard_cache(undefined, _Bucket, _Ref, _Updates, _NewSeq) ->
+    ok;
+consolidate_shard_cache(Ets, Bucket, Ref, Updates, _NewSeq) ->
+    lists:foreach(
+        fun({Shard, ConsSeq, Consumed}) ->
+            CKey = {shard, Bucket, Ref, Shard},
+            case ets:lookup(Ets, CKey) of
+                [{_K, {_Stamp, _OldCS, _OldBloom, Deltas}}] ->
+                    Pending =
+                        [D || {Seq, _P} = D <- Deltas, not lists:member(Seq, Consumed)],
+                    %% the new bloom is not in hand here; drop the entry and
+                    %% let the next query reseed summary + pending deltas.
+                    _ = Pending,
+                    ets:delete(Ets, CKey);
+                [] ->
+                    ok
+            end,
+            _ = ConsSeq,
+            ets:delete(Ets, {base, Bucket, Ref, Shard})
+        end,
+        Updates
+    ),
+    ok.
+
+%% Drop every cached shard/base/marker entry (journal error resync).
+reset_fts_caches(undefined) ->
+    ok;
+reset_fts_caches(Ets) ->
+    ets:match_delete(Ets, {{shard, '_', '_', '_'}, '_'}),
+    ets:match_delete(Ets, {{base, '_', '_', '_'}, '_'}),
+    ets:match_delete(Ets, {{marker, '_', '_', '_'}, '_'}),
+    ok.
+
+%% Strip the include_docs option before the engine sees it: results
+%% cache on keys/ranks only; documents attach in the bookie runner.
+split_include_docs(Opts) when is_map(Opts) ->
+    {maps:get(include_docs, Opts, false) =:= true,
+        maps:remove(include_docs, Opts)};
+split_include_docs(Opts) ->
+    {false, Opts}.
 
 %% Extract per-doc marker updates from augmented object changes: the
 %% bookie applies them to the marker cache after journal success, so
@@ -2005,1273 +1511,6 @@ advance_marker_cache(Ets, Updates, NewSeq) ->
     ),
     ok.
 
-%% Advance the cached batch lists after a successful FTS write: entries
-%% stamped with the pre-write sequence move to the new sequence, gaining
-%% the new batch when their (bucket, ref) derived rows in this write;
-%% entries with any other stamp are dropped (the next query rediscovers).
-%% Only existing entries advance — a store nobody has queried yet keeps
-%% an empty cache until the first query seeds it.
-advance_seqs_cache(undefined, _Touched, _BatchSeq, _PrevSeq, _NewSeq) ->
-    ok;
-advance_seqs_cache(Ets, Touched, BatchSeq, PrevSeq, NewSeq) ->
-    lists:foreach(
-        fun({{seqs, Bucket, Ref} = Key, {Stamp, SeqList}}) ->
-            case Stamp of
-                PrevSeq ->
-                    SeqList1 =
-                        case lists:member({Bucket, Ref}, Touched) of
-                            true -> SeqList ++ [BatchSeq];
-                            false -> SeqList
-                        end,
-                    ets:insert(Ets, {Key, {NewSeq, SeqList1}});
-                _Stale ->
-                    ets:delete(Ets, Key)
-            end
-        end,
-        ets:match_object(Ets, {{seqs, '_', '_'}, '_'})
-    ),
-    ok.
-
-%% Drop every cached batch list (write failed after the sequence
-%% advanced, or the sequence was resynced): queries rediscover.
-reset_seqs_cache(undefined) ->
-    ok;
-reset_seqs_cache(Ets) ->
-    ets:match_delete(Ets, {{seqs, '_', '_'}, '_'}),
-    ets:match_delete(Ets, {{marker, '_', '_', '_'}, '_'}),
-    ok.
-
-discover_seqs(FoldSource, Bucket, Ref) ->
-    Fold =
-        fun(_B, {Term, _Key}, Acc) ->
-            case Term of
-                <<0:8, BatchSeq:64/unsigned-big>> -> [BatchSeq | Acc];
-                _Other -> Acc
-            end
-        end,
-    lists:reverse(
-        index_fold(
-            FoldSource,
-            {Bucket, null},
-            {Fold, []},
-            {seg_field(Ref), <<0:8, 0:64/unsigned-big>>,
-                <<0:8, 16#FFFFFFFFFFFFFFFF:64/unsigned-big>>},
-            {true, undefined}
-        )
-    ).
-
-resolve_dir(FoldSource, Bucket, Ref, BatchSeq, Cache) ->
-    CacheKey = {dir, Bucket, Ref, BatchSeq},
-    Ets =
-        case Cache of
-            {Tab, _Seq} -> Tab;
-            undefined -> undefined
-        end,
-    Cached =
-        case Ets of
-            undefined -> [];
-            _ -> ets:lookup(Ets, CacheKey)
-        end,
-    case Cached of
-        [{_K, ColMap}] ->
-            ColMap;
-        [] ->
-            Term = dir_term(BatchSeq),
-            Fold = fun(_B, {_Term, _Key, Payload}, _Acc) -> Payload end,
-            ColMap =
-                case
-                    index_fold(
-                        FoldSource,
-                        {Bucket, null},
-                        {Fold, not_found},
-                        {seg_field(Ref), Term, Term},
-                        {payload, undefined}
-                    )
-                of
-                    not_found ->
-                        {#{}, []};
-                    Payload ->
-                        case decode_dir(Payload) of
-                            {ok, Entries, Blooms, Aliases} ->
-                                {dir_col_map(Entries, Blooms), Aliases};
-                            error ->
-                                throw({fts_error, invalid_fts_payload})
-                        end
-                end,
-            case Ets of
-                undefined -> ok;
-                _ -> ets:insert(Ets, {CacheKey, ColMap})
-            end,
-            ColMap
-    end.
-
-%% Convert directory entries to, per column, a fixed-width probe binary plus a
-%% strings blob. Pages within a column are token-ordered and disjoint, so page
-%% location is a binary search over the probe rows; both parts are refc
-%% binaries, so handing the structure out of the ETS cache copies no row data.
-%% Probe row: <<FirstOff:32, FirstLen:16, LastOff:32, LastLen:16, PageNo:16>>.
--define(FTS_DIR_PROBE_BYTES, 14).
-
-dir_col_map(Entries, Blooms) ->
-    Grouped =
-        lists:foldl(
-            fun({ColId, PageNo, First, Last}, Acc) ->
-                maps:update_with(
-                    ColId,
-                    fun(L) -> [{First, Last, PageNo} | L] end,
-                    [{First, Last, PageNo}],
-                    Acc
-                )
-            end,
-            #{},
-            Entries
-        ),
-    maps:map(
-        fun(_ColId, L) ->
-            {Probe, Str} = build_dir_probe(lists:sort(L)),
-            {Probe, Str, Blooms}
-        end,
-        Grouped
-    ).
-
-build_dir_probe(Sorted) ->
-    {Probe, Str, _Off} =
-        lists:foldl(
-            fun({First, Last, PageNo}, {ProbeAcc, StrAcc, Off}) ->
-                FLen = byte_size(First),
-                LLen = byte_size(Last),
-                {
-                    <<ProbeAcc/binary, Off:32/unsigned-big, FLen:16/unsigned-big,
-                        (Off + FLen):32/unsigned-big, LLen:16/unsigned-big,
-                        PageNo:16/unsigned-big>>,
-                    <<StrAcc/binary, First/binary, Last/binary>>,
-                    Off + FLen + LLen
-                }
-            end,
-            {<<>>, <<>>, 0},
-            Sorted
-        ),
-    {Probe, Str}.
-
-probe_row({Probe, Str, _Blooms}, Idx) ->
-    <<FOff:32/unsigned-big, FLen:16/unsigned-big, LOff:32/unsigned-big,
-        LLen:16/unsigned-big, PageNo:16/unsigned-big>> =
-        binary:part(Probe, (Idx - 1) * ?FTS_DIR_PROBE_BYTES, ?FTS_DIR_PROBE_BYTES),
-    {binary:part(Str, FOff, FLen), binary:part(Str, LOff, LLen), PageNo}.
-
-probe_size({Probe, _Str, _Blooms}) ->
-    byte_size(Probe) div ?FTS_DIR_PROBE_BYTES.
-
-covering_pages(Dirs, ColId, Token) ->
-    %% A token split across entries spans a contiguous run of pages, so the
-    %% exact probe is the range [Token, Token ++ <<0>>) over the directory.
-    %% The page bloom then drops range-spanning pages that cannot contain
-    %% the token — without it an absent term reads one spanning page per
-    %% batch per column, O(#batches) ledger fetches per query.
-    lists:append(
-        [
-            case maps:get(ColId, ColMap, undefined) of
-                undefined ->
-                    [];
-                {_Probe, _Str, Blooms} = PS ->
-                    [
-                        {BatchSeq, PageNo}
-                     || PageNo <-
-                            pages_for_range(PS, Token, <<Token/binary, 0>>),
-                        bloom_pass(Blooms, PageNo, Token)
-                    ]
-            end
-         || {BatchSeq, ColMap} <- Dirs
-        ]
-    ).
-
-bloom_pass({<<>>, <<>>}, _PageNo, _Token) ->
-    %% Pre-bloom directory: never skip.
-    true;
-bloom_pass({_Probe, Blob} = BloomIdx, PageNo, Token) ->
-    case bloom_index_lookup(BloomIdx, PageNo) of
-        undefined -> true;
-        {Off, Len} -> bloom_member_at(Blob, Off, Len, Token)
-    end.
-
-covering_prefix_pages(Dirs, ColId, Prefix) ->
-    End =
-        case next_prefix(Prefix) of
-            {ok, Next} -> Next;
-            none -> none
-        end,
-    lists:append(
-        [
-            case maps:get(ColId, ColMap, undefined) of
-                undefined ->
-                    [];
-                PS ->
-                    [
-                        {BatchSeq, PageNo}
-                     || PageNo <- pages_for_range(PS, Prefix, End)
-                    ]
-            end
-         || {BatchSeq, ColMap} <- Dirs
-        ]
-    ).
-
-%% Pages overlapping [Start, End): both Firsts and Lasts ascend, so the run is
-%% from the first page with Last >= Start through the last page with
-%% First < End (End =:= none means unbounded).
-pages_for_range(PS, Start, End) ->
-    Size = probe_size(PS),
-    Lo = leftmost_last_geq(PS, Start, 1, Size, none),
-    case Lo of
-        none ->
-            [];
-        _ ->
-            Hi =
-                case End of
-                    none -> Size;
-                    _ -> rightmost_first_lt(PS, End, 1, Size, none)
-                end,
-            case Hi =:= none orelse Hi < Lo of
-                true ->
-                    [];
-                false ->
-                    [element(3, probe_row(PS, I)) || I <- lists:seq(Lo, Hi)]
-            end
-    end.
-
-leftmost_last_geq(_PS, _Token, Lo, Hi, Best) when Lo > Hi ->
-    Best;
-leftmost_last_geq(PS, Token, Lo, Hi, Best) ->
-    Mid = (Lo + Hi) div 2,
-    {_First, Last, _PageNo} = probe_row(PS, Mid),
-    case Last >= Token of
-        true -> leftmost_last_geq(PS, Token, Lo, Mid - 1, Mid);
-        false -> leftmost_last_geq(PS, Token, Mid + 1, Hi, Best)
-    end.
-
-rightmost_first_lt(_PS, _Token, Lo, Hi, Best) when Lo > Hi ->
-    Best;
-rightmost_first_lt(PS, Token, Lo, Hi, Best) ->
-    Mid = (Lo + Hi) div 2,
-    {First, _Last, _PageNo} = probe_row(PS, Mid),
-    case First < Token of
-        true -> rightmost_first_lt(PS, Token, Mid + 1, Hi, Mid);
-        false -> rightmost_first_lt(PS, Token, Lo, Mid - 1, Best)
-    end.
-
-read_page(#{pages := Pages} = Ctx, BatchSeq, PageNo) ->
-    case maps:get({BatchSeq, PageNo}, Pages, undefined) of
-        undefined ->
-            #{fold := FoldSource, bucket := Bucket, ref := Ref, cache := Cache} = Ctx,
-            PageKey = {page, Bucket, Ref, BatchSeq, PageNo},
-            Ets =
-                case Cache of
-                    {Tab, _Seq} -> Tab;
-                    undefined -> undefined
-                end,
-            CachedEntries =
-                case Ets of
-                    undefined -> undefined;
-                    _ ->
-                        case ets:lookup(Ets, PageKey) of
-                            [{_K, E}] -> E;
-                            [] -> undefined
-                        end
-                end,
-            Entries =
-                case CachedEntries of
-                    undefined ->
-                        Term = page_term(BatchSeq, PageNo),
-                        Fold = fun(_B, {_Term, _Key, Payload}, _Acc) -> Payload end,
-                        Read =
-                            case
-                                index_fold(
-                                    FoldSource,
-                                    {Bucket, null},
-                                    {Fold, not_found},
-                                    {seg_field(Ref), Term, Term},
-                                    {payload, undefined}
-                                )
-                            of
-                                not_found -> [];
-                                Payload -> page_entries(Payload)
-                            end,
-                        case
-                            Ets =/= undefined andalso
-                                ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS
-                        of
-                            true -> ets:insert(Ets, {PageKey, Read});
-                            false -> ok
-                        end,
-                        Read;
-                    _ ->
-                        CachedEntries
-                end,
-            {Ctx#{pages := Pages#{{BatchSeq, PageNo} => Entries}}, Entries};
-        Entries ->
-            {Ctx, Entries}
-    end.
-
-%% Marker liveness loads go through a write-through ETS cache: the
-%% bookie replaces entries authoritatively on every FTS write (stamped
-%% with the write sequence), queries fill cold entries with insert_new
-%% stamped at their own sequence, and a query only trusts an entry whose
-%% stamp is at or before its snapshot sequence — anything newer falls
-%% back to the fold for that key. Without the cache every candidate list
-%% larger than the seek cap degenerated into a marker range scan of the
-%% whole corpus (51ms for a 686-hit term at the 1GB gate rung).
-load_markers(#{cache := {Ets, Seq}} = Ctx, Keys) ->
-    {Cached, Missing} =
-        lists:foldl(
-            fun(Key, {CachedAcc, MissingAcc}) ->
-                case ets:lookup(Ets, marker_key(Ctx, Key)) of
-                    [{_K, {Stamp, Value}}] when Stamp =< Seq ->
-                        case Value of
-                            not_found -> {CachedAcc, MissingAcc};
-                            Marker -> {CachedAcc#{Key => Marker}, MissingAcc}
-                        end;
-                    _MissingOrNewer ->
-                        {CachedAcc, [Key | MissingAcc]}
-                end
-            end,
-            {#{}, []},
-            Keys
-        ),
-    case Missing of
-        [] ->
-            {Ctx, Cached};
-        _ ->
-            {Ctx1, Loaded} = load_markers_uncached(Ctx, Missing),
-            Cacheable = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
-            case Cacheable of
-                true ->
-                    lists:foreach(
-                        fun(Key) ->
-                            Value = maps:get(Key, Loaded, not_found),
-                            ets:insert_new(
-                                Ets, {marker_key(Ctx, Key), {Seq, Value}}
-                            )
-                        end,
-                        Missing
-                    );
-                false ->
-                    ok
-            end,
-            {Ctx1, maps:merge(Cached, Loaded)}
-    end;
-load_markers(Ctx, Keys) ->
-    load_markers_uncached(Ctx, Keys).
-
-marker_key(#{bucket := Bucket, ref := Ref}, Key) ->
-    {marker, Bucket, Ref, Key}.
-
-load_markers_uncached(#{fold := FoldSource, bucket := Bucket, ref := Ref} = Ctx, Keys) ->
-    Field = doc_field(Ref),
-    Markers =
-        case length(Keys) =< ?FTS_MARKER_SEEK_MAX of
-            true ->
-                lists:foldl(
-                    fun(Key, Acc) ->
-                        case seek_marker(FoldSource, Bucket, Field, Key) of
-                            {ok, BatchSeq, DocLength} ->
-                                Acc#{Key => {BatchSeq, DocLength}};
-                            not_found ->
-                                Acc
-                        end
-                    end,
-                    #{},
-                    Keys
-                );
-            false ->
-                Sorted = lists:sort(Keys),
-                MinKey = hd(Sorted),
-                MaxKey = lists:last(Sorted),
-                KeySet = sets:from_list(Keys),
-                Fold =
-                    fun(_B, {_Term, Key, Payload}, Acc) ->
-                        case Key > MaxKey of
-                            true ->
-                                throw({fts_fold_stop, Acc});
-                            false ->
-                                case sets:is_element(Key, KeySet) of
-                                    true ->
-                                        case decode_marker(Payload) of
-                                            {ok, BatchSeq, DocLength} ->
-                                                Acc#{Key => {BatchSeq, DocLength}};
-                                            error ->
-                                                Acc
-                                        end;
-                                    false ->
-                                        Acc
-                                end
-                        end
-                    end,
-                try
-                    index_fold(
-                        FoldSource,
-                        {Bucket, MinKey},
-                        {Fold, #{}},
-                        {Field, doc, doc},
-                        {payload, undefined}
-                    )
-                catch
-                    throw:{fts_fold_stop, Acc} -> Acc
-                end
-        end,
-    {Ctx, Markers}.
-
-seek_marker(FoldSource, Bucket, Field, Key) ->
-    Fold =
-        fun(_B, {_Term, Key0, Payload}, _Acc) ->
-            throw({fts_fold_stop, {Key0, Payload}})
-        end,
-    Found =
-        try
-            index_fold(
-                FoldSource,
-                {Bucket, Key},
-                {Fold, not_found},
-                {Field, doc, doc},
-                {payload, undefined}
-            )
-        catch
-            throw:{fts_fold_stop, KeyPayload} -> KeyPayload
-        end,
-    case Found of
-        {Key, Payload} ->
-            case decode_marker(Payload) of
-                {ok, BatchSeq, DocLength} -> {ok, BatchSeq, DocLength};
-                error -> not_found
-            end;
-        _Other ->
-            not_found
-    end.
-
-index_fold(FoldFun, BucketKey, FoldAccT, Range, TermHandling) when is_function(FoldFun, 4) ->
-    FoldFun(BucketKey, FoldAccT, Range, TermHandling);
-index_fold(Pid, BucketKey, FoldAccT, Range, TermHandling) when is_pid(Pid) ->
-    {async, Runner} =
-        leveled_bookie:book_indexfold(
-            Pid, BucketKey, FoldAccT, Range, TermHandling
-        ),
-    Runner().
-
-
-
-empty_meta(Index, Key, DocLength) ->
-    #{
-        version => ?VERSION,
-        kind => fts_doc,
-        key => Key,
-        index => Index,
-        doc_length => DocLength,
-        positions => #{}
-    }.
-
-evaluate_payload_candidates(Index, AST, Opts, Metas) ->
-    try
-        Hits =
-            lists:foldl(
-                fun
-                    ({_Key, #{version := ?VERSION, index := MetaIndex} = Meta}, Acc) when
-                        MetaIndex =:= Index
-                    ->
-                        case eval(AST, Meta) of
-                            {true, Positions} ->
-                                case public_hit(Meta, Positions, Opts) of
-                                    {ok, Hit} -> [Hit | Acc];
-                                    {error, Reason} -> throw({fts_error, Reason})
-                                end;
-                            false ->
-                                Acc
-                        end;
-                    (_Other, Acc) ->
-                        Acc
-                end,
-                [],
-                maps:to_list(Metas)
-            ),
-        Sorted = lists:sort(fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end, Hits),
-        {ok, hit_list_result(Sorted, Opts)}
-    catch
-        throw:{fts_error, Reason} -> {error, Reason}
-    end.
-
-%% ----------------------------------------------------------------------------
-%% BM25 ranking, matching SQLite FTS5's bm25() auxiliary function (the
-%% reference the differential suite checks against): k1 = 1.2, b = 0.75,
-%% idf = ln((N - n + 0.5) / (n + 0.5)) clamped to a small positive epsilon,
-%% score = sum over query phrases of idf * (tf * (k1+1)) / (tf + k1 * (1 -
-%% b + b * dl/avgdl)). tf is the phrase instance count in the document
-%% (respecting the phrase's column constraint), n the number of live
-%% documents matching the phrase, dl the document token count from its
-%% marker, N/avgdl the live corpus stats. The hit's rank is the negative
-%% score (FTS5's sign convention: ORDER BY rank ascending = best first).
-%% ----------------------------------------------------------------------------
-
-evaluate_ranked_candidates(Index, EvalAST, Leaves, Opts, Metas, Np0, {DocCount, TotalLen}) ->
-    MetaList =
-        [
-            Meta
-         || {_Key, #{version := ?VERSION, index := MetaIndex} = Meta} <-
-                maps:to_list(Metas),
-            MetaIndex =:= Index
-        ],
-    Np =
-        case Np0 of
-            positional -> np_map(Leaves, MetaList);
-            _ -> Np0
-        end,
-    AvgDl =
-        case DocCount of
-            0 -> 0.0;
-            _ -> TotalLen / DocCount
-        end,
-    try
-        Hits =
-            lists:foldl(
-                fun(Meta, Acc) ->
-                    case eval(EvalAST, Meta) of
-                        {true, Positions} ->
-                            Score = bm25_score(Meta, Leaves, Np, DocCount, AvgDl),
-                            case public_hit(Meta, Positions, Opts) of
-                                {ok, Hit} ->
-                                    [Hit#{rank => -Score, score => Score} | Acc];
-                                {error, Reason} ->
-                                    throw({fts_error, Reason})
-                            end;
-                        false ->
-                            Acc
-                    end
-                end,
-                [],
-                MetaList
-            ),
-        Sorted =
-            lists:sort(
-                fun(A, B) ->
-                    {maps:get(rank, A), maps:get(key, A)} =<
-                        {maps:get(rank, B), maps:get(key, B)}
-                end,
-                Hits
-            ),
-        {ok, hit_list_result(Sorted, Opts)}
-    catch
-        throw:{fts_error, Reason} -> {error, Reason}
-    end.
-
-%% The scoring phrases of a query: term and phrase leaves in match
-%% position — both AND/OR branches, NEAR members individually (FTS5
-%% scores each phrase of a NEAR group), and only the LEFT side of NOT.
-%% Duplicates are preserved: a term written twice in the query scores
-%% twice, as in FTS5. NEAR members keep their group context: FTS5 trims
-%% each member's position list to the instances that participate in a
-%% NEAR-satisfying configuration before counting tf (while df stays the
-%% member's standalone document frequency) — see the NEAR scoring
-%% dissection in docs/fts_sqlite_gate.md.
-scoring_phrases({term, _Token, _Prefix, _Cols} = Leaf) -> [Leaf];
-scoring_phrases({phrase, _Specs, _Cols} = Leaf) -> [Leaf];
-scoring_phrases({near, Items, Distance, Cols}) ->
-    [{near_member, Index, Items, Distance, Cols} || Index <- lists:seq(1, length(Items))];
-scoring_phrases({anchor, AST}) -> scoring_phrases(AST);
-scoring_phrases({'and', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
-scoring_phrases({'or', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
-scoring_phrases({'not', A, _B}) -> scoring_phrases(A);
-scoring_phrases(_Other) -> [].
-
-leaf_tf(Meta, {term, Token, Prefix, Cols}) ->
-    length(term_positions(Meta, Token, Prefix, Cols));
-leaf_tf(Meta, {phrase, Specs, Cols}) ->
-    length(phrase_match_positions(Meta, Specs, Cols));
-leaf_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
-    near_member_tf(Meta, Items, Index, Distance, Cols, filtered).
-
-%% Document frequency counts for a leaf use the member's STANDALONE
-%% matches (FTS5's xQueryPhrase runs each phrase alone for nHit), while
-%% per-document tf for NEAR members is NEAR-filtered above.
-leaf_df_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
-    near_member_tf(Meta, Items, Index, Distance, Cols, standalone);
-leaf_df_tf(Meta, Leaf) ->
-    leaf_tf(Meta, Leaf).
-
-near_member_tf(Meta, Items, Index, Distance, Cols, Mode) ->
-    Member = lists:nth(Index, Items),
-    lists:sum([
-        length(near_member_column_spans(Meta, Items, Index, Member, Distance, Column, Mode))
-     || Column <- concrete_columns(Cols)
-    ]).
-
-near_member_column_spans(Meta, _Items, _Index, Member, _Distance, Column, standalone) ->
-    item_spans_in_column(Meta, Member, Column);
-near_member_column_spans(Meta, Items, Index, _Member, Distance, Column, filtered) ->
-    SpanLists = [item_spans_in_column(Meta, Item, Column) || Item <- Items],
-    case lists:any(fun(Spans) -> Spans =:= [] end, SpanLists) of
-        true ->
-            [];
-        false ->
-            {Before, [MemberSpans | After]} = lists:split(Index - 1, SpanLists),
-            case Before ++ After of
-                [OtherSpans] ->
-                    near_sweep(MemberSpans, OtherSpans, Distance);
-                Others ->
-                    [
-                        Span
-                     || Span <- MemberSpans,
-                        near_position_matches([Span], Others, Distance)
-                    ]
-            end
-    end.
-
-%% A scoring leaf has a keys-only exact document frequency when it is a
-%% plain term (or a NEAR member that is a plain term): df is then the
-%% count of live documents carrying the token, which needs page keys and
-%% cached markers but no positions. Phrase leaves need positional df
-%% (FTS5's xQueryPhrase counts docs matching the phrase).
-ranked_fast_df(Leaves) ->
-    lists:all(
-        fun
-            ({term, _T, _P, _C}) -> true;
-            ({near_member, Index, Items, _D, _C}) ->
-                case lists:nth(Index, Items) of
-                    {term, _T2, _P2, _C2} -> true;
-                    _Positional -> false
-                end;
-            (_Positional) -> false
-        end,
-        Leaves
-    ).
-
-%% Exact per-leaf document frequencies without positions: one keys-only
-%% load per unique scoring term, liveness through the marker cache, and
-%% the result cached per write sequence alongside stats (df is immutable
-%% per sequence).
-fast_np_map(FoldSource, Bucket, Schema, Cache, Leaves) ->
-    Ctx = #{
-        fold => FoldSource,
-        bucket => Bucket,
-        ref => index_ref(Schema),
-        columns => maps:get(columns, Schema),
-        dirs => undefined,
-        cache => Cache,
-        return_positions_opt => false,
-        pages => #{}
-    },
-    {_Ctx1, Np} =
-        lists:foldl(
-            fun(Leaf, {CtxA, Acc}) ->
-                case maps:is_key(Leaf, Acc) of
-                    true ->
-                        {CtxA, Acc};
-                    false ->
-                        {CtxB, N} = leaf_df(CtxA, df_leaf_term(Leaf)),
-                        {CtxB, Acc#{Leaf => N}}
-                end
-            end,
-            {Ctx, #{}},
-            Leaves
-        ),
-    Np.
-
-df_leaf_term({term, _T, _P, _C} = Leaf) ->
-    Leaf;
-df_leaf_term({near_member, Index, Items, _D, GroupCols}) ->
-    %% restrict_ast_columns passes `all` through and intersects lists;
-    %% {empty} cannot arise here (parse rejects empty column sets).
-    restrict_ast_columns(lists:nth(Index, Items), GroupCols).
-
-leaf_df(#{bucket := Bucket, ref := Ref, cache := Cache} = Ctx, {term, Token, Prefix, Cols}) ->
-    DfKey = {df, Bucket, Ref, {Token, Prefix, Cols}},
-    case Cache of
-        {Ets, Seq} ->
-            case ets:lookup(Ets, DfKey) of
-                [{_K, {Seq, N}}] ->
-                    {Ctx, N};
-                _MissOrStale ->
-                    {Ctx1, N} = compute_leaf_df(Ctx, Token, Prefix, Cols),
-                    ets:insert(Ets, {DfKey, {Seq, N}}),
-                    {Ctx1, N}
-            end;
-        undefined ->
-            compute_leaf_df(Ctx, Token, Prefix, Cols)
-    end.
-
-compute_leaf_df(#{ref := Ref} = Ctx, Token, Prefix, Cols) ->
-    {Ctx1, Raw} =
-        lists:foldl(
-            fun(Col, {CtxA, RawA}) ->
-                load_term(CtxA, Col, Token, Prefix, all, false, RawA)
-            end,
-            {Ctx, #{}},
-            concrete_columns(Cols)
-        ),
-    {Ctx2, Markers} = load_markers(Ctx1, maps:keys(Raw)),
-    Live = build_metas(Raw, Markers, Ref, ctx_alias_map(Ctx2)),
-    {Ctx2, maps:size(Live)}.
-
-np_map(Leaves, MetaList) ->
-    lists:foldl(
-        fun(Leaf, Acc) ->
-            case maps:is_key(Leaf, Acc) of
-                true ->
-                    Acc;
-                false ->
-                    N = length([ok || Meta <- MetaList, leaf_df_tf(Meta, Leaf) > 0]),
-                    Acc#{Leaf => N}
-            end
-        end,
-        #{},
-        Leaves
-    ).
-
-bm25_score(Meta, Leaves, Np, DocCount, AvgDl) ->
-    K1 = 1.2,
-    B = 0.75,
-    Dl = maps:get(doc_length, Meta, 0),
-    lists:foldl(
-        fun(Leaf, Acc) ->
-            Tf = leaf_tf(Meta, Leaf),
-            case Tf > 0 of
-                false ->
-                    Acc;
-                true ->
-                    NHit = maps:get(Leaf, Np),
-                    Idf0 = math:log((DocCount - NHit + 0.5) / (NHit + 0.5)),
-                    Idf =
-                        case Idf0 > 0.0 of
-                            true -> Idf0;
-                            false -> 1.0e-6
-                        end,
-                    LenRatio =
-                        case AvgDl > 0.0 of
-                            true -> Dl / AvgDl;
-                            false -> 1.0
-                        end,
-                    Acc +
-                        Idf * (Tf * (K1 + 1)) /
-                            (Tf + K1 * (1 - B + B * LenRatio))
-            end
-        end,
-        0.0,
-        Leaves
-    ).
-
-%% Live corpus stats (document count and total token count) from the doc
-%% markers. Exact incremental maintenance is impossible under blind
-%% writes (an update or delete cannot adjust N/TotalLen without the
-%% superseded marker, which only an LSM fold resolves), so the fold is
-%% the exact mechanism. The entry lives under a stable key stamped with
-%% the write sequence it was computed at; a ranked query may accept a
-%% stamp up to stats_staleness sequences behind its own (default 0 =
-%% exact per sequence). With a window, ranked queries on write-heavy
-%% stores skip the O(N) refold between nearby writes at a bounded,
-%% documented score staleness — BM25 corpus stats move slowly, exact
-%% scores return as soon as the window is exceeded or writes pause.
-corpus_stats(FoldSource, Bucket, Schema, Cache, Staleness) ->
-    Ref = index_ref(Schema),
-    case Cache of
-        {Ets, Seq} ->
-            StatsKey = {stats, Bucket, Ref},
-            case ets:lookup(Ets, StatsKey) of
-                [{_K, {Stamp, Stats}}] when Stamp =< Seq, Seq - Stamp =< Staleness ->
-                    Stats;
-                _MissingOrOutsideWindow ->
-                    Stats = compute_corpus_stats(FoldSource, Bucket, Ref),
-                    ets:insert(Ets, {StatsKey, {Seq, Stats}}),
-                    Stats
-            end;
-        undefined ->
-            compute_corpus_stats(FoldSource, Bucket, Ref)
-    end.
-
-compute_corpus_stats(FoldSource, Bucket, Ref) ->
-    Fold =
-        fun(_B, {_Term, _Key, Payload}, {N, L} = Acc) ->
-            case decode_marker(Payload) of
-                {ok, _BatchSeq, DocLength} -> {N + 1, L + DocLength};
-                error -> Acc
-            end
-        end,
-    index_fold(
-        FoldSource,
-        {Bucket, null},
-        {Fold, {0, 0}},
-        {doc_field(Ref), doc, doc},
-        {payload, undefined}
-    ).
-
-query_terms({empty}, _Columns) ->
-    [];
-query_terms({all_docs}, _Columns) ->
-    [];
-query_terms({term, Token, Prefix, Columns}, _SearchColumns) ->
-    [{Column, Token, Prefix} || Column <- concrete_columns(Columns)];
-query_terms({phrase, Specs, Columns}, _SearchColumns) ->
-    lists:usort([
-        {Column, Token, Prefix}
-     || Column <- concrete_columns(Columns),
-        {Token, Prefix, _Offset} <- Specs
-    ]);
-query_terms({near, Items, _Distance, Columns}, SearchColumns) ->
-    lists:usort(lists:append([query_terms(restrict_ast_columns(Item, Columns), SearchColumns)
-        || Item <- Items]));
-query_terms({anchor, AST}, Columns) ->
-    query_terms(AST, Columns);
-query_terms({'and', A, B}, Columns) ->
-    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns));
-query_terms({'or', A, B}, Columns) ->
-    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns));
-query_terms({'not', A, B}, Columns) ->
-    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns)).
-
-%% Marker, directory, and page codecs for the packed posting representation.
-encode_marker(BatchSeq, DocLength) ->
-    <<BatchSeq:64/unsigned-big, DocLength:32/unsigned-big>>.
-
-decode_marker(<<BatchSeq:64/unsigned-big, DocLength:32/unsigned-big>>) ->
-    {ok, BatchSeq, DocLength};
-decode_marker(_Payload) ->
-    error.
-
-dir_term(BatchSeq) ->
-    <<0:8, BatchSeq:64/unsigned-big>>.
-
-page_term(BatchSeq, PageNo) ->
-    <<1:8, BatchSeq:64/unsigned-big, PageNo:16/unsigned-big>>.
-
-%% Page blooms and the alias section trail the classic entry section, so
-%% directories written before either existed decode with an empty bloom
-%% map and no aliases (exact prior behavior) and mixed-era stores work
-%% unchanged.
-encode_dir(NumberedPages, Aliases) ->
-    iolist_to_binary([
-        <<(length(NumberedPages)):16/unsigned-big>>,
-        [
-            <<ColId:8/unsigned-big, PageNo:16/unsigned-big,
-                (byte_size(First)):16/unsigned-big, First/binary,
-                (byte_size(Last)):16/unsigned-big, Last/binary>>
-         || {PageNo, {ColId, First, Last, _Payload, _Bloom}} <- NumberedPages
-        ],
-        <<(length(NumberedPages)):16/unsigned-big>>,
-        [
-            <<PageNo:16/unsigned-big, (byte_size(Bloom)):16/unsigned-big, Bloom/binary>>
-         || {PageNo, {_ColId, _First, _Last, _Payload, Bloom}} <- NumberedPages
-        ],
-        case Aliases of
-            [] -> <<>>;
-            _ -> [<<(length(Aliases)):16/unsigned-big>>, [<<S:64/unsigned-big>> || S <- Aliases]]
-        end
-    ]).
-
-decode_dir(<<Count:16/unsigned-big, Rest/binary>>) ->
-    decode_dir_entries(Count, Rest, []);
-decode_dir(_Payload) ->
-    error.
-
-decode_dir_entries(0, <<>>, Acc) ->
-    {ok, lists:reverse(Acc), {<<>>, <<>>}, []};
-decode_dir_entries(0, <<Count:16/unsigned-big, Rest/binary>>, Acc) ->
-    case decode_dir_blooms(Count, Rest, []) of
-        {ok, Blooms, Aliases} -> {ok, lists:reverse(Acc), Blooms, Aliases};
-        error -> error
-    end;
-decode_dir_entries(Count, Bin, Acc) when Count > 0 ->
-    case Bin of
-        <<ColId:8/unsigned-big, PageNo:16/unsigned-big, FirstLen:16/unsigned-big,
-            First:FirstLen/binary, LastLen:16/unsigned-big, Last:LastLen/binary,
-            Rest/binary>> ->
-            decode_dir_entries(Count - 1, Rest, [{ColId, PageNo, First, Last} | Acc]);
-        _Other ->
-            error
-    end;
-decode_dir_entries(_Count, _Bin, _Acc) ->
-    error.
-
-decode_dir_blooms(0, <<>>, Acc) ->
-    {ok, finish_bloom_index(Acc), []};
-decode_dir_blooms(0, <<AliasCount:16/unsigned-big, Rest/binary>>, Acc) ->
-    case decode_dir_aliases(AliasCount, Rest, []) of
-        {ok, Aliases} -> {ok, finish_bloom_index(Acc), Aliases};
-        error -> error
-    end;
-decode_dir_blooms(Count, Bin, Acc) when Count > 0 ->
-    case Bin of
-        <<PageNo:16/unsigned-big, Len:16/unsigned-big, Bloom:Len/binary, Rest/binary>> ->
-            decode_dir_blooms(Count - 1, Rest, [{PageNo, Bloom} | Acc]);
-        _Other ->
-            error
-    end;
-decode_dir_blooms(_Count, _Bin, _Acc) ->
-    error.
-
-%% Blooms are kept as one flat fixed-width probe plus one blob (both refc
-%% binaries), mirroring the page probe/str layout: a decoded directory in
-%% ETS then costs O(1) to copy out per query, where a map of thousands of
-%% small heap binaries cost milliseconds per lookup on large compacted
-%% batches (measured as the nomatch floor growing with corpus size).
-finish_bloom_index(PageBloomsRev) ->
-    Sorted = lists:keysort(1, lists:reverse(PageBloomsRev)),
-    {Probe, Blob, _Off} =
-        lists:foldl(
-            fun({PageNo, Bloom}, {ProbeAcc, BlobAcc, Off}) ->
-                Len = byte_size(Bloom),
-                {
-                    <<ProbeAcc/binary, PageNo:16/unsigned-big, Off:32/unsigned-big,
-                        Len:16/unsigned-big>>,
-                    <<BlobAcc/binary, Bloom/binary>>,
-                    Off + Len
-                }
-            end,
-            {<<>>, <<>>, 0},
-            Sorted
-        ),
-    {Probe, Blob}.
-
-bloom_index_lookup({Probe, Blob}, PageNo) ->
-    bloom_index_lookup(Probe, Blob, PageNo, 1, byte_size(Probe) div 8).
-
-bloom_index_lookup(_Probe, _Blob, _PageNo, Lo, Hi) when Lo > Hi ->
-    undefined;
-bloom_index_lookup(Probe, Blob, PageNo, Lo, Hi) ->
-    Mid = (Lo + Hi) div 2,
-    <<P:16/unsigned-big, Off:32/unsigned-big, Len:16/unsigned-big>> =
-        binary:part(Probe, (Mid - 1) * 8, 8),
-    if
-        PageNo < P -> bloom_index_lookup(Probe, Blob, PageNo, Lo, Mid - 1);
-        PageNo > P -> bloom_index_lookup(Probe, Blob, PageNo, Mid + 1, Hi);
-        true -> {Off, Len}
-    end.
-
-%% Alias section: the batch sequences this (compacted) batch subsumes.
-decode_dir_aliases(0, <<>>, Acc) ->
-    {ok, lists:reverse(Acc)};
-decode_dir_aliases(Count, Bin, Acc) when Count > 0 ->
-    case Bin of
-        <<Seq:64/unsigned-big, Rest/binary>> ->
-            decode_dir_aliases(Count - 1, Rest, [Seq | Acc]);
-        _Other ->
-            error
-    end;
-decode_dir_aliases(_Count, _Bin, _Acc) ->
-    error.
-
-%% Lazily parses a page payload to [{Token, DocsBin}] in token order: only
-%% entry boundaries are walked; doc keys and positions stay as binary slices
-%% for extract_docs/3 to decode on demand.
-page_entries(<<Count:16/unsigned-big, Rest/binary>>) ->
-    page_entries(Count, Rest, []);
-page_entries(_Payload) ->
-    throw({fts_error, invalid_fts_payload}).
-
-page_entries(0, <<>>, Acc) ->
-    lists:reverse(Acc);
-page_entries(Count, Bin, Acc) when Count > 0 ->
-    case Bin of
-        <<TokenLen:16/unsigned-big, Token:TokenLen/binary, DocCount:16/unsigned-big,
-            Rest/binary>> ->
-            DocsLen = docs_byte_length(DocCount, Rest, 0),
-            <<DocsBin:DocsLen/binary, Rest1/binary>> = Rest,
-            page_entries(Count - 1, Rest1, [{Token, DocsBin} | Acc]);
-        _Other ->
-            throw({fts_error, invalid_fts_payload})
-    end;
-page_entries(_Count, _Bin, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
-
-docs_byte_length(0, _Bin, Len) ->
-    Len;
-docs_byte_length(Count, Bin, Len) ->
-    case Bin of
-        <<KeyLen:16/unsigned-big, _Key:KeyLen/binary, PosLen:16/unsigned-big,
-            _PosBin:PosLen/binary, Rest/binary>> ->
-            docs_byte_length(Count - 1, Rest, Len + 4 + KeyLen + PosLen);
-        _Other ->
-            throw({fts_error, invalid_fts_payload})
-    end.
-
-%% Decodes a page payload to [{Token, [{Key, Positions}]}] in token order.
-%% Malformed payloads raise {fts_error, invalid_fts_payload}.
-decode_page(<<Count:16/unsigned-big, Rest/binary>>) ->
-    decode_page_tokens(Count, Rest, []);
-decode_page(_Payload) ->
-    throw({fts_error, invalid_fts_payload}).
-
-decode_page_tokens(0, <<>>, Acc) ->
-    lists:reverse(Acc);
-decode_page_tokens(Count, Bin, Acc) when Count > 0 ->
-    case Bin of
-        <<TokenLen:16/unsigned-big, Token:TokenLen/binary, DocCount:16/unsigned-big,
-            Rest/binary>> ->
-            {Docs, Rest1} = decode_page_docs(DocCount, Rest, []),
-            decode_page_tokens(Count - 1, Rest1, [{Token, Docs} | Acc]);
-        _Other ->
-            throw({fts_error, invalid_fts_payload})
-    end;
-decode_page_tokens(_Count, _Bin, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
-
-decode_page_docs(0, Rest, Acc) ->
-    {lists:reverse(Acc), Rest};
-decode_page_docs(Count, Bin, Acc) when Count > 0 ->
-    case Bin of
-        <<KeyLen:16/unsigned-big, Key:KeyLen/binary, PosLen:16/unsigned-big,
-            PosBin:PosLen/binary, Rest/binary>> ->
-            case decode_positions(PosBin, 0, []) of
-                {ok, Positions} ->
-                    decode_page_docs(Count - 1, Rest, [{Key, Positions} | Acc]);
-                error ->
-                    throw({fts_error, invalid_fts_payload})
-            end;
-        _Other ->
-            throw({fts_error, invalid_fts_payload})
-    end.
-%% Positions are supplied already ascending (see group_positions/1), so no
-%% sort; deltas are appended directly onto the accumulator binary.
-encode_positions(Positions) ->
-    encode_positions(Positions, 0, <<>>).
-
-encode_positions([], _Last, Acc) ->
-    Acc;
-encode_positions([Pos | Rest], Last, Acc) ->
-    encode_positions(Rest, Pos, varint_append(Pos - Last, Acc)).
-
-decode_positions(<<>>, _Last, Acc) ->
-    {ok, lists:reverse(Acc)};
-decode_positions(Bin, Last, Acc) ->
-    case decode_varint(Bin) of
-        {ok, Delta, Rest} ->
-            Pos = Last + Delta,
-            decode_positions(Rest, Pos, [Pos | Acc]);
-        error ->
-            error
-    end.
-
-varint_append(N, Acc) when N < 128 ->
-    <<Acc/binary, N:8>>;
-varint_append(N, Acc) ->
-    varint_append(N bsr 7, <<Acc/binary, (16#80 bor (N band 16#7F)):8>>).
-
-decode_varint(Bin) ->
-    decode_varint(Bin, 0, 0).
-
-decode_varint(<<Byte:8, Rest/binary>>, Shift, Acc) when Shift =< 63 ->
-    Value = Acc bor ((Byte band 16#7F) bsl Shift),
-    case Byte band 16#80 of
-        0 -> {ok, Value, Rest};
-        _ -> decode_varint(Rest, Shift + 7, Value)
-    end;
-decode_varint(_Bin, _Shift, _Acc) ->
-    error.
-
-public_hit(Meta, Positions, Opts) ->
-    Base = #{
-        key => maps:get(key, Meta),
-        rank => 0.0,
-        score => 0.0,
-        doc_length => maps:get(doc_length, Meta, 0)
-    },
-    case maps:get(return_positions, Opts, false) of
-        true ->
-            case position_count(Positions) =< ?MAX_RETURN_POSITIONS of
-                true -> {ok, Base#{positions => Positions}};
-                false -> {error, fts_query_positions_limit_exceeded}
-            end;
-        false ->
-            {ok, Base}
-    end.
-
-position_count(Value) when is_map(Value) ->
-    lists:sum([position_count(V) || {_K, V} <- maps:to_list(Value)]);
-position_count(Value) when is_list(Value) ->
-    length(Value);
-position_count(_Value) ->
-    0.
-
-eval({empty}, _Meta) ->
-    false;
-eval({all_docs}, Meta) ->
-    {true, maps:get(positions, Meta, #{})};
-eval({term, Token, Prefix, Columns}, Meta) ->
-    case term_positions(Meta, Token, Prefix, Columns) of
-        [] -> false;
-        Positions -> {true, #{Token => Positions}}
-    end;
-eval({phrase, Specs, Columns}, Meta) ->
-    case phrase_match_positions(Meta, Specs, Columns) of
-        [] -> false;
-        Positions -> {true, #{phrase => Positions}}
-    end;
-eval({near, Items, Distance, Columns}, Meta) ->
-    case near_match_positions(Meta, Items, Distance, Columns) of
-        [] -> false;
-        Positions -> {true, #{near => Positions}}
-    end;
-eval({anchor, AST}, Meta) ->
-    case eval(AST, Meta) of
-        {true, Positions} ->
-            case anchored_positions(Positions) of
-                true -> {true, Positions};
-                false -> false
-            end;
-        false ->
-            false
-    end;
-eval({'and', A, B}, Meta) ->
-    case {eval(A, Meta), eval(B, Meta)} of
-        {{true, PosA}, {true, PosB}} -> {true, maps:merge(PosA, PosB)};
-        _ -> false
-    end;
-eval({'or', A, B}, Meta) ->
-    case {eval(A, Meta), eval(B, Meta)} of
-        {{true, PosA}, {true, PosB}} -> {true, maps:merge(PosA, PosB)};
-        {{true, PosA}, false} -> {true, PosA};
-        {false, {true, PosB}} -> {true, PosB};
-        _ -> false
-    end;
-eval({'not', A, B}, Meta) ->
-    case eval(A, Meta) of
-        {true, PosA} ->
-            case eval(B, Meta) of
-                false -> {true, PosA};
-                {true, _PosB} -> false
-            end;
-        false ->
-            false
-    end.
-
-term_positions(Meta, Token, Prefix, Columns) ->
-    lists:append([
-        column_term_positions(Meta, Column, Token, Prefix)
-     || Column <- concrete_columns(Columns)
-    ]).
-
-column_term_positions(Meta, Column, Token, false) ->
-    maps:get(Token, column_positions(Meta, Column), []);
-column_term_positions(Meta, Column, Prefix, true) ->
-    lists:append([
-        Positions
-     || {Token, Positions} <- maps:to_list(column_positions(Meta, Column)),
-        binary_prefix(Token, Prefix)
-    ]).
-
-phrase_match_positions(Meta, Specs, Columns) ->
-    lists:append([
-        phrase_column_match_positions(Meta, Specs, Column)
-     || Column <- concrete_columns(Columns)
-    ]).
-
-phrase_column_match_positions(_Meta, [], _Column) ->
-    [];
-phrase_column_match_positions(Meta, [{FirstToken, FirstPrefix, FirstOffset} | Rest], Column) ->
-    FirstPositions = column_term_positions(Meta, Column, FirstToken, FirstPrefix),
-    [
-        Pos - FirstOffset
-     || Pos <- FirstPositions,
-        phrase_rest_matches(Meta, Rest, Column, Pos - FirstOffset)
-    ].
-
-phrase_rest_matches(_Meta, [], _Column, _Start) ->
-    true;
-phrase_rest_matches(Meta, [{Token, Prefix, Offset} | Rest], Column, Start) ->
-    Positions = column_term_positions(Meta, Column, Token, Prefix),
-    lists:member(Start + Offset, Positions) andalso
-        phrase_rest_matches(Meta, Rest, Column, Start).
-
-near_match_positions(Meta, Items, Distance, Columns) ->
-    lists:append([
-        near_column_match_positions(Meta, Items, Distance, Column)
-     || Column <- concrete_columns(Columns)
-    ]).
-
-near_column_match_positions(Meta, Items, Distance, Column) ->
-    SpanLists = [item_spans_in_column(Meta, Item, Column) || Item <- Items],
-    case lists:any(fun(Spans) -> Spans =:= [] end, SpanLists) of
-        true -> [];
-        false -> near_positions(SpanLists, Distance)
-    end.
-
-item_positions_in_column(Meta, {term, Token, Prefix, Columns}, Column) ->
-    case item_allows_column(Columns, Column) of
-        true -> column_term_positions(Meta, Column, Token, Prefix);
-        false -> []
-    end;
-item_positions_in_column(Meta, {phrase, Specs, Columns}, Column) ->
-    case item_allows_column(Columns, Column) of
-        true -> phrase_column_match_positions(Meta, Specs, Column);
-        false -> []
-    end;
-item_positions_in_column(Meta, {anchor, AST}, Column) ->
-    [P || P <- item_positions_in_column(Meta, AST, Column), P =:= 0];
-item_positions_in_column(Meta, Other, Column) ->
-    case eval(restrict_ast_columns(Other, [Column]), Meta) of
-        {true, PosMap} -> flatten_position_map(PosMap);
-        false -> []
-    end.
-
-item_spans_in_column(Meta, {term, Token, Prefix, Columns}, Column) ->
-    case item_allows_column(Columns, Column) of
-        true -> [{P, P} || P <- column_term_positions(Meta, Column, Token, Prefix)];
-        false -> []
-    end;
-item_spans_in_column(Meta, {phrase, Specs, Columns}, Column) ->
-    case item_allows_column(Columns, Column) of
-        true -> phrase_column_match_spans(Meta, Specs, Column);
-        false -> []
-    end;
-item_spans_in_column(Meta, {anchor, AST}, Column) ->
-    [{P, P} || P <- item_positions_in_column(Meta, AST, Column), P =:= 0];
-item_spans_in_column(Meta, Other, Column) ->
-    [{P, P} || P <- item_positions_in_column(Meta, Other, Column)].
-
-%% Column selectors reaching per-document checks are canonical (see
-%% canonicalise_ast_columns/1) — plain membership, no re-normalising.
-item_allows_column(all, _Column) ->
-    true;
-item_allows_column({not_columns, Columns}, Column) ->
-    not lists:member(Column, Columns);
-item_allows_column(Columns, Column) ->
-    lists:member(Column, Columns).
-
-canonicalise_ast_columns({term, T, P, Cols}) ->
-    {term, T, P, canonical_selector(Cols)};
-canonicalise_ast_columns({phrase, Specs, Cols}) ->
-    {phrase, Specs, canonical_selector(Cols)};
-canonicalise_ast_columns({near, Items, D, Cols}) ->
-    {near, [canonicalise_ast_columns(I) || I <- Items], D, canonical_selector(Cols)};
-canonicalise_ast_columns({anchor, A}) ->
-    {anchor, canonicalise_ast_columns(A)};
-canonicalise_ast_columns({'and', A, B}) ->
-    {'and', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
-canonicalise_ast_columns({'or', A, B}) ->
-    {'or', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
-canonicalise_ast_columns({'not', A, B}) ->
-    {'not', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
-canonicalise_ast_columns(Other) ->
-    Other.
-
-canonical_selector(all) ->
-    all;
-canonical_selector({not_columns, Cols}) ->
-    {not_columns, schema_columns(Cols)};
-canonical_selector(Cols) ->
-    schema_columns(Cols).
-
-phrase_column_match_spans(_Meta, [], _Column) ->
-    [];
-phrase_column_match_spans(Meta, [{FirstToken, FirstPrefix, FirstOffset} | Rest] = Specs, Column) ->
-    FirstPositions = column_term_positions(Meta, Column, FirstToken, FirstPrefix),
-    LastOffset = phrase_last_offset(Specs),
-    [
-        {Pos - FirstOffset, Pos - FirstOffset + LastOffset}
-     || Pos <- FirstPositions,
-        phrase_rest_matches(Meta, Rest, Column, Pos - FirstOffset)
-    ].
-
-phrase_last_offset(Specs) ->
-    lists:max([Offset || {_Token, _Prefix, Offset} <- Specs]).
-
-%% Two-leg NEAR (the overwhelmingly common shape) runs as a linear
-%% two-pointer interval sweep over the sorted span lists instead of the
-%% general exists-backtracking — measured ~9x against SQLite's NEAR
-%% before the sweep, dominated by per-span scanning of the other leg.
 near_positions([LegA, LegB], Distance) ->
     [Start || {Start, _End} <- near_sweep(LegA, LegB, Distance)];
 near_positions([First | Rest], Distance) ->
@@ -4456,3 +2695,1441 @@ unicode_chars(List) when is_list(List) ->
         Chars ->
             Chars
     end.
+
+
+%% ============================================================================
+%% Grid storage (v2, docs/FTS.md "Storage Shape").
+%%
+%% Token space is partitioned into a fixed, order-preserving prefix grid.
+%% Every posting fact belongs to exactly one shard forever: write batches
+%% emit per-shard DELTA rows, consolidation folds deltas into the shard's
+%% BASE object (journal value), and a SUMMARY row carries the
+%% consolidated-through sequence and a token bloom. Doc frames are stamped
+%% with their write sequence, so liveness (frame seq =:= marker seq)
+%% travels with the posting wherever consolidation copies it.
+
+shard_id(<<>>) ->
+    0;
+shard_id(<<B1:8>>) ->
+    (B1 bsl 8) bsr (16 - ?FTS_GRID_BITS);
+shard_id(<<B1:8, B2:8, _/binary>>) ->
+    ((B1 bsl 8) bor B2) bsr (16 - ?FTS_GRID_BITS).
+
+%% The shard range covered by a prefix (order-preserving grid).
+prefix_shard_range(Prefix) ->
+    {shard_id(Prefix), shard_id(prefix_hi2(Prefix))}.
+
+prefix_hi2(<<>>) -> <<255, 255>>;
+prefix_hi2(<<B1:8>>) -> <<B1, 255>>;
+prefix_hi2(<<B1:8, B2:8, _/binary>>) -> <<B1, B2>>.
+
+%% Shard-first terms keep one shard's whole state (summary then deltas)
+%% contiguous, and shard order contiguous for prefix ranges.
+summary_term(Shard) ->
+    <<Shard:16/unsigned-big, 0:8>>.
+
+delta_term(Shard, Seq) ->
+    <<Shard:16/unsigned-big, 1:8, Seq:64/unsigned-big>>.
+
+shard_term_range(Shard) ->
+    {summary_term(Shard),
+        <<Shard:16/unsigned-big, 1:8, 16#FFFFFFFFFFFFFFFF:64/unsigned-big>>}.
+
+%% Reserved object keys: the base object per shard and the carrier the
+%% delta rows ride. The write path never derives postings from reserved
+%% keys; application folds should skip them.
+base_object_key(Index, Shard) ->
+    <<"$fts$", Index/binary, Shard:16/unsigned-big>>.
+
+delta_carrier_key(Index, Shard) ->
+    <<"$fts_d$", Index/binary, Shard:16/unsigned-big>>.
+
+reserved_fts_key(<<"$fts", _/binary>>) -> true;
+reserved_fts_key(_Key) -> false.
+
+%% Doc frame: the posting's write sequence travels with it.
+%%   <<Seq:64, KeyLen:16, Key, PosLen:16, PosBin>>
+encode_frame(Seq, Key, PosBin) ->
+    <<Seq:64/unsigned-big, (byte_size(Key)):16/unsigned-big, Key/binary,
+        (byte_size(PosBin)):16/unsigned-big, PosBin/binary>>.
+
+%% Walk frames, decoding positions only for wanted keys.
+extract_frames(FramesBin, KeyFilter, NeedPos) ->
+    extract_frames(FramesBin, KeyFilter, NeedPos, []).
+
+extract_frames(<<>>, _KeyFilter, _NeedPos, Acc) ->
+    lists:reverse(Acc);
+extract_frames(
+    <<Seq:64/unsigned-big, KeyLen:16/unsigned-big, Key:KeyLen/binary,
+        PosLen:16/unsigned-big, PosBin:PosLen/binary, Rest/binary>>,
+    KeyFilter,
+    NeedPos,
+    Acc
+) ->
+    Wanted = KeyFilter =:= all orelse sets:is_element(Key, KeyFilter),
+    case Wanted of
+        false ->
+            extract_frames(Rest, KeyFilter, NeedPos, Acc);
+        true ->
+            Value =
+                case NeedPos of
+                    true ->
+                        case decode_positions(PosBin, 0, []) of
+                            {ok, Positions} -> Positions;
+                            error -> throw({fts_error, invalid_fts_payload})
+                        end;
+                    false ->
+                        present
+                end,
+            extract_frames(Rest, KeyFilter, NeedPos, [{Key, Seq, Value} | Acc])
+    end;
+extract_frames(_Bad, _KeyFilter, _NeedPos, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% Entry: <<TokLen:16, Token, NDocs:32, FramesLen:32, Frames>> — the
+%% frames length makes entry walking O(1) per entry.
+encode_entry(Token, NDocs, FramesBin) ->
+    <<(byte_size(Token)):16/unsigned-big, Token/binary, NDocs:32/unsigned-big,
+        (byte_size(FramesBin)):32/unsigned-big, FramesBin/binary>>.
+
+%% Fold token entries of a stream: Fun(Token, NDocs, FramesBin, Acc).
+fold_entries(<<>>, _Fun, Acc) ->
+    Acc;
+fold_entries(
+    <<TokLen:16/unsigned-big, Token:TokLen/binary, NDocs:32/unsigned-big,
+        FLen:32/unsigned-big, Frames:FLen/binary, Rest/binary>>,
+    Fun,
+    Acc
+) ->
+    fold_entries(Rest, Fun, Fun(Token, NDocs, Frames, Acc));
+fold_entries(_Bad, _Fun, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% Delta payload: per-column entry streams.
+%%   <<NCols:8, [ColId:8, StreamLen:32, EntryStream]...>>
+encode_delta(ColStreams) ->
+    iolist_to_binary([
+        <<(length(ColStreams)):8/unsigned-big>>,
+        [
+            [<<ColId:8/unsigned-big, (iolist_size(Stream)):32/unsigned-big>>, Stream]
+         || {ColId, Stream} <- ColStreams
+        ]
+    ]).
+
+decode_delta(<<NCols:8/unsigned-big, Rest/binary>>) ->
+    decode_delta_cols(NCols, Rest, []);
+decode_delta(_Bad) ->
+    throw({fts_error, invalid_fts_payload}).
+
+decode_delta_cols(0, <<>>, Acc) ->
+    lists:reverse(Acc);
+decode_delta_cols(
+    N,
+    <<ColId:8/unsigned-big, Len:32/unsigned-big, Stream:Len/binary, Rest/binary>>,
+    Acc
+) when N > 0 ->
+    decode_delta_cols(N - 1, Rest, [{ColId, Stream} | Acc]);
+decode_delta_cols(_N, _Bad, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% Base binary: per column, a fixed-width probe (token binary search)
+%% over an entry stream.
+%%   <<NCols:8, [ColId:8, ProbeLen:32, Probe, StreamLen:32, Stream]...>>
+%% Probe row: <<EntryOff:32, EntryLen:32, TokLen:16>> (token bytes at
+%% EntryOff+2 within the stream).
+encode_base(ColSections) ->
+    iolist_to_binary([
+        <<(length(ColSections)):8/unsigned-big>>,
+        [
+            begin
+                {Probe, StreamSize} = base_probe(Stream),
+                [
+                    <<ColId:8/unsigned-big, (byte_size(Probe)):32/unsigned-big>>,
+                    Probe,
+                    <<StreamSize:32/unsigned-big>>,
+                    Stream
+                ]
+            end
+         || {ColId, Stream} <- ColSections
+        ]
+    ]).
+
+base_probe(Stream) when is_binary(Stream) ->
+    base_probe(Stream, 0, byte_size(Stream), <<>>).
+
+base_probe(_Stream, Off, Size, Acc) when Off >= Size ->
+    {Acc, Size};
+base_probe(Stream, Off, Size, Acc) ->
+    <<_:Off/binary, TokLen:16/unsigned-big, _Tok:TokLen/binary, _ND:32/unsigned-big,
+        FLen:32/unsigned-big, _/binary>> = Stream,
+    EntryLen = 2 + TokLen + 4 + 4 + FLen,
+    base_probe(
+        Stream,
+        Off + EntryLen,
+        Size,
+        <<Acc/binary, Off:32/unsigned-big, EntryLen:32/unsigned-big,
+            TokLen:16/unsigned-big>>
+    ).
+
+decode_base(<<NCols:8/unsigned-big, Rest/binary>>) ->
+    decode_base_cols(NCols, Rest, #{});
+decode_base(_Bad) ->
+    throw({fts_error, invalid_fts_payload}).
+
+decode_base_cols(0, <<>>, Acc) ->
+    Acc;
+decode_base_cols(
+    N,
+    <<ColId:8/unsigned-big, PLen:32/unsigned-big, Probe:PLen/binary,
+        SLen:32/unsigned-big, Stream:SLen/binary, Rest/binary>>,
+    Acc
+) when N > 0 ->
+    decode_base_cols(N - 1, Rest, Acc#{ColId => {Probe, Stream}});
+decode_base_cols(_N, _Bad, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+base_probe_row({Probe, Stream}, Idx) ->
+    <<EntryOff:32/unsigned-big, EntryLen:32/unsigned-big, TokLen:16/unsigned-big>> =
+        binary:part(Probe, (Idx - 1) * ?FTS_BASE_PROBE_BYTES, ?FTS_BASE_PROBE_BYTES),
+    Token = binary:part(Stream, EntryOff + 2, TokLen),
+    {Token, EntryOff, EntryLen}.
+
+base_probe_size({Probe, _Stream}) ->
+    byte_size(Probe) div ?FTS_BASE_PROBE_BYTES.
+
+%% Entries whose token is exactly Token, or in [Lo, Hi) for prefixes:
+%% binary search over the probe, then contiguous slices of the stream.
+base_entries_range(Section, Lo, Hi) ->
+    Size = base_probe_size(Section),
+    From = base_leftmost_geq(Section, Lo, 1, Size, none),
+    case From of
+        none ->
+            [];
+        _ ->
+            base_collect(Section, From, Size, Hi, [])
+    end.
+
+base_leftmost_geq(_Section, _Tok, LoI, HiI, Best) when LoI > HiI ->
+    Best;
+base_leftmost_geq(Section, Tok, LoI, HiI, Best) ->
+    Mid = (LoI + HiI) div 2,
+    {MTok, _Off, _Len} = base_probe_row(Section, Mid),
+    case MTok >= Tok of
+        true -> base_leftmost_geq(Section, Tok, LoI, Mid - 1, Mid);
+        false -> base_leftmost_geq(Section, Tok, Mid + 1, HiI, Best)
+    end.
+
+base_collect(_Section, Idx, Size, _Hi, Acc) when Idx > Size ->
+    lists:reverse(Acc);
+base_collect({_Probe, Stream} = Section, Idx, Size, Hi, Acc) ->
+    {Tok, Off, Len} = base_probe_row(Section, Idx),
+    Within =
+        case Hi of
+            none -> true;
+            _ -> Tok < Hi
+        end,
+    case Within of
+        false ->
+            lists:reverse(Acc);
+        true ->
+            <<_:Off/binary, Entry:Len/binary, _/binary>> = Stream,
+            TokLen = byte_size(Tok),
+            <<_:16/unsigned-big, _:TokLen/binary, _ND:32/unsigned-big,
+                FLen:32/unsigned-big, Frames:FLen/binary>> = Entry,
+            base_collect(Section, Idx + 1, Size, Hi, [{Tok, Frames} | Acc])
+    end.
+
+%% Summary payload: <<ConsSeq:64, BloomLen:32, Bloom>>.
+encode_summary(ConsSeq, Bloom) ->
+    <<ConsSeq:64/unsigned-big, (byte_size(Bloom)):32/unsigned-big, Bloom/binary>>.
+
+decode_summary(<<ConsSeq:64/unsigned-big, BLen:32/unsigned-big, Bloom:BLen/binary>>) ->
+    {ConsSeq, Bloom};
+decode_summary(_Bad) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% Heap-merge sorted entry streams into ONE stream (token-sorted,
+%% same-token frames concatenated in run order).
+merge_streams_to_stream(Runs) ->
+    {Heap, Tails} = merge_streams_init(Runs),
+    iolist_to_binary(merge_streams_loop(Heap, Tails, [])).
+
+merge_streams_init(Runs) ->
+    lists:foldl(
+        fun(Run, {H, T}) ->
+            case Run of
+                <<>> ->
+                    {H, T};
+                _ ->
+                    Idx = maps:size(T) + 1,
+                    {Tok, ND, Frames, Tail} = stream_head(Run),
+                    {gb_sets:add({Tok, Idx}, H), T#{Idx => {ND, Frames, Tail}}}
+            end
+        end,
+        {gb_sets:empty(), #{}},
+        Runs
+    ).
+
+stream_head(<<TokLen:16/unsigned-big, Token:TokLen/binary, ND:32/unsigned-big,
+        FLen:32/unsigned-big, Frames:FLen/binary, Tail/binary>>) ->
+    {Token, ND, Frames, Tail};
+stream_head(_Bad) ->
+    throw({fts_error, invalid_fts_payload}).
+
+merge_streams_loop(Heap, Tails, Acc) ->
+    case gb_sets:is_empty(Heap) of
+        true ->
+            lists:reverse(Acc);
+        false ->
+            {{MinTok, _Idx}, _} = gb_sets:take_smallest(Heap),
+            {ND, FramesIo, Heap1, Tails1} =
+                stream_take_token(Heap, Tails, MinTok, 0, []),
+            Entry =
+                [
+                    <<(byte_size(MinTok)):16/unsigned-big>>,
+                    MinTok,
+                    <<ND:32/unsigned-big, (iolist_size(FramesIo)):32/unsigned-big>>,
+                    FramesIo
+                ],
+            merge_streams_loop(Heap1, Tails1, [Entry | Acc])
+    end.
+
+stream_take_token(Heap0, Tails0, MinTok, NDSum, FramesAcc) ->
+    case gb_sets:is_empty(Heap0) of
+        true ->
+            {NDSum, lists:reverse(FramesAcc), Heap0, Tails0};
+        false ->
+            case gb_sets:smallest(Heap0) of
+                {MinTok, Idx} ->
+                    Heap1 = gb_sets:del_element({MinTok, Idx}, Heap0),
+                    {ND, Frames, Tail} = maps:get(Idx, Tails0),
+                    {Heap2, Tails1} =
+                        case Tail of
+                            <<>> ->
+                                {Heap1, maps:remove(Idx, Tails0)};
+                            _ ->
+                                {Tok2, ND2, F2, T2} = stream_head(Tail),
+                                {gb_sets:add({Tok2, Idx}, Heap1),
+                                    Tails0#{Idx => {ND2, F2, T2}}}
+                        end,
+                    stream_take_token(
+                        Heap2, Tails1, MinTok, NDSum + ND, [Frames | FramesAcc]
+                    );
+                _Other ->
+                    {NDSum, lists:reverse(FramesAcc), Heap0, Tails0}
+            end
+    end.
+
+%% Distinct tokens of an entry stream (for shard blooms).
+stream_tokens(Stream) ->
+    lists:reverse(
+        fold_entries(Stream, fun(Tok, _ND, _F, Acc) -> [Tok | Acc] end, [])
+    ).
+
+%% ============================================================================
+%% Grid read path: shard state (summary + pending deltas) through a
+%% write-through ETS cache under the marker-cache stamp discipline, and
+%% decoded bases through a ConsSeq-validated cache with journal fetches.
+
+query_ctx(FoldSource, Bucket, Schema, Cache, ReturnPositions) ->
+    {_Index, Tag} = Ref = index_ref(Schema),
+    Fetch =
+        case FoldSource of
+            #{fetch := F} ->
+                fun(Key) -> F(Bucket, Key, Tag) end;
+            Pid when is_pid(Pid) ->
+                fun(Key) ->
+                    case leveled_bookie:book_get(Pid, Bucket, Key, Tag) of
+                        {ok, Value} -> {ok, Value};
+                        not_found -> not_found;
+                        {error, _} -> not_found
+                    end
+                end;
+            _FunOnly ->
+                undefined
+        end,
+    #{
+        fold => FoldSource,
+        bucket => Bucket,
+        ref => Ref,
+        columns => maps:get(columns, Schema),
+        cache => Cache,
+        return_positions_opt => ReturnPositions,
+        shards => #{},
+        bases => #{},
+        fetch => Fetch
+    }.
+
+shard_state(#{shards := Memo} = Ctx, Shard) when is_map_key(Shard, Memo) ->
+    {Ctx, maps:get(Shard, Memo)};
+shard_state(#{cache := Cache} = Ctx, Shard) ->
+    State =
+        case Cache of
+            {Ets, Seq} ->
+                CKey = {shard, maps:get(bucket, Ctx), maps:get(ref, Ctx), Shard},
+                case ets:lookup(Ets, CKey) of
+                    [{_K, {Stamp, ConsSeq, Bloom, Deltas}}] when Stamp =< Seq ->
+                        #{cons_seq => ConsSeq, bloom => Bloom, deltas => Deltas};
+                    _MissOrNewer ->
+                        Loaded = load_shard_state(Ctx, Shard),
+                        case ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS of
+                            true ->
+                                ets:insert_new(
+                                    Ets,
+                                    {CKey,
+                                        {Seq, maps:get(cons_seq, Loaded),
+                                            maps:get(bloom, Loaded),
+                                            maps:get(deltas, Loaded)}}
+                                );
+                            false ->
+                                ok
+                        end,
+                        Loaded
+                end;
+            undefined ->
+                load_shard_state(Ctx, Shard)
+        end,
+    Memo = maps:get(shards, Ctx),
+    {Ctx#{shards := Memo#{Shard => State}}, State}.
+
+%% One contiguous fold covers the shard's summary and every delta.
+load_shard_state(#{fold := FoldSource, bucket := Bucket, ref := Ref}, Shard) ->
+    {StartTerm, EndTerm} = shard_term_range(Shard),
+    Fold =
+        fun(_B, {Term, _Key, Payload}, {ConsSeq, Bloom, Deltas}) ->
+            case Term of
+                <<_S:16/unsigned-big, 0:8>> ->
+                    {CS, B} = decode_summary(Payload),
+                    {CS, B, Deltas};
+                <<_S:16/unsigned-big, 1:8, Seq:64/unsigned-big>> ->
+                    {ConsSeq, Bloom, [{Seq, Payload} | Deltas]}
+            end
+        end,
+    {ConsSeq, Bloom, DeltasRev} =
+        index_fold(
+            FoldSource,
+            {Bucket, null},
+            {Fold, {0, <<>>, []}},
+            {seg_field(Ref), StartTerm, EndTerm},
+            {payload, undefined}
+        ),
+    Pending = [D || {Seq, _P} = D <- lists:reverse(DeltasRev), Seq > ConsSeq],
+    #{cons_seq => ConsSeq, bloom => Bloom, deltas => Pending}.
+
+%% Decoded base sections, validated against the shard's consolidated
+%% sequence (a stale cached base refetches after consolidation).
+shard_base(#{bases := Memo} = Ctx, Shard, _ConsSeq) when is_map_key(Shard, Memo) ->
+    {Ctx, maps:get(Shard, Memo)};
+shard_base(Ctx, _Shard, 0) ->
+    {Ctx, none};
+shard_base(#{cache := Cache} = Ctx, Shard, ConsSeq) ->
+    Sections =
+        case Cache of
+            {Ets, _Seq} ->
+                CKey = {base, maps:get(bucket, Ctx), maps:get(ref, Ctx), Shard},
+                case ets:lookup(Ets, CKey) of
+                    [{_K, {ConsSeq, Cached}}] ->
+                        Cached;
+                    _MissOrStale ->
+                        Fetched = fetch_shard_base(Ctx, Shard),
+                        case ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS of
+                            true -> ets:insert(Ets, {CKey, {ConsSeq, Fetched}});
+                            false -> ok
+                        end,
+                        Fetched
+                end;
+            undefined ->
+                fetch_shard_base(Ctx, Shard)
+        end,
+    Memo = maps:get(bases, Ctx),
+    {Ctx#{bases := Memo#{Shard => Sections}}, Sections}.
+
+fetch_shard_base(#{fetch := undefined}, _Shard) ->
+    none;
+fetch_shard_base(#{fetch := Fetch, ref := {Index, _Tag}}, Shard) ->
+    case Fetch(base_object_key(Index, Shard)) of
+        not_found -> none;
+        {ok, BaseBin} -> decode_base(BaseBin)
+    end.
+
+%% All postings for a term (or prefix) in one shard neighbourhood:
+%% bloom-gated base entry plus the pending delta streams.
+shard_token_entries(Ctx0, Shard, ColId, Token, Prefix) ->
+    {Ctx1, State} = shard_state(Ctx0, Shard),
+    #{cons_seq := ConsSeq, bloom := Bloom, deltas := Deltas} = State,
+    BaseWanted =
+        case {Prefix, Bloom} of
+            {true, _} -> ConsSeq > 0;
+            {false, <<>>} -> ConsSeq > 0;
+            {false, _} -> bloom_member_at(Bloom, 0, byte_size(Bloom), Token)
+        end,
+    {Ctx2, BaseEntries} =
+        case BaseWanted of
+            false ->
+                {Ctx1, []};
+            true ->
+                {CtxB, Sections} = shard_base(Ctx1, Shard, ConsSeq),
+                case Sections of
+                    none ->
+                        {CtxB, []};
+                    _ ->
+                        case maps:get(ColId, Sections, undefined) of
+                            undefined ->
+                                {CtxB, []};
+                            Section ->
+                                Hi =
+                                    case Prefix of
+                                        false -> <<Token/binary, 0>>;
+                                        true -> prefix_upper(Token)
+                                    end,
+                                {CtxB, base_entries_range(Section, Token, Hi)}
+                        end
+                end
+        end,
+    DeltaEntries =
+        lists:append([
+            delta_token_entries(DeltaBin, ColId, Token, Prefix)
+         || {_Seq, DeltaBin} <- Deltas
+        ]),
+    {Ctx2, BaseEntries ++ DeltaEntries}.
+
+prefix_upper(Prefix) ->
+    case next_prefix(Prefix) of
+        {ok, Next} -> Next;
+        none -> none
+    end.
+
+delta_token_entries(DeltaBin, ColId, Token, Prefix) ->
+    case lists:keyfind(ColId, 1, decode_delta(DeltaBin)) of
+        false ->
+            [];
+        {ColId, Stream} ->
+            fold_entries(
+                Stream,
+                fun(Tok, _ND, Frames, Acc) ->
+                    Match =
+                        case Prefix of
+                            false -> Tok =:= Token;
+                            true -> binary_prefix(Tok, Token)
+                        end,
+                    case Match of
+                        true -> [{Tok, Frames} | Acc];
+                        false -> Acc
+                    end
+                end,
+                []
+            )
+    end.
+
+%% ============================================================================
+%% Consolidation (docs/FTS.md "Consolidation"): fold a shard's pending
+%% deltas into its base. Everything superseded is collected by native
+%% machinery — the journal compactor reclaims the old base value, the
+%% LSM merge collects the replaced summary and the removed delta rows.
+
+%% Shards with pending deltas, from one fold over the whole field range.
+consolidate_plan(FoldSource, Bucket, Ref) ->
+    Fold =
+        fun(_B, {Term, _Key}, Acc) ->
+            case Term of
+                <<_Shard:16/unsigned-big, 0:8>> ->
+                    Acc;
+                <<Shard:16/unsigned-big, 1:8, _Seq:64/unsigned-big>> ->
+                    sets:add_element(Shard, Acc)
+            end
+        end,
+    Shards =
+        index_fold(
+            FoldSource,
+            {Bucket, null},
+            {Fold, sets:new()},
+            {seg_field(Ref), summary_term(0),
+                <<(?FTS_SHARDS - 1):16/unsigned-big, 1:8,
+                    16#FFFFFFFFFFFFFFFF:64/unsigned-big>>},
+            {true, undefined}
+        ),
+    lists:sort(sets:to_list(Shards)).
+
+%% Derive one shard's consolidated state: merge base and pending delta
+%% streams, drop dead frames against the markers (the liveness join),
+%% and return the new base, summary, and consumed delta sequences.
+consolidate_shard(FoldSource, Bucket, Schema, Cache, Shard) ->
+    Ctx0 = query_ctx(FoldSource, Bucket, Schema, Cache, false),
+    State = load_shard_state(Ctx0, Shard),
+    #{deltas := Deltas} = State,
+    case Deltas of
+        [] ->
+            noop;
+        _ ->
+            {Ctx1, Sections0} =
+                shard_base(
+                    Ctx0#{shards := #{Shard => State}},
+                    Shard,
+                    maps:get(cons_seq, State)
+                ),
+            BaseCols =
+                case Sections0 of
+                    none ->
+                        #{};
+                    _ ->
+                        maps:map(fun(_C, {_Probe, Stream}) -> Stream end, Sections0)
+                end,
+            DeltaCols =
+                lists:foldl(
+                    fun({_Seq, DeltaBin}, Acc) ->
+                        lists:foldl(
+                            fun({ColId, Stream}, A) ->
+                                maps:update_with(
+                                    ColId, fun(L) -> [Stream | L] end, [Stream], A
+                                )
+                            end,
+                            Acc,
+                            decode_delta(DeltaBin)
+                        )
+                    end,
+                    #{},
+                    Deltas
+                ),
+            ColIds = lists:usort(maps:keys(BaseCols) ++ maps:keys(DeltaCols)),
+            Merged =
+                [
+                    {ColId,
+                        merge_streams_to_stream(
+                            case maps:get(ColId, BaseCols, undefined) of
+                                undefined -> [];
+                                B -> [B]
+                            end ++ lists:reverse(maps:get(ColId, DeltaCols, []))
+                        )}
+                 || ColId <- ColIds
+                ],
+            Keys = lists:usort(stream_keys([St || {_C, St} <- Merged])),
+            {_Ctx2, Markers} = load_markers(Ctx1, Keys),
+            Filtered =
+                [
+                    {ColId, filter_stream_frames(Stream, Markers)}
+                 || {ColId, Stream} <- Merged
+                ],
+            Live = [CS || {_C, St} = CS <- Filtered, St =/= <<>>],
+            Tokens =
+                lists:usort(lists:append([stream_tokens(St) || {_C, St} <- Live])),
+            NewConsSeq = lists:max([Seq || {Seq, _P} <- Deltas]),
+            {ok, #{
+                shard => Shard,
+                base => encode_base(Live),
+                summary => encode_summary(NewConsSeq, page_bloom(Tokens)),
+                cons_seq => NewConsSeq,
+                consumed => [Seq || {Seq, _P} <- Deltas]
+            }}
+    end.
+
+stream_keys(Streams) ->
+    lists:append([
+        fold_entries(
+            Stream,
+            fun(_Tok, _ND, Frames, Acc) -> frame_keys(Frames, Acc) end,
+            []
+        )
+     || Stream <- Streams
+    ]).
+
+frame_keys(<<>>, Acc) ->
+    Acc;
+frame_keys(
+    <<_Seq:64/unsigned-big, KeyLen:16/unsigned-big, Key:KeyLen/binary,
+        PosLen:16/unsigned-big, _P:PosLen/binary, Rest/binary>>,
+    Acc
+) ->
+    frame_keys(Rest, [Key | Acc]);
+frame_keys(_Bad, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% Rewrite a stream keeping only frames whose stamp matches the doc's
+%% marker; entries left empty disappear.
+filter_stream_frames(Stream, Markers) ->
+    iolist_to_binary(
+        lists:reverse(
+            fold_entries(
+                Stream,
+                fun(Tok, _ND, Frames, Acc) ->
+                    {Kept, KeptBin} = live_frames(Frames, Markers, 0, <<>>),
+                    case Kept of
+                        0 -> Acc;
+                        _ -> [encode_entry(Tok, Kept, KeptBin) | Acc]
+                    end
+                end,
+                []
+            )
+        )
+    ).
+
+live_frames(<<>>, _Markers, Kept, Acc) ->
+    {Kept, Acc};
+live_frames(
+    <<Seq:64/unsigned-big, KeyLen:16/unsigned-big, Key:KeyLen/binary,
+        PosLen:16/unsigned-big, _PosBin:PosLen/binary, _/binary>> = Bin,
+    Markers,
+    Kept,
+    Acc
+) ->
+    FrameLen = 8 + 2 + KeyLen + 2 + PosLen,
+    <<Frame:FrameLen/binary, Rest/binary>> = Bin,
+    Live =
+        case maps:get(Key, Markers, undefined) of
+            {Seq, _DocLength} -> true;
+            _DeadOrMissing -> false
+        end,
+    case Live of
+        true ->
+            live_frames(Rest, Markers, Kept + 1, <<Acc/binary, Frame/binary>>);
+        false ->
+            live_frames(Rest, Markers, Kept, Acc)
+    end;
+live_frames(_Bad, _Markers, _Kept, _Acc) ->
+    throw({fts_error, invalid_fts_payload}).
+
+%% ===================== restored evaluation engine =====================
+
+%% Marker liveness loads go through a write-through ETS cache: the
+%% bookie replaces entries authoritatively on every FTS write (stamped
+%% with the write sequence), queries fill cold entries with insert_new
+%% stamped at their own sequence, and a query only trusts an entry whose
+%% stamp is at or before its snapshot sequence — anything newer falls
+%% back to the fold for that key. Without the cache every candidate list
+%% larger than the seek cap degenerated into a marker range scan of the
+%% whole corpus (51ms for a 686-hit term at the 1GB gate rung).
+load_markers(#{cache := {Ets, Seq}} = Ctx, Keys) ->
+    {Cached, Missing} =
+        lists:foldl(
+            fun(Key, {CachedAcc, MissingAcc}) ->
+                case ets:lookup(Ets, marker_key(Ctx, Key)) of
+                    [{_K, {Stamp, Value}}] when Stamp =< Seq ->
+                        case Value of
+                            not_found -> {CachedAcc, MissingAcc};
+                            Marker -> {CachedAcc#{Key => Marker}, MissingAcc}
+                        end;
+                    _MissingOrNewer ->
+                        {CachedAcc, [Key | MissingAcc]}
+                end
+            end,
+            {#{}, []},
+            Keys
+        ),
+    case Missing of
+        [] ->
+            {Ctx, Cached};
+        _ ->
+            {Ctx1, Loaded} = load_markers_uncached(Ctx, Missing),
+            Cacheable = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
+            case Cacheable of
+                true ->
+                    lists:foreach(
+                        fun(Key) ->
+                            Value = maps:get(Key, Loaded, not_found),
+                            ets:insert_new(
+                                Ets, {marker_key(Ctx, Key), {Seq, Value}}
+                            )
+                        end,
+                        Missing
+                    );
+                false ->
+                    ok
+            end,
+            {Ctx1, maps:merge(Cached, Loaded)}
+    end;
+load_markers(Ctx, Keys) ->
+    load_markers_uncached(Ctx, Keys).
+
+marker_key(#{bucket := Bucket, ref := Ref}, Key) ->
+    {marker, Bucket, Ref, Key}.
+
+load_markers_uncached(#{fold := FoldSource, bucket := Bucket, ref := Ref} = Ctx, Keys) ->
+    Field = doc_field(Ref),
+    Markers =
+        case length(Keys) =< ?FTS_MARKER_SEEK_MAX of
+            true ->
+                lists:foldl(
+                    fun(Key, Acc) ->
+                        case seek_marker(FoldSource, Bucket, Field, Key) of
+                            {ok, BatchSeq, DocLength} ->
+                                Acc#{Key => {BatchSeq, DocLength}};
+                            not_found ->
+                                Acc
+                        end
+                    end,
+                    #{},
+                    Keys
+                );
+            false ->
+                Sorted = lists:sort(Keys),
+                MinKey = hd(Sorted),
+                MaxKey = lists:last(Sorted),
+                KeySet = sets:from_list(Keys),
+                Fold =
+                    fun(_B, {_Term, Key, Payload}, Acc) ->
+                        case Key > MaxKey of
+                            true ->
+                                throw({fts_fold_stop, Acc});
+                            false ->
+                                case sets:is_element(Key, KeySet) of
+                                    true ->
+                                        case decode_marker(Payload) of
+                                            {ok, BatchSeq, DocLength} ->
+                                                Acc#{Key => {BatchSeq, DocLength}};
+                                            error ->
+                                                Acc
+                                        end;
+                                    false ->
+                                        Acc
+                                end
+                        end
+                    end,
+                try
+                    index_fold(
+                        FoldSource,
+                        {Bucket, MinKey},
+                        {Fold, #{}},
+                        {Field, doc, doc},
+                        {payload, undefined}
+                    )
+                catch
+                    throw:{fts_fold_stop, Acc} -> Acc
+                end
+        end,
+    {Ctx, Markers}.
+
+seek_marker(FoldSource, Bucket, Field, Key) ->
+    Fold =
+        fun(_B, {_Term, Key0, Payload}, _Acc) ->
+            throw({fts_fold_stop, {Key0, Payload}})
+        end,
+    Found =
+        try
+            index_fold(
+                FoldSource,
+                {Bucket, Key},
+                {Fold, not_found},
+                {Field, doc, doc},
+                {payload, undefined}
+            )
+        catch
+            throw:{fts_fold_stop, KeyPayload} -> KeyPayload
+        end,
+    case Found of
+        {Key, Payload} ->
+            case decode_marker(Payload) of
+                {ok, BatchSeq, DocLength} -> {ok, BatchSeq, DocLength};
+                error -> not_found
+            end;
+        _Other ->
+            not_found
+    end.
+
+index_fold(#{fold := FoldFun}, BucketKey, FoldAccT, Range, TermHandling) ->
+    FoldFun(BucketKey, FoldAccT, Range, TermHandling);
+index_fold(FoldFun, BucketKey, FoldAccT, Range, TermHandling) when is_function(FoldFun, 4) ->
+    FoldFun(BucketKey, FoldAccT, Range, TermHandling);
+index_fold(Pid, BucketKey, FoldAccT, Range, TermHandling) when is_pid(Pid) ->
+    {async, Runner} =
+        leveled_bookie:book_indexfold(
+            Pid, BucketKey, FoldAccT, Range, TermHandling
+        ),
+    Runner().
+
+empty_meta(Index, Key, DocLength) ->
+    #{
+        version => ?VERSION,
+        kind => fts_doc,
+        key => Key,
+        index => Index,
+        doc_length => DocLength,
+        positions => #{}
+    }.
+
+evaluate_payload_candidates(Index, AST, Opts, Metas) ->
+    try
+        Hits =
+            lists:foldl(
+                fun
+                    ({_Key, #{version := ?VERSION, index := MetaIndex} = Meta}, Acc) when
+                        MetaIndex =:= Index
+                    ->
+                        case eval(AST, Meta) of
+                            {true, Positions} ->
+                                case public_hit(Meta, Positions, Opts) of
+                                    {ok, Hit} -> [Hit | Acc];
+                                    {error, Reason} -> throw({fts_error, Reason})
+                                end;
+                            false ->
+                                Acc
+                        end;
+                    (_Other, Acc) ->
+                        Acc
+                end,
+                [],
+                maps:to_list(Metas)
+            ),
+        Sorted = lists:sort(fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end, Hits),
+        {ok, hit_list_result(Sorted, Opts)}
+    catch
+        throw:{fts_error, Reason} -> {error, Reason}
+    end.
+
+evaluate_ranked_candidates(Index, EvalAST, Leaves, Opts, Metas, Np0, {DocCount, TotalLen}) ->
+    MetaList =
+        [
+            Meta
+         || {_Key, #{version := ?VERSION, index := MetaIndex} = Meta} <-
+                maps:to_list(Metas),
+            MetaIndex =:= Index
+        ],
+    Np =
+        case Np0 of
+            positional -> np_map(Leaves, MetaList);
+            _ -> Np0
+        end,
+    AvgDl =
+        case DocCount of
+            0 -> 0.0;
+            _ -> TotalLen / DocCount
+        end,
+    try
+        Hits =
+            lists:foldl(
+                fun(Meta, Acc) ->
+                    case eval(EvalAST, Meta) of
+                        {true, Positions} ->
+                            Score = bm25_score(Meta, Leaves, Np, DocCount, AvgDl),
+                            case public_hit(Meta, Positions, Opts) of
+                                {ok, Hit} ->
+                                    [Hit#{rank => -Score, score => Score} | Acc];
+                                {error, Reason} ->
+                                    throw({fts_error, Reason})
+                            end;
+                        false ->
+                            Acc
+                    end
+                end,
+                [],
+                MetaList
+            ),
+        Sorted =
+            lists:sort(
+                fun(A, B) ->
+                    {maps:get(rank, A), maps:get(key, A)} =<
+                        {maps:get(rank, B), maps:get(key, B)}
+                end,
+                Hits
+            ),
+        {ok, hit_list_result(Sorted, Opts)}
+    catch
+        throw:{fts_error, Reason} -> {error, Reason}
+    end.
+
+%% The scoring phrases of a query: term and phrase leaves in match
+%% position — both AND/OR branches, NEAR members individually (FTS5
+%% scores each phrase of a NEAR group), and only the LEFT side of NOT.
+%% Duplicates are preserved: a term written twice in the query scores
+%% twice, as in FTS5. NEAR members keep their group context: FTS5 trims
+%% each member's position list to the instances that participate in a
+%% NEAR-satisfying configuration before counting tf (while df stays the
+%% member's standalone document frequency) — see the NEAR scoring
+%% dissection in docs/fts_sqlite_gate.md.
+scoring_phrases({term, _Token, _Prefix, _Cols} = Leaf) -> [Leaf];
+scoring_phrases({phrase, _Specs, _Cols} = Leaf) -> [Leaf];
+scoring_phrases({near, Items, Distance, Cols}) ->
+    [{near_member, Index, Items, Distance, Cols} || Index <- lists:seq(1, length(Items))];
+scoring_phrases({anchor, AST}) -> scoring_phrases(AST);
+scoring_phrases({'and', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
+scoring_phrases({'or', A, B}) -> scoring_phrases(A) ++ scoring_phrases(B);
+scoring_phrases({'not', A, _B}) -> scoring_phrases(A);
+scoring_phrases(_Other) -> [].
+
+leaf_tf(Meta, {term, Token, Prefix, Cols}) ->
+    length(term_positions(Meta, Token, Prefix, Cols));
+leaf_tf(Meta, {phrase, Specs, Cols}) ->
+    length(phrase_match_positions(Meta, Specs, Cols));
+leaf_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
+    near_member_tf(Meta, Items, Index, Distance, Cols, filtered).
+
+%% Document frequency counts for a leaf use the member's STANDALONE
+%% matches (FTS5's xQueryPhrase runs each phrase alone for nHit), while
+%% per-document tf for NEAR members is NEAR-filtered above.
+leaf_df_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
+    near_member_tf(Meta, Items, Index, Distance, Cols, standalone);
+leaf_df_tf(Meta, Leaf) ->
+    leaf_tf(Meta, Leaf).
+
+near_member_tf(Meta, Items, Index, Distance, Cols, Mode) ->
+    Member = lists:nth(Index, Items),
+    lists:sum([
+        length(near_member_column_spans(Meta, Items, Index, Member, Distance, Column, Mode))
+     || Column <- concrete_columns(Cols)
+    ]).
+
+near_member_column_spans(Meta, _Items, _Index, Member, _Distance, Column, standalone) ->
+    item_spans_in_column(Meta, Member, Column);
+near_member_column_spans(Meta, Items, Index, _Member, Distance, Column, filtered) ->
+    SpanLists = [item_spans_in_column(Meta, Item, Column) || Item <- Items],
+    case lists:any(fun(Spans) -> Spans =:= [] end, SpanLists) of
+        true ->
+            [];
+        false ->
+            {Before, [MemberSpans | After]} = lists:split(Index - 1, SpanLists),
+            case Before ++ After of
+                [OtherSpans] ->
+                    near_sweep(MemberSpans, OtherSpans, Distance);
+                Others ->
+                    [
+                        Span
+                     || Span <- MemberSpans,
+                        near_position_matches([Span], Others, Distance)
+                    ]
+            end
+    end.
+
+%% A scoring leaf has a keys-only exact document frequency when it is a
+%% plain term (or a NEAR member that is a plain term): df is then the
+%% count of live documents carrying the token, which needs page keys and
+%% cached markers but no positions. Phrase leaves need positional df
+%% (FTS5's xQueryPhrase counts docs matching the phrase).
+ranked_fast_df(Leaves) ->
+    lists:all(
+        fun
+            ({term, _T, _P, _C}) -> true;
+            ({near_member, Index, Items, _D, _C}) ->
+                case lists:nth(Index, Items) of
+                    {term, _T2, _P2, _C2} -> true;
+                    _Positional -> false
+                end;
+            (_Positional) -> false
+        end,
+        Leaves
+    ).
+
+%% Exact per-leaf document frequencies without positions: one keys-only
+%% load per unique scoring term, liveness through the marker cache, and
+%% the result cached per write sequence alongside stats (df is immutable
+%% per sequence).
+fast_np_map(FoldSource, Bucket, Schema, Cache, Leaves) ->
+    Ctx = query_ctx(FoldSource, Bucket, Schema, Cache, false),
+    {_Ctx1, Np} =
+        lists:foldl(
+            fun(Leaf, {CtxA, Acc}) ->
+                case maps:is_key(Leaf, Acc) of
+                    true ->
+                        {CtxA, Acc};
+                    false ->
+                        {CtxB, N} = leaf_df(CtxA, df_leaf_term(Leaf)),
+                        {CtxB, Acc#{Leaf => N}}
+                end
+            end,
+            {Ctx, #{}},
+            Leaves
+        ),
+    Np.
+
+df_leaf_term({term, _T, _P, _C} = Leaf) ->
+    Leaf;
+df_leaf_term({near_member, Index, Items, _D, GroupCols}) ->
+    %% restrict_ast_columns passes `all` through and intersects lists;
+    %% {empty} cannot arise here (parse rejects empty column sets).
+    restrict_ast_columns(lists:nth(Index, Items), GroupCols).
+
+leaf_df(#{bucket := Bucket, ref := Ref, cache := Cache} = Ctx, {term, Token, Prefix, Cols}) ->
+    DfKey = {df, Bucket, Ref, {Token, Prefix, Cols}},
+    case Cache of
+        {Ets, Seq} ->
+            case ets:lookup(Ets, DfKey) of
+                [{_K, {Seq, N}}] ->
+                    {Ctx, N};
+                _MissOrStale ->
+                    {Ctx1, N} = compute_leaf_df(Ctx, Token, Prefix, Cols),
+                    ets:insert(Ets, {DfKey, {Seq, N}}),
+                    {Ctx1, N}
+            end;
+        undefined ->
+            compute_leaf_df(Ctx, Token, Prefix, Cols)
+    end.
+
+compute_leaf_df(#{ref := Ref} = Ctx, Token, Prefix, Cols) ->
+    {Ctx1, Raw} =
+        lists:foldl(
+            fun(Col, {CtxA, RawA}) ->
+                load_term(CtxA, Col, Token, Prefix, all, false, RawA)
+            end,
+            {Ctx, #{}},
+            concrete_columns(Cols)
+        ),
+    {Ctx2, Markers} = load_markers(Ctx1, maps:keys(Raw)),
+    Live = build_metas(Raw, Markers, Ref),
+    {Ctx2, maps:size(Live)}.
+
+np_map(Leaves, MetaList) ->
+    lists:foldl(
+        fun(Leaf, Acc) ->
+            case maps:is_key(Leaf, Acc) of
+                true ->
+                    Acc;
+                false ->
+                    N = length([ok || Meta <- MetaList, leaf_df_tf(Meta, Leaf) > 0]),
+                    Acc#{Leaf => N}
+            end
+        end,
+        #{},
+        Leaves
+    ).
+
+bm25_score(Meta, Leaves, Np, DocCount, AvgDl) ->
+    K1 = 1.2,
+    B = 0.75,
+    Dl = maps:get(doc_length, Meta, 0),
+    lists:foldl(
+        fun(Leaf, Acc) ->
+            Tf = leaf_tf(Meta, Leaf),
+            case Tf > 0 of
+                false ->
+                    Acc;
+                true ->
+                    NHit = maps:get(Leaf, Np),
+                    Idf0 = math:log((DocCount - NHit + 0.5) / (NHit + 0.5)),
+                    Idf =
+                        case Idf0 > 0.0 of
+                            true -> Idf0;
+                            false -> 1.0e-6
+                        end,
+                    LenRatio =
+                        case AvgDl > 0.0 of
+                            true -> Dl / AvgDl;
+                            false -> 1.0
+                        end,
+                    Acc +
+                        Idf * (Tf * (K1 + 1)) /
+                            (Tf + K1 * (1 - B + B * LenRatio))
+            end
+        end,
+        0.0,
+        Leaves
+    ).
+
+%% Live corpus stats (document count and total token count) from the doc
+%% markers. Exact incremental maintenance is impossible under blind
+%% writes (an update or delete cannot adjust N/TotalLen without the
+%% superseded marker, which only an LSM fold resolves), so the fold is
+%% the exact mechanism. The entry lives under a stable key stamped with
+%% the write sequence it was computed at; a ranked query may accept a
+%% stamp up to stats_staleness sequences behind its own (default 0 =
+%% exact per sequence). With a window, ranked queries on write-heavy
+%% stores skip the O(N) refold between nearby writes at a bounded,
+%% documented score staleness — BM25 corpus stats move slowly, exact
+%% scores return as soon as the window is exceeded or writes pause.
+corpus_stats(FoldSource, Bucket, Schema, Cache, Staleness) ->
+    Ref = index_ref(Schema),
+    case Cache of
+        {Ets, Seq} ->
+            StatsKey = {stats, Bucket, Ref},
+            case ets:lookup(Ets, StatsKey) of
+                [{_K, {Stamp, Stats}}] when Stamp =< Seq, Seq - Stamp =< Staleness ->
+                    Stats;
+                _MissingOrOutsideWindow ->
+                    Stats = compute_corpus_stats(FoldSource, Bucket, Ref),
+                    ets:insert(Ets, {StatsKey, {Seq, Stats}}),
+                    Stats
+            end;
+        undefined ->
+            compute_corpus_stats(FoldSource, Bucket, Ref)
+    end.
+
+compute_corpus_stats(FoldSource, Bucket, Ref) ->
+    Fold =
+        fun(_B, {_Term, _Key, Payload}, {N, L} = Acc) ->
+            case decode_marker(Payload) of
+                {ok, _BatchSeq, DocLength} -> {N + 1, L + DocLength};
+                error -> Acc
+            end
+        end,
+    index_fold(
+        FoldSource,
+        {Bucket, null},
+        {Fold, {0, 0}},
+        {doc_field(Ref), doc, doc},
+        {payload, undefined}
+    ).
+
+query_terms({empty}, _Columns) ->
+    [];
+query_terms({all_docs}, _Columns) ->
+    [];
+query_terms({term, Token, Prefix, Columns}, _SearchColumns) ->
+    [{Column, Token, Prefix} || Column <- concrete_columns(Columns)];
+query_terms({phrase, Specs, Columns}, _SearchColumns) ->
+    lists:usort([
+        {Column, Token, Prefix}
+     || Column <- concrete_columns(Columns),
+        {Token, Prefix, _Offset} <- Specs
+    ]);
+query_terms({near, Items, _Distance, Columns}, SearchColumns) ->
+    lists:usort(lists:append([query_terms(restrict_ast_columns(Item, Columns), SearchColumns)
+        || Item <- Items]));
+query_terms({anchor, AST}, Columns) ->
+    query_terms(AST, Columns);
+query_terms({'and', A, B}, Columns) ->
+    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns));
+query_terms({'or', A, B}, Columns) ->
+    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns));
+query_terms({'not', A, B}, Columns) ->
+    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns)).
+
+%% Marker, directory, and page codecs for the packed posting representation.
+encode_marker(BatchSeq, DocLength) ->
+    <<BatchSeq:64/unsigned-big, DocLength:32/unsigned-big>>.
+
+decode_marker(<<BatchSeq:64/unsigned-big, DocLength:32/unsigned-big>>) ->
+    {ok, BatchSeq, DocLength};
+decode_marker(_Payload) ->
+    error.
+
+%% Positions are supplied already ascending (see group_positions/1), so no
+%% sort; deltas are appended directly onto the accumulator binary.
+encode_positions(Positions) ->
+    encode_positions(Positions, 0, <<>>).
+
+encode_positions([], _Last, Acc) ->
+    Acc;
+encode_positions([Pos | Rest], Last, Acc) ->
+    encode_positions(Rest, Pos, varint_append(Pos - Last, Acc)).
+
+decode_positions(<<>>, _Last, Acc) ->
+    {ok, lists:reverse(Acc)};
+decode_positions(Bin, Last, Acc) ->
+    case decode_varint(Bin) of
+        {ok, Delta, Rest} ->
+            Pos = Last + Delta,
+            decode_positions(Rest, Pos, [Pos | Acc]);
+        error ->
+            error
+    end.
+
+varint_append(N, Acc) when N < 128 ->
+    <<Acc/binary, N:8>>;
+varint_append(N, Acc) ->
+    varint_append(N bsr 7, <<Acc/binary, (16#80 bor (N band 16#7F)):8>>).
+
+decode_varint(Bin) ->
+    decode_varint(Bin, 0, 0).
+
+decode_varint(<<Byte:8, Rest/binary>>, Shift, Acc) when Shift =< 63 ->
+    Value = Acc bor ((Byte band 16#7F) bsl Shift),
+    case Byte band 16#80 of
+        0 -> {ok, Value, Rest};
+        _ -> decode_varint(Rest, Shift + 7, Value)
+    end;
+decode_varint(_Bin, _Shift, _Acc) ->
+    error.
+
+public_hit(Meta, Positions, Opts) ->
+    Base = #{
+        key => maps:get(key, Meta),
+        rank => 0.0,
+        score => 0.0,
+        doc_length => maps:get(doc_length, Meta, 0)
+    },
+    case maps:get(return_positions, Opts, false) of
+        true ->
+            case position_count(Positions) =< ?MAX_RETURN_POSITIONS of
+                true -> {ok, Base#{positions => Positions}};
+                false -> {error, fts_query_positions_limit_exceeded}
+            end;
+        false ->
+            {ok, Base}
+    end.
+
+position_count(Value) when is_map(Value) ->
+    lists:sum([position_count(V) || {_K, V} <- maps:to_list(Value)]);
+position_count(Value) when is_list(Value) ->
+    length(Value);
+position_count(_Value) ->
+    0.
+
+eval({empty}, _Meta) ->
+    false;
+eval({all_docs}, Meta) ->
+    {true, maps:get(positions, Meta, #{})};
+eval({term, Token, Prefix, Columns}, Meta) ->
+    case term_positions(Meta, Token, Prefix, Columns) of
+        [] -> false;
+        Positions -> {true, #{Token => Positions}}
+    end;
+eval({phrase, Specs, Columns}, Meta) ->
+    case phrase_match_positions(Meta, Specs, Columns) of
+        [] -> false;
+        Positions -> {true, #{phrase => Positions}}
+    end;
+eval({near, Items, Distance, Columns}, Meta) ->
+    case near_match_positions(Meta, Items, Distance, Columns) of
+        [] -> false;
+        Positions -> {true, #{near => Positions}}
+    end;
+eval({anchor, AST}, Meta) ->
+    case eval(AST, Meta) of
+        {true, Positions} ->
+            case anchored_positions(Positions) of
+                true -> {true, Positions};
+                false -> false
+            end;
+        false ->
+            false
+    end;
+eval({'and', A, B}, Meta) ->
+    case {eval(A, Meta), eval(B, Meta)} of
+        {{true, PosA}, {true, PosB}} -> {true, maps:merge(PosA, PosB)};
+        _ -> false
+    end;
+eval({'or', A, B}, Meta) ->
+    case {eval(A, Meta), eval(B, Meta)} of
+        {{true, PosA}, {true, PosB}} -> {true, maps:merge(PosA, PosB)};
+        {{true, PosA}, false} -> {true, PosA};
+        {false, {true, PosB}} -> {true, PosB};
+        _ -> false
+    end;
+eval({'not', A, B}, Meta) ->
+    case eval(A, Meta) of
+        {true, PosA} ->
+            case eval(B, Meta) of
+                false -> {true, PosA};
+                {true, _PosB} -> false
+            end;
+        false ->
+            false
+    end.
+
+term_positions(Meta, Token, Prefix, Columns) ->
+    lists:append([
+        column_term_positions(Meta, Column, Token, Prefix)
+     || Column <- concrete_columns(Columns)
+    ]).
+
+column_term_positions(Meta, Column, Token, false) ->
+    maps:get(Token, column_positions(Meta, Column), []);
+column_term_positions(Meta, Column, Prefix, true) ->
+    lists:append([
+        Positions
+     || {Token, Positions} <- maps:to_list(column_positions(Meta, Column)),
+        binary_prefix(Token, Prefix)
+    ]).
+
+phrase_match_positions(Meta, Specs, Columns) ->
+    lists:append([
+        phrase_column_match_positions(Meta, Specs, Column)
+     || Column <- concrete_columns(Columns)
+    ]).
+
+phrase_column_match_positions(_Meta, [], _Column) ->
+    [];
+phrase_column_match_positions(Meta, [{FirstToken, FirstPrefix, FirstOffset} | Rest], Column) ->
+    FirstPositions = column_term_positions(Meta, Column, FirstToken, FirstPrefix),
+    [
+        Pos - FirstOffset
+     || Pos <- FirstPositions,
+        phrase_rest_matches(Meta, Rest, Column, Pos - FirstOffset)
+    ].
+
+phrase_rest_matches(_Meta, [], _Column, _Start) ->
+    true;
+phrase_rest_matches(Meta, [{Token, Prefix, Offset} | Rest], Column, Start) ->
+    Positions = column_term_positions(Meta, Column, Token, Prefix),
+    lists:member(Start + Offset, Positions) andalso
+        phrase_rest_matches(Meta, Rest, Column, Start).
+
+near_match_positions(Meta, Items, Distance, Columns) ->
+    lists:append([
+        near_column_match_positions(Meta, Items, Distance, Column)
+     || Column <- concrete_columns(Columns)
+    ]).
+
+near_column_match_positions(Meta, Items, Distance, Column) ->
+    SpanLists = [item_spans_in_column(Meta, Item, Column) || Item <- Items],
+    case lists:any(fun(Spans) -> Spans =:= [] end, SpanLists) of
+        true -> [];
+        false -> near_positions(SpanLists, Distance)
+    end.
+
+item_positions_in_column(Meta, {term, Token, Prefix, Columns}, Column) ->
+    case item_allows_column(Columns, Column) of
+        true -> column_term_positions(Meta, Column, Token, Prefix);
+        false -> []
+    end;
+item_positions_in_column(Meta, {phrase, Specs, Columns}, Column) ->
+    case item_allows_column(Columns, Column) of
+        true -> phrase_column_match_positions(Meta, Specs, Column);
+        false -> []
+    end;
+item_positions_in_column(Meta, {anchor, AST}, Column) ->
+    [P || P <- item_positions_in_column(Meta, AST, Column), P =:= 0];
+item_positions_in_column(Meta, Other, Column) ->
+    case eval(restrict_ast_columns(Other, [Column]), Meta) of
+        {true, PosMap} -> flatten_position_map(PosMap);
+        false -> []
+    end.
+
+item_spans_in_column(Meta, {term, Token, Prefix, Columns}, Column) ->
+    case item_allows_column(Columns, Column) of
+        true -> [{P, P} || P <- column_term_positions(Meta, Column, Token, Prefix)];
+        false -> []
+    end;
+item_spans_in_column(Meta, {phrase, Specs, Columns}, Column) ->
+    case item_allows_column(Columns, Column) of
+        true -> phrase_column_match_spans(Meta, Specs, Column);
+        false -> []
+    end;
+item_spans_in_column(Meta, {anchor, AST}, Column) ->
+    [{P, P} || P <- item_positions_in_column(Meta, AST, Column), P =:= 0];
+item_spans_in_column(Meta, Other, Column) ->
+    [{P, P} || P <- item_positions_in_column(Meta, Other, Column)].
+
+%% Column selectors reaching per-document checks are canonical (see
+%% canonicalise_ast_columns/1) — plain membership, no re-normalising.
+item_allows_column(all, _Column) ->
+    true;
+item_allows_column({not_columns, Columns}, Column) ->
+    not lists:member(Column, Columns);
+item_allows_column(Columns, Column) ->
+    lists:member(Column, Columns).
+
+canonicalise_ast_columns({term, T, P, Cols}) ->
+    {term, T, P, canonical_selector(Cols)};
+canonicalise_ast_columns({phrase, Specs, Cols}) ->
+    {phrase, Specs, canonical_selector(Cols)};
+canonicalise_ast_columns({near, Items, D, Cols}) ->
+    {near, [canonicalise_ast_columns(I) || I <- Items], D, canonical_selector(Cols)};
+canonicalise_ast_columns({anchor, A}) ->
+    {anchor, canonicalise_ast_columns(A)};
+canonicalise_ast_columns({'and', A, B}) ->
+    {'and', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
+canonicalise_ast_columns({'or', A, B}) ->
+    {'or', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
+canonicalise_ast_columns({'not', A, B}) ->
+    {'not', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
+canonicalise_ast_columns(Other) ->
+    Other.
+
+canonical_selector(all) ->
+    all;
+canonical_selector({not_columns, Cols}) ->
+    {not_columns, schema_columns(Cols)};
+canonical_selector(Cols) ->
+    schema_columns(Cols).
+
+phrase_column_match_spans(_Meta, [], _Column) ->
+    [];
+phrase_column_match_spans(Meta, [{FirstToken, FirstPrefix, FirstOffset} | Rest] = Specs, Column) ->
+    FirstPositions = column_term_positions(Meta, Column, FirstToken, FirstPrefix),
+    LastOffset = phrase_last_offset(Specs),
+    [
+        {Pos - FirstOffset, Pos - FirstOffset + LastOffset}
+     || Pos <- FirstPositions,
+        phrase_rest_matches(Meta, Rest, Column, Pos - FirstOffset)
+    ].
+
+phrase_last_offset(Specs) ->
+    lists:max([Offset || {_Token, _Prefix, Offset} <- Specs]).
+

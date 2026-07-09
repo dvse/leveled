@@ -56,7 +56,7 @@
     book_batchput/2,
     book_batchput/3,
     book_ftssearch/5,
-    book_ftscompact/4,
+    book_ftsconsolidate/4,
     book_casput/9,
     book_casbatchput/3,
     book_casbatchput/4,
@@ -622,20 +622,19 @@ book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
 book_ftssearch(Pid, Bucket, Index, Query, Opts) ->
     leveled_fts:book_ftssearch(Pid, Bucket, Index, Query, Opts).
 
--spec book_ftscompact(pid(), leveled_codec:key(), binary() | atom(), pos_integer()) ->
+-spec book_ftsconsolidate(pid(), leveled_codec:key(), binary() | atom(), map()) ->
     {async, fun(() -> ok | noop | {error, term()})} | {error, term()}.
 %% @doc
-%% Merge the oldest MaxBatches live posting batches of an FTS index into
-%% one (docs/FTS.md "Batch Compaction"). Returns a runner: derivation
-%% reads from a snapshot in the calling process; the merged batch is then
-%% applied as one atomic write. Concurrent reads and writes are safe;
-%% run repeatedly to converge a store with many batches. Administrative —
-%% callers serialise their own compaction schedule (one at a time).
-book_ftscompact(Pid, Bucket, Index0, Limits) when
-    (is_integer(Limits) andalso Limits >= 2) orelse is_map(Limits)
-->
+%% Fold every shard's pending posting deltas into its base
+%% (docs/FTS.md "Consolidation"). Returns a runner: shards derive in
+%% parallel against snapshots in the calling process, then apply in
+%% chunks through the bookie. Shard applies are independent — a failure
+%% mid-way leaves a partially consolidated, fully consistent store.
+%% Concurrent reads and writes are safe. Administrative — callers
+%% serialise their own maintenance schedule (one at a time).
+book_ftsconsolidate(Pid, Bucket, Index0, Opts) when is_map(Opts) ->
     Index = leveled_fts:normalise_index(Index0),
-    gen_server:call(Pid, {ftscompact, Bucket, Index, Limits}, infinity).
+    gen_server:call(Pid, {ftsconsolidate, Bucket, Index, Opts}, infinity).
 
 -spec book_casput(
     pid(),
@@ -1690,77 +1689,103 @@ handle_call(
             gen_server:reply(From, {error, invalid_index_specs}),
             {noreply, State};
         true ->
-            case augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) of
+            case
+                augment_fts_object_changes(
+                    [{LedgerKey, Object, {IndexSpecs, TTL}}], State
+                )
+            of
                 {error, FtsReason} ->
                     gen_server:reply(From, {error, FtsReason}),
                     {noreply, State};
-                {AugIndexSpecs, State0, FtsAdvance} ->
+                {[{LedgerKey, Object, {AugIndexSpecs, TTL}}], State0, FtsAdvance} ->
                     do_augmented_put(
                         LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0,
                         FtsAdvance
-                    )
+                    );
+                {MultiChanges, State0, FtsAdvance} ->
+                    %% the write derived per-shard delta carriers: commit
+                    %% object plus carriers as one atomic batch.
+                    do_batchput(MultiChanges, DataSync, From, State0, FtsAdvance)
             end
     end;
-handle_call({ftscompact, Bucket, Index, Limits}, _From, State) when
+handle_call({ftsconsolidate, Bucket, Index, _Opts}, _From, State) when
     State#state.head_only == false
 ->
     case leveled_fts:find_schema(Bucket, Index, State#state.fts_indexes) of
         {ok, Schema} ->
             Ref = leveled_fts:index_ref(Schema),
             SnapFun = return_snapfun(State, ledger, no_lookup, false, true),
+            Inker = State#state.inker,
+            FtsCache =
+                case State#state.fts_dir_cache of
+                    undefined -> undefined;
+                    Cache -> {Cache, State#state.fts_seq}
+                end,
             Self = self(),
             Runner =
                 fun() ->
-                    {ok, LedgerSnapshot, _J, AfterFun} = SnapFun(),
-                    IndexFold = fts_index_fold_fun(LedgerSnapshot),
-                    %% Phase 1 (one snapshot): plan every group plus the
-                    %% single liveness fold. Phase 2 (parallel, one
-                    %% snapshot per group): derive merged specs with a
-                    %% placeholder sequence — the real one is only known
-                    %% at apply time (fts_seq must stay equal to the
-                    %% journal SQN). Phase 3 (sequential): apply each
-                    %% group atomically; a failure mid-way leaves a
-                    %% partially compacted, consistent store.
+                    {ok, LS0, _J0, After0} = SnapFun(),
                     Plan =
                         try
-                            leveled_fts:compact_plan(IndexFold, Bucket, Ref, Limits)
+                            leveled_fts:consolidate_plan(
+                                fts_fold_source(LS0, Inker), Bucket, Ref
+                            )
                         catch
-                            throw:{fts_error, Reason} -> {error, Reason}
+                            throw:{fts_error, Reason0} -> {error, Reason0}
                         after
-                            AfterFun()
+                            After0()
                         end,
                     case Plan of
-                        noop ->
-                            noop;
-                        {error, _Reason} = Error ->
-                            Error;
-                        {ok, Groups, LiveByBatch} ->
-                            run_fts_compaction(Self, Bucket, Ref, Groups, LiveByBatch)
+                        {error, _R} = Error -> Error;
+                        [] -> noop;
+                        Shards ->
+                            run_fts_consolidation(
+                                Self, Bucket, Ref, Schema, Shards, Inker, FtsCache
+                            )
                     end
                 end,
             {reply, {async, Runner}, State};
         _NotFound ->
             {reply, {error, missing_fts_schema}, State}
     end;
-handle_call({ftscompact_apply, Bucket, Ref, ChosenSeqs, Specs0}, From, State) when
+handle_call({ftsconsolidate_apply, Bucket, Ref, Results}, From, State) when
     State#state.head_only == false
 ->
-    PrevSeq = State#state.fts_seq,
-    NewSeq = PrevSeq + 1,
-    Specs = leveled_fts:restamp_compact_specs(Specs0, NewSeq),
     {Index, Tag} = Ref,
-    SentinelKey = <<"$fts_compact$", Index/binary>>,
-    LedgerKey = leveled_codec:to_objectkey(Bucket, SentinelKey, Tag),
-    Object = term_to_binary({fts_compaction, NewSeq, ChosenSeqs}),
-    do_augmented_put(
-        LedgerKey,
-        Object,
-        Specs,
-        infinity,
-        false,
-        From,
-        State#state{fts_seq = NewSeq},
-        {compact, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq}
+    Field = {fts_term, Index, Tag},
+    Changes =
+        lists:append([
+            [
+                {leveled_codec:to_objectkey(
+                     Bucket, leveled_fts:base_object_key(Index, Shard), Tag
+                 ),
+                    Base,
+                    {[
+                         {add_payload, Field, leveled_fts:summary_term(Shard),
+                             Summary}
+                     ],
+                        infinity}},
+                {leveled_codec:to_objectkey(
+                     Bucket, leveled_fts:delta_carrier_key(Index, Shard), Tag
+                 ),
+                    <<0>>,
+                    {[
+                         {remove, Field, leveled_fts:delta_term(Shard, Seq)}
+                      || Seq <- Consumed
+                     ],
+                        infinity}}
+            ]
+         || #{shard := Shard, base := Base, summary := Summary,
+                consumed := Consumed} <- Results
+        ]),
+    Updates =
+        [
+            {Shard, ConsSeq, Consumed}
+         || #{shard := Shard, cons_seq := ConsSeq, consumed := Consumed} <- Results
+        ],
+    do_batchput(
+        Changes, false, From, State,
+        {consolidate, Bucket, Ref, Updates}
     );
 handle_call({batchput, BatchSpecs, DataSync}, From, State) when
     State#state.head_only == false
@@ -2690,19 +2715,26 @@ get_runner(State, {index_query, Constraint, FoldAccT, Range, TermHandling}) ->
     leveled_runner:index_query(
         SnapFun, {StartKey, EndKey, TermHandling}, FoldAccT
     );
-get_runner(State, {fts_query, Bucket, Index, Query, Opts}) ->
+get_runner(State, {fts_query, Bucket, Index, Query, Opts0}) ->
     SnapFun = return_snapfun(State, ledger, no_lookup, false, false),
+    Inker = State#state.inker,
     FtsCache =
         case State#state.fts_dir_cache of
             undefined -> undefined;
             Cache -> {Cache, State#state.fts_seq}
         end,
+    {IncludeDocs, Opts} = leveled_fts:split_include_docs(Opts0),
     {async, fun() ->
         case leveled_fts:cached_search(FtsCache, Bucket, Index, Query, Opts) of
+            {ok, CachedResult} when IncludeDocs ->
+                attach_fts_documents(CachedResult, SnapFun, Inker, Bucket, Index, State);
             {ok, CachedResult} ->
                 CachedResult;
             miss ->
-                run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache)
+                run_fts_query(
+                    SnapFun, Bucket, Index, Query, Opts, State, FtsCache, IncludeDocs,
+                    Inker
+                )
         end
     end};
 get_runner(
@@ -3306,7 +3338,7 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
             %% marker and page-directory terms after a later reseed). Cached
             %% batch lists are stamped with pre-resync sequences: drop them
             %% and let the next query rediscover.
-            ok = leveled_fts:reset_seqs_cache(State#state.fts_dir_cache),
+            ok = leveled_fts:reset_fts_caches(State#state.fts_dir_cache),
             {ok, JournalSQN} =
                 leveled_inker:ink_getjournalsqn(State#state.inker),
             {noreply, State#state{fts_seq = JournalSQN}}
@@ -3322,34 +3354,117 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
 %% superseded postings are filtered against the doc marker at query time. The
 %% batch sequence is seeded from the journal SQN at startup so it stays
 %% monotonic across restarts.
-run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache) ->
+run_fts_query(SnapFun, Bucket, Index, Query, Opts, State, FtsCache, IncludeDocs, Inker) ->
     {ok, LedgerSnapshot, _JournalSnapshot, AfterFun} = SnapFun(),
-    IndexFold = fts_index_fold_fun(LedgerSnapshot),
+    FoldSource = fts_fold_source(LedgerSnapshot, Inker),
     try
-        leveled_fts:search(
-            IndexFold,
-            Bucket,
-            Index,
-            Query,
-            Opts,
-            State#state.fts_indexes,
-            FtsCache
-        )
+        Result =
+            leveled_fts:search(
+                FoldSource,
+                Bucket,
+                Index,
+                Query,
+                Opts,
+                State#state.fts_indexes,
+                FtsCache
+            ),
+        case {IncludeDocs, Result} of
+            {true, {ok, Hits}} when is_list(Hits) ->
+                {ok,
+                    attach_documents(
+                        Hits, LedgerSnapshot, Inker, Bucket, Index, State
+                    )};
+            _NoDocs ->
+                Result
+        end
     after
         AfterFun()
     end.
 
-%% Compaction orchestration, run in the caller's process: groups derive
-%% in parallel (one ledger snapshot each), then apply sequentially
-%% through the bookie. Derivation reads immutable batches, so parallel
-%% workers never conflict; group applies are independent by design.
-run_fts_compaction(Bookie, Bucket, Ref, Groups, LiveByBatch) ->
+%% The fold source handed to leveled_fts: index folds against one ledger
+%% snapshot, plus an object fetch (heads through the snapshot, values
+%% through the LIVE inker — book_get's split, no per-query inker clone)
+%% for shard bases and include_docs hydration.
+fts_fold_source(LedgerSnapshot, Inker) ->
+    #{
+        fold => fts_index_fold_fun(LedgerSnapshot),
+        fetch =>
+            fun(Bucket, Key, Tag) ->
+                fetch_object_snapshot(LedgerSnapshot, Inker, Bucket, Key, Tag)
+            end
+    }.
+
+%% Enrich a cached hit list with documents through a fresh snapshot
+%% (cache hits are keyed by the write sequence, so the current view is
+%% the view the hits were computed against).
+attach_fts_documents({ok, Hits}, SnapFun, Inker, Bucket, Index, State) when is_list(Hits) ->
+    {ok, LedgerSnapshot, _JS, AfterFun} = SnapFun(),
+    try
+        {ok, attach_documents(Hits, LedgerSnapshot, Inker, Bucket, Index, State)}
+    after
+        AfterFun()
+    end;
+attach_fts_documents(Result, _SnapFun, _Inker, _Bucket, _Index, _State) ->
+    Result.
+
+attach_documents(Hits, LedgerSnapshot, Inker, Bucket, Index, State) ->
+    Tag =
+        case leveled_fts:find_schema(Bucket, Index, State#state.fts_indexes) of
+            {ok, #{tag := T}} -> T;
+            _ -> ?STD_TAG
+        end,
+    lists:filtermap(
+        fun(Hit) ->
+            case
+                fetch_object_snapshot(
+                    LedgerSnapshot, Inker, Bucket, maps:get(key, Hit), Tag
+                )
+            of
+                {ok, Object} -> {true, Hit#{document => Object}};
+                not_found -> false
+            end
+        end,
+        Hits
+    ).
+
+%% book_get's liveness semantics (tombstone and TTL handling, journal
+%% fetch by SQN): heads from the query's ledger snapshot (index-less L0
+%% fetch — fold-shaped snapshots carry no L0 index), values through the
+%% live inker exactly as book_get reads them.
+fetch_object_snapshot(LedgerSnapshot, Inker, Bucket, Key, Tag) ->
+    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    Hash = leveled_codec:segment_hash(LedgerKey),
+    case leveled_penciller:pcl_fetch(LedgerSnapshot, LedgerKey, Hash, false) of
+        not_present ->
+            not_found;
+        {_LedgerKey, Head} ->
+            {SQN, Status, _MH, _MD} = leveled_codec:striphead_to_v1details(Head),
+            case Status of
+                tomb ->
+                    not_found;
+                {active, TS} ->
+                    case TS >= leveled_util:integer_now() of
+                        false ->
+                            not_found;
+                        true ->
+                            case fetch_value(Inker, {LedgerKey, SQN}) of
+                                not_present -> not_found;
+                                Object -> {ok, Object}
+                            end
+                    end
+            end
+    end.
+
+%% Consolidation orchestration, run in the caller's process: shards
+%% derive in parallel (one snapshot each), then apply in chunks through
+%% the bookie. Shard applies are independent by design.
+run_fts_consolidation(Bookie, Bucket, Ref, Schema, Shards, Inker, FtsCache) ->
     DeriveOne =
-        fun(Group) ->
+        fun(Shard) ->
             {ok, LS, _JS} = book_snapshot(Bookie, ledger, no_lookup, false),
             try
-                leveled_fts:compact_group_specs(
-                    fts_index_fold_fun(LS), Bucket, Ref, Group, LiveByBatch
+                leveled_fts:consolidate_shard(
+                    fts_fold_source(LS, Inker), Bucket, Schema, FtsCache, Shard
                 )
             catch
                 throw:{fts_error, Reason} -> {error, Reason}
@@ -3362,10 +3477,10 @@ run_fts_compaction(Bookie, Bucket, Ref, Groups, LiveByBatch) ->
         [
             begin
                 MRef = make_ref(),
-                spawn_link(fun() -> Parent ! {MRef, DeriveOne(Group)} end),
+                spawn_link(fun() -> Parent ! {MRef, DeriveOne(Shard)} end),
                 MRef
             end
-         || Group <- Groups
+         || Shard <- Shards
         ],
     Results =
         [
@@ -3378,19 +3493,25 @@ run_fts_compaction(Bookie, Bucket, Ref, Groups, LiveByBatch) ->
         [FirstError | _] ->
             FirstError;
         [] ->
-            apply_fts_compaction(Bookie, Bucket, Ref, lists:append(Results))
+            Derived = [D || {ok, D} <- Results],
+            apply_fts_consolidation(Bookie, Bucket, Ref, Derived)
     end.
 
-apply_fts_compaction(_Bookie, _Bucket, _Ref, []) ->
+apply_fts_consolidation(_Bookie, _Bucket, _Ref, []) ->
     ok;
-apply_fts_compaction(Bookie, Bucket, Ref, [{ChosenSeqs, Specs} | Rest]) ->
+apply_fts_consolidation(Bookie, Bucket, Ref, Derived) ->
+    {Chunk, Rest} =
+        case length(Derived) > 64 of
+            true -> lists:split(64, Derived);
+            false -> {Derived, []}
+        end,
     case
         gen_server:call(
-            Bookie, {ftscompact_apply, Bucket, Ref, ChosenSeqs, Specs}, infinity
+            Bookie, {ftsconsolidate_apply, Bucket, Ref, Chunk}, infinity
         )
     of
-        ok -> apply_fts_compaction(Bookie, Bucket, Ref, Rest);
-        pause -> apply_fts_compaction(Bookie, Bucket, Ref, Rest);
+        ok -> apply_fts_consolidation(Bookie, Bucket, Ref, Rest);
+        pause -> apply_fts_consolidation(Bookie, Bucket, Ref, Rest);
         {error, _Reason} = Error -> Error
     end.
 
@@ -3420,11 +3541,6 @@ maybe_new_fts_dir_cache([]) ->
 maybe_new_fts_dir_cache(_FtsIndexes) ->
     ets:new(fts_dir_cache, [set, public, {read_concurrency, true}]).
 
-%% Both augment paths return an fts_advance() alongside the changes: the
-%% touched (bucket, ref) pairs, the batch sequence stamped into the rows,
-%% and the pre-write sequence. The success path hands it to
-%% leveled_fts:advance_seqs_cache/5 so cached batch lists move forward
-%% incrementally instead of forcing a rediscovery fold per write.
 augment_fts_object_changes(ObjectChanges, #state{fts_indexes = []} = State) ->
     {ObjectChanges, State, {[], 0, 0, []}};
 augment_fts_object_changes(ObjectChanges, State) ->
@@ -3446,36 +3562,17 @@ augment_fts_object_changes(ObjectChanges, State) ->
             {error, Reason}
     end.
 
-augment_fts_single(_LedgerKey, _Object, IndexSpecs, _TTL, #state{fts_indexes = []} = State) ->
-    {IndexSpecs, State, {[], 0, 0, []}};
-augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) ->
-    PrevSeq = State#state.fts_seq,
-    Seq = PrevSeq + 1,
-    case
-        leveled_fts:augment_object_changes(
-            [{LedgerKey, Object, {IndexSpecs, TTL}}], State#state.fts_indexes, Seq
-        )
-    of
-        {ok, [{LedgerKey, Object, {AugIndexSpecs, TTL}}], Touched} ->
-            Markers =
-                leveled_fts:marker_cache_updates(
-                    [{LedgerKey, Object, {AugIndexSpecs, TTL}}],
-                    State#state.fts_indexes
-                ),
-            {AugIndexSpecs, State#state{fts_seq = Seq},
-                {Touched, Seq, PrevSeq, Markers}};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
+%% Both augment paths return an fts_advance() alongside the changes:
+%% the touched shard deltas, the batch sequence, the pre-write sequence,
+%% and the per-doc marker updates. The success path applies them to the
+%% write-through shard-state and marker caches; consolidation applies
+%% resets its shards instead.
 advance_fts_seqs_cache(_DirCache, _NewSeq, {[], 0, 0, []}) ->
     ok;
-advance_fts_seqs_cache(DirCache, NewFtsSeq, {compact, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq}) ->
-    leveled_fts:compact_seqs_cache(
-        DirCache, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq, NewFtsSeq
-    );
-advance_fts_seqs_cache(DirCache, NewSeq, {Touched, BatchSeq, PrevSeq, Markers}) ->
-    ok = leveled_fts:advance_seqs_cache(DirCache, Touched, BatchSeq, PrevSeq, NewSeq),
+advance_fts_seqs_cache(DirCache, NewFtsSeq, {consolidate, Bucket, Ref, Updates}) ->
+    leveled_fts:consolidate_shard_cache(DirCache, Bucket, Ref, Updates, NewFtsSeq);
+advance_fts_seqs_cache(DirCache, NewSeq, {Touched, _BatchSeq, _PrevSeq, Markers}) ->
+    ok = leveled_fts:advance_shard_cache(DirCache, Touched, NewSeq),
     leveled_fts:advance_marker_cache(DirCache, Markers, NewSeq).
 
 current_head_state(LedgerKey, State) ->

@@ -5,9 +5,9 @@
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([
     single_object_contract/1,
-    incremental_batch_list_cache/1,
+    fts_shard_cache/1,
     stats_staleness_window/1,
-    fts_batch_compaction/1,
+    fts_consolidation/1,
     batchput_contract/1,
     multi_token_phrase_contract/1,
     index_update_contract/1,
@@ -39,9 +39,9 @@
 all() ->
     [
         single_object_contract,
-        incremental_batch_list_cache,
+        fts_shard_cache,
         stats_staleness_window,
-        fts_batch_compaction,
+        fts_consolidation,
         batchput_contract,
         multi_token_phrase_contract,
         index_update_contract,
@@ -2463,11 +2463,15 @@ metadata_index_contract(_Config) ->
     [<<"direct-metadata">>] =
         keys(search(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"honest">>, #{})),
     [] = search(ReplayedBookie, <<"metadata">>, <<"directidx">>, <<"leak">>, #{}),
+    %% The journal key changes durably carry the FTS facts for the write:
+    %% the delta specs ride the shard's reserved carrier key, and must
+    %% contain the honest token for this document.
+    HonestCarrier =
+        leveled_fts:delta_carrier_key(
+            <<"directidx">>, leveled_fts:shard_id(<<"honest">>)
+        ),
     DirectIndexSpecs =
-        current_user_indexspecs(ReplayedBookie, <<"metadata">>, <<"direct-metadata">>),
-    %% The journal key changes durably carry the FTS facts for the write: the
-    %% page specs for the directidx index must contain the honest token for
-    %% this document.
+        current_user_indexspecs(ReplayedBookie, <<"metadata">>, HonestCarrier),
     true =
         lists:member(
             {<<"honest">>, <<"direct-metadata">>},
@@ -2850,46 +2854,39 @@ unicode61_supported_parity_corpus_contract(_Config) ->
     ),
     ok = leveled_bookie:book_close(Bookie).
 
-%% The cached batch list advances incrementally on the write path
-%% (advance_seqs_cache): after the first query seeds it, writes append
-%% their batch (or just re-stamp, when the write does not touch the
-%% index) without a per-write rediscovery fold. Observed directly in
-%% the bookie's public fts_dir_cache table.
-incremental_batch_list_cache(_Config) ->
-    RootPath = testutil:reset_filestructure("fts_incremental_seqs"),
+%% The shard-state cache advances on the write path: after a query
+%% seeds a shard entry, writes touching that shard append their delta
+%% payload to it (no fold), writes elsewhere leave it untouched (an
+%% entry is "true as of" its stamp), and consolidation resets it.
+fts_shard_cache(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_shard_cache"),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
     Bucket = <<"batch">>,
     Index = <<"main">>,
-    Opts = #{columns => [body]},
+    Opts = #{columns => [body], limit => 100},
+    Shard = leveled_fts:shard_id(<<"alpha">>),
     ok = fts_put(Bookie, Bucket, <<"k1">>, <<"o1">>, Index, #{body => <<"alpha one">>}, #{}),
     [<<"k1">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
-    {S1, Batches1} = seqs_cache_entry(Bucket),
-    1 = length(Batches1),
-    %% A matching write advances the stamp AND appends its batch with no
-    %% query in between: the entry moved without a rediscovery fold.
+    {_S1, _CS1, _B1, Deltas1} = shard_cache_entry(Bucket, Shard),
+    true = length(Deltas1) >= 1,
+    %% a write with the token appends its delta to the cached entry
     ok = fts_put(Bookie, Bucket, <<"k2">>, <<"o2">>, Index, #{body => <<"alpha two">>}, #{}),
-    {S2, Batches2} = seqs_cache_entry(Bucket),
-    true = S2 > S1,
-    2 = length(Batches2),
-    Batches1 = lists:sublist(Batches2, 1),
+    {_S2, _CS2, _B2, Deltas2} = shard_cache_entry(Bucket, Shard),
+    true = length(Deltas2) =:= length(Deltas1) + 1,
     [<<"k1">>, <<"k2">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
-    {S2, Batches2} = seqs_cache_entry(Bucket),
-    %% A write that does not touch this index re-stamps without append.
+    %% a write not touching the shard leaves the entry untouched
     ok =
         leveled_bookie:book_put(
-            Bookie, <<"no-fts-bucket">>, <<"n1">>, <<"raw">>, [], ?STD_TAG, infinity, false
+            Bookie, <<"no-fts-bucket">>, <<"n1">>, <<"raw">>, [], ?STD_TAG, infinity,
+            false
         ),
-    {S3, Batches2} = seqs_cache_entry(Bucket),
-    true = S3 > S2,
-    [<<"k1">>, <<"k2">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
-    %% An update supersedes through the incrementally appended batch.
+    {_S3, _CS3, _B3, Deltas2} = shard_cache_entry(Bucket, Shard),
+    %% an update supersedes through frame stamps
     ok = fts_put(Bookie, Bucket, <<"k1">>, <<"o1b">>, Index, #{body => <<"gamma one">>}, #{}),
-    {_S4, Batches4} = seqs_cache_entry(Bucket),
-    3 = length(Batches4),
     [<<"k2">>] = keys(search(Bookie, Bucket, Index, <<"alpha">>, Opts)),
     [<<"k1">>] = keys(search(Bookie, Bucket, Index, <<"gamma">>, Opts)),
     ok = leveled_bookie:book_close(Bookie),
-    %% Cold restart: the cache is empty, discovery still serves queries.
+    %% cold restart: discovery folds reseed
     {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
     [<<"k2">>] = keys(search(Bookie2, Bucket, Index, <<"alpha">>, Opts)),
     [<<"k1">>] = keys(search(Bookie2, Bucket, Index, <<"gamma">>, Opts)),
@@ -2937,13 +2934,13 @@ stats_staleness_window(_Config) ->
     ok = leveled_bookie:book_close(Bookie),
     testutil:reset_filestructure().
 
-%% Batch compaction merges live postings of many batches into one and
-%% hides the subsumed batches behind the merged directory's alias list.
-%% Every result — keys, order, and exact bm25 ranks — must be identical
-%% before and after (same live docs, same tf/df/dl/avgdl), across
-%% supersession, post-compaction writes, re-compaction, and restart.
-fts_batch_compaction(_Config) ->
-    RootPath = testutil:reset_filestructure("fts_batch_compaction"),
+%% Consolidation folds every shard's pending deltas into its base and
+%% hides consumed deltas behind removals. Every result — keys, order,
+%% and exact bm25 ranks — must be identical before and after, across
+%% supersession, post-consolidation writes, re-consolidation, and
+%% restart.
+fts_consolidation(_Config) ->
+    RootPath = testutil:reset_filestructure("fts_consolidation"),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
     Bucket = <<"batch">>,
     Index = <<"main">>,
@@ -2964,8 +2961,6 @@ fts_batch_compaction(_Config) ->
              || {Q, O} <- Queries
             ]
         end,
-    %% Six single-put batches, including an update that supersedes k1's
-    %% first postings (the merge must drop them).
     Put(Bookie, <<"k1">>, <<"alpha beta gamma">>),
     Put(Bookie, <<"k2">>, <<"alpha delta epsilon words">>),
     Put(Bookie, <<"k3">>, <<"beta gamma delta phrase target here">>),
@@ -2986,43 +2981,41 @@ fts_batch_compaction(_Config) ->
         {<<"gamma">>, RankOpts}
     ],
     Before = Snap(Bookie, Queries),
-    {_S0, BatchesBefore} = seqs_cache_entry(Bucket),
-    true = length(BatchesBefore) >= 6,
-    {async, Compact} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 100),
-    ok = Compact(),
+    {async, Cons} = leveled_bookie:book_ftsconsolidate(Bookie, Bucket, Index, #{}),
+    ok = Cons(),
     Before = Snap(Bookie, Queries),
-    {_S1, BatchesAfter} = seqs_cache_entry(Bucket),
-    1 = length(BatchesAfter),
-    %% Nothing left to merge: a second pass is a noop.
-    {async, Compact2} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 100),
-    noop = Compact2(),
-    %% Post-compaction writes supersede merged postings and add new ones.
+    %% consumed deltas leave the shard state; the base carries the shard
+    AlphaShard = leveled_fts:shard_id(<<"alpha">>),
+    {_S, ConsSeq, _Bloom, PendingDeltas} = shard_cache_entry(Bucket, AlphaShard),
+    true = ConsSeq > 0,
+    [] = PendingDeltas,
+    %% nothing pending: a second pass is a noop
+    {async, Cons2} = leveled_bookie:book_ftsconsolidate(Bookie, Bucket, Index, #{}),
+    noop = Cons2(),
+    %% post-consolidation writes supersede consolidated postings
     Put(Bookie, <<"k4">>, <<"replaced text entirely">>),
     [] = keys(search(Bookie, Bucket, Index, <<"unicorn">>, Opts)),
     [<<"k4">>] = keys(search(Bookie, Bucket, Index, <<"replaced">>, Opts)),
     Put(Bookie, <<"k6">>, <<"unicorn returns">>),
     [<<"k6">>] = keys(search(Bookie, Bucket, Index, <<"unicorn">>, Opts)),
-    %% Re-compaction folds the merged batch and the new batches together
-    %% (alias lists compose).
-    {async, Compact3} = leveled_bookie:book_ftscompact(Bookie, Bucket, Index, 100),
-    ok = Compact3(),
+    %% re-consolidation folds the new deltas in
+    {async, Cons3} = leveled_bookie:book_ftsconsolidate(Bookie, Bucket, Index, #{}),
+    ok = Cons3(),
     [<<"k6">>] = keys(search(Bookie, Bucket, Index, <<"unicorn">>, Opts)),
     [<<"k4">>] = keys(search(Bookie, Bucket, Index, <<"replaced">>, Opts)),
     [<<"k1">>] = keys(search(Bookie, Bucket, Index, <<"rewritten">>, Opts)),
     PostWrites = Snap(Bookie, Queries),
     ok = leveled_bookie:book_close(Bookie),
-    %% Cold restart: discovery + alias filtering serve the same results.
+    %% cold restart: summaries, bases, and deltas reload from the store
     {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
     PostWrites = Snap(Bookie2, Queries),
-    {_S2, BatchesCold} = seqs_cache_entry(Bucket),
-    1 = length(BatchesCold),
     ok = leveled_bookie:book_close(Bookie2),
     testutil:reset_filestructure().
 
-seqs_cache_entry(Bucket) ->
+shard_cache_entry(Bucket, Shard) ->
     Entries =
         lists:append([
-            ets:match_object(T, {{seqs, Bucket, '_'}, '_'})
+            ets:match_object(T, {{shard, Bucket, '_', Shard}, '_'})
          || T <- ets:all(),
             ets:info(T, name) =:= fts_dir_cache
         ]),
