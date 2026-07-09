@@ -13,6 +13,8 @@
     augment_object_changes/3,
     advance_seqs_cache/5,
     reset_seqs_cache/1,
+    marker_cache_updates/2,
+    advance_marker_cache/3,
     compact_index_specs/5,
     compact_seqs_cache/7,
     restamp_compact_specs/2,
@@ -604,11 +606,11 @@ take_byte([P | Rest], Base, Byte) when P < Base + 8 ->
 take_byte(Positions, _Base, Byte) ->
     {Byte, Positions}.
 
-bloom_member(Bloom, Token) ->
-    Bits = byte_size(Bloom) * 8,
+bloom_member_at(Blob, Off, Len, Token) ->
+    Bits = Len * 8,
     lists:all(
         fun(P) ->
-            Byte = binary:at(Bloom, P div 8),
+            Byte = binary:at(Blob, Off + P div 8),
             (Byte band (1 bsl (P rem 8))) =/= 0
         end,
         bloom_positions(Token, Bits)
@@ -1808,6 +1810,64 @@ compact_seqs_cache(Ets, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq, NewFtsSeq) ->
     ),
     ok.
 
+%% Extract per-doc marker updates from augmented object changes: the
+%% bookie applies them to the marker cache after journal success, so
+%% cached markers are always authoritative as of the write that set
+%% them (query-side fills never overwrite writer entries — insert_new).
+marker_cache_updates(_ObjectChanges, []) ->
+    [];
+marker_cache_updates(ObjectChanges, Indexes) ->
+    lists:append([change_marker_updates(Change, Indexes) || Change <- ObjectChanges]).
+
+change_marker_updates({{Tag, Bucket, Key, null}, _Obj, {Specs, _TTL}}, Indexes) ->
+    [
+        Update
+     || #{bucket := B0, tag := T0} = Schema <- Indexes,
+        T0 =:= Tag,
+        bucket_matches(B0, Bucket),
+        Update <- spec_marker_updates(Specs, index_ref(Schema), Bucket, Key)
+    ].
+
+spec_marker_updates(Specs, Ref, Bucket, Key) ->
+    Field = doc_field(Ref),
+    lists:filtermap(
+        fun
+            ({add_payload, F, doc, Payload}) when F =:= Field ->
+                case decode_marker(Payload) of
+                    {ok, BatchSeq, DocLength} ->
+                        {true, {Bucket, Ref, Key, {BatchSeq, DocLength}}};
+                    error ->
+                        false
+                end;
+            ({remove, F, doc}) when F =:= Field ->
+                {true, {Bucket, Ref, Key, not_found}};
+            (_Other) ->
+                false
+        end,
+        Specs
+    ).
+
+%% Writer-side marker cache application: authoritative replacement,
+%% stamped with the post-write sequence. Over the cache budget the key
+%% is deleted instead — absence is always safe (queries fold).
+advance_marker_cache(undefined, _Updates, _NewSeq) ->
+    ok;
+advance_marker_cache(_Ets, [], _NewSeq) ->
+    ok;
+advance_marker_cache(Ets, Updates, NewSeq) ->
+    UnderCap = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
+    lists:foreach(
+        fun({Bucket, Ref, Key, Value}) ->
+            MarkerKey = {marker, Bucket, Ref, Key},
+            case UnderCap of
+                true -> ets:insert(Ets, {MarkerKey, {NewSeq, Value}});
+                false -> ets:delete(Ets, MarkerKey)
+            end
+        end,
+        Updates
+    ),
+    ok.
+
 %% Advance the cached batch lists after a successful FTS write: entries
 %% stamped with the pre-write sequence move to the new sequence, gaining
 %% the new batch when their (bucket, ref) derived rows in this write;
@@ -1841,6 +1901,7 @@ reset_seqs_cache(undefined) ->
     ok;
 reset_seqs_cache(Ets) ->
     ets:match_delete(Ets, {{seqs, '_', '_'}, '_'}),
+    ets:match_delete(Ets, {{marker, '_', '_', '_'}, '_'}),
     ok.
 
 discover_seqs(FoldSource, Bucket, Ref) ->
@@ -1987,11 +2048,13 @@ covering_pages(Dirs, ColId, Token) ->
         ]
     ).
 
-bloom_pass(Blooms, PageNo, Token) ->
-    case maps:get(PageNo, Blooms, undefined) of
-        %% Pre-bloom directory: never skip.
+bloom_pass({<<>>, <<>>}, _PageNo, _Token) ->
+    %% Pre-bloom directory: never skip.
+    true;
+bloom_pass({_Probe, Blob} = BloomIdx, PageNo, Token) ->
+    case bloom_index_lookup(BloomIdx, PageNo) of
         undefined -> true;
-        Bloom -> bloom_member(Bloom, Token)
+        {Off, Len} -> bloom_member_at(Blob, Off, Len, Token)
     end.
 
 covering_prefix_pages(Dirs, ColId, Prefix) ->
@@ -2111,7 +2174,60 @@ read_page(#{pages := Pages} = Ctx, BatchSeq, PageNo) ->
             {Ctx, Entries}
     end.
 
-load_markers(#{fold := FoldSource, bucket := Bucket, ref := Ref} = Ctx, Keys) ->
+%% Marker liveness loads go through a write-through ETS cache: the
+%% bookie replaces entries authoritatively on every FTS write (stamped
+%% with the write sequence), queries fill cold entries with insert_new
+%% stamped at their own sequence, and a query only trusts an entry whose
+%% stamp is at or before its snapshot sequence — anything newer falls
+%% back to the fold for that key. Without the cache every candidate list
+%% larger than the seek cap degenerated into a marker range scan of the
+%% whole corpus (51ms for a 686-hit term at the 1GB gate rung).
+load_markers(#{cache := {Ets, Seq}} = Ctx, Keys) ->
+    {Cached, Missing} =
+        lists:foldl(
+            fun(Key, {CachedAcc, MissingAcc}) ->
+                case ets:lookup(Ets, marker_key(Ctx, Key)) of
+                    [{_K, {Stamp, Value}}] when Stamp =< Seq ->
+                        case Value of
+                            not_found -> {CachedAcc, MissingAcc};
+                            Marker -> {CachedAcc#{Key => Marker}, MissingAcc}
+                        end;
+                    _MissingOrNewer ->
+                        {CachedAcc, [Key | MissingAcc]}
+                end
+            end,
+            {#{}, []},
+            Keys
+        ),
+    case Missing of
+        [] ->
+            {Ctx, Cached};
+        _ ->
+            {Ctx1, Loaded} = load_markers_uncached(Ctx, Missing),
+            Cacheable = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
+            case Cacheable of
+                true ->
+                    lists:foreach(
+                        fun(Key) ->
+                            Value = maps:get(Key, Loaded, not_found),
+                            ets:insert_new(
+                                Ets, {marker_key(Ctx, Key), {Seq, Value}}
+                            )
+                        end,
+                        Missing
+                    );
+                false ->
+                    ok
+            end,
+            {Ctx1, maps:merge(Cached, Loaded)}
+    end;
+load_markers(Ctx, Keys) ->
+    load_markers_uncached(Ctx, Keys).
+
+marker_key(#{bucket := Bucket, ref := Ref}, Key) ->
+    {marker, Bucket, Ref, Key}.
+
+load_markers_uncached(#{fold := FoldSource, bucket := Bucket, ref := Ref} = Ctx, Keys) ->
     Field = doc_field(Ref),
     Markers =
         case length(Keys) =< ?FTS_MARKER_SEEK_MAX of
@@ -2524,9 +2640,9 @@ decode_dir(_Payload) ->
     error.
 
 decode_dir_entries(0, <<>>, Acc) ->
-    {ok, lists:reverse(Acc), #{}, []};
+    {ok, lists:reverse(Acc), {<<>>, <<>>}, []};
 decode_dir_entries(0, <<Count:16/unsigned-big, Rest/binary>>, Acc) ->
-    case decode_dir_blooms(Count, Rest, #{}) of
+    case decode_dir_blooms(Count, Rest, []) of
         {ok, Blooms, Aliases} -> {ok, lists:reverse(Acc), Blooms, Aliases};
         error -> error
     end;
@@ -2543,21 +2659,59 @@ decode_dir_entries(_Count, _Bin, _Acc) ->
     error.
 
 decode_dir_blooms(0, <<>>, Acc) ->
-    {ok, Acc, []};
+    {ok, finish_bloom_index(Acc), []};
 decode_dir_blooms(0, <<AliasCount:16/unsigned-big, Rest/binary>>, Acc) ->
     case decode_dir_aliases(AliasCount, Rest, []) of
-        {ok, Aliases} -> {ok, Acc, Aliases};
+        {ok, Aliases} -> {ok, finish_bloom_index(Acc), Aliases};
         error -> error
     end;
 decode_dir_blooms(Count, Bin, Acc) when Count > 0 ->
     case Bin of
         <<PageNo:16/unsigned-big, Len:16/unsigned-big, Bloom:Len/binary, Rest/binary>> ->
-            decode_dir_blooms(Count - 1, Rest, Acc#{PageNo => Bloom});
+            decode_dir_blooms(Count - 1, Rest, [{PageNo, Bloom} | Acc]);
         _Other ->
             error
     end;
 decode_dir_blooms(_Count, _Bin, _Acc) ->
     error.
+
+%% Blooms are kept as one flat fixed-width probe plus one blob (both refc
+%% binaries), mirroring the page probe/str layout: a decoded directory in
+%% ETS then costs O(1) to copy out per query, where a map of thousands of
+%% small heap binaries cost milliseconds per lookup on large compacted
+%% batches (measured as the nomatch floor growing with corpus size).
+finish_bloom_index(PageBloomsRev) ->
+    Sorted = lists:keysort(1, lists:reverse(PageBloomsRev)),
+    {Probe, Blob, _Off} =
+        lists:foldl(
+            fun({PageNo, Bloom}, {ProbeAcc, BlobAcc, Off}) ->
+                Len = byte_size(Bloom),
+                {
+                    <<ProbeAcc/binary, PageNo:16/unsigned-big, Off:32/unsigned-big,
+                        Len:16/unsigned-big>>,
+                    <<BlobAcc/binary, Bloom/binary>>,
+                    Off + Len
+                }
+            end,
+            {<<>>, <<>>, 0},
+            Sorted
+        ),
+    {Probe, Blob}.
+
+bloom_index_lookup({Probe, Blob}, PageNo) ->
+    bloom_index_lookup(Probe, Blob, PageNo, 1, byte_size(Probe) div 8).
+
+bloom_index_lookup(_Probe, _Blob, _PageNo, Lo, Hi) when Lo > Hi ->
+    undefined;
+bloom_index_lookup(Probe, Blob, PageNo, Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    <<P:16/unsigned-big, Off:32/unsigned-big, Len:16/unsigned-big>> =
+        binary:part(Probe, (Mid - 1) * 8, 8),
+    if
+        PageNo < P -> bloom_index_lookup(Probe, Blob, PageNo, Lo, Mid - 1);
+        PageNo > P -> bloom_index_lookup(Probe, Blob, PageNo, Mid + 1, Hi);
+        true -> {Off, Len}
+    end.
 
 %% Alias section: the batch sequences this (compacted) batch subsumes.
 decode_dir_aliases(0, <<>>, Acc) ->

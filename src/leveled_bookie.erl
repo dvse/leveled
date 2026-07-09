@@ -3381,7 +3381,7 @@ maybe_new_fts_dir_cache(_FtsIndexes) ->
 %% leveled_fts:advance_seqs_cache/5 so cached batch lists move forward
 %% incrementally instead of forcing a rediscovery fold per write.
 augment_fts_object_changes(ObjectChanges, #state{fts_indexes = []} = State) ->
-    {ObjectChanges, State, {[], 0, 0}};
+    {ObjectChanges, State, {[], 0, 0, []}};
 augment_fts_object_changes(ObjectChanges, State) ->
     PrevSeq = State#state.fts_seq,
     Seq = PrevSeq + 1,
@@ -3391,13 +3391,18 @@ augment_fts_object_changes(ObjectChanges, State) ->
         )
     of
         {ok, AugObjectChanges, Touched} ->
-            {AugObjectChanges, State#state{fts_seq = Seq}, {Touched, Seq, PrevSeq}};
+            Markers =
+                leveled_fts:marker_cache_updates(
+                    AugObjectChanges, State#state.fts_indexes
+                ),
+            {AugObjectChanges, State#state{fts_seq = Seq},
+                {Touched, Seq, PrevSeq, Markers}};
         {error, Reason} ->
             {error, Reason}
     end.
 
 augment_fts_single(_LedgerKey, _Object, IndexSpecs, _TTL, #state{fts_indexes = []} = State) ->
-    {IndexSpecs, State, {[], 0, 0}};
+    {IndexSpecs, State, {[], 0, 0, []}};
 augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) ->
     PrevSeq = State#state.fts_seq,
     Seq = PrevSeq + 1,
@@ -3407,19 +3412,26 @@ augment_fts_single(LedgerKey, Object, IndexSpecs, TTL, State) ->
         )
     of
         {ok, [{LedgerKey, Object, {AugIndexSpecs, TTL}}], Touched} ->
-            {AugIndexSpecs, State#state{fts_seq = Seq}, {Touched, Seq, PrevSeq}};
+            Markers =
+                leveled_fts:marker_cache_updates(
+                    [{LedgerKey, Object, {AugIndexSpecs, TTL}}],
+                    State#state.fts_indexes
+                ),
+            {AugIndexSpecs, State#state{fts_seq = Seq},
+                {Touched, Seq, PrevSeq, Markers}};
         {error, Reason} ->
             {error, Reason}
     end.
 
-advance_fts_seqs_cache(_DirCache, _NewSeq, {[], 0, 0}) ->
+advance_fts_seqs_cache(_DirCache, _NewSeq, {[], 0, 0, []}) ->
     ok;
 advance_fts_seqs_cache(DirCache, NewFtsSeq, {compact, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq}) ->
     leveled_fts:compact_seqs_cache(
         DirCache, Bucket, Ref, ChosenSeqs, NewSeq, PrevSeq, NewFtsSeq
     );
-advance_fts_seqs_cache(DirCache, NewSeq, {Touched, BatchSeq, PrevSeq}) ->
-    leveled_fts:advance_seqs_cache(DirCache, Touched, BatchSeq, PrevSeq, NewSeq).
+advance_fts_seqs_cache(DirCache, NewSeq, {Touched, BatchSeq, PrevSeq, Markers}) ->
+    ok = leveled_fts:advance_seqs_cache(DirCache, Touched, BatchSeq, PrevSeq, NewSeq),
+    leveled_fts:advance_marker_cache(DirCache, Markers, NewSeq).
 
 current_head_state(LedgerKey, State) ->
     {Head, _CacheHit} =
