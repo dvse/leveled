@@ -747,7 +747,17 @@ search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
                                             AST1, maps:get(filter, Opts, []), Schema
                                         )
                                     of
-                                        {ok, EvalAST, ScoreAST} ->
+                                        {ok, EvalAST0, ScoreAST0} ->
+                                            %% Canonicalise column selectors
+                                            %% ONCE: per-document checks then
+                                            %% compare without re-normalising
+                                            %% (the full Unicode lowercasing
+                                            %% in item_allows_column was half
+                                            %% the cost of a NEAR query).
+                                            EvalAST =
+                                                canonicalise_ast_columns(EvalAST0),
+                                            ScoreAST =
+                                                canonicalise_ast_columns(ScoreAST0),
                                             search_evaluate(
                                                 FoldSource, Bucket, Schema, EvalAST,
                                                 ScoreAST, Columns, Cache, Opts
@@ -3112,12 +3122,38 @@ item_spans_in_column(Meta, {anchor, AST}, Column) ->
 item_spans_in_column(Meta, Other, Column) ->
     [{P, P} || P <- item_positions_in_column(Meta, Other, Column)].
 
+%% Column selectors reaching per-document checks are canonical (see
+%% canonicalise_ast_columns/1) — plain membership, no re-normalising.
 item_allows_column(all, _Column) ->
     true;
 item_allows_column({not_columns, Columns}, Column) ->
-    not lists:member(Column, schema_columns(Columns));
+    not lists:member(Column, Columns);
 item_allows_column(Columns, Column) ->
-    lists:member(Column, schema_columns(Columns)).
+    lists:member(Column, Columns).
+
+canonicalise_ast_columns({term, T, P, Cols}) ->
+    {term, T, P, canonical_selector(Cols)};
+canonicalise_ast_columns({phrase, Specs, Cols}) ->
+    {phrase, Specs, canonical_selector(Cols)};
+canonicalise_ast_columns({near, Items, D, Cols}) ->
+    {near, [canonicalise_ast_columns(I) || I <- Items], D, canonical_selector(Cols)};
+canonicalise_ast_columns({anchor, A}) ->
+    {anchor, canonicalise_ast_columns(A)};
+canonicalise_ast_columns({'and', A, B}) ->
+    {'and', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
+canonicalise_ast_columns({'or', A, B}) ->
+    {'or', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
+canonicalise_ast_columns({'not', A, B}) ->
+    {'not', canonicalise_ast_columns(A), canonicalise_ast_columns(B)};
+canonicalise_ast_columns(Other) ->
+    Other.
+
+canonical_selector(all) ->
+    all;
+canonical_selector({not_columns, Cols}) ->
+    {not_columns, schema_columns(Cols)};
+canonical_selector(Cols) ->
+    schema_columns(Cols).
 
 phrase_column_match_spans(_Meta, [], _Column) ->
     [];
