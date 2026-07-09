@@ -107,7 +107,11 @@ parse_args([Other | _Rest], _Opts) ->
 
 run(Opts) ->
     Root = maps:get(root, Opts),
-    ok = reset_dir(Root),
+    ok =
+        case maps:get(skip_load, Opts, undefined) of
+            undefined -> reset_dir(Root);
+            _Existing -> ok
+        end,
     StartOpts = [
         {root_path, Root},
         {sync_strategy, none},
