@@ -1746,41 +1746,39 @@ compact_runs(FoldSource, Bucket, Ref, Chosen, LiveByBatch) ->
         Chosen
     ).
 
-compact_batch_run(FoldSource, Bucket, Ref, BatchSeq, PS, LiveSet) ->
-    PageNos =
-        [element(3, probe_row(PS, I)) || I <- lists:seq(1, probe_size(PS))],
-    iolist_to_binary([
-        compact_page_run(FoldSource, Bucket, Ref, BatchSeq, PageNo, LiveSet)
-     || PageNo <- PageNos
-    ]).
-
-compact_page_run(FoldSource, Bucket, Ref, BatchSeq, PageNo, LiveSet) ->
-    Term = page_term(BatchSeq, PageNo),
-    Fold = fun(_B, {_Term, _Key, Payload}, _Acc) -> Payload end,
-    case
+compact_batch_run(FoldSource, Bucket, Ref, BatchSeq, _PS, LiveSet) ->
+    %% ONE range fold per batch: page terms are contiguous
+    %% (<<1, BatchSeq, PageNo>>) and ascend in page order, so the whole
+    %% batch reads in a single LSM descent. Per-page unit folds cost a
+    %% full fold setup each (~tens of ms on a deep store) — thousands
+    %% per pass made convergence passes slow down as earlier passes
+    %% deepened the store.
+    Fold =
+        fun(_B, {_Term, _Key, Payload}, Acc) ->
+            [
+                [
+                    begin
+                        Entry =
+                            <<(byte_size(Token)):16/unsigned-big, Token/binary,
+                                Kept:32/unsigned-big, KeptBin/binary>>,
+                        <<(byte_size(Entry)):32/unsigned-big, Entry/binary>>
+                    end
+                 || {Token, DocsBin} <- page_entries(Payload),
+                    {Kept, KeptBin} <- [filter_doc_frames(DocsBin, LiveSet)],
+                    Kept > 0
+                ]
+                | Acc
+            ]
+        end,
+    Runs =
         index_fold(
             FoldSource,
             {Bucket, null},
-            {Fold, not_found},
-            {seg_field(Ref), Term, Term},
+            {Fold, []},
+            {seg_field(Ref), page_term(BatchSeq, 0), page_term(BatchSeq, 65535)},
             {payload, undefined}
-        )
-    of
-        not_found ->
-            <<>>;
-        Payload ->
-            [
-                begin
-                    Entry =
-                        <<(byte_size(Token)):16/unsigned-big, Token/binary,
-                            Kept:32/unsigned-big, KeptBin/binary>>,
-                    <<(byte_size(Entry)):32/unsigned-big, Entry/binary>>
-                end
-             || {Token, DocsBin} <- page_entries(Payload),
-                {Kept, KeptBin} <- [filter_doc_frames(DocsBin, LiveSet)],
-                Kept > 0
-            ]
-    end.
+        ),
+    iolist_to_binary(lists:reverse(Runs)).
 
 %% Re-stamp derivation-time placeholder terms with the batch sequence
 %% assigned at apply time. Only the index TERMS embed the sequence —
