@@ -272,6 +272,17 @@ Leveled object and configure columns over the fields you want searchable. FTS
 does not replace the object model and does not require a second per-response
 index write.
 
+Two batched paths avoid a `book_get` round trip per hit:
+
+- `{include_docs, true}` in the query options attaches each live hit's
+  object under a `document` key in the result map, hydrated inside the
+  query with one batched journal read.
+- `leveled_bookie:book_mget(Bookie, Bucket, Keys, Tag)` fetches any key
+  list with `book_get` semantics per key, resolving heads against one
+  ledger snapshot and reading the values through batched, parallel
+  journal reads. Concurrent callers scale far beyond the one-value-per-
+  round-trip ceiling of a `book_get` loop.
+
 ## Existing Data
 
 FTS maintenance applies to writes made after the index is configured. Existing

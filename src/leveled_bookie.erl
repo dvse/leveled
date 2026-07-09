@@ -65,6 +65,8 @@
     book_delete/4,
     book_get/3,
     book_get/4,
+    book_mget/3,
+    book_mget/4,
     book_get_sqn/3,
     book_get_sqn/4,
     book_head/3,
@@ -802,6 +804,31 @@ book_delete(Pid, Bucket, Key, IndexSpecs) ->
 
 book_get(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {get, Bucket, Key, Tag}, infinity).
+
+-spec book_mget(
+    pid(),
+    leveled_codec:key(),
+    list(leveled_codec:key()),
+    leveled_codec:tag()
+) ->
+    list({leveled_codec:key(), {ok, any()} | not_found}).
+%% @doc - Batched GET
+%%
+%% Fetch a list of objects from a single bucket, returning results in the
+%% same order as the requested Keys.  Semantics per key match book_get/4
+%% (tombstone and TTL handling included).
+%%
+%% The bookie only takes a ledger snapshot; head lookups and the journal
+%% reads run in the calling process, with all journal fetches batched into
+%% a single inker request (grouped by journal file, files read in
+%% parallel).  Many callers can therefore fetch concurrently without
+%% serialising one journal round-trip per object through the inker.
+book_mget(Pid, Bucket, Keys, Tag) ->
+    {async, Runner} = gen_server:call(Pid, {mget, Bucket, Keys, Tag}, infinity),
+    Runner().
+
+book_mget(Pid, Bucket, Keys) ->
+    book_mget(Pid, Bucket, Keys, ?STD_TAG).
 
 book_get_sqn(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {get_sqn, Bucket, Key, Tag}, infinity).
@@ -1916,6 +1943,21 @@ handle_call({get, Bucket, Key, Tag}, _From, State) when
         State#state.monitor, TS0, TS1, GetResult == not_found
     ),
     {reply, GetResult, State};
+handle_call({mget, Bucket, Keys, Tag}, _From, State) when
+    State#state.head_only == false
+->
+    SnapFun = return_snapfun(State, ledger, no_lookup, false, true),
+    Inker = State#state.inker,
+    Runner =
+        fun() ->
+            {ok, LS, _JS, AfterFun} = SnapFun(),
+            try
+                mget_objects(LS, Inker, Bucket, Keys, Tag)
+            after
+                AfterFun()
+            end
+        end,
+    {reply, {async, Runner}, State};
 handle_call({get_sqn, Bucket, Key, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -3409,47 +3451,155 @@ attach_documents(Hits, LedgerSnapshot, Inker, Bucket, Index, State) ->
             {ok, #{tag := T}} -> T;
             _ -> ?STD_TAG
         end,
-    lists:filtermap(
-        fun(Hit) ->
-            case
-                fetch_object_snapshot(
-                    LedgerSnapshot, Inker, Bucket, maps:get(key, Hit), Tag
-                )
-            of
-                {ok, Object} -> {true, Hit#{document => Object}};
-                not_found -> false
-            end
-        end,
-        Hits
-    ).
+    Heads =
+        [
+            {Hit,
+                snapshot_head_fetchspec(
+                    LedgerSnapshot, Bucket, maps:get(key, Hit), Tag
+                )}
+         || Hit <- Hits
+        ],
+    case [{LK, SQN} || {_Hit, {fetch, LK, SQN}} <- Heads] of
+        [] ->
+            [];
+        Pairs ->
+            zip_documents(Heads, leveled_inker:ink_mget(Inker, Pairs))
+    end.
+
+%% Hits whose object is no longer live (deleted or expired since the
+%% search snapshot) are dropped, as attach_documents always has.
+zip_documents([], []) ->
+    [];
+zip_documents([{_Hit, not_found} | RestH], Values) ->
+    zip_documents(RestH, Values);
+zip_documents([{Hit, {fetch, _LK, _SQN}} | RestH], [Value | RestV]) ->
+    case Value of
+        {ok, Object} ->
+            [Hit#{document => Object} | zip_documents(RestH, RestV)];
+        not_present ->
+            zip_documents(RestH, RestV)
+    end.
 
 %% book_get's liveness semantics (tombstone and TTL handling, journal
 %% fetch by SQN): heads from the query's ledger snapshot (index-less L0
-%% fetch — fold-shaped snapshots carry no L0 index), values through the
+%% fetch - fold-shaped snapshots carry no L0 index), values through the
 %% live inker exactly as book_get reads them.
 fetch_object_snapshot(LedgerSnapshot, Inker, Bucket, Key, Tag) ->
+    case snapshot_head_fetchspec(LedgerSnapshot, Bucket, Key, Tag) of
+        not_found ->
+            not_found;
+        {fetch, LedgerKey, SQN} ->
+            case fetch_value(Inker, {LedgerKey, SQN}) of
+                not_present -> not_found;
+                Object -> {ok, Object}
+            end
+    end.
+
+-spec snapshot_head_fetchspec(
+    pid(),
+    leveled_codec:key(),
+    leveled_codec:key(),
+    leveled_codec:tag()
+) ->
+    not_found | {fetch, leveled_codec:ledger_key(), non_neg_integer()}.
+%% Resolve a key against a ledger snapshot to the journal reference of
+%% its live value - or not_found for absent, tombstoned or expired keys
+%% (book_get's liveness rules).
+snapshot_head_fetchspec(LedgerSnapshot, Bucket, Key, Tag) ->
     LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
     Hash = leveled_codec:segment_hash(LedgerKey),
     case leveled_penciller:pcl_fetch(LedgerSnapshot, LedgerKey, Hash, false) of
         not_present ->
             not_found;
         {_LedgerKey, Head} ->
-            {SQN, Status, _MH, _MD} = leveled_codec:striphead_to_v1details(Head),
+            {SQN, Status, _MH, _MD} = leveled_codec:striphead_to_v1details(
+                Head
+            ),
             case Status of
                 tomb ->
                     not_found;
                 {active, TS} ->
                     case TS >= leveled_util:integer_now() of
-                        false ->
-                            not_found;
-                        true ->
-                            case fetch_value(Inker, {LedgerKey, SQN}) of
-                                not_present -> not_found;
-                                Object -> {ok, Object}
-                            end
+                        false -> not_found;
+                        true -> {fetch, LedgerKey, SQN}
                     end
             end
     end.
+
+% mget batches are processed in chunks of this size; 13 divides a
+% typical limit-50 hydration batch into four balanced chunks
+-define(MGET_CHUNKSIZE, 13).
+
+%% book_mget's runner: resolve heads against the ledger snapshot (same
+%% liveness semantics as book_get), then batched inker requests for the
+%% live values.  The batch is split into chunks that are processed
+%% concurrently - each chunk worker walks its heads and then blocks on
+%% one batched journal read - so a batch's ledger and journal reads
+%% overlap and the batch completes in the time of its slowest chunk,
+%% not the sum of its parts.
+mget_objects(LedgerSnapshot, Inker, Bucket, Keys, Tag) ->
+    Parent = self(),
+    Workers =
+        [
+            begin
+                ChunkRef = make_ref(),
+                {_Pid, Mon} =
+                    spawn_monitor(
+                        fun() ->
+                            Parent ! {ChunkRef, mget_chunk(
+                                LedgerSnapshot, Inker, Bucket, Chunk, Tag
+                            )}
+                        end
+                    ),
+                {ChunkRef, Mon, Chunk}
+            end
+         || Chunk <- mget_chunks(Keys)
+        ],
+    lists:flatmap(
+        fun({ChunkRef, Mon, Chunk}) ->
+            receive
+                {ChunkRef, Results} ->
+                    erlang:demonitor(Mon, [flush]),
+                    Results;
+                {'DOWN', Mon, process, _Pid, _Reason} ->
+                    % the same degradation ink_mget applies on a
+                    % journal file-close race
+                    [{Key, not_found} || Key <- Chunk]
+            end
+        end,
+        Workers
+    ).
+
+mget_chunk(LedgerSnapshot, Inker, Bucket, Chunk, Tag) ->
+    Heads =
+        [
+            {Key, snapshot_head_fetchspec(LedgerSnapshot, Bucket, Key, Tag)}
+         || Key <- Chunk
+        ],
+    case [{LK, SQN} || {_Key, {fetch, LK, SQN}} <- Heads] of
+        [] ->
+            Heads;
+        Pairs ->
+            zip_mget(Heads, leveled_inker:ink_mget(Inker, Pairs))
+    end.
+
+mget_chunks(Keys) when length(Keys) =< ?MGET_CHUNKSIZE ->
+    [Keys];
+mget_chunks(Keys) ->
+    {Chunk, Rest} = lists:split(?MGET_CHUNKSIZE, Keys),
+    [Chunk | mget_chunks(Rest)].
+
+zip_mget([], []) ->
+    [];
+zip_mget([{Key, not_found} | RestH], Values) ->
+    [{Key, not_found} | zip_mget(RestH, Values)];
+zip_mget([{Key, {fetch, _LK, _SQN}} | RestH], [Value | RestV]) ->
+    Result =
+        case Value of
+            {ok, Object} -> {ok, Object};
+            not_present -> not_found
+        end,
+    [{Key, Result} | zip_mget(RestH, RestV)].
 
 %% Consolidation orchestration, run in the caller's process: shards
 %% derive in parallel (one snapshot each), then apply in chunks through
@@ -4462,6 +4612,52 @@ ttl_test() ->
         ObjL2
     ),
 
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+mget_test_() ->
+    {timeout, 60, fun mget_testto/0}.
+
+mget_testto() ->
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} = book_start([{root_path, RootPath}]),
+    ObjL1 = generate_multiple_objects(200, 1),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, V, S, ?STD_TAG)
+        end,
+        ObjL1
+    ),
+    % a tombstone and an expired object should both be not_found
+    {DelK, _DelV, _DelS} = lists:nth(7, ObjL1),
+    ok = book_delete(Bookie1, <<"Bucket">>, DelK, []),
+    {ExpK, ExpV, ExpS} = lists:nth(11, ObjL1),
+    Past = leveled_util:integer_now() - 300,
+    ok = book_tempput(Bookie1, <<"Bucket">>, ExpK, ExpV, ExpS, ?STD_TAG, Past),
+    Keys =
+        [K || {K, _V, _S} <- ObjL1] ++
+            [<<"no_such_key">>, hd([K || {K, _V, _S} <- ObjL1])],
+    Results = book_mget(Bookie1, <<"Bucket">>, Keys, ?STD_TAG),
+    % results are in input order (duplicates included) and every result
+    % matches book_get
+    ?assertEqual(Keys, [K || {K, _R} <- Results]),
+    lists:foreach(
+        fun({K, R}) ->
+            ?assertEqual(book_get(Bookie1, <<"Bucket">>, K, ?STD_TAG), R)
+        end,
+        Results
+    ),
+    ?assertEqual(not_found, proplists:get_value(DelK, Results)),
+    ?assertEqual(not_found, proplists:get_value(ExpK, Results)),
+    ?assertEqual([], book_mget(Bookie1, <<"Bucket">>, [], ?STD_TAG)),
+    ?assertEqual(
+        [{<<"no_such_key">>, not_found}],
+        book_mget(Bookie1, <<"Bucket">>, [<<"no_such_key">>])
+    ),
+    % values are served from the journal after a restart
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
     ok = book_close(Bookie2),
     reset_filestructure().
 

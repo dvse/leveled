@@ -100,6 +100,7 @@
     ink_mput/3,
     ink_get/3,
     ink_fetch/3,
+    ink_mget/2,
     ink_keycheck/3,
     ink_fold/4,
     ink_loadpcl/5,
@@ -297,6 +298,81 @@ ink_get(Pid, PrimaryKey, SQN) ->
 %% fetching the Key prompted some anticipated error (e.g. CRC check failed)
 ink_fetch(Pid, PrimaryKey, SQN) ->
     gen_server:call(Pid, {fetch, PrimaryKey, SQN}, infinity).
+
+-spec ink_mget(pid(), list({leveled_codec:ledger_key(), integer()})) ->
+    list({ok, any()} | not_present).
+%% @doc
+%% Fetch several values in one call. The inker only GROUPS the keys by
+%% journal file (a manifest lookup each); the batched reads and value
+%% decoding then run here in the calling process, fanned out in parallel
+%% across the touched journal files. The per-value round trip through
+%% the singleton inker, which serialises every journal read in the
+%% store, amortises to one grouping call per batch - so concurrent
+%% callers scale with journal file count, not with inker throughput.
+%% Results are in input order with ink_fetch/3's semantics.
+ink_mget(Pid, KeySQNPairs) ->
+    {grouped, ByFile} = gen_server:call(Pid, {mget, KeySQNPairs}, infinity),
+    Parent = self(),
+    Workers =
+        [
+            begin
+                Tag = make_ref(),
+                OrderedEntries = lists:reverse(Entries),
+                {_Pid, Mon} =
+                    spawn_monitor(
+                        fun() ->
+                            Fetched =
+                                leveled_cdb:cdb_mget(
+                                    JournalP, [IK || {_N, IK} <- OrderedEntries]
+                                ),
+                            Decoded =
+                                lists:map(
+                                    fun({{N, _IK}, Obj}) ->
+                                        case
+                                            leveled_codec:from_inkerkv(
+                                                Obj, true
+                                            )
+                                        of
+                                            {{_SQN, _PK}, {V, _IdxSpecs}} ->
+                                                {N, {ok, V}};
+                                            _NotPresent ->
+                                                {N, not_present}
+                                        end
+                                    end,
+                                    lists:zip(OrderedEntries, Fetched)
+                                ),
+                            Parent ! {Tag, Decoded}
+                        end
+                    ),
+                {Tag, Mon, OrderedEntries}
+            end
+         || {JournalP, Entries} <- ByFile
+        ],
+    Indexed =
+        lists:foldl(
+            fun({Tag, Mon, FileEntries}, Acc) ->
+                receive
+                    {Tag, Decoded} ->
+                        erlang:demonitor(Mon, [flush]),
+                        lists:foldl(
+                            fun({N, Value}, A) -> A#{N => Value} end,
+                            Acc,
+                            Decoded
+                        );
+                    {'DOWN', Mon, process, _Pid2, _Reason} ->
+                        %% file-close race (journal compaction): degrade to
+                        %% not_present, the same exposure ink_fetch has
+                        lists:foldl(
+                            fun({N, _IK}, A) -> A#{N => not_present} end,
+                            Acc,
+                            FileEntries
+                        )
+                end
+            end,
+            #{},
+            Workers
+        ),
+    [maps:get(N, Indexed) || N <- lists:seq(0, length(KeySQNPairs) - 1)].
 
 -spec ink_keycheck(
     pid(),
@@ -640,6 +716,34 @@ handle_call(
         {_, UpdState, _ObjSize} ->
             {reply, {ok, UpdState#state.journal_sqn}, UpdState}
     end;
+handle_call({mget, KeySQNPairs}, _From, State) ->
+    Manifest = State#state.manifest,
+    %% group by journal file, preserving each pair's input position.  The
+    %% inker only plans here - the caller-side of ink_mget/2 fetches from
+    %% the journal files in parallel, so concurrent batches from different
+    %% callers do not serialise through this process
+    ByFile =
+        element(
+            1,
+            lists:foldl(
+                fun({Key, SQN}, {Grouped, N}) ->
+                    JournalP = leveled_imanifest:find_entry(SQN, Manifest),
+                    InkerKey = leveled_codec:to_inkerkey(Key, SQN),
+                    {
+                        maps:update_with(
+                            JournalP,
+                            fun(L) -> [{N, InkerKey} | L] end,
+                            [{N, InkerKey}],
+                            Grouped
+                        ),
+                        N + 1
+                    }
+                end,
+                {#{}, 0},
+                KeySQNPairs
+            )
+        ),
+    {reply, {grouped, maps:to_list(ByFile)}, State};
 handle_call({fetch, Key, SQN}, _From, State) ->
     case get_object(Key, SQN, State#state.manifest, true) of
         {{SQN, Key}, {Value, _IndexSpecs}} ->
