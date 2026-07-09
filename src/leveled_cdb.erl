@@ -1906,22 +1906,31 @@ maybelog_get_timing(_Monitor, _IndexTime, _ReadTime, _CC) ->
 %% Load (or reuse) the file's hash tables as one binary, so that the
 %% cdb_mget/2 spec can carry them to the calling process - large
 %% binaries are reference-counted, so repeated replies share the same
-%% heap copy.  The tables sit contiguously between the end of the data
-%% section (the lowest table position) and the end of the file.
+%% heap copy.  The region is derived from the top index (each table's
+%% position and entry count), not assumed from the file layout.
 hashtable_cache(State = #state{hashtable_cache = {Base, Bin}}) ->
     {{Base, Bin}, State};
 hashtable_cache(State = #state{handle = Handle, hash_index = Index}) ->
-    Positions =
-        [P || {P, C} <- tuple_to_list(Index), C > 0],
+    Regions =
+        [
+            {P, P + C * ?DWORD_SIZE}
+         || {P, C} <- tuple_to_list(Index), C > 0
+        ],
     Tables =
-        case Positions of
+        case Regions of
             [] ->
                 {0, <<>>};
             _ ->
-                Base = lists:min(Positions),
-                {ok, EoF} = file:position(Handle, eof),
-                {ok, Bin} = file:pread(Handle, Base, EoF - Base),
-                {Base, Bin}
+                Base = lists:min([RS || {RS, _RE} <- Regions]),
+                End = lists:max([RE || {_RS, RE} <- Regions]),
+                case file:pread(Handle, Base, End - Base) of
+                    {ok, Bin} ->
+                        % a truncated file returns a short binary here;
+                        % probes beyond it skip, as get/6's read errors do
+                        {Base, Bin};
+                    _ReadError ->
+                        {Base, <<>>}
+                end
         end,
     {Tables, State#state{hashtable_cache = Tables}}.
 
@@ -1980,7 +1989,9 @@ probe_positions(TablesBin, Base, Slot, Cycle, Count, Hash, Acc) ->
             _/binary>> ->
             probe_positions(TablesBin, Base, Slot, Cycle + 1, Count, Hash, Acc);
         _Truncated ->
-            lists:reverse(Acc)
+            % unreadable slot (a corrupt or truncated file): skip it and
+            % keep probing, as get/6 does when a slot read fails
+            probe_positions(TablesBin, Base, Slot, Cycle + 1, Count, Hash, Acc)
     end.
 
 mget_rounds(_Pid, [], Resolved, _BinaryMode) ->
@@ -3176,6 +3187,117 @@ mget_test() ->
     % delete_pending state
     ?assertEqual(Expected, cdb_mget(P1, QueryKeys)),
     ok = cdb_close(P1).
+
+mget_differential_test_() ->
+    {timeout, 240, fun mget_differential_tester/0}.
+
+%% Differential guard for the cdb_mget direct read path: it re-expresses
+%% the record search over batched preads rather than calling get/6, so
+%% pin the two implementations together over randomised files - value
+%% sizes straddling the speculative read length, colliding keys, missing
+%% keys, duplicates - in every state that serves reads.
+mget_differential_tester() ->
+    _ = rand:seed(exsss, {20260709, 42, 7}),
+    lists:foreach(
+        fun({BinaryMode, Round}) ->
+            mget_differential_round(BinaryMode, Round)
+        end,
+        [{BM, R} || BM <- [false, true], R <- lists:seq(1, 3)]
+    ).
+
+mget_differential_round(BinaryMode, Round) ->
+    FN =
+        "test/test_area/mget_diff_" ++ atom_to_list(BinaryMode) ++
+            integer_to_list(Round),
+    KeyCount = 150 + rand:uniform(150),
+    KVL =
+        [
+            {
+                diff_key(BinaryMode, N),
+                diff_value(BinaryMode, rand:uniform(12000))
+            }
+         || N <- lists:seq(1, KeyCount)
+        ] ++ diff_collisions(BinaryMode),
+    {ok, P1} =
+        cdb_open_writer(FN ++ ".pnd", #cdb_options{binary_mode = BinaryMode}),
+    ok = cdb_mput(P1, KVL),
+    QueryKeys = diff_querykeys(BinaryMode, KVL, KeyCount),
+    % writer state
+    ?assertEqual([cdb_get(P1, K) || K <- QueryKeys], cdb_mget(P1, QueryKeys)),
+    {ok, F} = cdb_complete(P1),
+    {ok, P2} = cdb_open_reader(F, #cdb_options{binary_mode = BinaryMode}),
+    % reader state (the direct read path)
+    ?assertEqual([cdb_get(P2, K) || K <- QueryKeys], cdb_mget(P2, QueryKeys)),
+    ok = cdb_deletepending(P2),
+    % delete_pending state
+    ?assertEqual([cdb_get(P2, K) || K <- QueryKeys], cdb_mget(P2, QueryKeys)),
+    ok = cdb_close(P2),
+    _ = file:delete(F),
+    ok.
+
+diff_key(false, N) ->
+    "DKey" ++ integer_to_list(N);
+diff_key(true, N) ->
+    <<"DKey_", (integer_to_binary(N))/binary>>.
+
+diff_value(false, Length) ->
+    lists:duplicate(Length, $v);
+diff_value(true, Length) ->
+    rand:bytes(Length).
+
+%% Known same-hash keys (see hashclash_test), exercising the
+%% collision-continue branch of the direct probe.
+diff_collisions(false) ->
+    [{"Key4184465780", "colval1"}, {"Key4254669179", "colval99"}];
+diff_collisions(true) ->
+    [].
+
+diff_querykeys(BinaryMode, KVL, KeyCount) ->
+    AllKeys = [K || {K, _V} <- KVL],
+    Missing =
+        [diff_key(BinaryMode, KeyCount + N) || N <- lists:seq(1, 20)] ++
+            case BinaryMode of
+                % missing, but colliding with the stored pair above
+                false -> ["Key9070567319"];
+                true -> []
+            end,
+    Duplicates = lists:sublist(AllKeys, 10),
+    Shuffled =
+        [
+            K
+         || {_R, K} <-
+                lists:sort([{rand:uniform(), K} || K <- AllKeys ++ Missing])
+        ],
+    Shuffled ++ Duplicates.
+
+mget_truncation_test_() ->
+    {timeout, 60, fun mget_truncation_tester/0}.
+
+%% Clip the tail of the hash tables under an open reader: both paths
+%% must then skip the unreadable slots the same way and stay equal
+%% (the direct path loads its table copy lazily, on the first mget).
+mget_truncation_tester() ->
+    _ = rand:seed(exsss, {20260709, 43, 11}),
+    FN = "test/test_area/mget_trunc",
+    KVL =
+        [
+            {diff_key(true, N), diff_value(true, rand:uniform(9000))}
+         || N <- lists:seq(1, 200)
+        ],
+    {ok, P1} = cdb_open_writer(FN ++ ".pnd", #cdb_options{binary_mode = true}),
+    ok = cdb_mput(P1, KVL),
+    {ok, F} = cdb_complete(P1),
+    {ok, P2} = cdb_open_reader(F, #cdb_options{binary_mode = true}),
+    {ok, WH} = file:open(F, [read, write, raw, binary]),
+    {ok, EoF} = file:position(WH, eof),
+    {ok, _} = file:position(WH, EoF - 500),
+    ok = file:truncate(WH),
+    ok = file:close(WH),
+    QueryKeys = diff_querykeys(true, KVL, 200),
+    ?assertEqual([cdb_get(P2, K) || K <- QueryKeys], cdb_mget(P2, QueryKeys)),
+    ok = cdb_close(P2),
+    _ = file:delete(F),
+    ok.
 
 state_test() ->
     {ok, P1} = cdb_open_writer(
