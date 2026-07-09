@@ -777,6 +777,17 @@ search_evaluate(FoldSource, Bucket, Schema, EvalAST, ScoreAST, Columns, Cache, O
     IndexRef = index_ref(Schema),
     Ranked = maps:get(rank, Opts, none) =:= bm25,
     try
+        Leaves =
+            case Ranked of
+                true -> scoring_phrases(ScoreAST);
+                false -> []
+            end,
+        RankMode =
+            case {Ranked, Ranked andalso ranked_fast_df(Leaves)} of
+                {false, _} -> none;
+                {true, true} -> fast;
+                {true, false} -> full
+            end,
         Metas =
             collect_metas(
                 FoldSource,
@@ -786,7 +797,7 @@ search_evaluate(FoldSource, Bucket, Schema, EvalAST, ScoreAST, Columns, Cache, O
                 Columns,
                 Cache,
                 maps:get(return_positions, Opts, false) orelse Ranked,
-                Ranked
+                RankMode
             ),
         case Ranked of
             false ->
@@ -800,8 +811,15 @@ search_evaluate(FoldSource, Bucket, Schema, EvalAST, ScoreAST, Columns, Cache, O
                         Cache,
                         maps:get(stats_staleness, Opts, 0)
                     ),
+                Np =
+                    case RankMode of
+                        fast ->
+                            fast_np_map(FoldSource, Bucket, Schema, Cache, Leaves);
+                        full ->
+                            positional
+                    end,
                 evaluate_ranked_candidates(
-                    IndexRef, EvalAST, ScoreAST, Opts, Metas, Stats
+                    IndexRef, EvalAST, Leaves, Opts, Metas, Np, Stats
                 )
         end
     catch
@@ -1161,7 +1179,14 @@ collect_metas(FoldSource, Bucket, Schema, AST, Columns, Cache, ReturnPositions, 
     case AST of
         {all_docs} ->
             all_doc_metas(Ctx0);
-        _ when Ranked ->
+        %% fast ranked mode: exact df for term-shaped scoring leaves
+        %% comes from a keys-only pass (fast_np_map), so candidates load
+        %% through the same driver flow as unranked queries — positions
+        %% on candidates only. Positional-df leaves (phrases) use the
+        %% full mode: every scoring term loaded whole, with positions.
+        _ when Ranked =:= fast ->
+            term_metas(Ctx0, AST, query_terms(AST, Columns));
+        _ when Ranked =:= full ->
             ranked_term_metas(Ctx0, query_terms(AST, Columns));
         _ ->
             term_metas(Ctx0, AST, query_terms(AST, Columns))
@@ -2371,8 +2396,7 @@ evaluate_payload_candidates(Index, AST, Opts, Metas) ->
 %% score (FTS5's sign convention: ORDER BY rank ascending = best first).
 %% ----------------------------------------------------------------------------
 
-evaluate_ranked_candidates(Index, EvalAST, ScoreAST, Opts, Metas, {DocCount, TotalLen}) ->
-    Leaves = scoring_phrases(ScoreAST),
+evaluate_ranked_candidates(Index, EvalAST, Leaves, Opts, Metas, Np0, {DocCount, TotalLen}) ->
     MetaList =
         [
             Meta
@@ -2380,7 +2404,11 @@ evaluate_ranked_candidates(Index, EvalAST, ScoreAST, Opts, Metas, {DocCount, Tot
                 maps:to_list(Metas),
             MetaIndex =:= Index
         ],
-    Np = np_map(Leaves, MetaList),
+    Np =
+        case Np0 of
+            positional -> np_map(Leaves, MetaList);
+            _ -> Np0
+        end,
     AvgDl =
         case DocCount of
             0 -> 0.0;
@@ -2469,13 +2497,103 @@ near_member_column_spans(Meta, Items, Index, _Member, Distance, Column, filtered
             [];
         false ->
             {Before, [MemberSpans | After]} = lists:split(Index - 1, SpanLists),
-            Others = Before ++ After,
-            [
-                Span
-             || Span <- MemberSpans,
-                near_position_matches([Span], Others, Distance)
-            ]
+            case Before ++ After of
+                [OtherSpans] ->
+                    near_sweep(MemberSpans, OtherSpans, Distance);
+                Others ->
+                    [
+                        Span
+                     || Span <- MemberSpans,
+                        near_position_matches([Span], Others, Distance)
+                    ]
+            end
     end.
+
+%% A scoring leaf has a keys-only exact document frequency when it is a
+%% plain term (or a NEAR member that is a plain term): df is then the
+%% count of live documents carrying the token, which needs page keys and
+%% cached markers but no positions. Phrase leaves need positional df
+%% (FTS5's xQueryPhrase counts docs matching the phrase).
+ranked_fast_df(Leaves) ->
+    lists:all(
+        fun
+            ({term, _T, _P, _C}) -> true;
+            ({near_member, Index, Items, _D, _C}) ->
+                case lists:nth(Index, Items) of
+                    {term, _T2, _P2, _C2} -> true;
+                    _Positional -> false
+                end;
+            (_Positional) -> false
+        end,
+        Leaves
+    ).
+
+%% Exact per-leaf document frequencies without positions: one keys-only
+%% load per unique scoring term, liveness through the marker cache, and
+%% the result cached per write sequence alongside stats (df is immutable
+%% per sequence).
+fast_np_map(FoldSource, Bucket, Schema, Cache, Leaves) ->
+    Ctx = #{
+        fold => FoldSource,
+        bucket => Bucket,
+        ref => index_ref(Schema),
+        columns => maps:get(columns, Schema),
+        dirs => undefined,
+        cache => Cache,
+        return_positions_opt => false,
+        pages => #{}
+    },
+    {_Ctx1, Np} =
+        lists:foldl(
+            fun(Leaf, {CtxA, Acc}) ->
+                case maps:is_key(Leaf, Acc) of
+                    true ->
+                        {CtxA, Acc};
+                    false ->
+                        {CtxB, N} = leaf_df(CtxA, df_leaf_term(Leaf)),
+                        {CtxB, Acc#{Leaf => N}}
+                end
+            end,
+            {Ctx, #{}},
+            Leaves
+        ),
+    Np.
+
+df_leaf_term({term, _T, _P, _C} = Leaf) ->
+    Leaf;
+df_leaf_term({near_member, Index, Items, _D, GroupCols}) ->
+    %% restrict_ast_columns passes `all` through and intersects lists;
+    %% {empty} cannot arise here (parse rejects empty column sets).
+    restrict_ast_columns(lists:nth(Index, Items), GroupCols).
+
+leaf_df(#{bucket := Bucket, ref := Ref, cache := Cache} = Ctx, {term, Token, Prefix, Cols}) ->
+    DfKey = {df, Bucket, Ref, {Token, Prefix, Cols}},
+    case Cache of
+        {Ets, Seq} ->
+            case ets:lookup(Ets, DfKey) of
+                [{_K, {Seq, N}}] ->
+                    {Ctx, N};
+                _MissOrStale ->
+                    {Ctx1, N} = compute_leaf_df(Ctx, Token, Prefix, Cols),
+                    ets:insert(Ets, {DfKey, {Seq, N}}),
+                    {Ctx1, N}
+            end;
+        undefined ->
+            compute_leaf_df(Ctx, Token, Prefix, Cols)
+    end.
+
+compute_leaf_df(#{ref := Ref} = Ctx, Token, Prefix, Cols) ->
+    {Ctx1, Raw} =
+        lists:foldl(
+            fun(Col, {CtxA, RawA}) ->
+                load_term(CtxA, Col, Token, Prefix, all, false, RawA)
+            end,
+            {Ctx, #{}},
+            concrete_columns(Cols)
+        ),
+    {Ctx2, Markers} = load_markers(Ctx1, maps:keys(Raw)),
+    Live = build_metas(Raw, Markers, Ref, ctx_alias_map(Ctx2)),
+    {Ctx2, maps:size(Live)}.
 
 np_map(Leaves, MetaList) ->
     lists:foldl(
@@ -3015,12 +3133,38 @@ phrase_column_match_spans(Meta, [{FirstToken, FirstPrefix, FirstOffset} | Rest] 
 phrase_last_offset(Specs) ->
     lists:max([Offset || {_Token, _Prefix, Offset} <- Specs]).
 
+%% Two-leg NEAR (the overwhelmingly common shape) runs as a linear
+%% two-pointer interval sweep over the sorted span lists instead of the
+%% general exists-backtracking — measured ~9x against SQLite's NEAR
+%% before the sweep, dominated by per-span scanning of the other leg.
+near_positions([LegA, LegB], Distance) ->
+    [Start || {Start, _End} <- near_sweep(LegA, LegB, Distance)];
 near_positions([First | Rest], Distance) ->
     [
         Start
      || {Start, _End} = Span <- First,
         near_position_matches([Span], Rest, Distance)
     ].
+
+%% Emit every span of the FIRST list within Distance of some span of the
+%% second. Both lists ascend by start (and by end — spans within a leg
+%% share their phrase length), so each list is walked at most once.
+near_sweep([], _B, _Distance) ->
+    [];
+near_sweep(_A, [], _Distance) ->
+    [];
+near_sweep([{SA, EA} = Span | RestA] = A, [{SB, EB} | RestB] = B, Distance) ->
+    if
+        %% b entirely too far left for this a — and every later a starts
+        %% at or after SA, so b can never match again.
+        EB < SA - Distance - 1 ->
+            near_sweep(A, RestB, Distance);
+        %% nearest surviving b is already too far right: no match for a.
+        SB > EA + Distance + 1 ->
+            near_sweep(RestA, B, Distance);
+        true ->
+            [Span | near_sweep(RestA, B, Distance)]
+    end.
 
 near_position_matches(_Chosen, [], _Distance) ->
     true;
