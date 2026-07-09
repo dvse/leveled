@@ -90,6 +90,8 @@ parse_args(["--compact" | Rest], Opts) ->
     parse_args(Rest, Opts#{compact => true});
 parse_args(["--stable" | Rest], Opts) ->
     parse_args(Rest, Opts#{bust_mode => stable});
+parse_args(["--skip-load", DocCount | Rest], Opts) ->
+    parse_args(Rest, Opts#{skip_load => list_to_integer(DocCount)});
 parse_args(["--limit", N | Rest], Opts) ->
     parse_args(Rest, Opts#{limit => list_to_integer(N)});
 parse_args(["--runs", N | Rest], Opts) ->
@@ -132,18 +134,30 @@ run(Opts) ->
     ] ++ cache_start_opts(Opts) ++ sst_start_opts(Opts),
     {ok, Bookie} = leveled_bookie:book_start(StartOpts),
     LoadStart = erlang:monotonic_time(microsecond),
-    LoadResult = load_tsv(Bookie, Opts),
+    %% --skip-load N: measure against an existing store (e.g. the store
+    %% the other rank mode just built and compacted — identical state).
+    LoadResult =
+        case maps:get(skip_load, Opts, undefined) of
+            undefined -> load_tsv(Bookie, Opts);
+            SkipDocs -> {ok, SkipDocs, 0, #{}}
+        end,
     LoadEnd = erlang:monotonic_time(microsecond),
     Result =
         case LoadResult of
             {ok, DocCount, TextBytes, LoadStats} ->
+                %% skip-load stores are already compacted by the builder.
+                SkipMaintenance = maps:get(skip_load, Opts, undefined) =/= undefined,
                 %% --compact: converge the store to few posting batches
                 %% before measuring, the steady state a maintained store
                 %% runs at (SQLite's index is likewise fully merged after
                 %% its build). Oldest-first selection makes merged
                 %% batches (newest sequences) accumulate at the tail, so
                 %% convergence rewrites each posting about twice.
-                ok = maybe_compact(Bookie, Opts),
+                ok =
+                    case SkipMaintenance of
+                        true -> ok;
+                        false -> maybe_compact(Bookie, Opts)
+                    end,
                 LoadStatus = leveled_bookie:book_status(Bookie),
                 LoadMemory = memory_snapshot(),
                 CloseStart = erlang:monotonic_time(microsecond),

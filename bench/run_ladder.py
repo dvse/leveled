@@ -79,7 +79,7 @@ def run_sqlite(helper, tsv, db, queries, result, rank, limit, runs, warmup, batc
 
 
 def run_leveled(ebin, tsv, root, queries, result, rank, limit, runs, warmup, batch,
-                log, regime="warm", compact=False):
+                log, regime="warm", compact=False, skip_load=None):
     eval_src = (
         "Args=init:get_plain_arguments(), "
         "case leveled_fts_bench:main(Args) of "
@@ -103,6 +103,8 @@ def run_leveled(ebin, tsv, root, queries, result, rank, limit, runs, warmup, bat
         cmd.append("--stable")
     if compact:
         cmd.append("--compact")
+    if skip_load is not None:
+        cmd.extend(["--skip-load", str(skip_load)])
     with open(log, "ab") as lg:
         lg.write(f"\n$ {' '.join(cmd)}\n".encode())
         lg.flush()
@@ -197,14 +199,15 @@ def main() -> int:
         if target and target > 0:
             slice_path = work / f"docs-{label}.tsv"
             t0 = time.time()
-            docs, tb = slice_tsv(tsv, slice_path, target)
-            print(f"sliced {label}: {docs} docs, {tb/1e6:.1f} MB text "
+            rung_docs, tb = slice_tsv(tsv, slice_path, target)
+            print(f"sliced {label}: {rung_docs} docs, {tb/1e6:.1f} MB text "
                   f"({time.time()-t0:.0f}s)", flush=True)
             rung_tsv = slice_path
         else:
             rung_tsv = tsv
             slice_path = None
-            print(f"rung {label}: using full corpus TSV", flush=True)
+            rung_docs = sum(1 for _ in tsv.open("rb"))
+            print(f"rung {label}: using full corpus TSV ({rung_docs} docs)", flush=True)
 
         regime = args.regime or ("uncached" if args.uncached else "warm")
         for rank in ranks:
@@ -222,22 +225,36 @@ def main() -> int:
                 if rc != 0:
                     print(f"  !! sqlite failed; see {slog}", flush=True)
 
-            root = work / f"leveled-{label}-{rank}-{regime}"
+            # In the stable regime (no writes during measurement) the store
+            # state is identical across rank modes: build + compact once for
+            # the first rank, then measure later ranks against the same root
+            # with --skip-load. Full-scale compaction is ~1.5h; paying it per
+            # rank mode measured nothing new.
+            shared_root = work / f"leveled-{label}-shared-{regime}"
+            reuse_store = regime == "stable"
+            root = shared_root if reuse_store else work / f"leveled-{label}-{rank}-{regime}"
+            built = reuse_store and (root / "ledger").exists()
+            skip_load = rung_docs if built else None
             lres = results / f"leveled-{label}-{rank}-{regime}.tsv"
             llog = logs / f"leveled-{label}-{rank}-{regime}.log"
             t0 = time.time()
             rc = run_leveled(ebin, rung_tsv, root, args.queries, lres, rank, args.limit,
                              rung["runs"], rung["warmup"], args.batch, llog, regime=regime,
-                             compact=args.compact)
-            print(f"  leveled {label} {rank} [{regime}]: rc={rc} ({time.time()-t0:.0f}s) -> {lres.name}",
-                  flush=True)
+                             compact=args.compact, skip_load=skip_load)
+            print(f"  leveled {label} {rank} [{regime}]"
+                  f"{' (reused store)' if skip_load else ''}: rc={rc} "
+                  f"({time.time()-t0:.0f}s) -> {lres.name}", flush=True)
             if rc != 0:
                 print(f"  !! leveled failed; see {llog}", flush=True)
 
             if not keep:
                 if db.exists():
                     db.unlink()
-                shutil.rmtree(root, ignore_errors=True)
+                if not reuse_store:
+                    shutil.rmtree(root, ignore_errors=True)
+
+        if not keep:
+            shutil.rmtree(work / f"leveled-{label}-shared-{regime}", ignore_errors=True)
 
         if slice_path is not None and not keep:
             slice_path.unlink(missing_ok=True)
