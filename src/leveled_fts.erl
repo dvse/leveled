@@ -412,6 +412,12 @@ pack_index_specs(Ref, ByCol, BatchSeq, Aliases) ->
                 Runs =/= []
             ]
         ),
+    %% Page terms carry 16-bit page numbers: beyond 65,536 pages the
+    %% terms wrap and overwrite each other. Refuse rather than corrupt.
+    case length(Pages) > 65535 of
+        true -> throw({fts_error, {batch_page_limit_exceeded, length(Pages)}});
+        false -> ok
+    end,
     case {Pages, Aliases} of
         {[], []} ->
             [];
@@ -1662,30 +1668,46 @@ compact_index_specs(FoldSource, Bucket, Ref, NewSeq, Limits0) ->
 %% exceed the budget, which reads in microseconds and never mega-merges.
 %% Batch size is estimated from the directory (pages x page target).
 compact_limits(MaxBatches) when is_integer(MaxBatches) ->
-    #{max_batches => MaxBatches, max_bytes => 512 * 1024 * 1024};
+    compact_limits(#{max_batches => MaxBatches});
 compact_limits(#{} = Limits) ->
     #{
         max_batches => maps:get(max_batches, Limits, 256),
-        max_bytes => maps:get(max_bytes, Limits, 512 * 1024 * 1024)
+        max_bytes => maps:get(max_bytes, Limits, 512 * 1024 * 1024),
+        %% Page numbers are 16-bit in page terms: a merged batch beyond
+        %% 65,536 pages would WRAP and silently overwrite its own pages
+        %% (same ledger key, last write wins) — the byte budget alone
+        %% crossed that boundary at the 5GB gate-run scale. Page counts
+        %% from the directory probes are exact, so this bound is hard.
+        max_pages => maps:get(max_pages, Limits, 60000)
     }.
 
-choose_compact_batches(LiveDirs, #{max_batches := MaxN, max_bytes := MaxBytes}) ->
-    choose_compact_batches(LiveDirs, MaxN, MaxBytes, 0, []).
+choose_compact_batches(LiveDirs, #{
+    max_batches := MaxN, max_bytes := MaxBytes, max_pages := MaxPages
+}) ->
+    choose_compact_batches(LiveDirs, MaxN, MaxBytes, MaxPages, 0, 0, []).
 
-choose_compact_batches([], _MaxN, _MaxBytes, _Bytes, Acc) ->
+choose_compact_batches([], _MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) ->
     lists:reverse(Acc);
-choose_compact_batches(_Rest, MaxN, _MaxBytes, _Bytes, Acc) when length(Acc) >= MaxN ->
+choose_compact_batches(_Rest, MaxN, _MaxBytes, _MaxPages, _Bytes, _Pages, Acc) when
+    length(Acc) >= MaxN
+->
     lists:reverse(Acc);
-choose_compact_batches([{_S, {ColMap, _A}} = SD | Rest], MaxN, MaxBytes, Bytes, Acc) ->
-    Estimate =
-        maps:fold(
-            fun(_ColId, PS, B) -> B + probe_size(PS) * ?FTS_PAGE_TARGET_BYTES end,
-            0,
-            ColMap
-        ),
-    case Bytes + Estimate > MaxBytes andalso Acc =/= [] of
-        true -> lists:reverse(Acc);
-        false -> choose_compact_batches(Rest, MaxN, MaxBytes, Bytes + Estimate, [SD | Acc])
+choose_compact_batches(
+    [{_S, {ColMap, _A}} = SD | Rest], MaxN, MaxBytes, MaxPages, Bytes, Pages, Acc
+) ->
+    BatchPages = maps:fold(fun(_ColId, PS, N) -> N + probe_size(PS) end, 0, ColMap),
+    Estimate = BatchPages * ?FTS_PAGE_TARGET_BYTES,
+    Over =
+        (Bytes + Estimate > MaxBytes orelse Pages + BatchPages > MaxPages) andalso
+            Acc =/= [],
+    case Over of
+        true ->
+            lists:reverse(Acc);
+        false ->
+            choose_compact_batches(
+                Rest, MaxN, MaxBytes, MaxPages, Bytes + Estimate, Pages + BatchPages,
+                [SD | Acc]
+            )
     end.
 
 %% One marker fold: doc key -> live batch (alias-resolved), restricted to
