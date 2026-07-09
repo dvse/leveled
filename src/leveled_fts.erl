@@ -215,9 +215,12 @@ augment_matching(ObjectChanges, Indexes, BatchSeq) ->
                                             lists:sort(maps:to_list(ByCol))
                                     ],
                                 Delta = encode_delta(ColStreams),
+                                %% reserved objects live under the STANDARD
+                                %% tag: per-tag head codecs (ash_leveled)
+                                %% must never see engine-internal values.
                                 CarrierLK =
                                     leveled_codec:to_objectkey(
-                                        Bucket, delta_carrier_key(Index, Shard), Tag
+                                        Bucket, delta_carrier_key(Index, Shard), ?STD_TAG
                                     ),
                                 Spec =
                                     {add_payload, seg_field(Ref),
@@ -3033,13 +3036,15 @@ stream_tokens(Stream) ->
 
 query_ctx(FoldSource, Bucket, Schema, Cache, ReturnPositions) ->
     {_Index, Tag} = Ref = index_ref(Schema),
+    %% reserved base objects live under the STANDARD tag regardless of
+    %% the index tag (per-tag head codecs must never see them).
     Fetch =
         case FoldSource of
             #{fetch := F} ->
-                fun(Key) -> F(Bucket, Key, Tag) end;
+                fun(Key) -> F(Bucket, Key, ?STD_TAG) end;
             Pid when is_pid(Pid) ->
                 fun(Key) ->
-                    case leveled_bookie:book_get(Pid, Bucket, Key, Tag) of
+                    case leveled_bookie:book_get(Pid, Bucket, Key, ?STD_TAG) of
                         {ok, Value} -> {ok, Value};
                         not_found -> not_found;
                         {error, _} -> not_found
@@ -3048,6 +3053,7 @@ query_ctx(FoldSource, Bucket, Schema, Cache, ReturnPositions) ->
             _FunOnly ->
                 undefined
         end,
+    _ = Tag,
     #{
         fold => FoldSource,
         bucket => Bucket,

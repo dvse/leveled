@@ -1748,11 +1748,12 @@ handle_call({ftsconsolidate_apply, Bucket, Ref, Results}, From, State) when
 ->
     {Index, Tag} = Ref,
     Field = {fts_term, Index, Tag},
+    %% reserved objects (bases, carriers) live under the STANDARD tag.
     Changes =
         lists:append([
             [
                 {leveled_codec:to_objectkey(
-                     Bucket, leveled_fts:base_object_key(Index, Shard), Tag
+                     Bucket, leveled_fts:base_object_key(Index, Shard), ?STD_TAG
                  ),
                     Base,
                     {[
@@ -1761,7 +1762,7 @@ handle_call({ftsconsolidate_apply, Bucket, Ref, Results}, From, State) when
                      ],
                         infinity}},
                 {leveled_codec:to_objectkey(
-                     Bucket, leveled_fts:delta_carrier_key(Index, Shard), Tag
+                     Bucket, leveled_fts:delta_carrier_key(Index, Shard), ?STD_TAG
                  ),
                     <<0>>,
                     {[
