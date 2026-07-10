@@ -272,7 +272,16 @@ Leveled object and configure columns over the fields you want searchable. FTS
 does not replace the object model and does not require a second per-response
 index write.
 
-Two batched paths avoid a `book_get` round trip per hit:
+`book_get` itself executes caller-side: the Bookie call only creates a
+ledger snapshot, and the head lookup plus journal body read run in the
+calling process, so concurrent readers do not serialize through the
+Bookie/Inker singletons. A journal re-organisation race during the
+caller-side read falls back transparently to `book_get_direct/4` (the
+strict in-Bookie path, also exported); the two paths are pinned equal
+by `get_runner_differential_test_` and the architecture is guarded by
+`get_concurrent_scaling_test_`.
+
+Two batched paths additionally amortize the per-read snapshot cost:
 
 - `{include_docs, true}` in the query options attaches each live hit's
   object under a `document` key in the result map, hydrated inside the

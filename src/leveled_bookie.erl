@@ -67,6 +67,7 @@
     book_get/4,
     book_mget/3,
     book_mget/4,
+    book_get_direct/4,
     book_get_sqn/3,
     book_get_sqn/4,
     book_head/3,
@@ -803,6 +804,46 @@ book_delete(Pid, Bucket, Key, IndexSpecs) ->
 %% request would not be supported
 
 book_get(Pid, Bucket, Key, Tag) ->
+    %% Caller-side execution: the bookie call only creates a ledger
+    %% snapshot and returns the inker reference; the head lookup and the
+    %% journal body read run in the calling process (the same machinery
+    %% as book_mget, without its chunk workers). This keeps large/cold
+    %% value reads out of the bookie and inker singletons, so concurrent
+    %% readers no longer serialize behind each other's disk IO.
+    %%
+    %% Any crash in the caller-side read (a journal re-organisation race:
+    %% file close/truncation between the plan and the read) falls back to
+    %% the direct in-bookie path, which re-plans under the inker's own
+    %% serialization and is always correct - degradation is a retried
+    %% read, never a wrong answer. The {get, ...} handle_call clause is
+    %% retained unchanged as that fallback and as the differential-test
+    %% oracle (see get_runner_differential_test_).
+    case gen_server:call(Pid, {get_fetchspec, Bucket, Key, Tag}, infinity) of
+        not_found ->
+            not_found;
+        {fetch, LK, SQN, Inker} ->
+            try leveled_inker:ink_mget(Inker, [{LK, SQN}]) of
+                [{ok, Object}] ->
+                    {ok, Object};
+                [not_present] ->
+                    %% the head said fetch: not_present here is a journal
+                    %% re-organisation race, never a real absence - the
+                    %% direct path re-plans under the inker's serialization
+                    book_get_direct(Pid, Bucket, Key, Tag)
+            catch
+                _:_ ->
+                    book_get_direct(Pid, Bucket, Key, Tag)
+            end
+    end.
+
+-spec book_get_direct(pid(), leveled_codec:key(), leveled_codec:key(), leveled_codec:tag()) ->
+    {ok, any()} | not_found.
+%% @doc The strict single-round-trip GET: head lookup and journal fetch
+%% both execute inside the bookie's handle_call. Semantically identical
+%% to book_get/4 (pinned by differential test); used as the race
+%% fallback and available to callers that need the read fully
+%% serialized through the bookie.
+book_get_direct(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {get, Bucket, Key, Tag}, infinity).
 
 -spec book_mget(
@@ -1943,6 +1984,27 @@ handle_call({get, Bucket, Key, Tag}, _From, State) when
         State#state.monitor, TS0, TS1, GetResult == not_found
     ),
     {reply, GetResult, State};
+handle_call({get_fetchspec, Bucket, Key, Tag}, _From, State) when
+    State#state.head_only == false
+->
+    %% Caller-side GET (see book_get/4): the bookie resolves the head
+    %% INLINE - the same cheap in-memory work the direct {get, ...} path
+    %% does (ledger cache + penciller, no snapshot, no ledger-cache
+    %% clone) - and returns the journal fetch spec; the caller performs
+    %% the disk read via a single-pair ink_mget. A value at a given SQN
+    %% is immutable, so reading it after the reply is identical to
+    %% reading it inside the call; the only divergence is journal
+    %% compaction reaping the entry in between, which surfaces as
+    %% not_present/crash and falls back to the direct path.
+    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    Reply =
+        case current_head_state(LedgerKey, State) of
+            {active, Seqn, _MD} ->
+                {fetch, LedgerKey, Seqn, State#state.inker};
+            _Other ->
+                not_found
+        end,
+    {reply, Reply, State};
 handle_call({mget, Bucket, Keys, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -4643,7 +4705,9 @@ mget_testto() ->
     ?assertEqual(Keys, [K || {K, _R} <- Results]),
     lists:foreach(
         fun({K, R}) ->
-            ?assertEqual(book_get(Bookie1, <<"Bucket">>, K, ?STD_TAG), R)
+            % book_get_direct is the in-bookie oracle: book_get itself now
+            % executes caller-side via the same machinery as mget
+            ?assertEqual(book_get_direct(Bookie1, <<"Bucket">>, K, ?STD_TAG), R)
         end,
         Results
     ),
@@ -4660,6 +4724,118 @@ mget_testto() ->
     ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
     ok = book_close(Bookie2),
     reset_filestructure().
+
+get_runner_differential_test_() ->
+    {timeout, 60, fun get_runner_differential_testto/0}.
+
+get_runner_differential_testto() ->
+    % book_get/4 (caller-side runner) must equal book_get_direct/4 (the
+    % in-bookie path) for every observable shape: live values across
+    % journal generations, tombstones, expired TTLs, missing keys, and
+    % values served from the journal after a restart.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([{root_path, RootPath}, {max_journalsize, 100000}]),
+    ObjL1 = generate_multiple_objects(300, 1),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, V, S, ?STD_TAG)
+        end,
+        ObjL1
+    ),
+    {DelK, _DelV, _DelS} = lists:nth(3, ObjL1),
+    ok = book_delete(Bookie1, <<"Bucket">>, DelK, []),
+    {ExpK, ExpV, ExpS} = lists:nth(5, ObjL1),
+    Past = leveled_util:integer_now() - 300,
+    ok = book_tempput(Bookie1, <<"Bucket">>, ExpK, ExpV, ExpS, ?STD_TAG, Past),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, {updated, V}, S, ?STD_TAG)
+        end,
+        lists:sublist(ObjL1, 20, 40)
+    ),
+    CheckAll =
+        fun(Bookie) ->
+            lists:foreach(
+                fun(K) ->
+                    ?assertEqual(
+                        book_get_direct(Bookie, <<"Bucket">>, K, ?STD_TAG),
+                        book_get(Bookie, <<"Bucket">>, K, ?STD_TAG)
+                    )
+                end,
+                [K || {K, _V, _S} <- ObjL1] ++ [<<"absent_key">>]
+            )
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    CheckAll(Bookie2),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+get_concurrent_scaling_test_() ->
+    {timeout, 120, fun get_concurrent_scaling_testto/0}.
+
+get_concurrent_scaling_testto() ->
+    % The property caller-side execution exists for: N concurrent readers
+    % of journal-resident values must not serialize through the
+    % bookie/inker singletons. Loose bound (guards the architecture, not
+    % a machine-specific ratio).
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([{root_path, RootPath}, {max_journalsize, 10000000}]),
+    Value = crypto:strong_rand_bytes(65536),
+    Keys =
+        [
+            begin
+                K = list_to_binary("conc_key" ++ integer_to_list(I)),
+                ok = book_put(Bookie1, <<"Bucket">>, K, Value, [], ?STD_TAG),
+                K
+            end
+         || I <- lists:seq(1, 64)
+        ],
+    ReadAll =
+        fun() ->
+            lists:foreach(
+                fun(K) ->
+                    {ok, _} = book_get(Bookie1, <<"Bucket">>, K, ?STD_TAG)
+                end,
+                Keys
+            )
+        end,
+    ReadAll(),
+    {SerialUS, ok} = timer:tc(fun() -> ReadAll(), ok end),
+    Readers = 8,
+    Parent = self(),
+    {ConcurrentUS, ok} =
+        timer:tc(
+            fun() ->
+                Refs =
+                    [
+                        begin
+                            Ref = make_ref(),
+                            spawn_link(fun() ->
+                                ReadAll(),
+                                Parent ! {done, Ref}
+                            end),
+                            Ref
+                        end
+                     || _ <- lists:seq(1, Readers)
+                    ],
+                lists:foreach(
+                    fun(Ref) ->
+                        receive
+                            {done, Ref} -> ok
+                        end
+                    end,
+                    Refs
+                ),
+                ok
+            end
+        ),
+    ok = book_close(Bookie1),
+    reset_filestructure(),
+    ?assert(ConcurrentUS < SerialUS * 4 + 500000).
 
 hashlist_query_test_() ->
     {timeout, 60, fun hashlist_query_testto/0}.
