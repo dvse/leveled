@@ -67,6 +67,12 @@
     book_get/4,
     book_mget/3,
     book_mget/4,
+    book_mhead/3,
+    book_mhead/4,
+    book_mput_std/2,
+    book_mput_std/3,
+    book_casmput/3,
+    book_casmput/4,
     book_get_direct/4,
     book_get_sqn/3,
     book_get_sqn/4,
@@ -606,6 +612,40 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
 %% cache before the caller is acknowledged. A `pause' return has the same
 %% meaning as book_put/8: the batch has been accepted, and the caller should
 %% back off before sending more writes.
+-spec book_mput_std(pid(), list(tuple()), boolean()) ->
+    ok | pause | {error, term()}.
+%% @doc Standard KV plural put (TARGET_API.md §3.2). For standard (not
+%% head_only) stores: Entries are the batch write specs; per-entry
+%% semantics are identical to N book_put calls, PLUS atomic durability -
+%% the batch commits as one journal group, so after a crash either every
+%% entry is recoverable or none is. No isolation is claimed; the
+%% transaction layer owns isolation. For head_only stores the historical
+%% ObjectSpecs/TTL semantics are preserved (dispatched by store mode).
+%%
+%% This is the target-state name for book_batchput, which is retained as
+%% a deprecated alias until consumers migrate.
+book_mput_std(Pid, Entries, DataSync) ->
+    gen_server:call(Pid, {batchput, Entries, DataSync}, infinity).
+
+book_mput_std(Pid, Entries) ->
+    book_mput_std(Pid, Entries, false).
+
+-spec book_casmput(pid(), list(tuple()), list(tuple()), boolean()) ->
+    ok | pause | {error, term()}.
+%% @doc Plural conditional put: book_mput_std semantics with CAS
+%% conditions checked before commit (target state per TARGET_API.md
+%% §3.3: per-entry publish-time evaluation; current stage preserves the
+%% existing whole-batch precondition contract of casbatchput, which the
+%% ash_leveled atomic layer relies on). Target-state name for
+%% book_casbatchput (retained as deprecated alias).
+book_casmput(Pid, Entries, Conditions, DataSync) ->
+    gen_server:call(Pid, {casbatchput, Entries, Conditions, DataSync}, infinity).
+
+book_casmput(Pid, Entries, Conditions) ->
+    book_casmput(Pid, Entries, Conditions, false).
+
+%% @deprecated Use book_mput_std/3 (standard stores). Alias retained for
+%% consumer migration; removed once ash_leveled is off it.
 book_batchput(Pid, BatchSpecs) ->
     book_batchput(Pid, BatchSpecs, false).
 
@@ -910,6 +950,17 @@ book_get_sqn(Pid, Bucket, Key, Tag) ->
 
 book_head(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {head, Bucket, Key, Tag, false}, infinity).
+
+-spec book_mhead(pid(), leveled_codec:key(), [leveled_codec:key()], leveled_codec:tag()) ->
+    [{leveled_codec:key(), {ok, any()} | not_found}].
+%% @doc Plural book_head: one call resolves every head inline (pure
+%% in-memory work, no snapshot). Input order preserved, duplicates
+%% allowed; per-key semantics identical to book_head/4.
+book_mhead(Pid, Bucket, Keys, Tag) ->
+    gen_server:call(Pid, {mhead, Bucket, Keys, Tag}, infinity).
+
+book_mhead(Pid, Bucket, Keys) ->
+    book_mhead(Pid, Bucket, Keys, ?STD_TAG).
 
 book_head_sqn(Pid, Bucket, Key, Tag) ->
     gen_server:call(Pid, {head_sqn, Bucket, Key, Tag}, infinity).
@@ -2039,6 +2090,24 @@ handle_call({get_fetchspec, Bucket, Key, Tag}, _From, State) when
                 not_found
         end,
     {reply, Reply, State};
+handle_call({mhead, Bucket, Keys, Tag}, _From, State) when
+    State#state.head_only == false
+->
+    %% Plural head: N inline resolutions, no snapshot (TARGET_API §3.1).
+    Results =
+        lists:map(
+            fun(Key) ->
+                LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+                case current_head_state(LedgerKey, State) of
+                    {active, _Seqn, MD} ->
+                        {Key, {ok, leveled_head:build_head(Tag, MD)}};
+                    _Other ->
+                        {Key, not_found}
+                end
+            end,
+            Keys
+        ),
+    {reply, Results, State};
 handle_call({mget_fetchspecs, Bucket, Keys, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -4779,6 +4848,55 @@ mget_testto() ->
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
     ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+mput_std_differential_test_() ->
+    {timeout, 60, fun mput_std_differential_testto/0}.
+
+mput_std_differential_testto() ->
+    % book_mput_std per-entry semantics must equal N book_puts: same
+    % stored values (via book_get_direct), same index behaviour, values
+    % served from the journal after restart. Also pins the deprecated
+    % book_batchput alias to book_mput_std equality, and book_mhead to
+    % per-key book_head.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} = book_start([{root_path, RootPath}]),
+    ObjL = generate_multiple_objects(60, 1),
+    {PutHalf, MputHalf} = lists:split(30, ObjL),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, V, S, ?STD_TAG)
+        end,
+        PutHalf
+    ),
+    Specs =
+        [{put, <<"Bucket">>, K, V, S, ?STD_TAG, infinity} || {K, V, S} <- MputHalf],
+    ok = book_mput_std(Bookie1, Specs, false),
+    CheckAll =
+        fun(Bookie) ->
+            lists:foreach(
+                fun({K, V, _S}) ->
+                    ?assertEqual(
+                        {ok, V}, book_get_direct(Bookie, <<"Bucket">>, K, ?STD_TAG)
+                    )
+                end,
+                ObjL
+            ),
+            Keys = [K || {K, _V, _S} <- ObjL],
+            MHeads = book_mhead(Bookie, <<"Bucket">>, Keys, ?STD_TAG),
+            ?assertEqual(Keys, [K || {K, _R} <- MHeads]),
+            lists:foreach(
+                fun({K, R}) ->
+                    ?assertEqual(book_head(Bookie, <<"Bucket">>, K, ?STD_TAG), R)
+                end,
+                MHeads
+            )
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    CheckAll(Bookie2),
     ok = book_close(Bookie2),
     reset_filestructure().
 

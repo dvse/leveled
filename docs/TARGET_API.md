@@ -1,6 +1,13 @@
 # Leveled Target Public API
 
-Status: TARGET SPECIFICATION (settled 2026-07-11). This document defines
+Status: TARGET SPECIFICATION (settled 2026-07-11). Landed so far:
+fetchspec `book_mget`/`book_get` (§3.1, snapshot-free reads);
+`book_mhead` (§3.1); `book_mput_std`/`book_casmput` surface (§3.2/§3.3
+naming + contract over the existing batch engine — the
+RESOLVE→IO→PUBLISH write engine is migration step 2; `book_mput/3` for
+standard stores awaits absorbing the head_only arity). Deprecated
+aliases `book_batchput`/`book_casbatchput` retained until ash_leveled
+migrates. This document defines
 the complete public Bookie surface in its target state, the uniform
 execution protocol underneath every operation, the guarantee each
 operation carries, and the migration/retirement plan for the current
