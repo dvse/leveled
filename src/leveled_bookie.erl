@@ -865,8 +865,42 @@ book_get_direct(Pid, Bucket, Key, Tag) ->
 %% parallel).  Many callers can therefore fetch concurrently without
 %% serialising one journal round-trip per object through the inker.
 book_mget(Pid, Bucket, Keys, Tag) ->
-    {async, Runner} = gen_server:call(Pid, {mget, Bucket, Keys, Tag}, infinity),
-    Runner().
+    %% Plural book_get: one bookie call resolves every head inline (no
+    %% snapshot - see {mget_fetchspecs, ...}); the caller reads all
+    %% journal values in one batched ink_mget. A journal
+    %% re-organisation race (crash, or not_present after a positive
+    %% head) falls back to the direct per-key path for the affected
+    %% keys - a retried read, never a wrong answer.
+    {Specs, Inker} = gen_server:call(Pid, {mget_fetchspecs, Bucket, Keys, Tag}, infinity),
+    Pairs = [{LK, SQN} || {_Key, {fetch, LK, SQN}} <- Specs],
+    Values =
+        try
+            leveled_inker:ink_mget(Inker, Pairs)
+        catch
+            _:_ -> race
+        end,
+    case Values of
+        race ->
+            [{Key, book_get_direct(Pid, Bucket, Key, Tag)} || {Key, _} <- Specs];
+        _ ->
+            zip_mget_fetchspecs(Pid, Bucket, Tag, Specs, Values)
+    end.
+
+zip_mget_fetchspecs(_Pid, _Bucket, _Tag, [], []) ->
+    [];
+zip_mget_fetchspecs(Pid, Bucket, Tag, [{Key, not_found} | RestS], Values) ->
+    [{Key, not_found} | zip_mget_fetchspecs(Pid, Bucket, Tag, RestS, Values)];
+zip_mget_fetchspecs(Pid, Bucket, Tag, [{Key, {fetch, _LK, _SQN}} | RestS], [Value | RestV]) ->
+    Result =
+        case Value of
+            {ok, Object} ->
+                {ok, Object};
+            not_present ->
+                %% positive head + missing journal value = reorganisation
+                %% race, never real absence - confirm via the direct path
+                book_get_direct(Pid, Bucket, Key, Tag)
+        end,
+    [{Key, Result} | zip_mget_fetchspecs(Pid, Bucket, Tag, RestS, RestV)].
 
 book_mget(Pid, Bucket, Keys) ->
     book_mget(Pid, Bucket, Keys, ?STD_TAG).
@@ -2005,6 +2039,29 @@ handle_call({get_fetchspec, Bucket, Key, Tag}, _From, State) when
                 not_found
         end,
     {reply, Reply, State};
+handle_call({mget_fetchspecs, Bucket, Keys, Tag}, _From, State) when
+    State#state.head_only == false
+->
+    %% Plural form of {get_fetchspec, ...}: N inline head resolutions in
+    %% one call - the same cheap in-memory work per key as the singular,
+    %% with NO ledger snapshot (a snapshot clones the write-heavy ledger
+    %% cache, measured as 3-37x regressions when paid per small batch).
+    %% The caller performs the journal reads for all fetch specs via one
+    %% batched ink_mget. Per-key semantics are pinned to book_get by
+    %% mget_fetchspec_differential_test_.
+    Inker = State#state.inker,
+    Specs =
+        lists:map(
+            fun(Key) ->
+                LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+                case current_head_state(LedgerKey, State) of
+                    {active, Seqn, _MD} -> {Key, {fetch, LedgerKey, Seqn}};
+                    _Other -> {Key, not_found}
+                end
+            end,
+            Keys
+        ),
+    {reply, {Specs, Inker}, State};
 handle_call({mget, Bucket, Keys, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -4722,6 +4779,55 @@ mget_testto() ->
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
     ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+mget_fetchspec_differential_test_() ->
+    {timeout, 60, fun mget_fetchspec_differential_testto/0}.
+
+mget_fetchspec_differential_testto() ->
+    % book_mget (fetchspec path) must equal per-key book_get_direct for
+    % every shape: live values across journal generations, tombstones,
+    % expired TTLs, absent keys, duplicates, and post-restart serving.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([{root_path, RootPath}, {max_journalsize, 100000}]),
+    ObjL1 = generate_multiple_objects(300, 1),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, V, S, ?STD_TAG)
+        end,
+        ObjL1
+    ),
+    {DelK, _DelV, _DelS} = lists:nth(3, ObjL1),
+    ok = book_delete(Bookie1, <<"Bucket">>, DelK, []),
+    {ExpK, ExpV, ExpS} = lists:nth(5, ObjL1),
+    Past = leveled_util:integer_now() - 300,
+    ok = book_tempput(Bookie1, <<"Bucket">>, ExpK, ExpV, ExpS, ?STD_TAG, Past),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, {updated, V}, S, ?STD_TAG)
+        end,
+        lists:sublist(ObjL1, 20, 40)
+    ),
+    Keys =
+        [K || {K, _V, _S} <- ObjL1] ++
+            [<<"absent_key">>, hd([K || {K, _V, _S} <- ObjL1])],
+    CheckAll =
+        fun(Bookie) ->
+            Results = book_mget(Bookie, <<"Bucket">>, Keys, ?STD_TAG),
+            ?assertEqual(Keys, [K || {K, _R} <- Results]),
+            lists:foreach(
+                fun({K, R}) ->
+                    ?assertEqual(book_get_direct(Bookie, <<"Bucket">>, K, ?STD_TAG), R)
+                end,
+                Results
+            )
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    CheckAll(Bookie2),
     ok = book_close(Bookie2),
     reset_filestructure().
 
