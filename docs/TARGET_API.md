@@ -22,8 +22,14 @@ make the stamp honest for concurrent writers on BOTH paths (direct
 writes route their advances through the same frontier). Public
 index-spec validation enforced on all caller-side paths (forged
 internal payload specs rejected identically to the direct path).
-Remaining §3.2 stage: batch-engine mput on the publish path; then
-alias retirement. Deprecated aliases retained until consumers migrate. This document defines
+**Batch mput on the caller-side path landed**: `book_mput_std`
+normalises, routes FTS buckets through the caller-side augmentation
+(one `{fts_put_intent}` seq for the batch), writes the journal via
+caller `ink_batchput`, and publishes through the frontier;
+`book_mput_std_direct` retained as oracle/fallback (differential
+test pins plain + FTS batches equal, pre/post restart). Remaining:
+casmput publish-time per-entry conditions; alias retirement.
+Deprecated aliases retained until consumers migrate. This document defines
 the complete public Bookie surface in its target state, the uniform
 execution protocol underneath every operation, the guarantee each
 operation carries, and the migration/retirement plan for the current

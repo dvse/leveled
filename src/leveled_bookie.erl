@@ -71,6 +71,7 @@
     book_mhead/4,
     book_mput_std/2,
     book_mput_std/3,
+    book_mput_std_direct/3,
     book_casmput/3,
     book_casmput/4,
     book_get_direct/4,
@@ -800,7 +801,88 @@ book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
 %% This is the target-state name for book_batchput, which is retained as
 %% a deprecated alias until consumers migrate.
 book_mput_std(Pid, Entries, DataSync) ->
+    %% Caller-side execution (TARGET_API §3.2, batch stage): spec
+    %% normalisation and - for FTS-indexed buckets - the posting
+    %% augmentation (the dominant CPU) run in THIS process; the journal
+    %% write goes through caller ink_batchput; the Bookie absorbs the
+    %% prepared ledger changes via {publish_fts, ...} behind the
+    %% absorption frontier. Any race or unsupported shape falls back to
+    %% the direct in-Bookie path (book_mput_std_direct), which is also
+    %% the differential oracle.
+    case write_refs(Pid) of
+        {ok, Inker, FtsIndexes} ->
+            mput_caller_side(Pid, Inker, FtsIndexes, Entries, DataSync);
+        unsupported ->
+            book_mput_std_direct(Pid, Entries, DataSync)
+    end.
+
+-spec book_mput_std_direct(pid(), list(tuple()), boolean()) ->
+    ok | pause | {error, term()}.
+%% @doc The strict in-Bookie batch put: normalisation, augmentation,
+%% journal write and ledger absorb all inside the handle_call.
+%% Semantically identical to book_mput_std/3 (pinned by differential
+%% test); the race fallback target and escape hatch.
+book_mput_std_direct(Pid, Entries, DataSync) ->
     gen_server:call(Pid, {batchput, Entries, DataSync}, infinity).
+
+mput_caller_side(Pid, Inker, FtsIndexes, Entries, DataSync) ->
+    try
+        case normalise_batch_specs(Entries) of
+            {ok, ObjectChanges} ->
+                AnyFts =
+                    lists:any(
+                        fun({{Tag, Bucket, _K, null}, _Obj, _SpecsTTL}) ->
+                            Tag =/= ?HEAD_TAG andalso
+                                leveled_fts:bucket_has_schema(Bucket, FtsIndexes)
+                        end,
+                        ObjectChanges
+                    ),
+                case AnyFts of
+                    true ->
+                        {ok, Seq, _Ix, _Ink} =
+                            gen_server:call(Pid, {fts_put_intent}, infinity),
+                        case
+                            leveled_fts:augment_object_changes(
+                                ObjectChanges, FtsIndexes, Seq
+                            )
+                        of
+                            {ok, AugChanges, Touched} ->
+                                Markers =
+                                    leveled_fts:marker_cache_updates(
+                                        AugChanges, FtsIndexes
+                                    ),
+                                FtsAdvance = {Touched, Seq, Seq - 1, Markers},
+                                mput_write_and_publish(
+                                    Pid, Inker, AugChanges, FtsAdvance, DataSync
+                                );
+                            {error, _Reason} ->
+                                book_mput_std_direct(Pid, Entries, DataSync)
+                        end;
+                    false ->
+                        mput_write_and_publish(
+                            Pid, Inker, ObjectChanges, {[], 0, 0, []}, DataSync
+                        )
+                end;
+            {error, Reason} ->
+                {error, Reason}
+        end
+    catch
+        _:_ ->
+            erlang:erase({leveled_bookie_write_refs, Pid}),
+            book_mput_std_direct(Pid, Entries, DataSync)
+    end.
+
+mput_write_and_publish(Pid, Inker, Changes, FtsAdvance, DataSync) ->
+    {ok, SQN, ObjectWriteInfos} =
+        leveled_inker:ink_batchput(Inker, Changes, DataSync),
+    ChangesList =
+        lists:map(
+            fun({LK, Obj, KeyChanges, ObjSize}) ->
+                preparefor_ledgercache(null, LK, SQN, Obj, ObjSize, KeyChanges)
+            end,
+            ObjectWriteInfos
+        ),
+    gen_server:call(Pid, {publish_fts, SQN, ChangesList, FtsAdvance}, infinity).
 
 book_mput_std(Pid, Entries) ->
     book_mput_std(Pid, Entries, false).
@@ -5421,6 +5503,69 @@ put_publish_reorder_testto() ->
     CheckAll(Bookie1),
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    CheckAll(Bookie2),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+mput_callerside_fts_differential_test_() ->
+    {timeout, 120, fun mput_callerside_fts_differential_testto/0}.
+
+mput_callerside_fts_differential_testto() ->
+    % Caller-side mput (normalisation + augmentation + journal write in
+    % the caller, frontier publish) must equal book_mput_std_direct for
+    % plain AND FTS-indexed buckets: values via book_get_direct, search
+    % results via book_ftssearch, pre/post restart.
+    RootPath = reset_filestructure(),
+    Indexes = [#{bucket => <<"docs">>, index => <<"main">>, columns => [body]}],
+    StartOpts = [{root_path, RootPath}, {fts_indexes, Indexes}],
+    {ok, Bookie1} = book_start(StartOpts),
+    MkSpec =
+        fun(Bucket, K, Obj) ->
+            {put, Bucket, K, Obj, [], ?STD_TAG, infinity}
+        end,
+    % direct batch into the fts bucket + plain bucket
+    DirectFts =
+        [MkSpec(<<"docs">>, list_to_binary("d" ++ integer_to_list(I)),
+             #{body => <<"alpha common">>}) || I <- lists:seq(1, 10)],
+    ok = book_mput_std_direct(Bookie1, DirectFts, false),
+    DirectPlain =
+        [MkSpec(<<"plain">>, list_to_binary("p" ++ integer_to_list(I)),
+             {v, I}) || I <- lists:seq(1, 10)],
+    ok = book_mput_std_direct(Bookie1, DirectPlain, false),
+    % caller-side batches, interleaved buckets
+    CallerFts =
+        [MkSpec(<<"docs">>, list_to_binary("c" ++ integer_to_list(I)),
+             #{body => <<"beta common">>}) || I <- lists:seq(1, 10)],
+    ok = book_mput_std(Bookie1, CallerFts, false),
+    CallerPlain =
+        [MkSpec(<<"plain">>, list_to_binary("q" ++ integer_to_list(I)),
+             {w, I}) || I <- lists:seq(1, 10)],
+    ok = book_mput_std(Bookie1, CallerPlain, false),
+    CheckAll =
+        fun(Bookie) ->
+            lists:foreach(
+                fun(I) ->
+                    KD = list_to_binary("d" ++ integer_to_list(I)),
+                    KC = list_to_binary("c" ++ integer_to_list(I)),
+                    KP = list_to_binary("p" ++ integer_to_list(I)),
+                    KQ = list_to_binary("q" ++ integer_to_list(I)),
+                    ?assertMatch({ok, _}, book_get_direct(Bookie, <<"docs">>, KD, ?STD_TAG)),
+                    ?assertMatch({ok, _}, book_get_direct(Bookie, <<"docs">>, KC, ?STD_TAG)),
+                    ?assertEqual({ok, {v, I}}, book_get_direct(Bookie, <<"plain">>, KP, ?STD_TAG)),
+                    ?assertEqual({ok, {w, I}}, book_get_direct(Bookie, <<"plain">>, KQ, ?STD_TAG))
+                end,
+                lists:seq(1, 10)
+            ),
+            {async, R1} = book_ftssearch(Bookie, <<"docs">>, <<"main">>, <<"common">>, #{}),
+            {ok, H1} = R1(),
+            ?assertEqual(20, length(H1)),
+            {async, R2} = book_ftssearch(Bookie, <<"docs">>, <<"main">>, <<"beta">>, #{}),
+            {ok, H2} = R2(),
+            ?assertEqual(10, length(H2))
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start(StartOpts),
     CheckAll(Bookie2),
     ok = book_close(Bookie2),
     reset_filestructure().
