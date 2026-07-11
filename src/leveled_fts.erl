@@ -1160,8 +1160,8 @@ count_frames(
     N
 ) ->
     count_frames(Rest, N + 1);
-count_frames(_Bad, _N) ->
-    throw({fts_error, invalid_fts_payload}).
+count_frames(Bad, N) ->
+    throw({fts_error, {invalid_fts_payload, count_frames, N, byte_size(Bad)}}).
 
 term_metas(_Ctx, _AST, []) ->
     #{};
@@ -2764,9 +2764,21 @@ reserved_fts_key(_Key) -> false.
 
 %% Doc frame: the posting's write sequence travels with it.
 %%   <<Seq:64, KeyLen:16, Key, PosLen:16, PosBin>>
-encode_frame(Seq, Key, PosBin) ->
+%% Both length fields are 16-bit: a size at or above 2^16 would wrap
+%% modulo 2^16 in the binary construction and desynchronise the frame
+%% walk at rest. Keys are bounded by the write path and positions by
+%% ?MAX_POSITIONS_BYTES (encode_positions); the guards make any future
+%% breach a loud error instead of silent index corruption.
+encode_frame(Seq, Key, PosBin) when
+    byte_size(Key) < 65536, byte_size(PosBin) < 65536
+->
     <<Seq:64/unsigned-big, (byte_size(Key)):16/unsigned-big, Key/binary,
-        (byte_size(PosBin)):16/unsigned-big, PosBin/binary>>.
+        (byte_size(PosBin)):16/unsigned-big, PosBin/binary>>;
+encode_frame(_Seq, Key, PosBin) ->
+    throw(
+        {fts_error,
+            {frame_field_overflow, byte_size(Key), byte_size(PosBin)}}
+    ).
 
 %% Walk frames, decoding positions only for wanted keys.
 extract_frames(FramesBin, KeyFilter, NeedPos) ->
@@ -2791,15 +2803,15 @@ extract_frames(
                     true ->
                         case decode_positions(PosBin, 0, []) of
                             {ok, Positions} -> Positions;
-                            error -> throw({fts_error, invalid_fts_payload})
+                            error -> throw({fts_error, {invalid_fts_payload, positions, byte_size(PosBin)}})
                         end;
                     false ->
                         present
                 end,
             extract_frames(Rest, KeyFilter, NeedPos, [{Key, Seq, Value} | Acc])
     end;
-extract_frames(_Bad, _KeyFilter, _NeedPos, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
+extract_frames(Bad, _KeyFilter, _NeedPos, _Acc) ->
+    throw({fts_error, {invalid_fts_payload, frames, byte_size(Bad)}}).
 
 %% Entry: <<TokLen:16, Token, NDocs:32, FramesLen:32, Frames>> — the
 %% frames length makes entry walking O(1) per entry.
@@ -2817,8 +2829,8 @@ fold_entries(
     Acc
 ) ->
     fold_entries(Rest, Fun, Fun(Token, NDocs, Frames, Acc));
-fold_entries(_Bad, _Fun, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
+fold_entries(Bad, _Fun, _Acc) ->
+    throw({fts_error, {invalid_fts_payload, entry_stream, byte_size(Bad)}}).
 
 %% Delta payload: per-column entry streams.
 %%   <<NCols:8, [ColId:8, StreamLen:32, EntryStream]...>>
@@ -2833,8 +2845,8 @@ encode_delta(ColStreams) ->
 
 decode_delta(<<NCols:8/unsigned-big, Rest/binary>>) ->
     decode_delta_cols(NCols, Rest, []);
-decode_delta(_Bad) ->
-    throw({fts_error, invalid_fts_payload}).
+decode_delta(Bad) ->
+    throw({fts_error, {invalid_fts_payload, delta_header, byte_size(Bad)}}).
 
 decode_delta_cols(0, <<>>, Acc) ->
     lists:reverse(Acc);
@@ -2844,8 +2856,12 @@ decode_delta_cols(
     Acc
 ) when N > 0 ->
     decode_delta_cols(N - 1, Rest, [{ColId, Stream} | Acc]);
-decode_delta_cols(_N, _Bad, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
+decode_delta_cols(N, Bad, Acc) ->
+    throw(
+        {fts_error,
+            {invalid_fts_payload, delta_cols, N, byte_size(Bad),
+                [{C, byte_size(St)} || {C, St} <- Acc]}}
+    ).
 
 %% Base binary: per column, a fixed-width probe (token binary search)
 %% over an entry stream.
@@ -2888,8 +2904,8 @@ base_probe(Stream, Off, Size, Acc) ->
 
 decode_base(<<NCols:8/unsigned-big, Rest/binary>>) ->
     decode_base_cols(NCols, Rest, #{});
-decode_base(_Bad) ->
-    throw({fts_error, invalid_fts_payload}).
+decode_base(Bad) ->
+    throw({fts_error, {invalid_fts_payload, base_header, byte_size(Bad)}}).
 
 decode_base_cols(0, <<>>, Acc) ->
     Acc;
@@ -2900,8 +2916,8 @@ decode_base_cols(
     Acc
 ) when N > 0 ->
     decode_base_cols(N - 1, Rest, Acc#{ColId => {Probe, Stream}});
-decode_base_cols(_N, _Bad, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
+decode_base_cols(N, Bad, _Acc) ->
+    throw({fts_error, {invalid_fts_payload, base_cols, N, byte_size(Bad)}}).
 
 base_probe_row({Probe, Stream}, Idx) ->
     <<EntryOff:32/unsigned-big, EntryLen:32/unsigned-big, TokLen:16/unsigned-big>> =
@@ -2960,8 +2976,8 @@ encode_summary(ConsSeq, Bloom) ->
 
 decode_summary(<<ConsSeq:64/unsigned-big, BLen:32/unsigned-big, Bloom:BLen/binary>>) ->
     {ConsSeq, Bloom};
-decode_summary(_Bad) ->
-    throw({fts_error, invalid_fts_payload}).
+decode_summary(Bad) ->
+    throw({fts_error, {invalid_fts_payload, summary, byte_size(Bad)}}).
 
 %% Heap-merge sorted entry streams into ONE stream (token-sorted,
 %% same-token frames concatenated in run order).
@@ -2988,8 +3004,8 @@ merge_streams_init(Runs) ->
 stream_head(<<TokLen:16/unsigned-big, Token:TokLen/binary, ND:32/unsigned-big,
         FLen:32/unsigned-big, Frames:FLen/binary, Tail/binary>>) ->
     {Token, ND, Frames, Tail};
-stream_head(_Bad) ->
-    throw({fts_error, invalid_fts_payload}).
+stream_head(Bad) ->
+    throw({fts_error, {invalid_fts_payload, stream_head, byte_size(Bad)}}).
 
 merge_streams_loop(Heap, Tails, Acc) ->
     case gb_sets:is_empty(Heap) of
@@ -3358,8 +3374,8 @@ frame_keys(
     Acc
 ) ->
     frame_keys(Rest, [Key | Acc]);
-frame_keys(_Bad, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
+frame_keys(Bad, Acc) ->
+    throw({fts_error, {invalid_fts_payload, frame_keys, length(Acc), byte_size(Bad)}}).
 
 %% Rewrite a stream keeping only frames whose stamp matches the doc's
 %% marker; entries left empty disappear.
@@ -3402,8 +3418,8 @@ live_frames(
         false ->
             live_frames(Rest, Markers, Kept, Acc)
     end;
-live_frames(_Bad, _Markers, _Kept, _Acc) ->
-    throw({fts_error, invalid_fts_payload}).
+live_frames(Bad, _Markers, Kept, _Acc) ->
+    throw({fts_error, {invalid_fts_payload, live_frames, Kept, byte_size(Bad)}}).
 
 %% ===================== restored evaluation engine =====================
 
@@ -3908,10 +3924,30 @@ decode_marker(_Payload) ->
 
 %% Positions are supplied already ascending (see group_positions/1), so no
 %% sort; deltas are appended directly onto the accumulator binary.
+%%
+%% Frames carry the positions binary behind a 16-bit length
+%% (encode_frame), so a document's per-token positions are capped at the
+%% largest varint-delta prefix that fits ?MAX_POSITIONS_BYTES. Without
+%% the cap, byte_size(PosBin):16 wrapped modulo 2^16 for tokens with
+%% tens of thousands of occurrences in one document (dense deltas are 1
+%% byte each), silently desynchronising the frame walk at rest: queries
+%% for THAT token and any full-stream walk (consolidation, count_frames)
+%% then failed with invalid_fts_payload while other tokens kept working.
+%% Dropping trailing occurrences loses nothing for term matching, doc
+%% counts, or ranking (tf saturates); phrase/NEAR matching ignores
+%% occurrences beyond the cap. The guard stops BEFORE an append, so the
+%% final binary is bounded by the cap plus one worst-case varint
+%% (10 bytes for a 64-bit delta): 65525 + 10 = 65535, the 16-bit max.
+-define(MAX_POSITIONS_BYTES, 65525).
+
 encode_positions(Positions) ->
     encode_positions(Positions, 0, <<>>).
 
 encode_positions([], _Last, Acc) ->
+    Acc;
+encode_positions(_Rest, _Last, Acc) when
+    byte_size(Acc) >= ?MAX_POSITIONS_BYTES
+->
     Acc;
 encode_positions([Pos | Rest], Last, Acc) ->
     encode_positions(Rest, Pos, varint_append(Pos - Last, Acc)).

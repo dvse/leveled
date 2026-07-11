@@ -248,6 +248,15 @@ instead of the hit list). Query size is capped at 4096 bytes and 128 tokens.
 Phrase and NEAR evaluation uses posting payload positions. It does not load
 candidate objects just to compare positions.
 
+A document's per-token positions are capped at the largest varint-delta
+prefix that fits the frame's 16-bit length field (~64 KiB — on the order
+of tens of thousands of occurrences of one token in one document). The
+cap drops trailing POSITIONS only: term matching, `doc_length`, counts,
+and ranking see every occurrence; phrase/NEAR matching ignores
+occurrences beyond the cap. Without it, the length field wrapped and
+silently corrupted the shard delta at rest (hot-token queries and
+consolidation then failed with `invalid_fts_payload`).
+
 Prefix terms are capped at 64 bytes and answered by reading the pages whose
 directory token ranges cover the prefix. The schema `prefixes` setting is a
 contract declaration -- search options naming different `prefixes` are

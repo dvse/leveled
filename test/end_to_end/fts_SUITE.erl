@@ -9,6 +9,7 @@
     fts_include_docs/1,
     stats_staleness_window/1,
     fts_consolidation/1,
+    hot_token_position_cap/1,
     batchput_contract/1,
     multi_token_phrase_contract/1,
     index_update_contract/1,
@@ -44,6 +45,7 @@ all() ->
         fts_include_docs,
         stats_staleness_window,
         fts_consolidation,
+        hot_token_position_cap,
         batchput_contract,
         multi_token_phrase_contract,
         index_update_contract,
@@ -2941,6 +2943,47 @@ stats_staleness_window(_Config) ->
 %% and exact bm25 ranks — must be identical before and after, across
 %% supersession, post-consolidation writes, re-consolidation, and
 %% restart.
+%% Positions ride a 16-bit length field per frame. A token with tens of
+%% thousands of occurrences in ONE document used to overflow it silently
+%% (byte_size(PosBin):16 wraps), corrupting the shard delta at rest:
+%% queries for that token and consolidation both failed with
+%% invalid_fts_payload while other tokens kept working. The write path
+%% now caps a document's per-token positions at the largest varint
+%% prefix that fits (?MAX_POSITIONS_BYTES in leveled_fts); this case
+%% pins the whole contract: hot-token query, doc_length, phrase within
+%% the capped range, consolidation, and restart.
+hot_token_position_cap(_Config) ->
+    RootPath = testutil:reset_filestructure("hot_token_position_cap"),
+    {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
+    Bucket = <<"hot-token">>,
+    Index = <<"main">>,
+    Hot = binary:copy(<<"zz ">>, 70000),
+    ok = fts_put(Bookie, Bucket, <<"khot">>, <<"o">>, Index, #{body => <<"lead marker ", Hot/binary>>}, #{}),
+    ok = fts_put(Bookie, Bucket, <<"kplain">>, <<"o">>, Index, #{body => <<"hello world">>}, #{}),
+    Check =
+        fun(B) ->
+            [HotHit] = search(B, Bucket, Index, <<"zz">>, #{}),
+            <<"khot">> = maps:get(key, HotHit),
+            %% doc_length counts every occurrence: the cap drops trailing
+            %% POSITIONS, never the document statistics
+            70002 = maps:get(doc_length, HotHit),
+            [<<"kplain">>] = keys(search(B, Bucket, Index, <<"hello">>, #{})),
+            %% phrase inside the capped range still position-matches
+            [<<"khot">>] = keys(search(B, Bucket, Index, <<"\"lead marker\"">>, #{})),
+            %% ranked query decodes the capped positions cleanly
+            [RankedHot] = search(B, Bucket, Index, <<"zz">>, #{rank => bm25}),
+            true = is_number(maps:get(rank, RankedHot))
+        end,
+    Check(Bookie),
+    {async, Cons} = leveled_bookie:book_ftsconsolidate(Bookie, Bucket, Index, #{}),
+    ok = Cons(),
+    Check(Bookie),
+    ok = leveled_bookie:book_close(Bookie),
+    {ok, Bookie2} = leveled_bookie:book_start(start_opts(RootPath)),
+    Check(Bookie2),
+    ok = leveled_bookie:book_close(Bookie2),
+    testutil:reset_filestructure().
+
 fts_consolidation(_Config) ->
     RootPath = testutil:reset_filestructure("fts_consolidation"),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(RootPath)),
@@ -3862,6 +3905,7 @@ test_fts_indexes() ->
             {<<"docs">>, <<"main">>},
             {<<"near-boundary">>, <<"main">>},
             {<<"batch">>, <<"main">>},
+            {<<"hot-token">>, <<"main">>},
             {<<"raw-contract">>, <<"main">>},
             {<<"phrase">>, <<"main">>},
             {<<"idx-maint">>, <<"main">>},
