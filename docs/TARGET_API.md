@@ -27,9 +27,22 @@ normalises, routes FTS buckets through the caller-side augmentation
 (one `{fts_put_intent}` seq for the batch), writes the journal via
 caller `ink_batchput`, and publishes through the frontier;
 `book_mput_std_direct` retained as oracle/fallback (differential
-test pins plain + FTS batches equal, pre/post restart). Remaining:
-casmput publish-time per-entry conditions; alias retirement.
-Deprecated aliases retained until consumers migrate. This document defines
+test pins plain + FTS batches equal, pre/post restart).
+**Migration complete (2026-07-12).** Alias retirement done:
+`book_batchput/2,3` and `book_casbatchput/3,4` are deleted; all
+consumers (ash_leveled, fts_SUITE, in-file tests) are on the target
+names. Naming resolution: the standard-mode batch write is
+`book_mput_std` — the bare `book_mput/2,3` name is the pre-existing
+head_only ObjectSpecs API and keeps its historical contract; §3.2's
+"book_mput" reads as `book_mput_std` for standard stores.
+`book_casmput` landed with a REVISED §3.3: publish-time per-entry
+condition evaluation is UNSOUND under current journal semantics
+(journal replay rebuilds the ledger from ALL records, so a
+condition-rejected caller-side batch resurrects on restart — proven
+by a crash-replay probe, now pinned as the restart assertion in
+`casmput_contract_test_`); conditions therefore evaluate atomically
+with the journal write inside the Bookie, preserving the whole-batch
+precondition contract. This document defines
 the complete public Bookie surface in its target state, the uniform
 execution protocol underneath every operation, the guarantee each
 operation carries, and the migration/retirement plan for the current
@@ -158,15 +171,31 @@ book_casput(Pid, Bucket, Key, Object, IndexSpecs, Tag, Condition [, TTL, DataSyn
   -> ok | {error, {condition_failed, Current}}
 
 book_casmput(Pid, Entries, Conditions [, DataSync])
-  -> [{Key, ok | {error, {condition_failed, Current}}}]
+  -> ok | pause | {error, {precondition_failed, Failures}}
 ```
 
-Conditions (current-SQN match, absence, attribute predicates — the
-existing condition vocabulary) are evaluated at PUBLISH, in-memory, per
-entry. A failed condition rejects that entry's publish; its already-
-appended journal record becomes compaction garbage (cheap, bounded by
-the batch). `book_casmput` reports per-key outcomes; there is no
-cross-entry atomicity — that is the transaction layer's job.
+**REVISED (2026-07-12).** The original target here — per-entry
+condition evaluation at PUBLISH, with rejected entries' journal
+records becoming compaction garbage — is unsound under current
+journal semantics: recovery rebuilds the ledger by replaying ALL
+journal records, so a rejected entry that was already appended
+caller-side resurrects on restart (proven by a crash-replay probe;
+the restart assertion in `casmput_contract_test_` pins the required
+behaviour). Making publish-time rejection sound needs journal abort
+records or publish-held key reservations — deferred to journal-format
+work, and not needed by any current consumer.
+
+Settled contract: conditions (current-SQN match, absence — the
+existing condition vocabulary; conditions may reference keys outside
+the write set) are evaluated in-memory inside the Bookie, atomically
+with the journal write. The contract is whole-batch: all conditions
+are checked before any entry is accepted; a failed condition rejects
+the entire batch with `{error, {precondition_failed, Failures}}` and
+leaves NO journal record. This is the one §1 exception by design: the
+batch's journal IO rides the Bookie call, bounded by the CAS batch
+size, which is small by contract (ash_leveled reservation/unique
+paths). Isolation beyond the single call remains the transaction
+layer's job.
 
 ### 3.4 Stable-view family (folds and queries)
 
@@ -202,9 +231,9 @@ book_loglevel/2, book_addlogs/2, book_removelogs/2, book_logsettings/1
 
 | Current | Disposition |
 |---|---|
-| `book_batchput/2,3` | superseded by `book_mput` (rename + protocol); removed after ash_leveled migrates |
-| `book_casbatchput/3,4` | superseded by `book_casmput`; same path |
-| current `book_mput/2,3` (existing semantics) | absorbed into the new `book_mput` contract above |
+| `book_batchput/2,3` | **RETIRED 2026-07-12** — deleted; `book_mput_std` is the name |
+| `book_casbatchput/3,4` | **RETIRED 2026-07-12** — deleted; `book_casmput` is the name (`book_casput` routes through it) |
+| `book_mput/2,3` (head_only ObjectSpecs API) | KEPT with its historical head_only contract; the standard-mode batch name is `book_mput_std` |
 | snapshot-based public mget path | internal only (fold hydration) |
 
 ## 6. Consumer mapping (ash_leveled)

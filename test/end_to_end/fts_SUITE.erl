@@ -441,7 +441,7 @@ batchput_contract(_Config) ->
         leveled_bookie:book_get(Bookie, <<"batch">>, <<"idx-batch">>),
 
     {error, invalid_index_specs} =
-        leveled_bookie:book_batchput(
+        leveled_bookie:book_mput_std(
             Bookie,
             [
                 {put, <<"raw">>, <<"metadata-spec">>, <<"obj">>,
@@ -483,7 +483,7 @@ batchput_contract(_Config) ->
 	            #{body => <<"rawbatchput">>}, #{}
 	        ),
 	    ok =
-	        leveled_bookie:book_batchput(
+	        leveled_bookie:book_mput_std(
 	            Bookie,
 	            [
 		                {put, <<"raw-contract">>, <<"raw-batch-put">>, <<"raw-normal-batch">>, [],
@@ -498,7 +498,7 @@ batchput_contract(_Config) ->
 	            #{body => <<"rawbatchdelete">>}, #{}
 	        ),
 	    ok =
-	        leveled_bookie:book_batchput(
+	        leveled_bookie:book_mput_std(
 	            Bookie,
 	            [
 	                {delete, <<"raw-contract">>, <<"raw-batch-delete">>, [], ?STD_TAG, infinity}
@@ -2252,7 +2252,7 @@ invalid_write_inputs(_Config) ->
             Bookie, <<"docs">>, HugeKey, <<"huge-key">>, [], ?STD_TAG
         ),
     {error, {invalid_fts_key, {<<"t">>, <<"k">>}}} =
-        leveled_bookie:book_batchput(Bookie, [
+        leveled_bookie:book_mput_std(Bookie, [
             {put, <<"docs">>, <<"good">>, fts_test_object(<<"o">>, #{body => <<"ok">>}),
                 [], ?STD_TAG, infinity},
             {put, <<"docs">>, {<<"t">>, <<"k">>}, <<"bad">>, [], ?STD_TAG, infinity}
@@ -3399,7 +3399,7 @@ failed_batch_sequence_contract(_Config) ->
     %% the journal SQN.
     Huge = crypto:strong_rand_bytes(200000),
     {error, batch_too_large} =
-        leveled_bookie:book_batchput(Bookie1, [
+        leveled_bookie:book_mput_std(Bookie1, [
             {put, <<"docs">>, <<"big">>, Huge, [], ?STD_TAG, infinity}
         ]),
     ok =
@@ -3471,7 +3471,7 @@ oversized_token_contract(_Config) ->
                 fts_test_object(<<"o">>, #{body => <<"common">>}), [], ?STD_TAG, infinity}
          || I <- lists:seq(1, M)
         ],
-    ok = leveled_bookie:book_batchput(Bookie, BatchSpecs),
+    ok = leveled_bookie:book_mput_std(Bookie, BatchSpecs),
     {async, CountRunner} =
         leveled_bookie:book_ftssearch(Bookie, <<"batch">>, <<"main">>, <<"common">>, #{
             result => summary
@@ -4000,7 +4000,7 @@ fts_batchput(Bookie, Ops) ->
 
 fts_batchput(Bookie, Ops, DataSync) when is_list(Ops), is_boolean(DataSync) ->
     case fts_batch_specs(Ops) of
-        {ok, BatchSpecs} -> leveled_bookie:book_batchput(Bookie, BatchSpecs, DataSync);
+        {ok, BatchSpecs} -> leveled_bookie:book_mput_std(Bookie, BatchSpecs, DataSync);
         {error, Reason} -> {error, Reason}
     end;
 fts_batchput(_Bookie, _Ops, _DataSync) ->

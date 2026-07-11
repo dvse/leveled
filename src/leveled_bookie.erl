@@ -53,13 +53,9 @@
     book_put/6,
     book_put/8,
     book_tempput/7,
-    book_batchput/2,
-    book_batchput/3,
     book_ftssearch/5,
     book_ftsconsolidate/4,
     book_casput/9,
-    book_casbatchput/3,
-    book_casbatchput/4,
     book_mput/2,
     book_mput/3,
     book_delete/4,
@@ -778,28 +774,17 @@ book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
         infinity
     ).
 
--spec book_batchput(pid(), list(leveled_codec:batch_object_spec())) ->
-    ok | pause | {error, term()}.
-%% @doc
-%%
-%% Batch standard-mode object puts/deletes under one Bookie call. The batch is
-%% invalid in head_only mode. All objects are written to the Journal under one
-%% SQN, and their object/index ledger changes are inserted into the ledger
-%% cache before the caller is acknowledged. A `pause' return has the same
-%% meaning as book_put/8: the batch has been accepted, and the caller should
-%% back off before sending more writes.
 -spec book_mput_std(pid(), list(tuple()), boolean()) ->
     ok | pause | {error, term()}.
-%% @doc Standard KV plural put (TARGET_API.md §3.2). For standard (not
-%% head_only) stores: Entries are the batch write specs; per-entry
-%% semantics are identical to N book_put calls, PLUS atomic durability -
-%% the batch commits as one journal group, so after a crash either every
-%% entry is recoverable or none is. No isolation is claimed; the
-%% transaction layer owns isolation. For head_only stores the historical
-%% ObjectSpecs/TTL semantics are preserved (dispatched by store mode).
-%%
-%% This is the target-state name for book_batchput, which is retained as
-%% a deprecated alias until consumers migrate.
+%% @doc Standard KV plural put (TARGET_API.md §3.2). Entries are batch
+%% standard-mode object puts/deletes ({put, Bucket, Key, Object,
+%% IndexSpecs, Tag, TTL} / {delete, ...}); invalid in head_only mode.
+%% Per-entry semantics are identical to N book_put calls, PLUS atomic
+%% durability - all objects are written to the Journal under one SQN, so
+%% after a crash either every entry is recoverable or none is. No
+%% isolation is claimed; the transaction layer owns isolation. A `pause'
+%% return has the same meaning as book_put/8: the batch has been
+%% accepted, and the caller should back off before sending more writes.
 book_mput_std(Pid, Entries, DataSync) ->
     %% Caller-side execution (TARGET_API §3.2, batch stage): spec
     %% normalisation and - for FTS-indexed buckets - the posting
@@ -890,30 +875,25 @@ book_mput_std(Pid, Entries) ->
 -spec book_casmput(pid(), list(tuple()), list(tuple()), boolean()) ->
     ok | pause | {error, term()}.
 %% @doc Plural conditional put: book_mput_std semantics with CAS
-%% conditions checked before commit (target state per TARGET_API.md
-%% §3.3: per-entry publish-time evaluation; current stage preserves the
-%% existing whole-batch precondition contract of casbatchput, which the
-%% ash_leveled atomic layer relies on). Target-state name for
-%% book_casbatchput (retained as deprecated alias).
+%% conditions checked before commit. Whole-batch contract: all
+%% conditions are evaluated before any entry is accepted; a failed
+%% condition returns {error, {precondition_failed, Failures}} with no
+%% entry written. Conditions may refer to keys outside the write set.
+%%
+%% Deliberately DIRECT, not caller-side (TARGET_API.md §3.3 boundary):
+%% the condition check and the journal write must be atomic in the
+%% Bookie, because journal replay rebuilds the ledger from ALL journal
+%% records - a condition-rejected batch written caller-side would
+%% resurrect on restart (proven by a crash-replay probe during
+%% caller-side development). A caller-side CAS path needs journal abort
+%% records or publish-held key reservations; deferred to journal-format
+%% work. The check itself is in-memory; only the batch's journal IO
+%% rides the Bookie here, and CAS batches are small by contract.
 book_casmput(Pid, Entries, Conditions, DataSync) ->
     gen_server:call(Pid, {casbatchput, Entries, Conditions, DataSync}, infinity).
 
 book_casmput(Pid, Entries, Conditions) ->
     book_casmput(Pid, Entries, Conditions, false).
-
-%% @deprecated Use book_mput_std/3 (standard stores). Alias retained for
-%% consumer migration; removed once ash_leveled is off it.
-book_batchput(Pid, BatchSpecs) ->
-    book_batchput(Pid, BatchSpecs, false).
-
--spec book_batchput(
-    pid(), list(leveled_codec:batch_object_spec()), boolean()
-) ->
-    ok | pause | {error, term()}.
-%% @doc
-%% See book_batchput/2.  DataSync applies to the whole batch.
-book_batchput(Pid, BatchSpecs, DataSync) when is_boolean(DataSync) ->
-    gen_server:call(Pid, {batchput, BatchSpecs, DataSync}, infinity).
 
 -spec book_ftssearch(
     pid(), leveled_codec:key(), term(), iodata() | all_docs, map() | list()
@@ -965,39 +945,11 @@ book_casput(
     DataSync,
     Condition
 ) when is_boolean(DataSync), is_atom(Tag) ->
-    book_casbatchput(
+    book_casmput(
         Pid,
         [{put, Bucket, Key, Object, IndexSpecs, Tag, TTL}],
         [{Bucket, Key, Tag, Condition}],
         DataSync
-    ).
-
--spec book_casbatchput(
-    pid(),
-    list(leveled_codec:batch_object_spec()),
-    list({leveled_codec:key(), leveled_codec:key(), leveled_codec:tag(), term()})
-) ->
-    ok | pause | {error, term()}.
-%% @doc
-%%
-%% Compare-and-set batch publication. All conditions are evaluated before any
-%% batch object is accepted. Conditions may refer to keys outside the write set
-%% so callers can implement reservation records or multi-key invariants.
-book_casbatchput(Pid, BatchSpecs, Conditions) ->
-    book_casbatchput(Pid, BatchSpecs, Conditions, false).
-
--spec book_casbatchput(
-    pid(),
-    list(leveled_codec:batch_object_spec()),
-    list({leveled_codec:key(), leveled_codec:key(), leveled_codec:tag(), term()}),
-    boolean()
-) ->
-    ok | pause | {error, term()}.
-%% @doc
-%% See book_casbatchput/3. DataSync applies to the whole accepted batch.
-book_casbatchput(Pid, BatchSpecs, Conditions, DataSync) when is_boolean(DataSync) ->
-    gen_server:call(
-        Pid, {casbatchput, BatchSpecs, Conditions, DataSync}, infinity
     ).
 
 -spec book_mput(pid(), list(leveled_codec:object_spec())) -> ok | pause.
@@ -5507,6 +5459,64 @@ put_publish_reorder_testto() ->
     ok = book_close(Bookie2),
     reset_filestructure().
 
+casmput_contract_test_() ->
+    {timeout, 60, fun casmput_contract_testto/0}.
+
+casmput_contract_testto() ->
+    % book_casmput's whole-batch contract: passing conditions commit;
+    % failing conditions reject the WHOLE batch with
+    % {error, {precondition_failed, _}} and publish nothing - including
+    % across restart. The restart probe is the load-bearing assertion:
+    % it is what forces the in-Bookie conditions+write atomicity (a
+    % rejected batch must leave NO journal record to replay; see the
+    % TARGET_API §3.3 boundary note on book_casmput).
+    RootPath = reset_filestructure(),
+    {ok, Bookie} = book_start([{root_path, RootPath}]),
+    Spec = fun(K, V) -> {put, <<"cas">>, K, V, [], ?STD_TAG, infinity} end,
+    ok = book_put(Bookie, <<"cas">>, <<"k1">>, v1, [], ?STD_TAG),
+    {ok, _, SQN1} = book_get_sqn(Bookie, <<"cas">>, <<"k1">>, ?STD_TAG),
+    ok =
+        book_casmput(
+            Bookie,
+            [Spec(<<"k1">>, v2)],
+            [{<<"cas">>, <<"k1">>, ?STD_TAG, {sqn, SQN1}}],
+            false
+        ),
+    {ok, _, SQN2} = book_get_sqn(Bookie, <<"cas">>, <<"k1">>, ?STD_TAG),
+    ok =
+        book_casmput(
+            Bookie,
+            [Spec(<<"k1">>, v3)],
+            [{<<"cas">>, <<"k1">>, ?STD_TAG, {sqn, SQN2}}],
+            false
+        ),
+    ?assertEqual({ok, v3}, book_get_direct(Bookie, <<"cas">>, <<"k1">>, ?STD_TAG)),
+    % stale-sqn condition rejects BOTH entries: k1 keeps v3, k_new never
+    % becomes visible
+    Fail =
+        book_casmput(
+            Bookie,
+            [Spec(<<"k1">>, bad), Spec(<<"k_new">>, bad)],
+            [{<<"cas">>, <<"k1">>, ?STD_TAG, {sqn, SQN1}}],
+            false
+        ),
+    ?assertMatch({error, {precondition_failed, _}}, Fail),
+    ?assertEqual({ok, v3}, book_get_direct(Bookie, <<"cas">>, <<"k1">>, ?STD_TAG)),
+    ?assertEqual(
+        not_found, book_get_direct(Bookie, <<"cas">>, <<"k_new">>, ?STD_TAG)
+    ),
+    ok = book_close(Bookie),
+    % restart: the rejected batch must not resurrect from the journal
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    ?assertEqual(
+        {ok, v3}, book_get_direct(Bookie2, <<"cas">>, <<"k1">>, ?STD_TAG)
+    ),
+    ?assertEqual(
+        not_found, book_get_direct(Bookie2, <<"cas">>, <<"k_new">>, ?STD_TAG)
+    ),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
 mput_callerside_fts_differential_test_() ->
     {timeout, 120, fun mput_callerside_fts_differential_testto/0}.
 
@@ -5577,7 +5587,7 @@ mput_std_differential_testto() ->
     % book_mput_std per-entry semantics must equal N book_puts: same
     % stored values (via book_get_direct), same index behaviour, values
     % served from the journal after restart. Also pins the deprecated
-    % book_batchput alias to book_mput_std equality, and book_mhead to
+    % retired book_batchput name now book_mput_std, and book_mhead to
     % per-key book_head.
     RootPath = reset_filestructure(),
     {ok, Bookie1} = book_start([{root_path, RootPath}]),
@@ -6488,7 +6498,7 @@ journalfold_changefeed_test() ->
     ok = book_put(Bookie1, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG),
     {ok, MidSQN} = book_journalsqn(Bookie1),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [], ?STD_TAG, infinity},
             {put, <<"B">>, <<"K1">>, {value, <<"V1b">>}, [], ?STD_TAG, infinity}
         ]),
@@ -6539,7 +6549,7 @@ batchput_standard_objects_test() ->
             {add, <<"city_bin">>, <<"SYD">>}
         ], ?STD_TAG, infinity}
     ],
-    ok = book_batchput(Bookie1, BatchSpecs),
+    ok = book_mput_std(Bookie1, BatchSpecs),
     {ok, {value, <<"V1">>}} = book_get(Bookie1, <<"B">>, <<"K1">>),
     {ok, {value, <<"V2">>}} = book_get(Bookie1, <<"B">>, <<"K2">>),
     {ok, _Head1} = book_head(Bookie1, <<"B">>, <<"K1">>),
@@ -6574,7 +6584,7 @@ batchput_standard_objects_test() ->
         ),
     ?assertMatch([{<<"NYC">>, <<"K1">>}], IdxFolder2()),
     ok =
-        book_batchput(Bookie2, [
+        book_mput_std(Bookie2, [
             {delete, <<"B">>, <<"K1">>, [
                 {remove, <<"city_bin">>, <<"NYC">>}
             ], ?STD_TAG, infinity}
@@ -6715,7 +6725,7 @@ casput_conditions_and_sqn_test() ->
         ),
     ?assertMatch([{<<"SYD">>, <<"K1">>}], SYDFolder1()),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {delete, <<"B">>, <<"K1">>, [
@@ -6829,7 +6839,7 @@ casbatchput_atomic_preconditions_test() ->
             {compression_method, none}
         ]),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"OLD1">>}
             ], ?STD_TAG, infinity},
@@ -6843,7 +6853,7 @@ casbatchput_atomic_preconditions_test() ->
         book_get_sqn(Bookie1, <<"B">>, <<"K2">>),
     ?assertMatch(
         {error, {precondition_failed, [_]}},
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {put, <<"B">>, <<"K1">>, {value, <<"LEAK1">>}, [
@@ -6875,7 +6885,7 @@ casbatchput_atomic_preconditions_test() ->
         ),
     ?assertMatch([], LeakFolder()),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
@@ -6932,11 +6942,11 @@ casbatchput_validation_test() ->
     DuplicatePutSpec = {put, <<"B">>, <<"K1">>, {value, <<"V2">>}, [], ?STD_TAG, infinity},
     ?assertMatch(
         {error, empty_cas_conditions},
-        book_casbatchput(Bookie1, [PutSpec], [])
+        book_casmput(Bookie1, [PutSpec], [])
     ),
     ?assertMatch(
         {error, {duplicate_key, _}},
-        book_casbatchput(Bookie1, [PutSpec, DuplicatePutSpec], [
+        book_casmput(Bookie1, [PutSpec, DuplicatePutSpec], [
             {<<"B">>, <<"K1">>, ?STD_TAG, absent}
         ])
     ),
@@ -6944,30 +6954,30 @@ casbatchput_validation_test() ->
         {error, {precondition_failed, [
             {precondition_failed, _, {expected, present}, {actual, duplicate_precondition}}
         ]}},
-        book_casbatchput(Bookie1, [PutSpec], [
+        book_casmput(Bookie1, [PutSpec], [
             {<<"B">>, <<"K1">>, ?STD_TAG, absent},
             {<<"B">>, <<"K1">>, ?STD_TAG, present}
         ])
     ),
     ?assertMatch(
         {error, invalid_cas_condition},
-        book_casbatchput(Bookie1, [PutSpec], [
+        book_casmput(Bookie1, [PutSpec], [
             {<<"B">>, <<"K1">>, ?STD_TAG, invalid}
         ])
     ),
     ?assertMatch(
         {error, invalid_cas_condition},
-        book_casbatchput(Bookie1, [PutSpec], invalid)
+        book_casmput(Bookie1, [PutSpec], invalid)
     ),
     ?assertMatch(
         {error, invalid_cas_condition},
-        book_casbatchput(Bookie1, [PutSpec], [invalid])
+        book_casmput(Bookie1, [PutSpec], [invalid])
     ),
     ?assertMatch(
         {error, {precondition_failed, [
             {precondition_failed, _, {expected, absent}, {actual, {invalid_tag, ?HEAD_TAG}}}
         ]}},
-        book_casbatchput(Bookie1, [PutSpec], [
+        book_casmput(Bookie1, [PutSpec], [
             {<<"B">>, <<"K1">>, ?HEAD_TAG, absent}
         ])
     ),
@@ -6975,7 +6985,7 @@ casbatchput_validation_test() ->
         {error, {precondition_failed, [
             {precondition_failed, _, {expected, present}, {actual, absent}}
         ]}},
-        book_casbatchput(Bookie1, [PutSpec], [
+        book_casmput(Bookie1, [PutSpec], [
             {<<"B">>, <<"KMISSING">>, ?STD_TAG, present}
         ])
     ),
@@ -6984,7 +6994,7 @@ casbatchput_validation_test() ->
         {error, {precondition_failed, [
             {precondition_failed, _, {expected, present}, {actual, tombstone}}
         ]}},
-        book_casbatchput(Bookie1, [PutSpec], [
+        book_casmput(Bookie1, [PutSpec], [
             {<<"B">>, <<"KTOMB">>, ?STD_TAG, present}
         ])
     ),
@@ -7004,7 +7014,7 @@ casbatchput_validation_test() ->
         {error, {precondition_failed, [
             {precondition_failed, _, {expected, present}, {actual, expired}}
         ]}},
-        book_casbatchput(Bookie1, [PutSpec], [
+        book_casmput(Bookie1, [PutSpec], [
             {<<"B">>, <<"KEXPIRED">>, ?STD_TAG, present}
         ])
     ),
@@ -7156,7 +7166,7 @@ casbatchput_concurrent_overlapping_keys_test() ->
             {compression_method, none}
         ]),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {counter, 0}, [], ?STD_TAG, infinity},
             {put, <<"B">>, <<"K2">>, {counter, 0}, [], ?STD_TAG, infinity}
         ]),
@@ -7167,7 +7177,7 @@ casbatchput_concurrent_overlapping_keys_test() ->
         [
             spawn(fun() ->
                 Result =
-                    book_casbatchput(
+                    book_casmput(
                         Bookie1,
                         [
                             {put, <<"B">>, <<"K1">>, {counter, N}, [], ?STD_TAG,
@@ -7221,7 +7231,7 @@ casbatchput_crash_recovery_test() ->
     ],
     {ok, Bookie1} = book_plainstart(Opts),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
@@ -7256,7 +7266,7 @@ casbatchput_crash_recovery_test() ->
     {ok, {value, <<"DELETE_ME">>}, DeleteSQN} =
         book_get_sqn(Bookie1, <<"B">>, <<"KDEL">>),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {delete, <<"B">>, <<"KDEL">>, [
@@ -7356,7 +7366,7 @@ casbatchput_partial_tail_test() ->
     ],
     {ok, Bookie1} = book_plainstart(Opts),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
@@ -7506,7 +7516,7 @@ casbatchput_recalc_compaction_test() ->
             ]}],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {put, <<"B">>, <<"K1">>, [{index, [1]}, {value, <<"V1">>}], [
@@ -7547,7 +7557,7 @@ casbatchput_recalc_compaction_test() ->
         )
     ),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie1,
             [
                 {put, <<"B">>, <<"K1">>, [{index, [4]}, {value, <<"V1B">>}], [
@@ -7601,7 +7611,7 @@ batchput_indexfold_atomic_visibility_test() ->
         indexfold_matches(Bookie1, <<"city_bin">>, <<"OLD">>)
     ),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"city_bin">>, <<"BATCH">>}
             ], ?STD_TAG, infinity},
@@ -7647,7 +7657,7 @@ batchput_roll_retry_test() ->
     {ok, Inker, _Penciller} = book_returnactors(Bookie1),
     BeforeManifestCount = length(gen_server:call(Inker, get_manifest)),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K5">>, {value, <<"V5">>}, [], ?STD_TAG, infinity}
         ]),
     AfterManifestCount = length(gen_server:call(Inker, get_manifest)),
@@ -7667,7 +7677,7 @@ batchput_too_large_test() ->
     BigObject = binary:copy(<<"x">>, 20000),
     ?assertMatch(
         {error, batch_too_large},
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, BigObject, [], ?STD_TAG, infinity}
         ])
     ),
@@ -7687,7 +7697,7 @@ batchput_crash_recovery_test() ->
     ],
     {ok, Bookie1} = book_plainstart(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"city_bin">>, <<"CRASH">>}
             ], ?STD_TAG, infinity},
@@ -7727,7 +7737,7 @@ batchput_hot_backup_test() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"BACKUP">>}
             ], ?STD_TAG, infinity},
@@ -7771,7 +7781,7 @@ batchput_loading_boundary_case(SeedCount, ExpectedSQN) ->
         lists:seq(1, SeedCount)
     ),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"KA">>, {value, <<"VA">>}, [
                 {add, <<"idx_bin">>, <<"BOUNDARY">>}
             ], ?STD_TAG, infinity},
@@ -7810,7 +7820,7 @@ batchput_partial_tail_test() ->
     ],
     {ok, Bookie1} = book_plainstart(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"TAIL">>}
             ], ?STD_TAG, infinity},
@@ -7851,7 +7861,7 @@ batchput_compaction_retain_test() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"OLD">>}
             ], ?STD_TAG, infinity},
@@ -7860,7 +7870,7 @@ batchput_compaction_retain_test() ->
             ], ?STD_TAG, infinity}
         ]),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
                 {remove, <<"idx_bin">>, <<"OLD">>},
                 {add, <<"idx_bin">>, <<"NEW">>}
@@ -7897,7 +7907,7 @@ batchput_hot_backup_after_compaction_test() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"OLD">>}
             ], ?STD_TAG, infinity},
@@ -7906,7 +7916,7 @@ batchput_hot_backup_after_compaction_test() ->
             ], ?STD_TAG, infinity}
         ]),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
                 {remove, <<"idx_bin">>, <<"OLD">>},
                 {add, <<"idx_bin">>, <<"NEW">>}
@@ -7946,7 +7956,7 @@ batchput_recovr_reload_case() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"RECOVR">>}
             ], ?STD_TAG, infinity},
@@ -8014,7 +8024,7 @@ batchput_appdefined_recalc_case() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, [{index, [1]}, {value, <<"V1">>}], [
                 {add, <<"temp_int">>, 1}
             ], Tag, infinity},
@@ -8023,7 +8033,7 @@ batchput_appdefined_recalc_case() ->
             ], Tag, infinity}
         ]),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, [{index, [3]}, {value, <<"V1B">>}], [
                 {remove, <<"temp_int">>, 1},
                 {add, <<"temp_int">>, 3}
@@ -8052,7 +8062,7 @@ batchput_manifest_sqn_test() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity},
             {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [], ?STD_TAG, infinity}
         ]),
@@ -8099,7 +8109,7 @@ batchput_large_batch_reload_test() ->
             lists:seq(1, BatchSize)
         ),
     {ok, Bookie1} = book_start(Opts),
-    ok = book_batchput(Bookie1, BatchSpecs, true),
+    ok = book_mput_std(Bookie1, BatchSpecs, true),
     ok = book_close(Bookie1),
     leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
 
@@ -8166,8 +8176,8 @@ batchput_mixed_large_reload_test() ->
     ],
 
     {ok, Bookie1} = book_start(Opts),
-    ok = book_batchput(Bookie1, SeedSpecs, true),
-    ok = book_batchput(Bookie1, UpdateSpecs ++ DeleteSpecs ++ AddSpecs, true),
+    ok = book_mput_std(Bookie1, SeedSpecs, true),
+    ok = book_mput_std(Bookie1, UpdateSpecs ++ DeleteSpecs ++ AddSpecs, true),
     ok = book_close(Bookie1),
     leveled_penciller:clean_testdir(RootPath ++ "/" ++ ?LEDGER_FP),
 
@@ -8231,7 +8241,7 @@ batchput_snapshot_and_fold_test() ->
         ),
     {ok, SnapshotBefore} = book_start([{snapshot_bookie, Bookie1}]),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
                 {add, <<"idx_bin">>, <<"BATCH">>}
             ], ?STD_TAG, infinity},
@@ -8293,7 +8303,7 @@ batchput_sqnorder_fold_test() ->
     {ok, Bookie1} = book_start(Opts),
     ok = book_put(Bookie1, <<"B">>, <<"K0">>, {value, <<"V0">>}, [], ?STD_TAG),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity},
             {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [], ?STD_TAG, infinity},
             {put, <<"B">>, <<"K3">>, {value, <<"V3">>}, [], ?STD_TAG, infinity}
@@ -8346,7 +8356,7 @@ batchput_pause_semantics_test() ->
             fun(State) -> State#state{slow_offer = true} end
         ),
     pause =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity}
         ]),
     {ok, {value, <<"V1">>}} = book_get(Bookie1, <<"B">>, <<"K1">>),
@@ -8362,20 +8372,20 @@ batchput_validation_test() ->
             {compression_method, none}
         ]),
     PutSpec = {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity},
-    ?assertMatch({error, empty_batch}, book_batchput(Bookie1, [])),
+    ?assertMatch({error, empty_batch}, book_mput_std(Bookie1, [])),
     ?assertMatch(
         {error, {duplicate_key, _}},
-        book_batchput(Bookie1, [PutSpec, PutSpec])
+        book_mput_std(Bookie1, [PutSpec, PutSpec])
     ),
     ?assertMatch(
         {error, head_tag_not_supported},
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?HEAD_TAG, infinity}
         ])
     ),
     ?assertMatch(
         {error, invalid_index_specs},
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [bad], ?STD_TAG, infinity}
         ])
     ),
@@ -8395,7 +8405,7 @@ batchput_validation_atomic_rejection_test() ->
     ], ?STD_TAG, infinity},
     ?assertMatch(
         {error, invalid_index_specs},
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             ValidSpec,
             {put, <<"B">>, <<"K2">>, {value, <<"V2">>}, [bad], ?STD_TAG,
                 infinity}
@@ -8420,7 +8430,7 @@ batchput_validation_atomic_rejection_test() ->
     ], ?STD_TAG, infinity},
     ?assertMatch(
         {error, {duplicate_key, _}},
-        book_batchput(Bookie1, [UpdateSpec, UpdateSpec])
+        book_mput_std(Bookie1, [UpdateSpec, UpdateSpec])
     ),
     {ok, {value, <<"OLD">>}} = book_get(Bookie1, <<"B">>, <<"K0">>),
     ?assertEqual(
@@ -8440,7 +8450,7 @@ batchput_bucket_isolation_test() ->
     ],
     {ok, Bookie1} = book_start(Opts),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B1">>, <<"K1">>, {value, b1_k1}, [
                 {add, <<"shared_bin">>, <<"SAME">>}
             ], ?STD_TAG, infinity},
@@ -8460,7 +8470,7 @@ batchput_bucket_isolation_test() ->
         indexfold_matches(Bookie1, <<"B2">>, <<"shared_bin">>, <<"SAME">>)
     ),
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {delete, <<"B2">>, <<"K1">>, [
                 {remove, <<"shared_bin">>, <<"SAME">>}
             ], ?STD_TAG, infinity}
@@ -8492,7 +8502,7 @@ batchput_ttl_test() ->
     Future = leveled_util:integer_now() + 300,
     Past = leveled_util:integer_now() - 300,
     ok =
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"KF">>, {value, future}, [
                 {add, <<"ttl_bin">>, <<"LIVE">>}
             ], ?STD_TAG, Future},
@@ -8525,7 +8535,7 @@ cas_compaction_opts(RootPath, ReloadStrategy) ->
 
 seed_cas_compaction_state(Bookie) ->
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie,
             [
                 {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [
@@ -8566,7 +8576,7 @@ seed_cas_compaction_state(Bookie) ->
         )
     ),
     ok =
-        book_casbatchput(
+        book_casmput(
             Bookie,
             [
                 {put, <<"B">>, <<"K1">>, {value, <<"V1B">>}, [
@@ -8759,7 +8769,7 @@ batchput_headonly_rejection_test() ->
         ]),
     ?assertMatch(
         {unsupported_message, batchput},
-        book_batchput(Bookie1, [
+        book_mput_std(Bookie1, [
             {put, <<"B">>, <<"K1">>, {value, <<"V1">>}, [], ?STD_TAG, infinity}
         ])
     ),

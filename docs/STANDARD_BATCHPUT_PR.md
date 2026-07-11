@@ -1,5 +1,9 @@
 # Standard-Mode Batch Put PR Notes
 
+> **Naming note (2026-07-12):** `book_batchput` was renamed `book_mput_std`
+> during the TARGET_API migration (see docs/TARGET_API.md §2/§5); this document
+> predates the rename and keeps the historical name.
+
 ## Summary
 
 This change adds `leveled_bookie:book_batchput/2` and

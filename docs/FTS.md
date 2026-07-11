@@ -122,7 +122,7 @@ under one SQN.
 Batches and deletes are also normal:
 
 ```erlang
-ok = leveled_bookie:book_batchput(Bookie, [
+ok = leveled_bookie:book_mput_std(Bookie, [
     {put, <<"openai_responses">>, <<"resp_002">>, Obj2, [], ?STD_TAG, infinity},
     {delete, <<"openai_responses">>, <<"resp_003">>, [], ?STD_TAG, infinity}
 ]).

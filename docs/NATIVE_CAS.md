@@ -1,5 +1,9 @@
 # Native CAS APIs
 
+> **Naming note (2026-07-12):** `book_casbatchput` was renamed `book_casmput`
+> during the TARGET_API migration (see docs/TARGET_API.md §3.3/§5); this
+> document predates the rename and keeps the historical name.
+
 Leveled exposes same-Bookie compare-and-set helpers for callers that need
 optimistic atomic writes without adding an external lock service.
 
