@@ -74,6 +74,7 @@
     book_casmput/3,
     book_casmput/4,
     book_get_direct/4,
+    book_put_direct/8,
     book_get_sqn/3,
     book_get_sqn/4,
     book_head/3,
@@ -133,6 +134,7 @@
 
 % Dummy key used for mput operations
 -define(DUMMY, dummy).
+-define(PUBLISH_GAP_TIMEOUT_MS, 5000).
 
 -define(OPTION_DEFAULTS, [
     {root_path, undefined},
@@ -191,6 +193,13 @@
     head_only = false :: boolean(),
     head_lookup = true :: boolean(),
     fts_indexes = [] :: list(),
+    %% caller-side write publish gate (TARGET_API §3.2): the ledger-cache
+    %% push watermark must never pass an allocated-but-unabsorbed SQN, or
+    %% journal replay after a crash would skip an acked write. Absorptions
+    %% advance a contiguous frontier; out-of-order publishes buffer.
+    publish_frontier = 0 :: non_neg_integer(),
+    publish_pending = gb_sets:empty() :: gb_sets:set(),
+    publish_gap_since = undefined :: undefined | erlang:timestamp(),
     fts_seq = 0 :: non_neg_integer(),
     fts_dir_cache :: ets:tid() | undefined,
     ink_checking = ?MAX_KEYCHECK_FREQUENCY :: integer(),
@@ -596,6 +605,96 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL) when is_atom(Tag) ->
     boolean()
 ) -> ok | pause.
 book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
+    %% Caller-side write path (TARGET_API §3.2): the journal write (the
+    %% disk IO) executes in THIS process via ink_put; the Bookie's
+    %% mailbox is touched only by the in-memory {publish, ...} absorb -
+    %% concurrent writers no longer serialize behind each other's disk
+    %% time inside the Bookie. Writes into FTS-indexed buckets keep the
+    %% direct path: their posting augmentation needs Bookie-held shard
+    %% state (caller-side FTS is a later stage of the migration).
+    %%
+    %% write_refs (inker pid + static FTS schema set) is cached in the
+    %% caller's process dictionary per Bookie: both are fixed for the
+    %% Bookie's lifetime. A dead cached inker falls back to a refresh
+    %% and then to the direct path - degradation is a retried write.
+    case write_refs(Pid) of
+        {ok, Inker, FtsIndexes} ->
+            case leveled_fts:bucket_has_schema(Bucket, FtsIndexes) of
+                true ->
+                    book_put_direct(
+                        Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync
+                    );
+                false ->
+                    put_caller_side(
+                        Pid, Inker, Bucket, Key, Object, IndexSpecs, Tag, TTL,
+                        DataSync
+                    )
+            end;
+        unsupported ->
+            book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync)
+    end.
+
+put_caller_side(Pid, Inker, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
+    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    try
+        {ok, SQN, ObjSize} =
+            leveled_inker:ink_put(
+                Inker, LedgerKey, Object, {IndexSpecs, TTL}, DataSync
+            ),
+        %% ledger-change preparation is a pure function: it runs here,
+        %% in the caller, so PUBLISH is a plain cache absorb
+        Changes =
+            preparefor_ledgercache(
+                null, LedgerKey, SQN, Object, ObjSize, {IndexSpecs, TTL}
+            ),
+        gen_server:call(Pid, {publish, SQN, Changes}, infinity)
+    catch
+        _:_ ->
+            %% inker restart / journal roll race: refresh refs and take
+            %% the direct path, which re-plans under the Bookie
+            erlang:erase({leveled_bookie_write_refs, Pid}),
+            book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync)
+    end.
+
+write_refs(Pid) ->
+    CacheKey = {leveled_bookie_write_refs, Pid},
+    case erlang:get(CacheKey) of
+        {ok, Inker, _FtsIndexes} = Cached ->
+            case is_process_alive(Inker) of
+                true -> Cached;
+                false -> refresh_write_refs(Pid, CacheKey)
+            end;
+        undefined ->
+            refresh_write_refs(Pid, CacheKey)
+    end.
+
+refresh_write_refs(Pid, CacheKey) ->
+    try gen_server:call(Pid, {write_refs}, infinity) of
+        {ok, _Inker, _FtsIndexes} = Refs ->
+            erlang:put(CacheKey, Refs),
+            Refs;
+        _Other ->
+            unsupported
+    catch
+        _:_ -> unsupported
+    end.
+
+-spec book_put_direct(
+    pid(),
+    leveled_codec:key(),
+    leveled_codec:key(),
+    any(),
+    list(),
+    leveled_codec:tag(),
+    infinity | integer(),
+    boolean()
+) -> ok | pause | {error, term()}.
+%% @doc The strict in-Bookie put: journal write and ledger absorb both
+%% execute inside the Bookie's handle_call. Semantically identical to
+%% book_put/8 (pinned by put_threephase_differential_test_); the race
+%% fallback target, the FTS-bucket path, and the escape hatch for
+%% callers that require the write fully serialized through the Bookie.
+book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
     gen_server:call(
         Pid,
         {put, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync},
@@ -1790,10 +1889,12 @@ init([Opts]) ->
                         JournalSQN
                 end,
             FtsDirCache = maybe_new_fts_dir_cache(FtsIndexes),
+            {ok, PublishFrontier} = leveled_inker:ink_getjournalsqn(Inker),
             {ok, #state{
                 cache_size = CacheSize,
                 cache_multiple = MaxCacheMultiple,
                 is_snapshot = false,
+                publish_frontier = PublishFrontier,
                 head_only = HeadOnly,
                 head_lookup = HeadLookup,
                 inker = Inker,
@@ -2006,20 +2107,40 @@ handle_call({mput, ObjectSpecs, TTL}, From, State) when
         false ->
             gen_server:reply(From, ok)
     end,
-    case
-        maybepush_ledgercache(
-            State#state.cache_size,
-            State#state.cache_multiple,
-            Cache0,
-            State#state.penciller,
-            State#state.monitor
-        )
-    of
-        {ok, Cache} ->
-            {noreply, State#state{ledger_cache = Cache, slow_offer = false}};
-        {returned, Cache} ->
-            {noreply, State#state{ledger_cache = Cache, slow_offer = true}}
+    StateA = absorb_sqns([SQN], State),
+    case maybe_gated_push(Cache0, StateA) of
+        {{ok, Cache}, StateB} ->
+            {noreply, StateB#state{ledger_cache = Cache, slow_offer = false}};
+        {{returned, Cache}, StateB} ->
+            {noreply, StateB#state{ledger_cache = Cache, slow_offer = true}}
     end;
+handle_call({publish, SQN, Changes}, _From, State) when
+    State#state.head_only == false
+->
+    %% PUBLISH phase of the caller-side write path (TARGET_API §3.2):
+    %% the journal write already happened in the caller; this is a pure
+    %% in-memory ledger-cache absorb. Reply carries the same ok|pause
+    %% backpressure contract as the direct put path.
+    Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
+    Reply =
+        case State#state.slow_offer of
+            true -> pause;
+            false -> ok
+        end,
+    StateA = absorb_sqns([SQN], State),
+    case maybe_gated_push(Cache0, StateA) of
+        {{ok, Cache}, StateB} ->
+            {reply, Reply, StateB#state{ledger_cache = Cache, slow_offer = false}};
+        {{returned, Cache}, StateB} ->
+            {reply, Reply, StateB#state{ledger_cache = Cache, slow_offer = true}}
+    end;
+handle_call({write_refs}, _From, State) when
+    State#state.head_only == false
+->
+    %% RESOLVE-adjacent: static references for the caller-side write
+    %% path. FtsIndexes is start-time configuration, so callers may
+    %% cache this reply for the bookie's lifetime.
+    {reply, {ok, State#state.inker, State#state.fts_indexes}, State};
 handle_call({get, Bucket, Key, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -3434,6 +3555,98 @@ addto_ledgercache_batch(PreparedChanges, Cache) ->
         max_sqn = MaxSQN
     }.
 
+%% TARGET_API §3.2 absorption tracking: every newly allocated journal
+%% SQN must pass through absorb_sqns before the ledger cache may be
+%% pushed past it. In-order SQNs advance the frontier; out-of-order ones
+%% buffer until the gap fills. A gap older than ?PUBLISH_GAP_TIMEOUT_MS
+%% is an abandoned intent (caller died between journal write and
+%% publish): the write was never acked, so the frontier skips it -
+%% unacked writes are indeterminate by contract.
+absorb_sqns([], State) ->
+    State;
+absorb_sqns([SQN | Rest], State) ->
+    absorb_sqns(Rest, absorb_sqn(SQN, State)).
+
+absorb_sqn(SQN, State) when SQN == State#state.publish_frontier + 1 ->
+    drain_pending(State#state{
+        publish_frontier = SQN,
+        publish_gap_since = undefined
+    });
+absorb_sqn(SQN, State) when SQN =< State#state.publish_frontier ->
+    %% replay/duplicate absorption (restart paths) - already covered
+    State;
+absorb_sqn(SQN, State) ->
+    GapSince =
+        case State#state.publish_gap_since of
+            undefined -> os:timestamp();
+            TS -> TS
+        end,
+    State#state{
+        publish_pending = gb_sets:add(SQN, State#state.publish_pending),
+        publish_gap_since = GapSince
+    }.
+
+drain_pending(State) ->
+    Pending = State#state.publish_pending,
+    Next = State#state.publish_frontier + 1,
+    case gb_sets:is_empty(Pending) of
+        true ->
+            State;
+        false ->
+            case gb_sets:smallest(Pending) of
+                Next ->
+                    drain_pending(State#state{
+                        publish_frontier = Next,
+                        publish_pending = gb_sets:del_element(Next, Pending)
+                    });
+                _Larger ->
+                    State
+            end
+    end.
+
+publish_gap_expired(State) ->
+    case {gb_sets:is_empty(State#state.publish_pending), State#state.publish_gap_since} of
+        {true, _} ->
+            false;
+        {false, undefined} ->
+            false;
+        {false, TS} ->
+            timer:now_diff(os:timestamp(), TS) div 1000 > ?PUBLISH_GAP_TIMEOUT_MS
+    end.
+
+%% Push gate: the opportunistic cache->penciller push is skipped while an
+%% absorption gap is open (so the persisted watermark cannot pass an
+%% unabsorbed acked write); an expired gap force-advances the frontier
+%% (the missing SQN was never acked).
+maybe_gated_push(Cache0, State) ->
+    State1 =
+        case publish_gap_expired(State) of
+            true ->
+                Skipped = gb_sets:smallest(State#state.publish_pending),
+                drain_pending(State#state{
+                    publish_frontier = Skipped,
+                    publish_pending =
+                        gb_sets:del_element(Skipped, State#state.publish_pending),
+                    publish_gap_since = undefined
+                });
+            false ->
+                State
+        end,
+    case gb_sets:is_empty(State1#state.publish_pending) of
+        false ->
+            {{ok, Cache0}, State1};
+        true ->
+            Result =
+                maybepush_ledgercache(
+                    State1#state.cache_size,
+                    State1#state.cache_multiple,
+                    Cache0,
+                    State1#state.penciller,
+                    State1#state.monitor
+                ),
+            {Result, State1}
+    end.
+
 do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0, FtsAdvance) ->
     SWLR = os:timestamp(),
     SW0 = leveled_monitor:maybe_time(State0#state.monitor),
@@ -3462,23 +3675,16 @@ do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0, 
     end,
     maybe_longrunning(SWLR, overall_put),
     maybelog_put_timing(State0#state.monitor, T0, T1, T2, ObjSize),
-    case
-        maybepush_ledgercache(
-            State0#state.cache_size,
-            State0#state.cache_multiple,
-            Cache0,
-            State0#state.penciller,
-            State0#state.monitor
-        )
-    of
-        {ok, Cache} ->
-            {noreply, State0#state{
+    StateA = absorb_sqns([SQN], State0),
+    case maybe_gated_push(Cache0, StateA) of
+        {{ok, Cache}, StateB} ->
+            {noreply, StateB#state{
                 slow_offer = false,
                 ledger_cache = Cache,
                 fts_seq = SQN
             }};
-        {returned, Cache} ->
-            {noreply, State0#state{
+        {{returned, Cache}, StateB} ->
+            {noreply, StateB#state{
                 slow_offer = true,
                 ledger_cache = Cache,
                 fts_seq = SQN
@@ -3534,23 +3740,16 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
             maybelog_put_timing(
                 State#state.monitor, T0, T1, T2, ObjSizeTotal
             ),
-            case
-                maybepush_ledgercache(
-                    State#state.cache_size,
-                    State#state.cache_multiple,
-                    Cache0,
-                    State#state.penciller,
-                    State#state.monitor
-                )
-            of
-                {ok, Cache} ->
-                    {noreply, State#state{
+            StateA = absorb_sqns([SQN], State),
+            case maybe_gated_push(Cache0, StateA) of
+                {{ok, Cache}, StateB} ->
+                    {noreply, StateB#state{
                         slow_offer = false,
                         ledger_cache = Cache,
                         fts_seq = SQN
                     }};
-                {returned, Cache} ->
-                    {noreply, State#state{
+                {{returned, Cache}, StateB} ->
+                    {noreply, StateB#state{
                         slow_offer = true,
                         ledger_cache = Cache,
                         fts_seq = SQN
@@ -4848,6 +5047,120 @@ mget_testto() ->
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
     ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+put_threephase_differential_test_() ->
+    {timeout, 60, fun put_threephase_differential_testto/0}.
+
+put_threephase_differential_testto() ->
+    % book_put (caller-side journal write + in-memory publish) must equal
+    % book_put_direct for every observable shape: stored value, overwrite
+    % generations, delete, TTL expiry, and journal serving after restart.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} = book_start([{root_path, RootPath}, {max_journalsize, 100000}]),
+    ObjL = generate_multiple_objects(200, 1),
+    {DirectHalf, CallerHalf} = lists:split(100, ObjL),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put_direct(
+                Bookie1, <<"Bucket">>, K, V, S, ?STD_TAG, infinity, false
+            )
+        end,
+        DirectHalf
+    ),
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, V, S, ?STD_TAG)
+        end,
+        CallerHalf
+    ),
+    % overwrite a range through the caller-side path
+    lists:foreach(
+        fun({K, V, S}) ->
+            ok = book_put(Bookie1, <<"Bucket">>, K, {updated, V}, S, ?STD_TAG)
+        end,
+        lists:sublist(ObjL, 50, 100)
+    ),
+    {DelK, _DV, _DS} = lists:nth(7, ObjL),
+    ok = book_delete(Bookie1, <<"Bucket">>, DelK, []),
+    CheckAll =
+        fun(Bookie) ->
+            lists:foreach(
+                fun({K, _V, _S}) ->
+                    ?assertEqual(
+                        book_get_direct(Bookie, <<"Bucket">>, K, ?STD_TAG),
+                        book_get(Bookie, <<"Bucket">>, K, ?STD_TAG)
+                    )
+                end,
+                ObjL
+            )
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    CheckAll(Bookie2),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+put_publish_reorder_test_() ->
+    {timeout, 60, fun put_publish_reorder_testto/0}.
+
+put_publish_reorder_testto() ->
+    % Out-of-order publishes (concurrent caller-side writers) must not
+    % let the ledger push watermark pass an unabsorbed SQN: interleave
+    % journal writes and publishes in reversed order, force cache
+    % pressure, restart, and assert every acked write survives.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([{root_path, RootPath}, {cache_size, 10}]),
+    {ok, Inker, _Fts} = gen_server:call(Bookie1, {write_refs}, infinity),
+    Pairs =
+        lists:map(
+            fun(I) ->
+                K = list_to_binary("reorder" ++ integer_to_list(I)),
+                LK = leveled_codec:to_objectkey(<<"Bucket">>, K, ?STD_TAG),
+                {ok, SQN, ObjSize} =
+                    leveled_inker:ink_put(Inker, LK, {v, I}, {[], infinity}, false),
+                Changes =
+                    preparefor_ledgercache(
+                        null, LK, SQN, {v, I}, ObjSize, {[], infinity}
+                    ),
+                {K, SQN, Changes}
+            end,
+            lists:seq(1, 40)
+        ),
+    % publish in reverse SQN order - every absorb but the last buffers
+    lists:foreach(
+        fun({_K, SQN, Changes}) ->
+            Reply = gen_server:call(Bookie1, {publish, SQN, Changes}, infinity),
+            ?assert(Reply == ok orelse Reply == pause)
+        end,
+        lists:reverse(Pairs)
+    ),
+    % interleave direct puts to drive cache pressure through the gate
+    lists:foreach(
+        fun(I) ->
+            K = list_to_binary("direct" ++ integer_to_list(I)),
+            ok = book_put(Bookie1, <<"Bucket">>, K, {d, I}, [], ?STD_TAG)
+        end,
+        lists:seq(1, 200)
+    ),
+    CheckAll =
+        fun(Bookie) ->
+            lists:foreach(
+                fun({K, _SQN, _Changes}) ->
+                    ?assertMatch(
+                        {ok, {v, _}}, book_get(Bookie, <<"Bucket">>, K, ?STD_TAG)
+                    )
+                end,
+                Pairs
+            )
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    CheckAll(Bookie2),
     ok = book_close(Bookie2),
     reset_filestructure().
 

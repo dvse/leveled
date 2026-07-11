@@ -25,6 +25,7 @@
     summary_term/1,
     delta_term/2,
     find_schema/3,
+    bucket_has_schema/2,
     index_ref/1,
     normalise_index/1,
     spec_token_entries/3,
@@ -839,6 +840,17 @@ normalise_column_mode(<<"verbatim">>) -> verbatim.
 duplicate_columns(Specs) ->
     Columns = [Column || {Column, _Path, _Mode} <- Specs],
     length(Columns) =/= length(lists:usort(Columns)).
+
+-spec bucket_has_schema(term(), list()) -> boolean().
+%% @doc True when any configured FTS schema applies to writes in Bucket
+%% (exact or prefix match). Used by the Bookie's write_refs RESOLVE so
+%% callers can route FTS-clean puts through the caller-side write path
+%% and FTS-affected puts through the direct in-Bookie path.
+bucket_has_schema(Bucket, Indexes) ->
+    lists:any(
+        fun(#{bucket := Bucket0}) -> bucket_matches(Bucket0, Bucket) end,
+        Indexes
+    ).
 
 find_schema(Bucket, Index, Indexes) ->
     Matching =

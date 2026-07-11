@@ -1,13 +1,20 @@
 # Leveled Target Public API
 
-Status: TARGET SPECIFICATION (settled 2026-07-11). Landed so far:
-fetchspec `book_mget`/`book_get` (§3.1, snapshot-free reads);
-`book_mhead` (§3.1); `book_mput_std`/`book_casmput` surface (§3.2/§3.3
-naming + contract over the existing batch engine — the
-RESOLVE→IO→PUBLISH write engine is migration step 2; `book_mput/3` for
-standard stores awaits absorbing the head_only arity). Deprecated
-aliases `book_batchput`/`book_casbatchput` retained until ash_leveled
-migrates. This document defines
+Status: TARGET SPECIFICATION (settled 2026-07-11). Landed:
+fetchspec `book_get`/`book_mget`/`book_mhead` (§3.1, snapshot-free
+reads); `book_mput_std`/`book_casmput` surface (§3.2/§3.3 naming over
+the batch engine); **`book_put` three-phase write engine (§3.2)** —
+the journal write executes in the caller via ink_put, ledger-change
+preparation is caller-side (pure), and the Bookie absorbs via the
+in-memory `{publish, SQN, Changes}` clause behind an SQN reorder gate
+(`absorb_sqns`/`maybe_gated_push`: the cache→penciller push watermark
+never passes an unabsorbed acked SQN; abandoned gaps — caller death
+between journal write and publish, i.e. unacked writes — expire after
+5s and are skipped, making unacked-write indeterminacy explicit).
+Writes into FTS-indexed buckets take `book_put_direct` (posting
+augmentation needs Bookie-held shard state; caller-side FTS is the
+remaining §3.2 stage, with batch-engine mput riding the same publish
+path after it). Deprecated aliases retained until consumers migrate. This document defines
 the complete public Bookie surface in its target state, the uniform
 execution protocol underneath every operation, the guarantee each
 operation carries, and the migration/retirement plan for the current
