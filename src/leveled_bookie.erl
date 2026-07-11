@@ -3809,13 +3809,13 @@ do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0, 
             {noreply, StateB#state{
                 slow_offer = false,
                 ledger_cache = Cache,
-                fts_seq = SQN
+                fts_seq = max(SQN, StateB#state.fts_seq)
             }};
         {{returned, Cache}, StateB} ->
             {noreply, StateB#state{
                 slow_offer = true,
                 ledger_cache = Cache,
-                fts_seq = SQN
+                fts_seq = max(SQN, StateB#state.fts_seq)
             }}
     end.
 
@@ -3873,13 +3873,13 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
                     {noreply, StateB#state{
                         slow_offer = false,
                         ledger_cache = Cache,
-                        fts_seq = SQN
+                        fts_seq = max(SQN, StateB#state.fts_seq)
                     }};
                 {{returned, Cache}, StateB} ->
                     {noreply, StateB#state{
                         slow_offer = true,
                         ledger_cache = Cache,
-                        fts_seq = SQN
+                        fts_seq = max(SQN, StateB#state.fts_seq)
                     }}
             end;
         {error, Reason} ->
@@ -5174,6 +5174,80 @@ mget_testto() ->
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
     ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+fts_seq_no_regress_test_() ->
+    {timeout, 60, fun fts_seq_no_regress_testto/0}.
+
+fts_seq_no_regress_testto() ->
+    % Regression for lost postings under interleaved write paths: a
+    % direct put's fts_seq maintenance must never move the allocator
+    % BACKWARD while caller-side intents hold higher provisional seqs -
+    % a regressed counter re-allocates an in-flight seq and the two
+    % batches' posting delta carriers collide (last write wins, postings
+    % silently lost; observed live as a search-hit count drop).
+    % Interleave held intents with direct puts, complete the held
+    % caller-side writes LAST, and assert every document is searchable.
+    RootPath = reset_filestructure(),
+    Indexes = [#{bucket => <<"docs">>, index => <<"main">>, columns => [body]}],
+    StartOpts = [{root_path, RootPath}, {fts_indexes, Indexes}],
+    {ok, Bookie} = book_start(StartOpts),
+    % take N intents up front (simulating concurrent workers mid-flight)
+    Intents =
+        [gen_server:call(Bookie, {fts_put_intent}, infinity) || _ <- lists:seq(1, 5)],
+    % direct puts interleave - their fts_seq maintenance runs with
+    % higher provisional seqs outstanding
+    lists:foreach(
+        fun(I) ->
+            K = list_to_binary("direct" ++ integer_to_list(I)),
+            ok = book_put_direct(
+                Bookie, <<"docs">>, K, #{body => <<"direct common">>}, [],
+                ?STD_TAG, infinity, false
+            )
+        end,
+        lists:seq(1, 5)
+    ),
+    % a fresh intent AFTER the direct puts must not collide with the
+    % held ones
+    Fresh = gen_server:call(Bookie, {fts_put_intent}, infinity),
+    HeldSeqs = [Seq || {ok, Seq, _Ix, _Ink} <- Intents],
+    {ok, FreshSeq, _FIx, _FInk} = Fresh,
+    ?assertNot(lists:member(FreshSeq, HeldSeqs)),
+    ?assert(FreshSeq > lists:max(HeldSeqs)),
+    % complete the held caller-side writes and the fresh one
+    All = Intents ++ [Fresh],
+    lists:foreach(
+        fun({Idx, {ok, Seq, Ix, _Ink}}) ->
+            K = list_to_binary("held" ++ integer_to_list(Idx)),
+            LK = leveled_codec:to_objectkey(<<"docs">>, K, ?STD_TAG),
+            Obj = #{body => <<"held common">>},
+            {ok, Aug, Touched} =
+                leveled_fts:augment_object_changes(
+                    [{LK, Obj, {[], infinity}}], Ix, Seq
+                ),
+            Markers = leveled_fts:marker_cache_updates(Aug, Ix),
+            ok = publish_fts_changes(
+                Bookie,
+                element(4, lists:nth(Idx, All)),
+                Aug,
+                {Touched, Seq, Seq - 1, Markers},
+                false
+            )
+        end,
+        lists:zip(lists:seq(1, length(All)), All)
+    ),
+    {async, Runner} =
+        book_ftssearch(Bookie, <<"docs">>, <<"main">>, <<"common">>, #{}),
+    {ok, Hits} = Runner(),
+    ?assertEqual(11, length(Hits)),
+    ok = book_close(Bookie),
+    % restart: postings must all be journal-recoverable
+    {ok, Bookie2} = book_start(StartOpts),
+    {async, Runner2} =
+        book_ftssearch(Bookie2, <<"docs">>, <<"main">>, <<"common">>, #{}),
+    {ok, Hits2} = Runner2(),
+    ?assertEqual(11, length(Hits2)),
     ok = book_close(Bookie2),
     reset_filestructure().
 
