@@ -216,6 +216,19 @@ only as the internal building block for fold hydration where a caller
 explicitly composes against one snapshot; it is not part of the public
 KV surface.
 
+### 3.1a Caller-side value cache (opt-in)
+
+`{value_cache_size, Bytes}` at book_start (default 0 = off) gives the
+caller-side read engine a shared value cache keyed `{LedgerKey, SQN}`.
+The RESOLVE phase returns the current SQN before any journal IO, and an
+overwrite allocates a new SQN, so a hit is provably the current value —
+no staleness window exists by construction; deletes never consult the
+cache (the head already said absent). book_get and book_mget consult it
+transparently; misses populate on fetch; eviction is byte-budgeted
+(approximate ETS memory) with the delete-first bound. This replaces the
+OS-page-cache role other stores get for free on decompressed values:
+a warm hit skips the journal pread, lz4 decompress, and term decode.
+
 ## 4. Control plane (unchanged)
 
 ```erlang

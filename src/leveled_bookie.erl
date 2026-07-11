@@ -166,7 +166,8 @@
     {stats_percentage, ?DEFAULT_STATS_PERC},
     {stats_logfrequency, element(1, leveled_monitor:get_defaults())},
     {monitor_loglist, element(2, leveled_monitor:get_defaults())},
-    {fts_indexes, []}
+    {fts_indexes, []},
+    {value_cache_size, 0}
 ]).
 
 -record(ledger_cache, {
@@ -729,6 +730,70 @@ publish_fts_changes(Pid, Inker, MultiChanges, FtsAdvance, DataSync) ->
         ),
     gen_server:call(Pid, {publish_fts, SQN, ChangesList, FtsAdvance}, infinity).
 
+%% ============================================================================
+%% Caller-side value cache (TARGET_API §3.1). Opt-in via the
+%% {value_cache_size, Bytes} start option (0 = disabled, the default).
+%% Entries are keyed {LedgerKey, SQN}: the RESOLVE phase returns the
+%% current SQN before any journal IO, and an overwrite allocates a new
+%% SQN, so a hit is provably the current value - there is no staleness
+%% window by construction. The table is a public ETS owned by the Bookie
+%% and discovered through persistent_term; eviction is the same
+%% delete-first bound used by the FTS result cache, budgeted by an
+%% approximate in-memory byte size.
+valuecache_init(Size) when is_integer(Size), Size > 0 ->
+    Tid =
+        ets:new(leveled_bookie_valuecache, [
+            set,
+            public,
+            {read_concurrency, true},
+            {write_concurrency, true}
+        ]),
+    persistent_term:put({?MODULE, valuecache, self()}, {Tid, Size}),
+    ok;
+valuecache_init(_Disabled) ->
+    ok.
+
+valuecache_lookup(Pid, LK, SQN) ->
+    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
+        undefined ->
+            miss;
+        {Tid, _Size} ->
+            try ets:lookup(Tid, {LK, SQN}) of
+                [{_K, Object}] -> {ok, Object};
+                [] -> miss
+            catch
+                error:badarg -> miss
+            end
+    end.
+
+valuecache_insert(Pid, LK, SQN, Object) ->
+    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
+        undefined ->
+            ok;
+        {Tid, Size} ->
+            try
+                ets:insert(Tid, {{LK, SQN}, Object}),
+                valuecache_bound(Tid, Size)
+            catch
+                error:badarg -> ok
+            end
+    end.
+
+valuecache_bound(Tid, Size) ->
+    Words = ets:info(Tid, memory),
+    case is_integer(Words) andalso Words * erlang:system_info(wordsize) > Size of
+        true ->
+            case ets:first(Tid) of
+                '$end_of_table' ->
+                    ok;
+                First ->
+                    ets:delete(Tid, First),
+                    valuecache_bound(Tid, Size)
+            end;
+        false ->
+            ok
+    end.
+
 write_refs(Pid) ->
     CacheKey = {leveled_bookie_write_refs, Pid},
     case erlang:get(CacheKey) of
@@ -1071,8 +1136,18 @@ book_get(Pid, Bucket, Key, Tag) ->
         not_found ->
             not_found;
         {fetch, LK, SQN, Inker} ->
-            try leveled_inker:ink_mget(Inker, [{LK, SQN}]) of
+            case valuecache_lookup(Pid, LK, SQN) of
+                {ok, _Object} = Cached ->
+                    Cached;
+                miss ->
+                    book_get_fetch(Pid, Bucket, Key, Tag, LK, SQN, Inker)
+            end
+    end.
+
+book_get_fetch(Pid, Bucket, Key, Tag, LK, SQN, Inker) ->
+    try leveled_inker:ink_mget(Inker, [{LK, SQN}]) of
                 [{ok, Object}] ->
+                    ok = valuecache_insert(Pid, LK, SQN, Object),
                     {ok, Object};
                 [not_present] ->
                     %% the head said fetch: not_present here is a journal
@@ -1082,7 +1157,6 @@ book_get(Pid, Bucket, Key, Tag) ->
             catch
                 _:_ ->
                     book_get_direct(Pid, Bucket, Key, Tag)
-            end
     end.
 
 -spec book_get_direct(pid(), leveled_codec:key(), leveled_codec:key(), leveled_codec:tag()) ->
@@ -1120,7 +1194,23 @@ book_mget(Pid, Bucket, Keys, Tag) ->
     %% re-organisation race (crash, or not_present after a positive
     %% head) falls back to the direct per-key path for the affected
     %% keys - a retried read, never a wrong answer.
-    {Specs, Inker} = gen_server:call(Pid, {mget_fetchspecs, Bucket, Keys, Tag}, infinity),
+    {Specs0, Inker} = gen_server:call(Pid, {mget_fetchspecs, Bucket, Keys, Tag}, infinity),
+    %% Value-cache pass: a fetchspec's SQN uniquely identifies the journal
+    %% record for its key, so a {LK, SQN} cache hit is provably current -
+    %% rewrite it to {cached, Object} and read only the misses.
+    Specs =
+        lists:map(
+            fun
+                ({Key, {fetch, LK, SQN}} = Spec) ->
+                    case valuecache_lookup(Pid, LK, SQN) of
+                        {ok, Object} -> {Key, {cached, Object}};
+                        miss -> Spec
+                    end;
+                (Spec) ->
+                    Spec
+            end,
+            Specs0
+        ),
     Pairs = [{LK, SQN} || {_Key, {fetch, LK, SQN}} <- Specs],
     Values =
         try
@@ -1139,10 +1229,13 @@ zip_mget_fetchspecs(_Pid, _Bucket, _Tag, [], []) ->
     [];
 zip_mget_fetchspecs(Pid, Bucket, Tag, [{Key, not_found} | RestS], Values) ->
     [{Key, not_found} | zip_mget_fetchspecs(Pid, Bucket, Tag, RestS, Values)];
-zip_mget_fetchspecs(Pid, Bucket, Tag, [{Key, {fetch, _LK, _SQN}} | RestS], [Value | RestV]) ->
+zip_mget_fetchspecs(Pid, Bucket, Tag, [{Key, {cached, Object}} | RestS], Values) ->
+    [{Key, {ok, Object}} | zip_mget_fetchspecs(Pid, Bucket, Tag, RestS, Values)];
+zip_mget_fetchspecs(Pid, Bucket, Tag, [{Key, {fetch, LK, SQN}} | RestS], [Value | RestV]) ->
     Result =
         case Value of
             {ok, Object} ->
+                ok = valuecache_insert(Pid, LK, SQN, Object),
                 {ok, Object};
             not_present ->
                 %% positive head + missing journal value = reorganisation
@@ -1917,6 +2010,7 @@ init([Opts]) ->
             of
                 {ok, FtsIndexes} ->
 
+            ok = valuecache_init(proplists:get_value(value_cache_size, Opts)),
             {ok, Monitor} =
                 leveled_monitor:monitor_start(
                     proplists:get_value(stats_logfrequency, Opts),
@@ -2751,6 +2845,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(Reason, _State) ->
+    _ = persistent_term:erase({?MODULE, valuecache, self()}),
     ?STD_LOG(b0003, [Reason]).
 
 code_change(_OldVsn, State, _Extra) ->
@@ -5456,6 +5551,72 @@ put_publish_reorder_testto() ->
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
     CheckAll(Bookie2),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+valuecache_test_() ->
+    {timeout, 60, fun valuecache_testto/0}.
+
+valuecache_testto() ->
+    % The caller-side value cache must be invisible semantically:
+    % reads equal the uncached direct path, overwrites are seen
+    % immediately (SQN-keyed entries cannot serve a stale value),
+    % deletes return not_found, mget mixes hits and misses correctly,
+    % and the table stays within its byte budget under pressure.
+    RootPath = reset_filestructure(),
+    Budget = 262144,
+    {ok, Bookie} =
+        book_start([{root_path, RootPath}, {value_cache_size, Budget}]),
+    B = <<"vc">>,
+    Obj = fun(I) -> {v, I, crypto:strong_rand_bytes(1024)} end,
+    Keys = [list_to_binary(io_lib:format("k~4..0w", [I])) || I <- lists:seq(1, 50)],
+    lists:foreach(
+        fun({K, I}) -> ok = book_put(Bookie, B, K, Obj(I), [], ?STD_TAG) end,
+        lists:zip(Keys, lists:seq(1, 50))
+    ),
+    % warm the cache, then re-read (hit path) and compare to direct
+    Reads1 = [book_get(Bookie, B, K, ?STD_TAG) || K <- Keys],
+    Reads2 = [book_get(Bookie, B, K, ?STD_TAG) || K <- Keys],
+    Direct = [book_get_direct(Bookie, B, K, ?STD_TAG) || K <- Keys],
+    ?assertEqual(Direct, Reads1),
+    ?assertEqual(Direct, Reads2),
+    % overwrite: the new SQN must miss the old entry and serve the new value
+    [K1 | _] = Keys,
+    ok = book_put(Bookie, B, K1, updated, [], ?STD_TAG),
+    ?assertEqual({ok, updated}, book_get(Bookie, B, K1, ?STD_TAG)),
+    % delete: head says absent - cache never consulted
+    ok = book_delete(Bookie, B, K1, []),
+    ?assertEqual(not_found, book_get(Bookie, B, K1, ?STD_TAG)),
+    % mget mixes cache hits (warm keys) and misses (fresh writes)
+    Fresh = [<<"fresh1">>, <<"fresh2">>],
+    lists:foreach(
+        fun(K) -> ok = book_put(Bookie, B, K, {fresh, K}, [], ?STD_TAG) end,
+        Fresh
+    ),
+    MgetKeys = Fresh ++ tl(Keys) ++ [<<"absent">>],
+    Expected = [{K, book_get_direct(Bookie, B, K, ?STD_TAG)} || K <- MgetKeys],
+    ?assertEqual(Expected, book_mget(Bookie, B, MgetKeys, ?STD_TAG)),
+    % pressure: write values well past the budget; the table stays bounded
+    BigKeys = [list_to_binary(io_lib:format("big~4..0w", [I])) || I <- lists:seq(1, 100)],
+    lists:foreach(
+        fun(K) -> ok = book_put(Bookie, B, K, crypto:strong_rand_bytes(16384), [], ?STD_TAG) end,
+        BigKeys
+    ),
+    BigDirect = [book_get_direct(Bookie, B, K, ?STD_TAG) || K <- BigKeys],
+    BigCached = [book_get(Bookie, B, K, ?STD_TAG) || K <- BigKeys],
+    ?assertEqual(BigDirect, BigCached),
+    {Tid, _} = persistent_term:get({?MODULE, valuecache, Bookie}),
+    Words = ets:info(Tid, memory),
+    ?assert(Words * erlang:system_info(wordsize) =< Budget + 32768),
+    ok = book_close(Bookie),
+    % restart: cold cache, reads still correct
+    {ok, Bookie2} =
+        book_start([{root_path, RootPath}, {value_cache_size, Budget}]),
+    ?assertEqual(not_found, book_get(Bookie2, B, K1, ?STD_TAG)),
+    ?assertEqual(
+        [book_get_direct(Bookie2, B, K, ?STD_TAG) || K <- Fresh],
+        [book_get(Bookie2, B, K, ?STD_TAG) || K <- Fresh]
+    ),
     ok = book_close(Bookie2),
     reset_filestructure().
 
