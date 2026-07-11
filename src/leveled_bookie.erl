@@ -198,7 +198,7 @@
     %% journal replay after a crash would skip an acked write. Absorptions
     %% advance a contiguous frontier; out-of-order publishes buffer.
     publish_frontier = 0 :: non_neg_integer(),
-    publish_pending = gb_sets:empty() :: gb_sets:set(),
+    publish_pending = gb_trees:empty() :: gb_trees:tree(),
     publish_gap_since = undefined :: undefined | erlang:timestamp(),
     fts_seq = 0 :: non_neg_integer(),
     fts_dir_cache :: ets:tid() | undefined,
@@ -621,7 +621,7 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
         {ok, Inker, FtsIndexes} ->
             case leveled_fts:bucket_has_schema(Bucket, FtsIndexes) of
                 true ->
-                    book_put_direct(
+                    put_caller_side_fts(
                         Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync
                     );
                 false ->
@@ -635,6 +635,19 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
     end.
 
 put_caller_side(Pid, Inker, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
+    %% the same public-spec validation the direct path enforces in its
+    %% handle_call: forged internal payload specs (fts_term carriers etc.)
+    %% must be rejected regardless of which path a caller takes
+    case valid_public_index_specs(IndexSpecs) of
+        false ->
+            {error, invalid_index_specs};
+        true ->
+            put_caller_side_validated(
+                Pid, Inker, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync
+            )
+    end.
+
+put_caller_side_validated(Pid, Inker, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
     LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
     try
         {ok, SQN, ObjSize} =
@@ -655,6 +668,69 @@ put_caller_side(Pid, Inker, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync)
             erlang:erase({leveled_bookie_write_refs, Pid}),
             book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync)
     end.
+
+%% Caller-side FTS write: the same three phases as put_caller_side with
+%% the pure augmentation inserted into the IO phase. RESOLVE allocates
+%% the fts batch seq; augmentation (tokenisation + page encoding - the
+%% dominant CPU of an FTS write) runs here against the static schema
+%% set; single-change results take ink_put, multi-change results (shard
+%% delta carriers) take ink_batchput - both journal writes in THIS
+%% process; PUBLISH absorbs ledger changes + the shard-cache advance
+%% behind the frontier. Any race falls back to the direct path.
+put_caller_side_fts(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
+    case valid_public_index_specs(IndexSpecs) of
+        false ->
+            {error, invalid_index_specs};
+        true ->
+            put_caller_side_fts_validated(
+                Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync
+            )
+    end.
+
+put_caller_side_fts_validated(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
+    LedgerKey = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    try
+        {ok, Seq, FtsIndexes, Inker} =
+            gen_server:call(Pid, {fts_put_intent}, infinity),
+        case
+            leveled_fts:augment_object_changes(
+                [{LedgerKey, Object, {IndexSpecs, TTL}}], FtsIndexes, Seq
+            )
+        of
+            {ok, AugChanges, Touched} ->
+                Markers =
+                    leveled_fts:marker_cache_updates(AugChanges, FtsIndexes),
+                FtsAdvance = {Touched, Seq, Seq - 1, Markers},
+                publish_fts_changes(
+                    Pid, Inker, AugChanges, FtsAdvance, DataSync
+                );
+            {error, _Reason} ->
+                book_put_direct(
+                    Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync
+                )
+        end
+    catch
+        _:_ ->
+            erlang:erase({leveled_bookie_write_refs, Pid}),
+            book_put_direct(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync)
+    end.
+
+publish_fts_changes(Pid, Inker, [{LK, Obj, {Specs, TTL}}], FtsAdvance, DataSync) ->
+    {ok, SQN, ObjSize} =
+        leveled_inker:ink_put(Inker, LK, Obj, {Specs, TTL}, DataSync),
+    Changes = preparefor_ledgercache(null, LK, SQN, Obj, ObjSize, {Specs, TTL}),
+    gen_server:call(Pid, {publish_fts, SQN, [Changes], FtsAdvance}, infinity);
+publish_fts_changes(Pid, Inker, MultiChanges, FtsAdvance, DataSync) ->
+    {ok, SQN, ObjectWriteInfos} =
+        leveled_inker:ink_batchput(Inker, MultiChanges, DataSync),
+    ChangesList =
+        lists:map(
+            fun({LK, Obj, KeyChanges, ObjSize}) ->
+                preparefor_ledgercache(null, LK, SQN, Obj, ObjSize, KeyChanges)
+            end,
+            ObjectWriteInfos
+        ),
+    gen_server:call(Pid, {publish_fts, SQN, ChangesList, FtsAdvance}, infinity).
 
 write_refs(Pid) ->
     CacheKey = {leveled_bookie_write_refs, Pid},
@@ -2141,6 +2217,40 @@ handle_call({write_refs}, _From, State) when
     %% path. FtsIndexes is start-time configuration, so callers may
     %% cache this reply for the bookie's lifetime.
     {reply, {ok, State#state.inker, State#state.fts_indexes}, State};
+handle_call({fts_put_intent}, _From, State) when
+    State#state.head_only == false
+->
+    %% RESOLVE for a caller-side FTS write (TARGET_API §3.2, FTS stage):
+    %% allocates the batch sequence the caller's augmentation embeds in
+    %% its posting deltas. Pure in-memory counter bump; the heavy
+    %% derivation (tokenisation, page encoding) runs caller-side against
+    %% the static index set, and the resulting cache advance rides the
+    %% caller's {publish_fts, ...} through the absorption frontier.
+    Seq = State#state.fts_seq + 1,
+    {reply, {ok, Seq, State#state.fts_indexes, State#state.inker},
+        State#state{fts_seq = Seq}};
+handle_call({publish_fts, SQN, ChangesList, FtsAdvance}, _From, State) when
+    State#state.head_only == false
+->
+    %% PUBLISH for a caller-side FTS write: identical to {publish, ...}
+    %% plus the FTS cache advance, which applies only when this SQN
+    %% joins the contiguous frontier (completeness-honest stamping).
+    Cache0 =
+        lists:foldl(
+            fun addto_ledgercache/2, State#state.ledger_cache, ChangesList
+        ),
+    Reply =
+        case State#state.slow_offer of
+            true -> pause;
+            false -> ok
+        end,
+    StateA = absorb_sqn(SQN, fts_advance_or_none(FtsAdvance), State),
+    case maybe_gated_push(Cache0, StateA) of
+        {{ok, Cache}, StateB} ->
+            {reply, Reply, StateB#state{ledger_cache = Cache, slow_offer = false}};
+        {{returned, Cache}, StateB} ->
+            {reply, Reply, StateB#state{ledger_cache = Cache, slow_offer = true}}
+    end;
 handle_call({get, Bucket, Key, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -3562,50 +3672,68 @@ addto_ledgercache_batch(PreparedChanges, Cache) ->
 %% is an abandoned intent (caller died between journal write and
 %% publish): the write was never acked, so the frontier skips it -
 %% unacked writes are indeterminate by contract.
+%% Each absorbed SQN may carry an FTS cache advance. Advances apply ONLY
+%% when their SQN joins the contiguous frontier: the FTS query cache
+%% treats its stamp as a completeness claim (Stamp =< QuerySeq serves the
+%% cache), so an advance stamping ahead of an unabsorbed hole would let a
+%% query trust a cache that is missing a concurrent writer's delta.
+%% Frontier-ordered application makes the stamp honest by construction -
+%% for the direct path exactly as for caller-side publishes.
 absorb_sqns([], State) ->
     State;
 absorb_sqns([SQN | Rest], State) ->
-    absorb_sqns(Rest, absorb_sqn(SQN, State)).
+    absorb_sqns(Rest, absorb_sqn(SQN, none, State)).
 
-absorb_sqn(SQN, State) when SQN == State#state.publish_frontier + 1 ->
+absorb_sqn(SQN, FtsAdvance, State) when SQN == State#state.publish_frontier + 1 ->
+    apply_fts_advance(SQN, FtsAdvance, State),
     drain_pending(State#state{
         publish_frontier = SQN,
         publish_gap_since = undefined
     });
-absorb_sqn(SQN, State) when SQN =< State#state.publish_frontier ->
+absorb_sqn(SQN, _FtsAdvance, State) when SQN =< State#state.publish_frontier ->
     %% replay/duplicate absorption (restart paths) - already covered
     State;
-absorb_sqn(SQN, State) ->
+absorb_sqn(SQN, FtsAdvance, State) ->
     GapSince =
         case State#state.publish_gap_since of
             undefined -> os:timestamp();
             TS -> TS
         end,
     State#state{
-        publish_pending = gb_sets:add(SQN, State#state.publish_pending),
+        publish_pending =
+            gb_trees:enter(SQN, FtsAdvance, State#state.publish_pending),
         publish_gap_since = GapSince
     }.
 
 drain_pending(State) ->
     Pending = State#state.publish_pending,
     Next = State#state.publish_frontier + 1,
-    case gb_sets:is_empty(Pending) of
+    case gb_trees:is_empty(Pending) of
         true ->
             State;
         false ->
-            case gb_sets:smallest(Pending) of
-                Next ->
+            case gb_trees:smallest(Pending) of
+                {Next, FtsAdvance} ->
+                    apply_fts_advance(Next, FtsAdvance, State),
                     drain_pending(State#state{
                         publish_frontier = Next,
-                        publish_pending = gb_sets:del_element(Next, Pending)
+                        publish_pending = gb_trees:delete(Next, Pending)
                     });
-                _Larger ->
+                {_Larger, _} ->
                     State
             end
     end.
 
+fts_advance_or_none({[], 0, 0, []}) -> none;
+fts_advance_or_none(FtsAdvance) -> FtsAdvance.
+
+apply_fts_advance(_SQN, none, _State) ->
+    ok;
+apply_fts_advance(SQN, FtsAdvance, State) ->
+    ok = advance_fts_seqs_cache(State#state.fts_dir_cache, SQN, FtsAdvance).
+
 publish_gap_expired(State) ->
-    case {gb_sets:is_empty(State#state.publish_pending), State#state.publish_gap_since} of
+    case {gb_trees:is_empty(State#state.publish_pending), State#state.publish_gap_since} of
         {true, _} ->
             false;
         {false, undefined} ->
@@ -3622,17 +3750,18 @@ maybe_gated_push(Cache0, State) ->
     State1 =
         case publish_gap_expired(State) of
             true ->
-                Skipped = gb_sets:smallest(State#state.publish_pending),
+                {SkippedTo, SkipAdv} = gb_trees:smallest(State#state.publish_pending),
+                apply_fts_advance(SkippedTo, SkipAdv, State),
                 drain_pending(State#state{
-                    publish_frontier = Skipped,
+                    publish_frontier = SkippedTo,
                     publish_pending =
-                        gb_sets:del_element(Skipped, State#state.publish_pending),
+                        gb_trees:delete(SkippedTo, State#state.publish_pending),
                     publish_gap_since = undefined
                 });
             false ->
                 State
         end,
-    case gb_sets:is_empty(State1#state.publish_pending) of
+    case gb_trees:is_empty(State1#state.publish_pending) of
         false ->
             {{ok, Cache0}, State1};
         true ->
@@ -3658,7 +3787,6 @@ do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0, 
             {AugIndexSpecs, TTL},
             DataSync
         ),
-    ok = advance_fts_seqs_cache(State0#state.fts_dir_cache, SQN, FtsAdvance),
     {T0, SW1} = leveled_monitor:step_time(SW0),
     Changes =
         preparefor_ledgercache(
@@ -3675,7 +3803,7 @@ do_augmented_put(LedgerKey, Object, AugIndexSpecs, TTL, DataSync, From, State0, 
     end,
     maybe_longrunning(SWLR, overall_put),
     maybelog_put_timing(State0#state.monitor, T0, T1, T2, ObjSize),
-    StateA = absorb_sqns([SQN], State0),
+    StateA = absorb_sqn(SQN, fts_advance_or_none(FtsAdvance), State0),
     case maybe_gated_push(Cache0, StateA) of
         {{ok, Cache}, StateB} ->
             {noreply, StateB#state{
@@ -3710,7 +3838,6 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
         )
     of
         {ok, SQN, ObjectWriteInfos} ->
-            ok = advance_fts_seqs_cache(State#state.fts_dir_cache, SQN, FtsAdvance),
             {T0, SW1} = leveled_monitor:step_time(SW0),
             %% The batch is durable in the journal, and no read can be served
             %% before this callback completes (the bookie is process-serial),
@@ -3740,7 +3867,7 @@ do_batchput(ObjectChanges, DataSync, From, State, FtsAdvance) ->
             maybelog_put_timing(
                 State#state.monitor, T0, T1, T2, ObjSizeTotal
             ),
-            StateA = absorb_sqns([SQN], State),
+            StateA = absorb_sqn(SQN, fts_advance_or_none(FtsAdvance), State),
             case maybe_gated_push(Cache0, StateA) of
                 {{ok, Cache}, StateB} ->
                     {noreply, StateB#state{
@@ -5047,6 +5174,66 @@ mget_testto() ->
     ok = book_close(Bookie1),
     {ok, Bookie2} = book_start([{root_path, RootPath}]),
     ?assertEqual(Results, book_mget(Bookie2, <<"Bucket">>, Keys, ?STD_TAG)),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+fts_put_callerside_differential_test_() ->
+    {timeout, 120, fun fts_put_callerside_differential_testto/0}.
+
+fts_put_callerside_differential_testto() ->
+    % Caller-side FTS writes (put_caller_side_fts: caller augmentation,
+    % caller journal write, frontier-published cache advance) must be
+    % search-identical to direct-path writes: interleave both paths into
+    % one FTS-indexed bucket, then every term must return exactly the
+    % same keys via book_ftssearch, before AND after restart (postings
+    % served from journal-recovered state).
+    RootPath = reset_filestructure(),
+    Indexes = [#{bucket => <<"docs">>, index => <<"main">>, columns => [body]}],
+    StartOpts = [{root_path, RootPath}, {fts_indexes, Indexes}],
+    {ok, Bookie1} = book_start(StartOpts),
+    Put =
+        fun(Bookie, K, Body, Direct) ->
+            Obj = #{body => Body},
+            case Direct of
+                true ->
+                    ok = book_put_direct(
+                        Bookie, <<"docs">>, K, Obj, [], ?STD_TAG, infinity, false
+                    );
+                false ->
+                    ok = book_put(Bookie, <<"docs">>, K, Obj, [], ?STD_TAG)
+            end
+        end,
+    Words = [<<"alpha">>, <<"beta">>, <<"gamma">>, <<"delta">>],
+    Expected =
+        lists:foldl(
+            fun(I, Acc) ->
+                K = list_to_binary("doc" ++ integer_to_list(I)),
+                Word = lists:nth(1 + (I rem length(Words)), Words),
+                Body = <<Word/binary, " filler text number ",
+                    (integer_to_binary(I))/binary>>,
+                Put(Bookie1, K, Body, I rem 2 == 0),
+                maps:update_with(Word, fun(Ks) -> [K | Ks] end, [K], Acc)
+            end,
+            #{},
+            lists:seq(1, 60)
+        ),
+    CheckAll =
+        fun(Bookie) ->
+            maps:foreach(
+                fun(Word, Ks) ->
+                    {async, Runner} =
+                        book_ftssearch(Bookie, <<"docs">>, <<"main">>, Word, #{}),
+                    {ok, Hits} = Runner(),
+                    Got = lists:sort([maps:get(key, H) || H <- Hits]),
+                    ?assertEqual(lists:sort(Ks), Got)
+                end,
+                Expected
+            )
+        end,
+    CheckAll(Bookie1),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start(StartOpts),
+    CheckAll(Bookie2),
     ok = book_close(Bookie2),
     reset_filestructure().
 

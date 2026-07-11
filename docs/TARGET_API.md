@@ -11,10 +11,19 @@ in-memory `{publish, SQN, Changes}` clause behind an SQN reorder gate
 never passes an unabsorbed acked SQN; abandoned gaps — caller death
 between journal write and publish, i.e. unacked writes — expire after
 5s and are skipped, making unacked-write indeterminacy explicit).
-Writes into FTS-indexed buckets take `book_put_direct` (posting
-augmentation needs Bookie-held shard state; caller-side FTS is the
-remaining §3.2 stage, with batch-engine mput riding the same publish
-path after it). Deprecated aliases retained until consumers migrate. This document defines
+**Caller-side FTS writes landed**: augmentation (tokenisation + page
+encoding, the dominant CPU) is a pure function and runs caller-side
+against the static schema set after a `{fts_put_intent}` RESOLVE (an
+in-memory batch-seq bump); journal writes via caller ink_put/
+ink_batchput; the shard-cache advance rides `{publish_fts, ...}` and
+applies ONLY at absorption-frontier advancement — the FTS query cache
+treats its stamp as a completeness claim, so frontier-ordered advances
+make the stamp honest for concurrent writers on BOTH paths (direct
+writes route their advances through the same frontier). Public
+index-spec validation enforced on all caller-side paths (forged
+internal payload specs rejected identically to the direct path).
+Remaining §3.2 stage: batch-engine mput on the publish path; then
+alias retirement. Deprecated aliases retained until consumers migrate. This document defines
 the complete public Bookie surface in its target state, the uniform
 execution protocol underneath every operation, the guarantee each
 operation carries, and the migration/retirement plan for the current
