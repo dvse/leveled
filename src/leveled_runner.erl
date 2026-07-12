@@ -31,7 +31,6 @@
     tictactree/5,
     foldheads_allkeys/7,
     foldobjects_allkeys/4,
-    foldobjects_journal/4,
     foldheads_bybucket/8,
     foldobjects_bybucket/4,
     foldobjects_byindex/3
@@ -141,7 +140,7 @@ bucket_list(SnapFun, Tag, FoldBucketsFun, InitAcc, MaxBuckets) ->
 -spec index_query(
     snap_fun(),
     {leveled_codec:ledger_key(), leveled_codec:ledger_key(), {
-        boolean() | binary() | payload, leveled_codec:term_expression()
+        boolean() | binary(), leveled_codec:term_expression()
     }},
     {fold_keys_fun(), foldacc()}
 ) -> {async, runner_fun()}.
@@ -388,11 +387,13 @@ foldobjects_allkeys(SnapFun, Tag, FoldObjectsFun, sqn_order) ->
                                     VBin,
                                     true
                                 ),
-                            %% Batch writes share one SQN, so the fold must
-                            %% loop through MaxSQN entries; the SQN > MaxSQN
-                            %% clause terminates the fold.
-                            {loop,
-                                {MinSQN, MaxSQN, [{B, K, SQN, Obj} | BatchAcc]}}
+                            {
+                                case SQN of
+                                    MaxSQN -> stop;
+                                    _ -> loop
+                                end,
+                                {MinSQN, MaxSQN, [{B, K, SQN, Obj} | BatchAcc]}
+                            }
                     end;
                 _ ->
                     {loop, Acc}
@@ -441,83 +442,6 @@ foldobjects_allkeys(SnapFun, Tag, FoldObjectsFun, sqn_order) ->
                 leveled_inker:ink_fold(
                     JournalSnapshot,
                     0,
-                    {FilterFun, InitAccFun, BatchFoldFun},
-                    InitAcc
-                ),
-            wrap_runner(InkFolder, AfterFun)
-        end,
-    {async, Folder}.
-
--spec foldobjects_journal(
-    snap_fun(),
-    leveled_codec:tag(),
-    non_neg_integer(),
-    {fun((term(), term(), non_neg_integer(), {put, term()} | delete, foldacc()) -> foldacc()),
-        foldacc()}
-) ->
-    {async, runner_fun()}.
-%% @doc
-%% Changefeed fold: walk the journal in order of receipt from FromSQN,
-%% calling FoldFun(Bucket, Key, SQN, {put, Object} | delete, Acc) for every
-%% standard put and tombstone of the given Tag, including entries that have
-%% since been superseded. Journal compaction may have removed or reduced
-%% superseded entries from older parts of the journal, so a consumer keeping
-%% a cursor should not lag behind the compaction horizon. The fold is bounded
-%% by the journal SQN at snapshot time; resume from MaxSeenSQN + 1.
-foldobjects_journal(SnapFun, Tag, FromSQN, {FoldFun, InitAcc}) ->
-    FilterFun =
-        fun(JKey, JVal, _Pos, Acc, ExtractFun) ->
-            {SQN, InkTag, LedgerKey} = JKey,
-            {MinSQN, MaxSQN, BatchAcc} = Acc,
-            case SQN of
-                SQN when SQN < MinSQN ->
-                    {loop, Acc};
-                SQN when SQN > MaxSQN ->
-                    {stop, Acc};
-                _ ->
-                    %% Batch writes share one SQN: loop through MaxSQN
-                    %% entries, the SQN > MaxSQN clause terminates.
-                    case {InkTag, leveled_codec:from_ledgerkey(Tag, LedgerKey)} of
-                        {?INKT_STND, {B, K}} ->
-                            {VBin, _VSize} = ExtractFun(JVal),
-                            {Obj, _IdxSpecs} =
-                                leveled_codec:revert_value_from_journal(
-                                    VBin, true
-                                ),
-                            {loop,
-                                {MinSQN, MaxSQN, [
-                                    {B, K, SQN, {put, Obj}} | BatchAcc
-                                ]}};
-                        {?INKT_TOMB, {B, K}} ->
-                            {loop,
-                                {MinSQN, MaxSQN, [
-                                    {B, K, SQN, delete} | BatchAcc
-                                ]}};
-                        _Other ->
-                            %% Key-delta entries (body compacted away) and
-                            %% head-only entries are not changefeed events.
-                            {loop, Acc}
-                    end
-            end
-        end,
-    InitAccFun = fun(_FN, _SQN) -> [] end,
-    BatchFoldFun =
-        fun(BatchAcc, ObjAcc) ->
-            lists:foldr(
-                fun({B, K, SQN, Change}, Acc) ->
-                    FoldFun(B, K, SQN, Change, Acc)
-                end,
-                ObjAcc,
-                BatchAcc
-            )
-        end,
-    Folder =
-        fun() ->
-            {ok, _LedgerSnapshot, JournalSnapshot, AfterFun} = SnapFun(),
-            InkFolder =
-                leveled_inker:ink_fold(
-                    JournalSnapshot,
-                    FromSQN,
                     {FilterFun, InitAccFun, BatchFoldFun},
                     InitAcc
                 ),

@@ -1040,7 +1040,7 @@ delete_pending(
     ?STD_LOG(sst07, [State#state.filename]),
     ok = file:close(RS#read_state.handle),
     ok =
-        delete_pending_file(
+        file:delete(
             filename:join(State#state.root_path, State#state.filename)
         ),
     {stop_and_reply, normal, [{reply, From, ok}], State};
@@ -1052,7 +1052,7 @@ delete_pending(
     ?STD_LOG(sst07, [State#state.filename]),
     ok = file:close(RS#read_state.handle),
     ok =
-        delete_pending_file(
+        file:delete(
             filename:join(State#state.root_path, State#state.filename)
         ),
     {stop, normal, State};
@@ -1719,23 +1719,6 @@ maxslots_level(Level, MaxSlotCount) when Level < ?DOUBLESIZE_LEVEL ->
     MaxSlotCount;
 maxslots_level(_Level, MaxSlotCount) ->
     2 * MaxSlotCount.
-
-%% A delete_pending SST's file can be unlinked from its path before the
-%% owning process closes: write_file/3 renames an on-disk file whose name
-%% collides with a newly written SST to *.discarded (the sst05 "rogue
-%% filename" path) while the previous owner is still alive awaiting
-%% pcl_confirmdelete. The postcondition of this delete is "file absent",
-%% so enoent is success - matching the defensive style of
-%% leveled_pmanifest:remove_manifest/2. Without this, the badmatch kills
-%% the SST and, through links, the penciller and bookie.
--spec delete_pending_file(string()) -> ok.
-delete_pending_file(Filename) ->
-    case file:delete(Filename) of
-        ok ->
-            ok;
-        {error, enoent} ->
-            ok
-    end.
 
 write_file(
     RootPath,
@@ -6021,58 +6004,6 @@ print_compare_size(Type, OptimisedSize, UnoptimisedSize) ->
     ),
     % Reduced by at least a quarter
     ?assert(OptimisedSize < (UnoptimisedSize - (UnoptimisedSize div 4))).
-
-delete_pending_enoent_test() ->
-    %% Regression: a delete_pending SST whose file has been unlinked from
-    %% its path (write_file/3 rogue-rename to *.discarded while the prior
-    %% owner is still awaiting pcl_confirmdelete) must terminate normally
-    %% on close instead of crashing with {badmatch, {error, enoent}} -
-    %% the crash propagates through links to the penciller and bookie.
-    FileName = "delete_pending_enoent_test",
-    LK = leveled_codec:to_objectkey(<<"Bucket0">>, <<"Key0">>, ?STD_TAG),
-    Chunk = crypto:strong_rand_bytes(16),
-    MV = leveled_codec:convert_to_ledgerv(LK, 1, Chunk, 16, infinity),
-    OptsSST =
-        #sst_options{
-            press_method = native,
-            log_options = leveled_log:get_opts()
-        },
-    %% cast-close arm (sst_deleteconfirmed)
-    {ok, P1, {LK, LK}, _Bloom1} =
-        sst_new(?TEST_AREA, FileName, 1, [{LK, MV}], 6000, OptsSST),
-    ok = sst_setfordelete(P1, false),
-    ok =
-        file:rename(
-            filename:join(?TEST_AREA, FileName ++ ".sst"),
-            filename:join(?TEST_AREA, FileName ++ ".sst.discarded")
-        ),
-    M1 = erlang:monitor(process, P1),
-    ok = sst_deleteconfirmed(P1),
-    receive
-        {'DOWN', M1, process, P1, Reason1} ->
-            ?assertMatch(normal, Reason1)
-    after 5000 ->
-        ?assert(false)
-    end,
-    ok = file:delete(filename:join(?TEST_AREA, FileName ++ ".sst.discarded")),
-    %% call-close arm (sst_close while delete_pending)
-    {ok, P2, {LK, LK}, _Bloom2} =
-        sst_new(?TEST_AREA, FileName, 1, [{LK, MV}], 6000, OptsSST),
-    ok = sst_setfordelete(P2, false),
-    ok =
-        file:rename(
-            filename:join(?TEST_AREA, FileName ++ ".sst"),
-            filename:join(?TEST_AREA, FileName ++ ".sst.discarded")
-        ),
-    M2 = erlang:monitor(process, P2),
-    ok = sst_close(P2),
-    receive
-        {'DOWN', M2, process, P2, Reason2} ->
-            ?assertMatch(normal, Reason2)
-    after 5000 ->
-        ?assert(false)
-    end,
-    ok = file:delete(filename:join(?TEST_AREA, FileName ++ ".sst.discarded")).
 
 single_key_test() ->
     FileName = "single_key_test",

@@ -459,18 +459,13 @@ handle_cast(
                 ok = CloseFun(FilterServer),
                 ok =
                     leveled_inker:ink_clerkcomplete(
-                        State#state.inker,
-                        ManifestSlice,
-                        FilesToDelete,
-                        length(BestRun0)
+                        State#state.inker, ManifestSlice, FilesToDelete
                     ),
                 length(BestRun0);
             false ->
                 ok = CloseFun(FilterServer),
                 ok =
-                    leveled_inker:ink_clerkcomplete(
-                        State#state.inker, [], [], 0
-                    ),
+                    leveled_inker:ink_clerkcomplete(State#state.inker, [], []),
                 0
         end,
     {Monitor, _} = CDBopts#cdb_options.monitor,

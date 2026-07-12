@@ -96,11 +96,9 @@
     ink_start/1,
     ink_snapstart/1,
     ink_put/5,
-    ink_batchput/3,
     ink_mput/3,
     ink_get/3,
     ink_fetch/3,
-    ink_mget/2,
     ink_keycheck/3,
     ink_fold/4,
     ink_loadpcl/5,
@@ -108,8 +106,6 @@
     ink_confirmdelete/3,
     ink_compactjournal/3,
     ink_clerkcomplete/3,
-    ink_clerkcomplete/4,
-    ink_lastcompactionresult/1,
     ink_compactionpending/1,
     ink_trim/2,
     ink_getmanifest/1,
@@ -163,7 +159,6 @@
     cdb_options :: #cdb_options{} | undefined,
     clerk :: pid() | undefined,
     compaction_pending = false :: boolean(),
-    last_compaction_run_length = undefined :: non_neg_integer() | undefined,
     bookie_monref :: reference() | undefined,
     is_snapshot = false :: boolean(),
     compression_method = native :: lz4 | native | none,
@@ -247,23 +242,6 @@ ink_put(Pid, PrimaryKey, Object, KeyChanges, DataSync) ->
         infinity
     ).
 
--spec ink_batchput(
-    pid(),
-    list({
-        leveled_codec:ledger_key(),
-        any(),
-        leveled_codec:journal_keychanges()
-    }),
-    boolean()
-) ->
-    {ok, non_neg_integer(), list()} | {error, term()}.
-%% @doc
-%% PUT a batch of standard objects into the journal under one sequence number.
-%% Each object is still written using its normal standard journal key, so normal
-%% fetch-by-ledger-key behaviour is preserved.
-ink_batchput(Pid, ObjectChanges, DataSync) ->
-    gen_server:call(Pid, {batchput, ObjectChanges, DataSync}, infinity).
-
 -spec ink_mput(pid(), any(), {list(), integer() | infinity}) -> {ok, integer()}.
 %% @doc
 %% MPUT as series of object specifications, which will be converted into
@@ -298,81 +276,6 @@ ink_get(Pid, PrimaryKey, SQN) ->
 %% fetching the Key prompted some anticipated error (e.g. CRC check failed)
 ink_fetch(Pid, PrimaryKey, SQN) ->
     gen_server:call(Pid, {fetch, PrimaryKey, SQN}, infinity).
-
--spec ink_mget(pid(), list({leveled_codec:ledger_key(), integer()})) ->
-    list({ok, any()} | not_present).
-%% @doc
-%% Fetch several values in one call. The inker only GROUPS the keys by
-%% journal file (a manifest lookup each); the batched reads and value
-%% decoding then run here in the calling process, fanned out in parallel
-%% across the touched journal files. The per-value round trip through
-%% the singleton inker, which serialises every journal read in the
-%% store, amortises to one grouping call per batch - so concurrent
-%% callers scale with journal file count, not with inker throughput.
-%% Results are in input order with ink_fetch/3's semantics.
-ink_mget(Pid, KeySQNPairs) ->
-    {grouped, ByFile} = gen_server:call(Pid, {mget, KeySQNPairs}, infinity),
-    Parent = self(),
-    Workers =
-        [
-            begin
-                Tag = make_ref(),
-                OrderedEntries = lists:reverse(Entries),
-                {_Pid, Mon} =
-                    spawn_monitor(
-                        fun() ->
-                            Fetched =
-                                leveled_cdb:cdb_mget(
-                                    JournalP, [IK || {_N, IK} <- OrderedEntries]
-                                ),
-                            Decoded =
-                                lists:map(
-                                    fun({{N, _IK}, Obj}) ->
-                                        case
-                                            leveled_codec:from_inkerkv(
-                                                Obj, true
-                                            )
-                                        of
-                                            {{_SQN, _PK}, {V, _IdxSpecs}} ->
-                                                {N, {ok, V}};
-                                            _NotPresent ->
-                                                {N, not_present}
-                                        end
-                                    end,
-                                    lists:zip(OrderedEntries, Fetched)
-                                ),
-                            Parent ! {Tag, Decoded}
-                        end
-                    ),
-                {Tag, Mon, OrderedEntries}
-            end
-         || {JournalP, Entries} <- ByFile
-        ],
-    Indexed =
-        lists:foldl(
-            fun({Tag, Mon, FileEntries}, Acc) ->
-                receive
-                    {Tag, Decoded} ->
-                        erlang:demonitor(Mon, [flush]),
-                        lists:foldl(
-                            fun({N, Value}, A) -> A#{N => Value} end,
-                            Acc,
-                            Decoded
-                        );
-                    {'DOWN', Mon, process, _Pid2, _Reason} ->
-                        %% file-close race (journal compaction): degrade to
-                        %% not_present, the same exposure ink_fetch has
-                        lists:foldl(
-                            fun({N, _IK}, A) -> A#{N => not_present} end,
-                            Acc,
-                            FileEntries
-                        )
-                end
-            end,
-            #{},
-            Workers
-        ),
-    [maps:get(N, Indexed) || N <- lists:seq(0, length(KeySQNPairs) - 1)].
 
 -spec ink_keycheck(
     pid(),
@@ -539,22 +442,7 @@ ink_compactjournal(Pid, Bookie, _Timeout) ->
 %% Used by a clerk to state that a compaction process is over, only change
 %% is to unlock the Inker for further compactions.
 ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete) ->
-    ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete, undefined).
-
--spec ink_clerkcomplete(
-    pid(), list(), list(), non_neg_integer() | undefined
-) -> ok.
-%% @doc
-%% As ink_clerkcomplete/3, additionally recording how many journal files
-%% the completed compaction cycle actually compacted (0 when scoring found
-%% no run worth compacting; undefined when the completion did not come from
-%% a compaction cycle, e.g. journal trim). Callers polling for compaction
-%% quiescence need this: compaction_pending only says a cycle is in flight,
-%% not whether further cycles would find work.
-ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete, RunLength) ->
-    gen_server:cast(
-        Pid, {clerk_complete, ManifestSnippet, FilesToDelete, RunLength}
-    ).
+    gen_server:cast(Pid, {clerk_complete, ManifestSnippet, FilesToDelete}).
 
 -spec ink_compactionpending(pid()) -> boolean().
 %% @doc
@@ -562,18 +450,6 @@ ink_clerkcomplete(Pid, ManifestSnippet, FilesToDelete, RunLength) ->
 %% if there is already some compaction work ongoing.
 ink_compactionpending(Pid) ->
     gen_server:call(Pid, compaction_pending, infinity).
-
--spec ink_lastcompactionresult(pid()) ->
-    pending | {done, non_neg_integer() | undefined}.
-%% @doc
-%% Outcome of the most recent compaction cycle: pending while one is in
-%% flight, otherwise {done, RunLength} where RunLength is the number of
-%% journal files compacted by the last completed cycle (0 = the scorer
-%% found nothing worth compacting - a caller loop can stop; undefined =
-%% no cycle has completed since startup, or the last completion was not a
-%% compaction cycle).
-ink_lastcompactionresult(Pid) ->
-    gen_server:call(Pid, last_compaction_result, infinity).
 
 -spec ink_trim(pid(), integer()) -> ok.
 %% @doc
@@ -695,19 +571,6 @@ handle_call(
             {reply, {ok, UpdState#state.journal_sqn, ObjSize}, UpdState}
     end;
 handle_call(
-    {batchput, ObjectChanges, DataSync},
-    _From,
-    State = #state{is_snapshot = Snap}
-) when Snap == false ->
-    case put_objects_batch(ObjectChanges, DataSync, State) of
-        {_, UpdState, ObjectWriteInfos} ->
-            {reply,
-                {ok, UpdState#state.journal_sqn, ObjectWriteInfos},
-                UpdState};
-        {{error, Reason}, UpdState} ->
-            {reply, {error, Reason}, UpdState}
-    end;
-handle_call(
     {mput, Key, ObjChanges},
     _From,
     State = #state{is_snapshot = Snap}
@@ -716,34 +579,6 @@ handle_call(
         {_, UpdState, _ObjSize} ->
             {reply, {ok, UpdState#state.journal_sqn}, UpdState}
     end;
-handle_call({mget, KeySQNPairs}, _From, State) ->
-    Manifest = State#state.manifest,
-    %% group by journal file, preserving each pair's input position.  The
-    %% inker only plans here - the caller-side of ink_mget/2 fetches from
-    %% the journal files in parallel, so concurrent batches from different
-    %% callers do not serialise through this process
-    ByFile =
-        element(
-            1,
-            lists:foldl(
-                fun({Key, SQN}, {Grouped, N}) ->
-                    JournalP = leveled_imanifest:find_entry(SQN, Manifest),
-                    InkerKey = leveled_codec:to_inkerkey(Key, SQN),
-                    {
-                        maps:update_with(
-                            JournalP,
-                            fun(L) -> [{N, InkerKey} | L] end,
-                            [{N, InkerKey}],
-                            Grouped
-                        ),
-                        N + 1
-                    }
-                end,
-                {#{}, 0},
-                KeySQNPairs
-            )
-        ),
-    {reply, {grouped, maps:to_list(ByFile)}, State};
 handle_call({fetch, Key, SQN}, _From, State) ->
     case get_object(Key, SQN, State#state.manifest, true) of
         {{SQN, Key}, {Value, _IndexSpecs}} ->
@@ -815,15 +650,6 @@ handle_call(
     {reply, {ok, Clerk}, State#state{compaction_pending = true}};
 handle_call(compaction_pending, _From, State) ->
     {reply, State#state.compaction_pending, State};
-handle_call(last_compaction_result, _From, State) ->
-    Reply =
-        case State#state.compaction_pending of
-            true ->
-                pending;
-            false ->
-                {done, State#state.last_compaction_run_length}
-        end,
-    {reply, Reply, State};
 handle_call(
     {trim, PersistedSQN}, _From, State = #state{is_snapshot = Snap}
 ) when
@@ -964,7 +790,7 @@ handle_call(
     {noreply, State}.
 
 handle_cast(
-    {clerk_complete, ManifestSnippet, FilesToDelete, RunLength},
+    {clerk_complete, ManifestSnippet, FilesToDelete},
     State = #state{cdb_options = CDBOpts}
 ) when
     ?IS_DEF(CDBOpts)
@@ -997,8 +823,7 @@ handle_cast(
         manifest = Man1,
         manifest_sqn = NewManifestSQN,
         pending_removals = FilesToDelete,
-        compaction_pending = false,
-        last_compaction_run_length = RunLength
+        compaction_pending = false
     }};
 handle_cast({confirm_delete, ManSQN, CDB}, State) ->
     % Check there are no snapshots that may be aware of the file process that
@@ -1305,126 +1130,6 @@ put_object(
                     active_journaldb = NewJournalP
                 },
                 byte_size(JournalBin)}
-    end.
-
--spec put_objects_batch(
-    list({
-        leveled_codec:ledger_key(),
-        any(),
-        leveled_codec:journal_keychanges()
-    }),
-    boolean(),
-    ink_state()
-) ->
-    {ok | rolling, ink_state(), list()}
-    | {{error, batch_too_large}, ink_state()}.
-%% @doc
-%% Add a standard-mode object batch to the current journal. All objects share
-%% one SQN, but each has its own normal standard journal key so object fetches
-%% can continue to use {SQN, LedgerKey}.
-serialise_chunks([], _Size) ->
-    [];
-serialise_chunks(List, Size) when length(List) =< Size ->
-    [List];
-serialise_chunks(List, Size) ->
-    {Chunk, Rest} = lists:split(Size, List),
-    [Chunk | serialise_chunks(Rest, Size)].
-
-put_objects_batch(
-    ObjectChanges,
-    Sync,
-    State =
-        #state{
-            active_journaldb = ActiveJournal,
-            cdb_options = CDBOpts,
-            root_path = RP
-        }
-) when
-    ?IS_DEF(ActiveJournal), ?IS_DEF(CDBOpts), ?IS_DEF(RP)
-->
-    NewSQN = State#state.journal_sqn + 1,
-    BatchSize = length(ObjectChanges),
-    Serialise =
-        fun({LedgerKey, Object, KeyChanges}) ->
-            {JournalKey, JournalBin} =
-                leveled_codec:to_batch_inkerkv(
-                    LedgerKey,
-                    NewSQN,
-                    Object,
-                    KeyChanges,
-                    BatchSize,
-                    State#state.compression_method,
-                    State#state.compress_on_receipt
-                ),
-            {
-                {JournalKey, JournalBin},
-                {LedgerKey, Object, KeyChanges, byte_size(JournalBin)}
-            }
-        end,
-    %% Journal value encoding is pure, so large batches are serialised in
-    %% parallel worker processes (order is preserved by chunk concatenation).
-    {JournalKVs, ObjectWriteInfos} =
-        lists:unzip(
-            case BatchSize >= 512 of
-                false ->
-                    lists:map(Serialise, ObjectChanges);
-                true ->
-                    Parent = self(),
-                    Ref = make_ref(),
-                    ChunkSize = max(1, (BatchSize + 7) div 8),
-                    Pids =
-                        [
-                            spawn_opt(
-                                fun() ->
-                                    Parent !
-                                        {Ref, self(), lists:map(Serialise, Chunk)}
-                                end,
-                                [link, {min_heap_size, 8192}]
-                            )
-                         || Chunk <- serialise_chunks(ObjectChanges, ChunkSize)
-                        ],
-                    lists:append([
-                        receive
-                            {Ref, Pid, Result} -> Result
-                        end
-                     || Pid <- Pids
-                    ])
-            end
-        ),
-    case leveled_cdb:cdb_mput(ActiveJournal, JournalKVs, Sync) of
-        ok ->
-            {ok, State#state{journal_sqn = NewSQN}, ObjectWriteInfos};
-        roll ->
-            case leveled_cdb:cdb_lastkey(ActiveJournal) of
-                empty ->
-                    {{error, batch_too_large}, State};
-                _LastKey ->
-                    SWroll = os:timestamp(),
-                    {NewJournalP, Manifest1, NewManSQN} =
-                        roll_active(
-                            ActiveJournal,
-                            State#state.manifest,
-                            NewSQN,
-                            State#state.cdb_options,
-                            State#state.root_path,
-                            State#state.manifest_sqn
-                        ),
-                    ?TMR_LOG(i0008, [], SWroll),
-                    UpdState =
-                        State#state{
-                            manifest = Manifest1,
-                            manifest_sqn = NewManSQN,
-                            active_journaldb = NewJournalP
-                        },
-                    case leveled_cdb:cdb_mput(NewJournalP, JournalKVs, Sync) of
-                        ok ->
-                            {rolling,
-                                UpdState#state{journal_sqn = NewSQN},
-                                ObjectWriteInfos};
-                        roll ->
-                            {{error, batch_too_large}, UpdState}
-                    end
-            end
     end.
 
 -spec get_object(

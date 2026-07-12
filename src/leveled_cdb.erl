@@ -71,11 +71,9 @@
     cdb_open_reader/2,
     cdb_reopen_reader/3,
     cdb_get/2,
-    cdb_mget/2,
     cdb_put/3,
     cdb_put/4,
     cdb_mput/2,
-    cdb_mput/3,
     cdb_getpositions/2,
     cdb_directfetch/3,
     cdb_lastkey/1,
@@ -140,10 +138,7 @@
     log_options = leveled_log:get_opts() ::
         leveled_log:log_options(),
     cached_score :: {float(), erlang:timestamp()} | undefined,
-    monitor = {no_monitor, 0} :: leveled_monitor:monitor(),
-    % lazy cache of the file's hash tables ({BaseOffset, TablesBin}),
-    % loaded on the first cdb_mget/2 so direct reads can probe in memory
-    hashtable_cache :: {non_neg_integer(), binary()} | undefined
+    monitor = {no_monitor, 0} :: leveled_monitor:monitor()
 }).
 
 -type cdb_options() :: #cdb_options{}.
@@ -228,33 +223,6 @@ cdb_open_reader(Filename, Opts) ->
 cdb_get(Pid, Key) ->
     gen_statem:call(Pid, {get_kv, Key}, infinity).
 
--spec cdb_mget(pid(), list(any())) -> list({any(), any()} | missing).
-%% @doc
-%% Extract several Keys and Values from a CDB file in a single call.
-%% Results are returned in the same order as the passed Keys, each
-%% result exactly as cdb_get/2 would return it (missing for any absent
-%% Key).
-%%
-%% For completed (immutable) files the state machine returns a read
-%% specification - the top index plus an in-memory copy of the file's
-%% hash tables (loaded once, shared by reference counting) - so all
-%% hash table probing happens here in the calling process without any
-%% file access.  The record reads are then issued as one batched
-%% file:pread/2 per round through the state machine, and record
-%% parsing, key comparison, CRC checking and any term decoding happen
-%% back in the calling process.  Compared with a cdb_get/2 loop the
-%% state machine does a small fraction of the per-key work, so
-%% concurrent callers stop queueing behind each other's reads.  For
-%% files still being written the reads are served by the state machine
-%% as only it can see the in-memory hash tree.
-cdb_mget(Pid, Keys) ->
-    case gen_statem:call(Pid, {mget, Keys}, infinity) of
-        {values, Results} ->
-            Results;
-        {spec, HashIndex, Tables, BinaryMode} ->
-            mget_fromspec(Pid, Keys, HashIndex, Tables, BinaryMode)
-    end.
-
 -spec cdb_put(pid(), any(), any()) -> ok | roll.
 %% @doc
 %% Put a key and value into a cdb file that is open as a writer, will fail
@@ -282,14 +250,7 @@ cdb_put(Pid, Key, Value, Sync) ->
 %% It may be preferable to respond to roll by trying individual PUTs until
 %% roll is returned again
 cdb_mput(Pid, KVList) ->
-    cdb_mput(Pid, KVList, false).
-
--spec cdb_mput(pid(), list(), boolean()) -> ok | roll.
-%% @doc
-%% See cdb_mput/2.  Addition of force-sync option, to be used when sync mode is
-%% none to force a sync to disk on this particular mput.
-cdb_mput(Pid, KVList, Sync) ->
-    gen_statem:call(Pid, {mput_kv, KVList, Sync}, infinity).
+    gen_statem:call(Pid, {mput_kv, KVList}, infinity).
 
 -spec cdb_getpositions(pid(), integer() | all) -> list().
 %% @doc
@@ -572,17 +533,6 @@ writer(
             )}
     ]};
 writer(
-    {call, From}, {mget, Keys}, State = #state{handle = IO}
-) when
-    ?IS_DEF(IO)
-->
-    Results =
-        [
-            get_mem(Key, IO, State#state.hashtree, State#state.binary_mode)
-         || Key <- Keys
-        ],
-    {keep_state_and_data, [{reply, From, {values, Results}}]};
-writer(
     {call, From}, {key_check, Key}, State = #state{handle = IO}
 ) when
     ?IS_DEF(IO)
@@ -646,17 +596,9 @@ writer(
     end;
 writer({call, From}, {mput_kv, []}, _State) ->
     {keep_state_and_data, [{reply, From, ok}]};
-writer({call, From}, {mput_kv, [], _Sync}, _State) ->
-    {keep_state_and_data, [{reply, From, ok}]};
 writer(
     {call, From},
     {mput_kv, KVList},
-    State
-) ->
-    writer({call, From}, {mput_kv, KVList, false}, State);
-writer(
-    {call, From},
-    {mput_kv, KVList, Sync},
     State = #state{last_position = LP, handle = IO}
 ) when
     ?IS_DEF(last_position), ?IS_DEF(IO)
@@ -669,10 +611,10 @@ writer(
             {keep_state_and_data, [{reply, From, roll}]};
         false ->
             Result =
-                mput_write(
+                mput(
                     IO,
                     KVList,
-                    LP,
+                    {LP, State#state.hashtree},
                     State#state.binary_mode,
                     State#state.max_size
                 ),
@@ -680,22 +622,7 @@ writer(
                 roll ->
                     %% Keys and values could not be written
                     {keep_state_and_data, [{reply, From, roll}]};
-                {UpdHandle, NewPosition, KPList, LastKey} ->
-                    ok =
-                        case {State#state.sync_strategy, Sync} of
-                            {riak_sync, _} ->
-                                file:datasync(UpdHandle);
-                            {none, true} ->
-                                file:datasync(UpdHandle);
-                            _ ->
-                                ok
-                        end,
-                    %% The batch is durably written, so the caller is released
-                    %% before the in-memory hashtree update; no read can be
-                    %% served until this callback returns, so lookups always
-                    %% see the completed tree.
-                    gen_statem:reply(From, ok),
-                    HashTree = mput_hashtree(KPList, State#state.hashtree),
+                {UpdHandle, NewPosition, HashTree, LastKey} ->
                     {keep_state,
                         State#state{
                             handle = UpdHandle,
@@ -703,7 +630,8 @@ writer(
                             last_position = NewPosition,
                             last_key = LastKey,
                             hashtree = HashTree
-                        }}
+                        },
+                        [{reply, From, ok}]}
             end
     end;
 writer(
@@ -748,17 +676,6 @@ rolling(
                 State#state.binary_mode
             )}
     ]};
-rolling(
-    {call, From}, {mget, Keys}, State = #state{handle = IO}
-) when
-    ?IS_DEF(IO)
-->
-    Results =
-        [
-            get_mem(Key, IO, State#state.hashtree, State#state.binary_mode)
-         || Key <- Keys
-        ],
-    {keep_state_and_data, [{reply, From, {values, Results}}]};
 rolling(
     {call, From}, {key_check, Key}, State = #state{handle = IO}
 ) when
@@ -837,16 +754,6 @@ reader(
             State#state.monitor
         ),
     {keep_state_and_data, [{reply, From, Result}]};
-reader({call, From}, {mget, _Keys}, State = #state{handle = IO}) when
-    ?IS_DEF(IO)
-->
-    {Tables, UpdState} = hashtable_cache(State),
-    Spec = {spec, State#state.hash_index, Tables, State#state.binary_mode},
-    {keep_state, UpdState, [{reply, From, Spec}]};
-reader({call, From}, {pread_batch, Locs}, #state{handle = IO}) when
-    ?IS_DEF(IO)
-->
-    {keep_state_and_data, [{reply, From, file:pread(IO, Locs)}]};
 reader({call, From}, {key_check, Key}, State) ->
     Result =
         get_withcache(
@@ -949,22 +856,6 @@ delete_pending(
             State#state.monitor
         ),
     {keep_state_and_data, [{reply, From, Result}, ?DELETE_TIMEOUT]};
-delete_pending(
-    {call, From}, {mget, _Keys}, State = #state{handle = IO}
-) when
-    ?IS_DEF(IO)
-->
-    {Tables, UpdState} = hashtable_cache(State),
-    Spec = {spec, State#state.hash_index, Tables, State#state.binary_mode},
-    {keep_state, UpdState, [{reply, From, Spec}, ?DELETE_TIMEOUT]};
-delete_pending(
-    {call, From}, {pread_batch, Locs}, #state{handle = IO}
-) when
-    ?IS_DEF(IO)
-->
-    {keep_state_and_data, [
-        {reply, From, file:pread(IO, Locs)}, ?DELETE_TIMEOUT
-    ]};
 delete_pending(
     {call, From}, {key_check, Key}, State = #state{handle = IO}
 ) when
@@ -1270,7 +1161,18 @@ put(
             end
     end.
 
-mput_write(Handle, KVList, LastPosition, BinaryMode, MaxSize) ->
+-spec mput(
+    file:io_device(),
+    list(tuple()),
+    {integer(), ets:tid()},
+    boolean(),
+    integer()
+) ->
+    roll | {file:io_device(), integer(), ets:tid(), any()}.
+%% @doc
+%% Multiple puts - either all will succeed or it will return roll with non
+%% succeeding.
+mput(Handle, KVList, {LastPosition, HashTree0}, BinaryMode, MaxSize) ->
     {KPList, Bin, LastKey} = multi_key_value_to_record(
         KVList,
         BinaryMode,
@@ -1282,17 +1184,15 @@ mput_write(Handle, KVList, LastPosition, BinaryMode, MaxSize) ->
             roll;
         true ->
             ok = file:pwrite(Handle, LastPosition, Bin),
-            {Handle, PotentialNewSize, KPList, LastKey}
+            HashTree1 = lists:foldl(
+                fun({K, P}, Acc) ->
+                    put_hashtree(K, P, Acc)
+                end,
+                HashTree0,
+                KPList
+            ),
+            {Handle, PotentialNewSize, HashTree1, LastKey}
     end.
-
-mput_hashtree(KPList, HashTree0) ->
-    lists:foldl(
-        fun({K, P}, Acc) ->
-            put_hashtree(K, P, Acc)
-        end,
-        HashTree0,
-        KPList
-    ).
 
 -spec get_withcache(
     file:io_device(),
@@ -1338,13 +1238,13 @@ get(Handle, Key, Cache, CacheFun, QuickCheck, BinaryMode, Monitor) ->
     SW0 = leveled_monitor:maybe_time(Monitor),
     Hash = hash(Key),
     Index = hash_to_index(Hash),
-    HashTableEntry = CacheFun(Handle, Index, Cache),
+    {HashTable, Count} = CacheFun(Handle, Index, Cache),
     {TS0, SW1} = leveled_monitor:step_time(SW0),
     % If the count is 0 for that index - key must be missing
-    case HashTableEntry of
-        {_, 0} ->
+    case Count of
+        0 ->
             missing;
-        {HashTable, Count} when is_integer(HashTable), is_integer(Count) ->
+        _ ->
             % Get starting slot in hashtable
             {ok, FirstHashPosition} =
                 file:position(Handle, {bof, HashTable}),
@@ -1360,9 +1260,7 @@ get(Handle, Key, Cache, CacheFun, QuickCheck, BinaryMode, Monitor) ->
                 ),
             {TS1, _SW2} = leveled_monitor:step_time(SW1),
             maybelog_get_timing(Monitor, TS0, TS1, CycleCount),
-            Result;
-        _ ->
-            missing
+            Result
     end.
 
 get_index(_Handle, Index, Cache) ->
@@ -1435,7 +1333,7 @@ load_index(Handle) ->
     LoadIndexFun =
         fun(X) ->
             file:position(Handle, {bof, ?DWORD_SIZE * X}),
-            read_next_2_integers_or_empty(Handle)
+            read_next_2_integers(Handle)
         end,
     list_to_tuple(lists:map(LoadIndexFun, Index)).
 
@@ -1458,12 +1356,8 @@ find_lastkey(Handle, IndexCache) ->
             empty;
         _ ->
             {ok, _} = file:position(Handle, LastPosition),
-            case read_next_2_integers(Handle) of
-                {KeyLength, _ValueLength} when is_integer(KeyLength) ->
-                    safe_read_next(Handle, KeyLength, key);
-                _ ->
-                    empty
-            end
+            {KeyLength, _ValueLength} = read_next_2_integers(Handle),
+            safe_read_next(Handle, KeyLength, key)
     end.
 
 scan_index_findlast(Handle, Position, Count, {LastPosition, TotalKeys}) ->
@@ -1522,37 +1416,21 @@ put_hashtree(Key, Position, HashTree) ->
 extract_kvpair(_H, [], _K, _BinaryMode) ->
     missing;
 extract_kvpair(Handle, [Position | Rest], Key, BinaryMode) ->
-    case file:position(Handle, Position) of
-        {ok, _} ->
-            case read_next_2_integers(Handle) of
-                {KeyLength, ValueLength} when
-                    is_integer(KeyLength), is_integer(ValueLength)
-                ->
-                    case safe_read_next(Handle, KeyLength, keybin) of
-                        % If same key as passed in, then found!
-                        {Key, KeyBin} ->
-                            case checkread_next_value(
-                                Handle, ValueLength, KeyBin
-                            ) of
-                                {false, _} ->
-                                    crc_wonky;
-                                {_, Value} ->
-                                    case BinaryMode of
-                                        true ->
-                                            {Key, Value};
-                                        false ->
-                                            {Key, binary_to_term(Value)}
-                                    end;
-                                false ->
-                                    extract_kvpair(
-                                        Handle, Rest, Key, BinaryMode
-                                    )
-                            end;
-                        _ ->
-                            extract_kvpair(Handle, Rest, Key, BinaryMode)
-                    end;
-                _ ->
-                    extract_kvpair(Handle, Rest, Key, BinaryMode)
+    {ok, _} = file:position(Handle, Position),
+    {KeyLength, ValueLength} = read_next_2_integers(Handle),
+    case safe_read_next(Handle, KeyLength, keybin) of
+        % If same key as passed in, then found!
+        {Key, KeyBin} ->
+            case checkread_next_value(Handle, ValueLength, KeyBin) of
+                {false, _} ->
+                    crc_wonky;
+                {_, Value} ->
+                    case BinaryMode of
+                        true ->
+                            {Key, Value};
+                        false ->
+                            {Key, binary_to_term(Value)}
+                    end
             end;
         _ ->
             extract_kvpair(Handle, Rest, Key, BinaryMode)
@@ -1751,21 +1629,17 @@ crccheck(_V, _KB) ->
 calc_crc(KeyBin, Value) -> erlang:crc32(<<KeyBin/binary, Value/binary>>).
 
 -spec checkread_next_value(file:io_device(), integer(), binary()) ->
-    false | {true, binary()} | {false, crc_wonky}.
+    {true, binary()} | {false, crc_wonky}.
 %% @doc
 %% Read next string where the string has a CRC prepended - stripping the crc
 %% and checking if requested
 checkread_next_value(Handle, Length, KeyBin) ->
-    case file:read(Handle, Length) of
-        {ok, <<CRC:32/integer, Value/binary>>} ->
-            case calc_crc(KeyBin, Value) of
-                CRC ->
-                    {true, Value};
-                _ ->
-                    {false, crc_wonky}
-            end;
+    {ok, <<CRC:32/integer, Value/binary>>} = file:read(Handle, Length),
+    case calc_crc(KeyBin, Value) of
+        CRC ->
+            {true, Value};
         _ ->
-            false
+            {false, crc_wonky}
     end.
 
 %% Extract value and size from binary containing CRC
@@ -1779,14 +1653,6 @@ read_next_2_integers(Handle) ->
             {Int1, Int2};
         ReadError ->
             ReadError
-    end.
-
-read_next_2_integers_or_empty(Handle) ->
-    case read_next_2_integers(Handle) of
-        {Int1, Int2} when is_integer(Int1), is_integer(Int2) ->
-            {Int1, Int2};
-        _ ->
-            {0, 0}
     end.
 
 read_next_n_integerpairs(Handle, NumberOfPairs) ->
@@ -1895,211 +1761,6 @@ maybelog_get_timing(
     );
 maybelog_get_timing(_Monitor, _IndexTime, _ReadTime, _CC) ->
     ok.
-
-%% Speculative read length for cdb_mget/2 record reads: each candidate
-%% record is fetched with a single pread of this length past its
-%% length words, so any key/value pair up to this size resolves in one
-%% read, with a second exact-length read only when the value outruns
-%% the guess.
--define(MGET_SPECREAD, 8192).
-
-%% Load (or reuse) the file's hash tables as one binary, so that the
-%% cdb_mget/2 spec can carry them to the calling process - large
-%% binaries are reference-counted, so repeated replies share the same
-%% heap copy.  The region is derived from the top index (each table's
-%% position and entry count), not assumed from the file layout.
-hashtable_cache(State = #state{hashtable_cache = {Base, Bin}}) ->
-    {{Base, Bin}, State};
-hashtable_cache(State = #state{handle = Handle, hash_index = Index}) ->
-    Regions =
-        [
-            {P, P + C * ?DWORD_SIZE}
-         || {P, C} <- tuple_to_list(Index), C > 0
-        ],
-    Tables =
-        case Regions of
-            [] ->
-                {0, <<>>};
-            _ ->
-                Base = lists:min([RS || {RS, _RE} <- Regions]),
-                End = lists:max([RE || {_RS, RE} <- Regions]),
-                case file:pread(Handle, Base, End - Base) of
-                    {ok, Bin} ->
-                        % a truncated file returns a short binary here;
-                        % probes beyond it skip, as get/6's read errors do
-                        {Base, Bin};
-                    _ReadError ->
-                        {Base, <<>>}
-                end
-        end,
-    {Tables, State#state{hashtable_cache = Tables}}.
-
-%% Client side of cdb_mget/2 for immutable files.  Hash table probing
-%% runs entirely against the in-memory copy of the tables from the
-%% spec; the record reads for each round are then issued as ONE
-%% pread_batch call - a single file:pread/2 with a location list,
-%% executed by the file's state machine.  Serialising the preads
-%% through one process keeps them at uncontended latency (concurrent
-%% preads on one file degrade badly on some platforms), while the
-%% record parsing, CRC checks and key comparisons all happen here in
-%% the calling process.  A follow-up round is only needed for values
-%% that outrun the speculative read length, or on hash collisions.
-mget_fromspec(Pid, Keys, HashIndex, Tables, BinaryMode) ->
-    Work =
-        lists:zipwith(
-            fun(N, Key) ->
-                Hash = hash(Key),
-                {N, Key, probe_positions(Hash, HashIndex, Tables)}
-            end,
-            lists:seq(1, length(Keys)),
-            Keys
-        ),
-    Resolved = mget_rounds(Pid, Work, #{}, BinaryMode),
-    [maps:get(N, Resolved) || N <- lists:seq(1, length(Keys))].
-
-%% Walk this key's probe run in the in-memory hash tables, returning
-%% every candidate data position (the same positions, in the same
-%% order, that search_hash_table/6 would visit).
-probe_positions(Hash, HashIndex, {TablesBase, TablesBin}) ->
-    case element(hash_to_index(Hash) + 1, HashIndex) of
-        {_Position, 0} ->
-            [];
-        {HashTable, Count} when is_integer(HashTable), is_integer(Count) ->
-            Slot = hash_to_slot(Hash, Count),
-            Base = HashTable - TablesBase,
-            probe_positions(TablesBin, Base, Slot, 0, Count, Hash, []);
-        _ ->
-            []
-    end.
-
-probe_positions(_Bin, _Base, _Slot, Count, Count, _Hash, Acc) ->
-    lists:reverse(Acc);
-probe_positions(TablesBin, Base, Slot, Cycle, Count, Hash, Acc) ->
-    Offset = Base + ((Slot + Cycle) rem Count) * ?DWORD_SIZE,
-    case TablesBin of
-        <<_:Offset/binary, 0:32/little-integer, 0:32/little-integer, _/binary>> ->
-            % an empty slot ends the probe run
-            lists:reverse(Acc);
-        <<_:Offset/binary, Hash:32/little-integer, DataLoc:32/little-integer,
-            _/binary>> ->
-            probe_positions(
-                TablesBin, Base, Slot, Cycle + 1, Count, Hash, [DataLoc | Acc]
-            );
-        <<_:Offset/binary, _H:32/little-integer, _D:32/little-integer,
-            _/binary>> ->
-            probe_positions(TablesBin, Base, Slot, Cycle + 1, Count, Hash, Acc);
-        _Truncated ->
-            % unreadable slot (a corrupt or truncated file): skip it and
-            % keep probing, as get/6 does when a slot read fails
-            probe_positions(TablesBin, Base, Slot, Cycle + 1, Count, Hash, Acc)
-    end.
-
-mget_rounds(_Pid, [], Resolved, _BinaryMode) ->
-    Resolved;
-mget_rounds(Pid, Work, Resolved0, BinaryMode) ->
-    {Pending, Resolved1} =
-        lists:foldr(
-            fun
-                ({N, _Key, []}, {PAcc, RAcc}) ->
-                    {PAcc, RAcc#{N => missing}};
-                ({N, Key, [Pos | Rest]}, {PAcc, RAcc}) ->
-                    Req = {Pos, ?DWORD_SIZE + ?MGET_SPECREAD},
-                    {[{N, Key, Pos, Rest, Req, spec} | PAcc], RAcc};
-                ({N, Key, {exact, Pos, Len}, Rest}, {PAcc, RAcc}) ->
-                    Req = {Pos, ?DWORD_SIZE + Len},
-                    {[{N, Key, Pos, Rest, Req, exact} | PAcc], RAcc}
-            end,
-            {[], Resolved0},
-            Work
-        ),
-    case Pending of
-        [] ->
-            Resolved1;
-        _ ->
-            Locs = [Req || {_N, _Key, _Pos, _Rest, Req, _Mode} <- Pending],
-            {ok, Blocks} =
-                gen_statem:call(Pid, {pread_batch, Locs}, infinity),
-            {NextWork, Resolved2} =
-                lists:foldr(
-                    fun({{N, Key, Pos, Rest, _Req, Mode}, Block}, {WAcc, RAcc}) ->
-                        case {parse_record(Block, Key, BinaryMode), Mode} of
-                            {{ok, KV}, _Mode} ->
-                                {WAcc, RAcc#{N => KV}};
-                            {crc_wonky, _Mode} ->
-                                {WAcc, RAcc#{N => crc_wonky}};
-                            {wrong_key, _Mode} ->
-                                % hash collision - try the next candidate
-                                {[{N, Key, Rest} | WAcc], RAcc};
-                            {{short, RecordLen}, spec} ->
-                                % the value outran the speculative read -
-                                % re-read this record at its exact length
-                                {
-                                    [
-                                        {N, Key, {exact, Pos, RecordLen}, Rest}
-                                        | WAcc
-                                    ],
-                                    RAcc
-                                };
-                            {{short, _RecordLen}, exact} ->
-                                % still short at its declared length: the
-                                % file is truncated - as unreadable as a
-                                % failed read
-                                {[{N, Key, Rest} | WAcc], RAcc};
-                            {read_error, _Mode} ->
-                                {[{N, Key, Rest} | WAcc], RAcc}
-                        end
-                    end,
-                    {[], Resolved1},
-                    lists:zip(Pending, Blocks)
-                ),
-            mget_rounds(Pid, NextWork, Resolved2, BinaryMode)
-    end.
-
-parse_record(Block, Key, BinaryMode) when is_binary(Block) ->
-    case Block of
-        <<KeyL:32/little-integer, ValueL:32/little-integer, Rest/binary>> ->
-            case Rest of
-                <<KeyBin:KeyL/binary, ValueBin:ValueL/binary, _/binary>> ->
-                    check_keyvalue(KeyBin, ValueBin, Key, BinaryMode);
-                <<KeyBin:KeyL/binary, _ValuePart/binary>> ->
-                    case is_matching_key(KeyBin, Key) of
-                        true -> {short, KeyL + ValueL};
-                        false -> wrong_key
-                    end;
-                _KeyIncomplete ->
-                    {short, KeyL + ValueL}
-            end;
-        _TooShort ->
-            read_error
-    end;
-parse_record(_ReadError, _Key, _BinaryMode) ->
-    read_error.
-
-is_matching_key(KeyBin, Key) ->
-    try
-        binary_to_term(KeyBin) == Key
-    catch
-        error:_Corrupt -> false
-    end.
-
-check_keyvalue(KeyBin, ValueBin, Key, BinaryMode) ->
-    try binary_to_term(KeyBin) of
-        Key ->
-            case crccheck(ValueBin, KeyBin) of
-                false ->
-                    crc_wonky;
-                Value ->
-                    case BinaryMode of
-                        true -> {ok, {Key, Value}};
-                        false -> {ok, {Key, binary_to_term(Value)}}
-                    end
-            end;
-        _OtherKey ->
-            wrong_key
-    catch
-        error:_Corrupt ->
-            wrong_key
-    end.
 
 %% Write the actual hashtables at the bottom of the file.  Each hash table
 %% entry is a doubleword in length.  The first word is the hash value
@@ -3150,155 +2811,6 @@ mput_test() ->
     ok = cdb_close(P2),
     ok = file:delete(F2).
 
-mget_test() ->
-    KeyCount = 1024,
-    {ok, P1} = cdb_open_writer(
-        "test/test_area/mget_test.pnd",
-        #cdb_options{binary_mode = false}
-    ),
-    KVList = generate_sequentialkeys(KeyCount, []),
-    ok = cdb_mput(P1, KVList),
-    % a value bigger than the direct read path's speculative read length,
-    % to force the exact-length follow-up round after the roll
-    BigValue = lists:duplicate(30000, $x),
-    ok = cdb_put(P1, "BigKey", BigValue),
-    QueryKeys =
-        ["Key300", "Key1025", "Key1", "BigKey", "Key1024", "Key300"],
-    Expected = [cdb_get(P1, K) || K <- QueryKeys],
-    ?assertMatch(
-        [
-            {"Key300", _},
-            missing,
-            {"Key1", _},
-            {"BigKey", BigValue},
-            {"Key1024", _},
-            {"Key300", _}
-        ],
-        Expected
-    ),
-    % writer state
-    ?assertEqual(Expected, cdb_mget(P1, QueryKeys)),
-    ?assertEqual([], cdb_mget(P1, [])),
-    ok = cdb_roll(P1),
-    % rolling state (and reader once the roll has completed)
-    ?assertEqual(Expected, cdb_mget(P1, QueryKeys)),
-    timer:sleep(500),
-    ok = cdb_deletepending(P1),
-    % delete_pending state
-    ?assertEqual(Expected, cdb_mget(P1, QueryKeys)),
-    ok = cdb_close(P1).
-
-mget_differential_test_() ->
-    {timeout, 240, fun mget_differential_tester/0}.
-
-%% Differential guard for the cdb_mget direct read path: it re-expresses
-%% the record search over batched preads rather than calling get/6, so
-%% pin the two implementations together over randomised files - value
-%% sizes straddling the speculative read length, colliding keys, missing
-%% keys, duplicates - in every state that serves reads.
-mget_differential_tester() ->
-    _ = rand:seed(exsss, {20260709, 42, 7}),
-    lists:foreach(
-        fun({BinaryMode, Round}) ->
-            mget_differential_round(BinaryMode, Round)
-        end,
-        [{BM, R} || BM <- [false, true], R <- lists:seq(1, 3)]
-    ).
-
-mget_differential_round(BinaryMode, Round) ->
-    FN =
-        "test/test_area/mget_diff_" ++ atom_to_list(BinaryMode) ++
-            integer_to_list(Round),
-    KeyCount = 150 + rand:uniform(150),
-    KVL =
-        [
-            {
-                diff_key(BinaryMode, N),
-                diff_value(BinaryMode, rand:uniform(12000))
-            }
-         || N <- lists:seq(1, KeyCount)
-        ] ++ diff_collisions(BinaryMode),
-    {ok, P1} =
-        cdb_open_writer(FN ++ ".pnd", #cdb_options{binary_mode = BinaryMode}),
-    ok = cdb_mput(P1, KVL),
-    QueryKeys = diff_querykeys(BinaryMode, KVL, KeyCount),
-    % writer state
-    ?assertEqual([cdb_get(P1, K) || K <- QueryKeys], cdb_mget(P1, QueryKeys)),
-    {ok, F} = cdb_complete(P1),
-    {ok, P2} = cdb_open_reader(F, #cdb_options{binary_mode = BinaryMode}),
-    % reader state (the direct read path)
-    ?assertEqual([cdb_get(P2, K) || K <- QueryKeys], cdb_mget(P2, QueryKeys)),
-    ok = cdb_deletepending(P2),
-    % delete_pending state
-    ?assertEqual([cdb_get(P2, K) || K <- QueryKeys], cdb_mget(P2, QueryKeys)),
-    ok = cdb_close(P2),
-    _ = file:delete(F),
-    ok.
-
-diff_key(false, N) ->
-    "DKey" ++ integer_to_list(N);
-diff_key(true, N) ->
-    <<"DKey_", (integer_to_binary(N))/binary>>.
-
-diff_value(false, Length) ->
-    lists:duplicate(Length, $v);
-diff_value(true, Length) ->
-    rand:bytes(Length).
-
-%% Known same-hash keys (see hashclash_test), exercising the
-%% collision-continue branch of the direct probe.
-diff_collisions(false) ->
-    [{"Key4184465780", "colval1"}, {"Key4254669179", "colval99"}];
-diff_collisions(true) ->
-    [].
-
-diff_querykeys(BinaryMode, KVL, KeyCount) ->
-    AllKeys = [K || {K, _V} <- KVL],
-    Missing =
-        [diff_key(BinaryMode, KeyCount + N) || N <- lists:seq(1, 20)] ++
-            case BinaryMode of
-                % missing, but colliding with the stored pair above
-                false -> ["Key9070567319"];
-                true -> []
-            end,
-    Duplicates = lists:sublist(AllKeys, 10),
-    Shuffled =
-        [
-            K
-         || {_R, K} <-
-                lists:sort([{rand:uniform(), K} || K <- AllKeys ++ Missing])
-        ],
-    Shuffled ++ Duplicates.
-
-mget_truncation_test_() ->
-    {timeout, 60, fun mget_truncation_tester/0}.
-
-%% Clip the tail of the hash tables under an open reader: both paths
-%% must then skip the unreadable slots the same way and stay equal
-%% (the direct path loads its table copy lazily, on the first mget).
-mget_truncation_tester() ->
-    _ = rand:seed(exsss, {20260709, 43, 11}),
-    FN = "test/test_area/mget_trunc",
-    KVL =
-        [
-            {diff_key(true, N), diff_value(true, rand:uniform(9000))}
-         || N <- lists:seq(1, 200)
-        ],
-    {ok, P1} = cdb_open_writer(FN ++ ".pnd", #cdb_options{binary_mode = true}),
-    ok = cdb_mput(P1, KVL),
-    {ok, F} = cdb_complete(P1),
-    {ok, P2} = cdb_open_reader(F, #cdb_options{binary_mode = true}),
-    {ok, WH} = file:open(F, [read, write, raw, binary]),
-    {ok, EoF} = file:position(WH, eof),
-    {ok, _} = file:position(WH, EoF - 500),
-    ok = file:truncate(WH),
-    ok = file:close(WH),
-    QueryKeys = diff_querykeys(true, KVL, 200),
-    ?assertEqual([cdb_get(P2, K) || K <- QueryKeys], cdb_mget(P2, QueryKeys)),
-    ok = cdb_close(P2),
-    _ = file:delete(F),
-    ok.
-
 state_test() ->
     {ok, P1} = cdb_open_writer(
         "test/test_area/state_test.pnd",
@@ -3545,34 +3057,6 @@ get_positions_corruption_test() ->
     ?assertMatch(true, length(KVCL) < 1000),
     ok = cdb_close(P3),
     file:delete(F2).
-
-point_get_stale_position_beyond_eof_test() ->
-    F1 = "test/test_area/stalepos_test.cdb",
-    file:delete(F1),
-    Key = "Key1",
-    Value = "Value1",
-    ok = from_dict(F1, dict:from_list([{Key, Value}])),
-
-    {ok, Handle} = file:open(F1, [binary, raw, read, write]),
-    Hash = hash(Key),
-    Index = hash_to_index(Hash),
-    {ok, _} = file:position(Handle, {bof, ?DWORD_SIZE * Index}),
-    {HashTable, Count} = read_next_2_integers(Handle),
-    Slot = hash_to_slot(Hash, Count),
-    HashSlotPosition = HashTable + Slot * ?DWORD_SIZE,
-    {ok, EofPosition} = file:position(Handle, eof),
-    StalePosition = EofPosition + ?DWORD_SIZE,
-    ok = file:pwrite(
-        Handle,
-        HashSlotPosition,
-        <<Hash:32/little-integer, StalePosition:32/little-integer>>
-    ),
-    ok = file:close(Handle),
-
-    {ok, P1} = cdb_open_reader(F1, #cdb_options{binary_mode = false}),
-    ?assertMatch(missing, cdb_get(P1, Key)),
-    ok = cdb_close(P1),
-    file:delete(F1).
 
 badly_written_test() ->
     F1 = "test/test_area/badfirstwrite_test.pnd",

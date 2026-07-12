@@ -11,8 +11,6 @@
 
 -eqwalizer({nowarn_function, convert_to_ledgerv/5}).
 
--define(BATCH_KEYCHANGES_V1, leveled_batch_keychanges_v1).
-
 -ifdef(TEST).
 -export([convert_to_ledgerv/5]).
 -endif.
@@ -36,10 +34,6 @@
     isvalid_ledgerkey/1,
     to_inkerkey/2,
     to_inkerkv/6,
-    to_standard_inkerkv/6,
-    to_batch_inkerkv/7,
-    unwrap_batch_keychanges/1,
-    batch_keychange_count/1,
     from_inkerkv/1,
     from_inkerkv/2,
     from_journalkey/1,
@@ -134,28 +128,10 @@
     }.
 -type object_spec() ::
     object_spec_v0() | object_spec_v1().
--type batch_object_spec() ::
-    {
-        put,
-        key(),
-        key(),
-        any(),
-        index_specs(),
-        tag(),
-        infinity | integer()
-    }
-    | {
-        delete,
-        key(),
-        key(),
-        index_specs(),
-        tag(),
-        infinity | integer()
-    }.
 -type compression_method() ::
     lz4 | native | zstd | none.
 -type index_specs() ::
-    list({add | remove, any(), any()} | {add_payload, any(), any(), binary()}).
+    list({add | remove, any(), any()}).
 -type journal_keychanges() ::
     % {KeyChanges, TTL}
     {index_specs(), infinity | integer()}.
@@ -197,7 +173,6 @@
     single_key/0,
     sqn/0,
     object_spec/0,
-    batch_object_spec/0,
     segment_hash/0,
     ledger_status/0,
     primary_key/0,
@@ -384,14 +359,6 @@ accumulate_index({false, undefined}, FoldKeysFun) ->
         ObjKey =/= null
     ->
         FoldKeysFun(Bucket, ObjKey, Acc)
-    end;
-accumulate_index({payload, undefined}, FoldKeysFun) ->
-    fun(
-        {?IDX_TAG, Bucket, {_IdxFld, IdxValue}, ObjKey}, Value, Acc
-    ) when
-        IdxValue =/= null, ObjKey =/= null
-    ->
-        FoldKeysFun(Bucket, {IdxValue, ObjKey, get_metadata(Value)}, Acc)
     end;
 accumulate_index({true, undefined}, FoldKeysFun) ->
     fun(
@@ -654,70 +621,6 @@ to_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
         create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
     {{SQN, InkerType, LedgerKey}, Value}.
 
--spec to_standard_inkerkv(
-    primary_key(),
-    non_neg_integer(),
-    any(),
-    journal_keychanges(),
-    compression_method(),
-    boolean()
-) ->
-    {journal_key(), binary()}.
-%% @doc
-%% Convert to a fetchable standard Journal key and value regardless of object
-%% body. This is used by standard-mode batch writes, where puts and deletes
-%% must share the same SQN and normal fetch key shape.
-to_standard_inkerkv(LedgerKey, SQN, Object, KeyChanges, PressMethod, Compress) ->
-    %% Deletes must journal as tombstones on the batch path exactly as on
-    %% the single-put path, so compaction scoring and journal folds treat
-    %% them uniformly.
-    InkerType = check_forinkertype(LedgerKey, Object),
-    Value =
-        create_value_for_journal({Object, KeyChanges}, Compress, PressMethod),
-    {{SQN, InkerType, LedgerKey}, Value}.
-
--spec to_batch_inkerkv(
-    primary_key(),
-    non_neg_integer(),
-    any(),
-    journal_keychanges(),
-    pos_integer(),
-    compression_method(),
-    boolean()
-) ->
-    {journal_key(), binary()}.
-%% @doc
-%% Convert a standard-mode batch object to a fetchable Journal key/value and
-%% carry the expected batch size in the key-change payload. Startup replay uses
-%% this to reject an incomplete same-SQN tail after a crash or torn write.
-to_batch_inkerkv(
-    LedgerKey, SQN, Object, KeyChanges, BatchSize, PressMethod, Compress
-) when
-    is_integer(BatchSize), BatchSize > 0
-->
-    to_standard_inkerkv(
-        LedgerKey,
-        SQN,
-        Object,
-        {?BATCH_KEYCHANGES_V1, BatchSize, KeyChanges},
-        PressMethod,
-        Compress
-    ).
-
--spec unwrap_batch_keychanges(journal_keychanges()) -> journal_keychanges().
-unwrap_batch_keychanges({?BATCH_KEYCHANGES_V1, _BatchSize, KeyChanges}) ->
-    KeyChanges;
-unwrap_batch_keychanges(KeyChanges) ->
-    KeyChanges.
-
--spec batch_keychange_count(journal_keychanges()) -> pos_integer() | undefined.
-batch_keychange_count({?BATCH_KEYCHANGES_V1, BatchSize, _KeyChanges}) when
-    is_integer(BatchSize), BatchSize > 0
-->
-    BatchSize;
-batch_keychange_count(_KeyChanges) ->
-    undefined.
-
 -spec revert_to_keydeltas(journal_key(), binary()) -> {journal_key(), any()}.
 %% @doc
 %% If we wish to retain key deltas when an object in the Journal has been
@@ -728,7 +631,7 @@ batch_keychange_count(_KeyChanges) ->
 %% types
 revert_to_keydeltas({SQN, ?INKT_STND, LedgerKey}, InkerV) ->
     {_V, KeyDeltas} = revert_value_from_journal(InkerV),
-    {{SQN, ?INKT_KEYD, LedgerKey}, {null, unwrap_batch_keychanges(KeyDeltas)}}.
+    {{SQN, ?INKT_KEYD, LedgerKey}, {null, KeyDeltas}}.
 
 %% Used when fetching objects, so only handles standard, hashable entries
 from_inkerkv(Object) ->
@@ -752,17 +655,7 @@ from_inkerkv(Object, ToIgnoreKeyChanges) ->
 create_value_for_journal({Object, KeyChanges}, Compress, Method) when
     not is_binary(KeyChanges)
 ->
-    %% Compressing key changes only pays for itself on mid-sized terms: tiny
-    %% terms are pure overhead, and very large key-change payloads (packed FTS
-    %% pages) are entropy-dense binaries that zlib shrinks little for
-    %% considerable cost. Both encodings are standard external term format, so
-    %% readers are unaffected.
-    PlainBin = term_to_binary(KeyChanges),
-    KeyChangeBin =
-        case byte_size(PlainBin) > 16777216 of
-            false -> PlainBin;
-            true -> term_to_binary(KeyChanges, [compressed])
-        end,
+    KeyChangeBin = term_to_binary(KeyChanges, [compressed]),
     create_value_for_journal({Object, KeyChangeBin}, Compress, Method);
 create_value_for_journal({Object, KeyChangeBin}, Compress, Method) ->
     KeyChangeBinLen = byte_size(KeyChangeBin),
@@ -799,7 +692,7 @@ serialise_object(Object, true, Method) when is_binary(Object) ->
             {ok, Bin} = lz4:pack(Object),
             Bin;
         zstd ->
-            leveled_zstd:compress(Object);
+            zstd:compress(Object);
         native ->
             zlib:compress(Object);
         none ->
@@ -841,7 +734,7 @@ deserialise_object(Binary, true, true, lz4) ->
     {ok, Deflated} = lz4:unpack(Binary),
     Deflated;
 deserialise_object(Binary, true, true, zstd) ->
-    leveled_zstd:decompress(Binary);
+    zstd:decompress(Binary);
 deserialise_object(Binary, true, true, native) ->
     zlib:uncompress(Binary);
 deserialise_object(Binary, true, false, _) ->
@@ -939,23 +832,17 @@ obj_objectspecs(ObjectSpecs, SQN, TTL) ->
 %% Convert index specs to KV entries ready for the ledger
 idx_indexspecs(IndexSpecs, Bucket, Key, SQN, TTL) ->
     lists:map(
-        fun
-            ({add_payload, IdxFld, IdxTrm, Payload}) ->
-                gen_indexspec(Bucket, Key, add, IdxFld, IdxTrm, SQN, TTL, Payload);
-            ({IdxOp, IdxFld, IdxTrm}) ->
-                gen_indexspec(Bucket, Key, IdxOp, IdxFld, IdxTrm, SQN, TTL)
+        fun({IdxOp, IdxFld, IdxTrm}) ->
+            gen_indexspec(Bucket, Key, IdxOp, IdxFld, IdxTrm, SQN, TTL)
         end,
         IndexSpecs
     ).
 
 gen_indexspec(Bucket, Key, IdxOp, IdxField, IdxTerm, SQN, TTL) ->
-    gen_indexspec(Bucket, Key, IdxOp, IdxField, IdxTerm, SQN, TTL, null).
-
-gen_indexspec(Bucket, Key, IdxOp, IdxField, IdxTerm, SQN, TTL, Payload) ->
     Status = set_status(IdxOp, TTL),
     {
         to_objectkey(Bucket, Key, ?IDX_TAG, IdxField, IdxTerm),
-        {SQN, Status, no_lookup, Payload}
+        {SQN, Status, no_lookup, null}
     }.
 
 -spec gen_headspec(object_spec(), integer(), integer() | infinity) ->
@@ -1166,18 +1053,6 @@ indexspecs_test() ->
         },
         lists:nth(3, Changes)
     ).
-
-standard_inkerkv_batch_delete_test() ->
-    LedgerKey = {?STD_TAG, <<"B">>, <<"K">>, null},
-    SQN = 42,
-    {JournalKey, JournalBin} =
-        to_standard_inkerkv(LedgerKey, SQN, delete, {[], infinity}, none, false),
-    %% Batch deletes journal as tombstones, matching the single-put path.
-    ?assertMatch({SQN, ?INKT_TOMB, LedgerKey}, JournalKey),
-    ?assertMatch({delete, {[], infinity}}, revert_value_from_journal(JournalBin)),
-    {PutKey, _PutBin} =
-        to_standard_inkerkv(LedgerKey, SQN, <<"object">>, {[], infinity}, none, false),
-    ?assertMatch({SQN, ?INKT_STND, LedgerKey}, PutKey).
 
 endkey_passed_test() ->
     TestKey = {i, null, null, null},
