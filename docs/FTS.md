@@ -44,8 +44,21 @@ index's bucket. For index `I`:
 - **Epoch rows** — one row per shard: `{I, ShardId, <<"epoch">>}` →
   small counter value. Rewritten in EVERY batch that touches the shard;
   its SQN is the shard's version token (§4).
-- **Base rows** — optional consolidated segments per shard:
-  `{I, ShardId, <<"base">>}` → merged postings of many docs (§5).
+- **Token pages (consolidated)** — the at-rest read format, chosen for
+  stock leveled's strengths (bloom-guarded point reads; ordered-key
+  range folds; journal for big values): one row per (token, page),
+  `{I, <<"t:", Token>>, PageNo}` → merged postings for that token slice
+  (docs, true counts, capped positions), pages bounded (~8–64KB) so SST
+  merges stay cheap; oversized hot tokens overflow to journal-bodied
+  pages behind ledger stubs. A term query is one or two point reads; a
+  missing term is a bloom miss; prefix expansion is a bounded ordered
+  range fold. Consolidation (§5) is the INVERTER: it folds the
+  doc-major tail into token pages. Doc-major posting rows exist only in
+  the unconsolidated tail — they are what makes a doc's write atomic
+  and overwrite-live — and the tail masks consolidated pages for
+  updated/removed docs (segment semantics). Version-stamp admission
+  applies to the tail; consolidation bakes only live versions into
+  pages.
 - **Stats row** — `{I, <<"stats">>}` → doc count and total length for
   BM25, updated in the same batches.
 

@@ -86,6 +86,8 @@ parse_args(["--uncached" | Rest], Opts) ->
     parse_args(Rest, Opts#{uncached => true, bust_mode => always});
 parse_args(["--amortized" | Rest], Opts) ->
     parse_args(Rest, Opts#{uncached => true, bust_mode => amortized});
+parse_args(["--settle-ms", V | Rest], Opts) ->
+    parse_args(Rest, Opts#{settle_ms => list_to_integer(V)});
 parse_args(["--compact" | Rest], Opts) ->
     parse_args(Rest, Opts#{compact => true});
 parse_args(["--stable" | Rest], Opts) ->
@@ -367,7 +369,8 @@ maybe_compact(Bookie, #{compact := true, schema := Schema}) ->
     %% let the LSM digest the maintenance burst before the timed window:
     %% queries measured seconds after a bulk write measure the settling,
     %% not the store (observed as 10x floor noise on selective cells).
-    timer:sleep(30000),
+    %% Fast iteration loops pass --settle-ms 0.
+    timer:sleep(maps:get(settle_ms, Opts, 30000)),
     ok;
 maybe_compact(_Bookie, _Opts) ->
     ok.
@@ -401,7 +404,7 @@ write_batch(Bookie, Batch, #{schema := Schema} = _Opts) ->
     %% same batch as a head row; ONE book_mput commits the whole batch
     %% atomically under one SQN.
     Bucket = maps:get(index, Schema),
-    Specs =
+    Specs0 =
         lists:append(
             lists:map(
                 fun({doc, Key, Object}) ->
@@ -409,6 +412,16 @@ write_batch(Bookie, Batch, #{schema := Schema} = _Opts) ->
                     [{add, Bucket, <<"src">>, Key, Object} | DocSpecs]
                 end,
                 lists:reverse(Batch)
+            )
+        ),
+    %% one epoch bump per touched shard per BATCH (not per doc): dedupe
+    %% by row identity, last spec wins - identical values for epoch rows
+    Specs =
+        maps:values(
+            lists:foldl(
+                fun({_, B, K, SK, _} = Spec, Acc) -> Acc#{{B, K, SK} => Spec} end,
+                #{},
+                Specs0
             )
         ),
     case leveled_bookie:book_mput(Bookie, Specs) of
