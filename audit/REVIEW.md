@@ -1,5 +1,46 @@
 # Audit review — my verification pass (post-Codex)
 
+## DISPOSITIONS UNDER THE REBUILT ARCHITECTURE (2026-07-12)
+
+The fork was rebuilt after this audit: all src except leveled_fts was
+replaced with upstream martinsumner/leveled (develop-3.4 tip 7f08bba)
+and the minimum patch in docs/NATIVE_CAS.md was written fresh
+(standard-mode book_mput + book_casmput + HEAD_TAG read fix). The
+caller-side write protocol, absorption frontier, fts_seq clock,
+book_mput_std/casput/mget/mhead/fetchspecs, and the value cache no
+longer exist. Per-repro dispositions:
+
+- L1-F1 (mhead mode guard): N/A — book_mhead removed. The CLASS is
+  addressed in the new surface: HEAD_TAG reads derive their plane
+  handling from the tag, not per-clause mode guards
+  (casmput_headplane_visibility_tester pins it).
+- L1-F2 (valuecache persistent_term leak): N/A — value cache removed.
+- L2-F1/F2/F4, L3-F1 (frontier/ordering/CAS classes): structurally
+  impossible — no caller-side write path exists; every write commits
+  inside one serialized Bookie callback (upstream semantics).
+  casmput linearizability pinned by casmput_single_winner_tester.
+- L2-F3 (fts_seq reuse): structurally impossible — no FTS sequence
+  clock exists; liveness is row overwrite (FTS.md §2).
+- L4/L5-F2, L5-F3, L5-F4 (stamp-trust cache classes): the epoch-row
+  admission law (FTS.md §4) replaces all stamped caches; gate tests
+  land with the leveled_fts library rewrite.
+- L4/L5-F1 (256-column wrap), L5-F5 (BM25 cap), L4-F3 (diacritics
+  modes), L4-F4 (malformed UTF-8): carried as REQUIRED FIXES in the
+  leveled_fts library rewrite (FTS.md §6); the SQLite oracle corpus is
+  the standing differential gate.
+- L5-F6 (consolidated base floor) + L5 suspicion (base-fetch
+  fallback): consolidation redesigned (base rows + casmput conditions,
+  FTS.md §5); re-evaluate against the new implementation's benchmarks.
+- L3 doc inconsistency (condition_failed shape): resolved — the only
+  documented failure shape is {error, {precondition_failed, Failures}}
+  (docs/NATIVE_CAS.md §3.2).
+
+The repro scripts below remain as historical evidence against 9d21968
+(preserved on that commit); they do not run against the rebuilt tree —
+their APIs are gone, which is the point.
+
+## Original review (against 9d21968) follows
+
 Protocol per user directive: every repro run by me personally; leveled tree
 verified untouched after each layer; severities adversarially re-checked
 against HEAD source. Fixes deferred until ALL layers finish (editing
