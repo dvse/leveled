@@ -321,7 +321,7 @@ load_loop(File, Bookie, Opts, BatchSize, Batch, BatchCount, DocCount, TextBytes,
             {error, {read_tsv, Reason}}
     end.
 
-parse_doc(Line0, Opts) ->
+parse_doc(Line0, _Opts) ->
     Line = trim_newline(Line0),
     case binary:split(Line, <<"\t">>, [global]) of
         [Key, Title64, Body64] ->
@@ -361,7 +361,7 @@ read_first_doc(Opts) ->
         ok = file:close(File)
     end.
 
-maybe_compact(Bookie, #{compact := true, schema := Schema}) ->
+maybe_compact(Bookie, #{compact := true, schema := Schema} = Opts) ->
     Start = erlang:monotonic_time(microsecond),
     Result = leveled_fts:consolidate(Bookie, Schema, #{}),
     Elapsed = erlang:monotonic_time(microsecond) - Start,
@@ -377,7 +377,8 @@ maybe_compact(_Bookie, _Opts) ->
 
 maybe_bust_cache(_Bookie, #{sentinel := undefined}) ->
     ok;
-maybe_bust_cache(Bookie, #{sentinel := {Key, Object}, schema := Schema}) ->
+maybe_bust_cache(Bookie, #{bust_mode := always,
+        sentinel := {Key, Object}, schema := Schema}) ->
     {ok, Specs} = leveled_fts:derive(Schema, Key, Object),
     _ = leveled_bookie:book_mput(Bookie, Specs),
     ok;
@@ -548,21 +549,15 @@ run_query_1(Bookie, Query, Opts) ->
     Timed =
         [
             begin
-                %% Cache-bust regimes under the LIBRARY model (docs/FTS.md):
-                %% there is NO result cache - every query evaluates from
-                %% per-shard cached states validated by epoch-row SQNs.
+                %% Read regimes under the store-direct library model
+                %% (docs/FTS.md): there is no library cache to invalidate.
                 %%   always    (--uncached): an idempotent re-derive+mput of
-                %%     an existing document BEFORE the timer bumps the epoch
-                %%     rows of every shard it touches, so the timed query
-                %%     refolds those shards from a snapshot and then
-                %%     evaluates. Write-per-query worst case.
-                %%   amortized (--amortized): bump once, then run the SAME
-                %%     query untimed to refold its shards; the timed run is
-                %%     then epoch-check + evaluation - the steady-state cost
-                %%     of a novel query between writes.
-                %%   stable (--stable): NO writes - epoch-check + evaluation
-                %%     against a write-quiescent store (equivalent to
-                %%     amortized without the write; kept for ladder compat).
+                %%     an existing document before the timer, exercising the
+                %%     dirty-tail worst case.
+                %%   amortized (--amortized): one untimed store-direct read
+                %%     warms leveled's ledger/page caches; no library state is
+                %%     mutated or invalidated.
+                %%   stable (--stable): no write and no per-run warmup read.
                 _ = maybe_bust_cache(Bookie, Opts),
                 BustMode = maps:get(bust_mode, Opts, none),
                 _ =

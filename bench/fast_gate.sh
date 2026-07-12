@@ -16,6 +16,7 @@ if [ ! -f "$SQL_R" ]; then
     --queries $Q --result $SQL_R --rank $RANK --runs 9 --warmup 3 2>&1 | tail -1
 fi
 # Leveled side: recompile bench + library, fresh store, no settle sleep
+./rebar3 compile >/dev/null
 erlc -o $FAST/ebin -I include -pa _build/default/lib/leveled/ebin bench/leveled_fts_bench.erl 2>/dev/null
 rm -rf $FAST/fast-store
 erl -noshell -pa $FAST/ebin -pa _build/default/lib/leveled/ebin -pa _build/default/lib/lz4/ebin -pa _build/default/lib/zstd/ebin -eval "

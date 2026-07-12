@@ -6,7 +6,7 @@
 -export([
     search_shapes/1,
     update_delete_visibility/1,
-    cache_admission/1,
+    tail_fold_interleaving/1,
     cross_shard_version_skew/1,
     consolidation_restart_equivalence/1,
     consolidation_write_race/1,
@@ -17,7 +17,7 @@ all() ->
     [
         search_shapes,
         update_delete_visibility,
-        cache_admission,
+        tail_fold_interleaving,
         cross_shard_version_skew,
         consolidation_restart_equivalence,
         consolidation_write_race,
@@ -78,21 +78,21 @@ update_delete_visibility(_Config) ->
         [] = keys(search(Bookie, Schema, all_docs, #{}))
     end).
 
-cache_admission(_Config) ->
+tail_fold_interleaving(_Config) ->
     with_bookie(fun(Bookie, _Root) ->
         Schema = schema(<<"cache">>, [body], #{}),
         ok = put_doc(Bookie, Schema, <<"seed">>, #{body => <<"common">>}),
         Gate = atomics:new(1, []),
-        Hook = fun({_Shard, _Epoch, _State}) ->
+        Hook = fun({_Shard, _Tail}) ->
             case atomics:exchange(Gate, 1, 1) of
                 0 -> put_doc(Bookie, Schema, <<"racer">>, #{body => <<"common">>});
                 1 -> ok
             end
         end,
-        [<<"racer">>, <<"seed">>] = keys(search(Bookie, Schema, <<"common">>,
-            #{cache_fill_hook => Hook})),
-        %% The stale snapshot was discarded; the installed entry has the
-        %% current epoch and serves the same complete result.
+        [<<"seed">>] = keys(search(Bookie, Schema, <<"common">>,
+            #{tail_fold_hook => Hook})),
+        %% The forced interleaving returns the exact pre-write snapshot; the
+        %% next store-direct query sees the committed tail.
         [<<"racer">>, <<"seed">>] = keys(search(Bookie, Schema, <<"common">>, #{}))
     end).
 
@@ -100,16 +100,14 @@ cross_shard_version_skew(_Config) ->
     %% A multi-shard AND must never assemble two versions of one doc
     %% into a false match (the doc-version stamp, FTS.md §2). Setup:
     %% v1 contains only <<"aa">> (shard 97), v2 only <<"zz">> (shard
-    %% 122). Shard 97 is served from a cache validated BEFORE the
-    %% update; shard 122 fills after it. Without the version stamp the
+    %% 122). Shard 97's tail snapshot is folded BEFORE the update;
+    %% shard 122 is folded after it. Without the version stamp the
     %% merge sees aa (v1) + zz (v2) and "aa AND zz" false-matches.
     with_bookie(fun(Bookie, _Root) ->
         Schema = schema(<<"skew">>, [body], #{}),
         ok = put_doc(Bookie, Schema, <<"1">>, #{body => <<"aa">>}),
-        %% warm the aa-shard cache at v1
-        [<<"1">>] = keys(search(Bookie, Schema, <<"aa">>, #{})),
         Gate = atomics:new(1, []),
-        Hook = fun({_Shard, _Epoch, _State}) ->
+        Hook = fun({_Shard, _Tail}) ->
             case atomics:exchange(Gate, 1, 1) of
                 0 ->
                     {ok, Manifest} = leveled_bookie:book_headonly(
@@ -124,7 +122,7 @@ cross_shard_version_skew(_Config) ->
             end
         end,
         [] = keys(search(Bookie, Schema, <<"aa AND zz">>,
-            #{cache_fill_hook => Hook})),
+            #{tail_fold_hook => Hook})),
         %% post-update state is v2 exactly: zz matches, aa does not
         [<<"1">>] = keys(search(Bookie, Schema, <<"zz">>, #{})),
         [] = keys(search(Bookie, Schema, <<"aa">>, #{}))
