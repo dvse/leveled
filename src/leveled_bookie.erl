@@ -55,6 +55,8 @@
     book_tempput/7,
     book_mput/2,
     book_mput/3,
+    book_casmput/3,
+    book_casmput/4,
     book_delete/4,
     book_get/3,
     book_get/4,
@@ -174,6 +176,13 @@
 -type book_state() :: #state{}.
 -type sync_mode() :: sync | none | riak_sync.
 -type ledger_cache() :: #ledger_cache{}.
+-type cas_condition() ::
+    {
+        leveled_codec:key(),
+        leveled_codec:key(),
+        leveled_codec:key() | null,
+        absent | present | {sqn, non_neg_integer()}
+    }.
 
 -type open_options() ::
     %% For full description of options see ../docs/STARTUP_OPTIONS.md
@@ -580,11 +589,16 @@ book_put(Pid, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync) ->
 -spec book_mput(pid(), list(leveled_codec:object_spec())) -> ok | pause.
 %% @doc
 %%
-%% When the store is being run in head_only mode, batches of object specs may
-%% be inserted in to the store using book_mput/2.  ObjectSpecs should be
-%% of the form {ObjectOp, Bucket, Key, SubKey, Value}.  The Value will be
-%% stored within the HEAD of the object (in the Ledger), so the full object
-%% is retrievable using a HEAD request.  The ObjectOp is either add or remove.
+%% Batches of object specs may be inserted into the store using book_mput/2.
+%% ObjectSpecs should be of the form {ObjectOp, Bucket, Key, SubKey, Value}.
+%% The Value will be stored within the HEAD of the object (in the Ledger), so
+%% the full object is retrievable using a HEAD request.  The ObjectOp is
+%% either add or remove.
+%%
+%% All specs in the batch are committed through ONE journal record (one SQN):
+%% after a crash either every spec is recovered or none is.  In a standard
+%% (head_only=false) store these HEAD_TAG rows form the transactional plane
+%% described in docs/NATIVE_CAS.md, alongside ordinary standard objects.
 %%
 %% The list should be de-duplicated before it is passed to the bookie.
 book_mput(Pid, ObjectSpecs) ->
@@ -594,15 +608,52 @@ book_mput(Pid, ObjectSpecs) ->
     ok | pause.
 %% @doc
 %%
-%% When the store is being run in head_only mode, batches of object specs may
-%% be inserted in to the store using book_mput/2.  ObjectSpecs should be
-%% of the form {action, Bucket, Key, SubKey, Value}.  The Value will be
-%% stored within the HEAD of the object (in the Ledger), so the full object
-%% is retrievable using a HEAD request.
-%%
-%% The list should be de-duplicated before it is passed to the bookie.
+%% Batches of object specs may be inserted into the store using book_mput/3,
+%% with a TTL applied to every spec in the batch.  See book_mput/2.
 book_mput(Pid, ObjectSpecs, TTL) ->
     gen_server:call(Pid, {mput, ObjectSpecs, TTL}, infinity).
+
+-spec book_casmput(
+    pid(),
+    list(leveled_codec:object_spec()),
+    list(cas_condition())
+) -> ok | pause | {error, {precondition_failed, list()} | term()}.
+%% @doc
+%% Conditional book_mput (docs/NATIVE_CAS.md): the transaction commit
+%% primitive.  See book_casmput/4.
+book_casmput(Pid, ObjectSpecs, Conditions) ->
+    book_casmput(Pid, ObjectSpecs, Conditions, infinity).
+
+-spec book_casmput(
+    pid(),
+    list(leveled_codec:object_spec()),
+    list(cas_condition()),
+    infinity | integer()
+) -> ok | pause | {error, {precondition_failed, list()} | term()}.
+%% @doc
+%% Conditional book_mput.  Conditions are
+%% [{Bucket, Key, SubKey, absent | present | {sqn, SQN}}], addressing
+%% HEAD_TAG rows (SubKey null for plain keys), inside or outside the write
+%% set.  ALL conditions are evaluated against current head state before ANY
+%% spec is accepted: a tombstoned (removed) or TTL-expired row is absent;
+%% {sqn, N} matches a live row's SQN exactly.  On any failure nothing is
+%% written - no journal append, SQN unchanged - and the reply is
+%% {error, {precondition_failed, Failures}} listing every failed condition
+%% with its observed state (absent | {present, SQN}).  On success the batch
+%% commits exactly as book_mput: one journal record, one SQN, atomic.
+%%
+%% Evaluation and commit share one serialized bookie callback - the callback
+%% is the commit point, so casmput is linearizable by construction.  Requires
+%% head_lookup (standard stores, or head_only stores started with_lookup).
+book_casmput(Pid, ObjectSpecs, Conditions, TTL) ->
+    case valid_cas_conditions(Conditions) of
+        true ->
+            gen_server:call(
+                Pid, {casmput, ObjectSpecs, Conditions, TTL}, infinity
+            );
+        false ->
+            {error, {invalid_conditions, Conditions}}
+    end.
 
 -spec book_delete(
     pid(),
@@ -1503,40 +1554,25 @@ handle_call(
         {returned, Cache} ->
             {noreply, State#state{slow_offer = true, ledger_cache = Cache}}
     end;
-handle_call({mput, ObjectSpecs, TTL}, From, State) when
-    State#state.head_only == true
+%% The head_only == true guard is relaxed relative to upstream
+%% (docs/NATIVE_CAS.md): the mput flow - one INKT_MPUT journal record
+%% carrying every spec, so the batch is atomic and torn-safe - is
+%% mode-agnostic, as are replay and compaction of INKT_MPUT records. In a
+%% standard store the resulting HEAD_TAG rows form the transactional
+%% plane.
+handle_call({mput, ObjectSpecs, TTL}, From, State) ->
+    do_mput(ObjectSpecs, TTL, From, State);
+handle_call({casmput, ObjectSpecs, Conditions, TTL}, From, State) when
+    State#state.head_lookup == true
 ->
-    {ok, SQN} =
-        leveled_inker:ink_mput(State#state.inker, dummy, {ObjectSpecs, TTL}),
-    Changes =
-        preparefor_ledgercache(
-            ?INKT_MPUT,
-            ?DUMMY,
-            SQN,
-            null,
-            length(ObjectSpecs),
-            {ObjectSpecs, TTL}
-        ),
-    Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
-    case State#state.slow_offer of
-        true ->
-            gen_server:reply(From, pause);
-        false ->
-            gen_server:reply(From, ok)
-    end,
-    case
-        maybepush_ledgercache(
-            State#state.cache_size,
-            State#state.cache_multiple,
-            Cache0,
-            State#state.penciller,
-            State#state.monitor
-        )
-    of
-        {ok, Cache} ->
-            {noreply, State#state{ledger_cache = Cache, slow_offer = false}};
-        {returned, Cache} ->
-            {noreply, State#state{ledger_cache = Cache, slow_offer = true}}
+    %% Conditional mput (docs/NATIVE_CAS.md): evaluation and commit share
+    %% this callback, which is the commit point - no other write can
+    %% interleave, so the CAS is linearizable by construction.
+    case check_cas_conditions(Conditions, State) of
+        [] ->
+            do_mput(ObjectSpecs, TTL, From, State);
+        Failures ->
+            {reply, {error, {precondition_failed, Failures}}, State}
     end;
 handle_call({get, Bucket, Key, Tag}, _From, State) when
     State#state.head_only == false
@@ -1592,16 +1628,23 @@ handle_call({head, Bucket, Key, Tag, SQNOnly}, _From, State) when
 ->
     SW0 = leveled_monitor:maybe_time(State#state.monitor),
     LK = leveled_codec:to_objectkey(Bucket, Key, Tag),
+    %% ?HEAD_TAG rows are written by mput/casmput object specs, which are
+    %% no_lookup ledger changes journaled under ?DUMMY: they are absent
+    %% from the penciller's L0 index, and a journal probe by row key
+    %% cannot find their INKT_MPUT record. Reads of the transactional
+    %% plane therefore bypass both, in every store mode - resolving
+    %% purely from ledger state (docs/NATIVE_CAS.md).
+    HeadPlane = State#state.head_only orelse Tag == ?HEAD_TAG,
     {Head, CacheHit} =
         fetch_head(
             LK,
             State#state.penciller,
             State#state.ledger_cache,
-            State#state.head_only
+            HeadPlane
         ),
     {TS0, SW1} = leveled_monitor:step_time(SW0),
     JrnalCheckFreq =
-        case State#state.head_only of
+        case HeadPlane of
             true ->
                 0;
             false ->
@@ -2669,6 +2712,133 @@ scan_table(Table, StartKey, EndKey, Acc, MinSQN, MaxSQN) ->
             end
     end.
 
+-spec do_mput(
+    list(leveled_codec:object_spec()),
+    infinity | integer(),
+    gen_server:from(),
+    book_state()
+) -> {noreply, book_state()}.
+%% @doc
+%% The shared commit flow of {mput, ...} and {casmput, ...}: one
+%% INKT_MPUT journal record carries every spec, so the batch is atomic
+%% and torn-safe (a torn record fails CDB CRC recovery whole); replay
+%% and compaction of INKT_MPUT records are existing upstream behaviour.
+do_mput(ObjectSpecs, TTL, From, State) ->
+    {ok, SQN} =
+        leveled_inker:ink_mput(State#state.inker, dummy, {ObjectSpecs, TTL}),
+    Changes =
+        preparefor_ledgercache(
+            ?INKT_MPUT,
+            ?DUMMY,
+            SQN,
+            null,
+            length(ObjectSpecs),
+            {ObjectSpecs, TTL}
+        ),
+    Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
+    case State#state.slow_offer of
+        true ->
+            gen_server:reply(From, pause);
+        false ->
+            gen_server:reply(From, ok)
+    end,
+    case
+        maybepush_ledgercache(
+            State#state.cache_size,
+            State#state.cache_multiple,
+            Cache0,
+            State#state.penciller,
+            State#state.monitor
+        )
+    of
+        {ok, Cache} ->
+            {noreply, State#state{ledger_cache = Cache, slow_offer = false}};
+        {returned, Cache} ->
+            {noreply, State#state{ledger_cache = Cache, slow_offer = true}}
+    end.
+
+-spec valid_cas_conditions(list()) -> boolean().
+%% @doc
+%% Pure client-side shape check for casmput conditions, so a malformed
+%% condition is rejected before the store call rather than surfacing as
+%% a server-side error.
+valid_cas_conditions(Conditions) when is_list(Conditions) ->
+    lists:all(
+        fun
+            ({_B, K, SK, C}) when
+                is_binary(K), (SK == null orelse is_binary(SK))
+            ->
+                case C of
+                    absent -> true;
+                    present -> true;
+                    {sqn, N} when is_integer(N), N >= 0 -> true;
+                    _ -> false
+                end;
+            (_) ->
+                false
+        end,
+        Conditions
+    );
+valid_cas_conditions(_) ->
+    false.
+
+-spec check_cas_conditions(list(cas_condition()), book_state()) -> list().
+%% @doc
+%% Evaluate casmput preconditions against current head state
+%% (docs/NATIVE_CAS.md §3.2): a row is present when active and
+%% unexpired; a tombstoned (removed) or TTL-expired row is absent;
+%% {sqn, N} matches a live row's SQN exactly. HEAD_TAG rows resolve
+%% purely from the ledger - no L0 index, no journal probe (they are
+%% no_lookup changes journaled under ?DUMMY). Returns the failed
+%% conditions with their observed states; [] means all hold.
+check_cas_conditions(Conditions, State) ->
+    lists:filtermap(
+        fun({Bucket, Key, SubKey, Cond}) ->
+            LK =
+                case SubKey of
+                    null ->
+                        leveled_codec:to_objectkey(Bucket, Key, ?HEAD_TAG);
+                    SK ->
+                        leveled_codec:to_objectkey(
+                            Bucket, {Key, SK}, ?HEAD_TAG
+                        )
+                end,
+            {Head, _Hit} =
+                fetch_head(
+                    LK,
+                    State#state.penciller,
+                    State#state.ledger_cache,
+                    true
+                ),
+            Observed =
+                case Head of
+                    not_present ->
+                        absent;
+                    Head ->
+                        case leveled_codec:striphead_to_v1details(Head) of
+                            {_SQN, tomb, _MH, _MD} ->
+                                absent;
+                            {SQN, {active, TS}, _MH, _MD} ->
+                                case TS >= leveled_util:integer_now() of
+                                    true -> {present, SQN};
+                                    false -> absent
+                                end
+                        end
+                end,
+            case {Cond, Observed} of
+                {absent, absent} ->
+                    false;
+                {present, {present, _}} ->
+                    false;
+                {{sqn, N}, {present, N}} ->
+                    false;
+                _ ->
+                    {true, {Bucket, Key, SubKey, Cond, Observed}}
+            end
+        end,
+        Conditions
+    ).
+
 -spec fetch_head(leveled_codec:ledger_key(), pid(), ledger_cache()) ->
     {not_present | leveled_codec:ledger_value(), boolean()}.
 %% @doc
@@ -3124,6 +3294,178 @@ generate_multiple_objects(Count, KeyNumber, ObjL) ->
         KeyNumber + 1,
         ObjL ++ [{Key, Value, IndexSpec}]
     ).
+
+casmput_conditions_test_() ->
+    {timeout, 60, fun casmput_conditions_tester/0}.
+
+casmput_conditions_tester() ->
+    %% The docs/NATIVE_CAS.md condition matrix in a STANDARD store:
+    %% absent/present/{sqn,N} against missing, live, removed and
+    %% TTL-expired rows; conditions on keys outside the write set;
+    %% whole-batch rejection writing nothing; exact failure shape.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} = book_start([{root_path, RootPath}]),
+    B = <<"tx">>,
+    Row = fun(K, V) -> {add, B, K, null, V} end,
+    %% create-if-absent
+    ok = book_casmput(Bookie1, [Row(<<"a">>, v1)], [{B, <<"a">>, null, absent}]),
+    {ok, v1} = book_headonly(Bookie1, B, <<"a">>, null),
+    {ok, SQNa} = book_sqn(Bookie1, B, <<"a">>, ?HEAD_TAG),
+    %% absent now fails with the observed present state
+    ?assertMatch(
+        {error, {precondition_failed, [{B, <<"a">>, null, absent, {present, SQNa}}]}},
+        book_casmput(Bookie1, [Row(<<"a">>, v2)], [{B, <<"a">>, null, absent}])
+    ),
+    {ok, v1} = book_headonly(Bookie1, B, <<"a">>, null),
+    %% {sqn, N} guarded update passes, stale sqn then fails
+    ok = book_casmput(
+        Bookie1, [Row(<<"a">>, v2)], [{B, <<"a">>, null, {sqn, SQNa}}]
+    ),
+    {ok, v2} = book_headonly(Bookie1, B, <<"a">>, null),
+    ?assertMatch(
+        {error, {precondition_failed, [{B, <<"a">>, null, {sqn, SQNa}, {present, _}}]}},
+        book_casmput(Bookie1, [Row(<<"a">>, v3)], [{B, <<"a">>, null, {sqn, SQNa}}])
+    ),
+    %% condition on a key OUTSIDE the write set gates the whole batch,
+    %% and a failed batch writes NOTHING
+    ?assertMatch(
+        {error, {precondition_failed, [{B, <<"guard">>, null, present, absent}]}},
+        book_casmput(
+            Bookie1,
+            [Row(<<"b">>, bv), Row(<<"c">>, cv)],
+            [{B, <<"guard">>, null, present}]
+        )
+    ),
+    not_found = book_headonly(Bookie1, B, <<"b">>, null),
+    not_found = book_headonly(Bookie1, B, <<"c">>, null),
+    %% a removed row is absent to conditions
+    ok = book_mput(Bookie1, [{remove, B, <<"a">>, null, v2}]),
+    ok = book_casmput(Bookie1, [Row(<<"a">>, v4)], [{B, <<"a">>, null, absent}]),
+    {ok, v4} = book_headonly(Bookie1, B, <<"a">>, null),
+    %% a TTL-expired row is absent to conditions
+    Past = leveled_util:integer_now() - 10,
+    ok = book_mput(Bookie1, [Row(<<"ttl">>, tv)], Past),
+    ok = book_casmput(
+        Bookie1, [Row(<<"ttl">>, tv2)], [{B, <<"ttl">>, null, absent}]
+    ),
+    {ok, tv2} = book_headonly(Bookie1, B, <<"ttl">>, null),
+    %% malformed conditions are rejected client-side
+    ?assertMatch(
+        {error, {invalid_conditions, _}},
+        book_casmput(Bookie1, [Row(<<"z">>, zv)], [{B, <<"z">>, null, nonsense}])
+    ),
+    %% restart equivalence: acked state is exactly what replay rebuilds
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    {ok, v4} = book_headonly(Bookie2, B, <<"a">>, null),
+    {ok, tv2} = book_headonly(Bookie2, B, <<"ttl">>, null),
+    not_found = book_headonly(Bookie2, B, <<"b">>, null),
+    not_found = book_headonly(Bookie2, B, <<"c">>, null),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+casmput_headplane_visibility_test_() ->
+    {timeout, 60, fun casmput_headplane_visibility_tester/0}.
+
+casmput_headplane_visibility_tester() ->
+    %% mput/casmput rows are no_lookup ledger changes: reads must stay
+    %% correct at every residency stage in a standard store - bookie
+    %% ledger cache, penciller L0 memory (the L0-index bypass), SST
+    %% files, and across restart. Sized to force cache pushes.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} =
+        book_start([{root_path, RootPath}, {cache_size, 100}]),
+    B = <<"plane">>,
+    Rows = lists:seq(1, 50),
+    RowKey = fun(I) -> list_to_binary("row" ++ integer_to_list(I)) end,
+    ok = book_mput(
+        Bookie1, [{add, B, RowKey(I), null, {v, I}} || I <- Rows]
+    ),
+    %% drive the ledger cache into the penciller with standard puts
+    lists:foreach(
+        fun(I) ->
+            K = list_to_binary("filler" ++ integer_to_list(I)),
+            ok = book_put(
+                Bookie1, <<"bulk">>, K, crypto:strong_rand_bytes(64),
+                [], ?STD_TAG
+            )
+        end,
+        lists:seq(1, 2000)
+    ),
+    CheckAll =
+        fun(Bookie) ->
+            lists:foreach(
+                fun(I) ->
+                    ?assertMatch(
+                        {ok, {v, I}}, book_headonly(Bookie, B, RowKey(I), null)
+                    ),
+                    {ok, _SQN} = book_sqn(Bookie, B, RowKey(I), ?HEAD_TAG)
+                end,
+                Rows
+            )
+        end,
+    CheckAll(Bookie1),
+    %% conditions read the same plane correctly under pressure
+    ok = book_casmput(
+        Bookie1,
+        [{add, B, RowKey(1), null, {v, updated}}],
+        [{B, RowKey(2), null, present}, {B, <<"nope">>, null, absent}]
+    ),
+    {ok, {v, updated}} = book_headonly(Bookie1, B, RowKey(1), null),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    {ok, {v, updated}} = book_headonly(Bookie2, B, RowKey(1), null),
+    lists:foreach(
+        fun(I) ->
+            ?assertMatch(
+                {ok, {v, I}}, book_headonly(Bookie2, B, RowKey(I), null)
+            )
+        end,
+        lists:seq(2, 50)
+    ),
+    ok = book_close(Bookie2),
+    reset_filestructure().
+
+casmput_single_winner_test_() ->
+    {timeout, 60, fun casmput_single_winner_tester/0}.
+
+casmput_single_winner_tester() ->
+    %% N concurrent absent-conditioned writers to one row: exactly one
+    %% wins - the serialized callback is the commit point.
+    RootPath = reset_filestructure(),
+    {ok, Bookie1} = book_start([{root_path, RootPath}]),
+    B = <<"race">>,
+    Parent = self(),
+    N = 16,
+    lists:foreach(
+        fun(I) ->
+            spawn(fun() ->
+                R = book_casmput(
+                    Bookie1,
+                    [{add, B, <<"one">>, null, {winner, I}}],
+                    [{B, <<"one">>, null, absent}]
+                ),
+                Parent ! {raced, I, R}
+            end)
+        end,
+        lists:seq(1, N)
+    ),
+    Results =
+        [
+            receive
+                {raced, _I, R} -> R
+            after 10000 -> error(race_timeout)
+            end
+         || _ <- lists:seq(1, N)
+        ],
+    Wins = [R || R <- Results, R == ok orelse R == pause],
+    ?assertMatch(1, length(Wins)),
+    {ok, {winner, W}} = book_headonly(Bookie1, B, <<"one">>, null),
+    ok = book_close(Bookie1),
+    {ok, Bookie2} = book_start([{root_path, RootPath}]),
+    {ok, {winner, W}} = book_headonly(Bookie2, B, <<"one">>, null),
+    ok = book_close(Bookie2),
+    reset_filestructure().
 
 shutdown_test_() ->
     {timeout, 10, fun shutdown_tester/0}.
