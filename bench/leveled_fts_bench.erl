@@ -105,7 +105,15 @@ parse_args(["--index", I | Rest], Opts) ->
 parse_args([Other | _Rest], _Opts) ->
     {error, {unknown_arg, Other}}.
 
-run(Opts) ->
+run(Opts0) ->
+    {ok, Schema} =
+        leveled_fts:schema(#{
+            index => maps:get(index, Opts0),
+            columns => [title, body],
+            prefixes => [5, 11],
+            remove_diacritics => 2
+        }),
+    Opts = Opts0#{schema => Schema},
     Root = maps:get(root, Opts),
     ok =
         case maps:get(skip_load, Opts, undefined) of
@@ -121,20 +129,7 @@ run(Opts) ->
         {compression_method, maps:get(compression_method, Opts)},
         {ledger_compression, maps:get(ledger_compression, Opts)},
         {stats_percentage, 100},
-        {monitor_loglist, []},
-        {fts_indexes, [
-            #{
-                bucket => maps:get(bucket, Opts),
-                index => maps:get(index, Opts),
-                tag => ?STD_TAG,
-                columns => [
-                    #{name => title, path => [1]},
-                    #{name => body, path => [2]}
-                ],
-                prefixes => [5, 11],
-                remove_diacritics => 2
-            }
-        ]}
+        {monitor_loglist, []}
     ] ++ cache_start_opts(Opts) ++ sst_start_opts(Opts),
     {ok, Bookie} = leveled_bookie:book_start(StartOpts),
     LoadStart = erlang:monotonic_time(microsecond),
@@ -270,7 +265,7 @@ load_tsv(Bookie, Opts) ->
 load_loop(File, Bookie, Opts, BatchSize, Batch, BatchCount, DocCount, TextBytes, Stats) ->
     case file:read_line(File) of
         eof ->
-            case timed_write_batch(Bookie, Batch, Stats) of
+            case timed_write_batch(Bookie, Batch, Stats, Opts) of
                 {ok, FinalStats} -> {ok, DocCount, TextBytes, FinalStats};
                 {error, Reason} -> {error, Reason}
             end;
@@ -288,7 +283,7 @@ load_loop(File, Bookie, Opts, BatchSize, Batch, BatchCount, DocCount, TextBytes,
                     maybe_progress(NextDocCount),
                     case NextBatchCount >= BatchSize of
                         true ->
-                            case timed_write_batch(Bookie, NextBatch, Stats1) of
+                            case timed_write_batch(Bookie, NextBatch, Stats1, Opts) of
                                 {ok, Stats2} ->
                                     load_loop(
                                         File,
@@ -331,8 +326,7 @@ parse_doc(Line0, Opts) ->
             try
                 Title = base64:decode(Title64),
                 Body = base64:decode(Body64),
-                Bucket = maps:get(bucket, Opts),
-                Op = {put, Bucket, Key, {Title, Body}, [], ?STD_TAG, infinity},
+                Op = {doc, Key, #{title => Title, body => Body}},
                 {ok, Op, byte_size(Title) + byte_size(Body)}
             catch
                 _:Reason ->
@@ -353,8 +347,8 @@ read_first_doc(Opts) ->
         case file:read_line(File) of
             {ok, Line} ->
                 case parse_doc(Line, Opts) of
-                    {ok, {put, Bucket, Key, Object, _Idx, Tag, TTL}, _Bytes} ->
-                        {Bucket, Key, Object, Tag, TTL};
+                    {ok, {doc, Key, Object}, _Bytes} ->
+                        {Key, Object};
                     _Other ->
                         undefined
                 end;
@@ -365,12 +359,9 @@ read_first_doc(Opts) ->
         ok = file:close(File)
     end.
 
-maybe_compact(Bookie, #{compact := true} = Opts) ->
-    Bucket = maps:get(bucket, Opts),
-    Index = maps:get(index, Opts),
+maybe_compact(Bookie, #{compact := true, schema := Schema}) ->
     Start = erlang:monotonic_time(microsecond),
-    {async, Run} = leveled_bookie:book_ftsconsolidate(Bookie, Bucket, Index, #{}),
-    Result = Run(),
+    Result = leveled_fts:consolidate(Bookie, Schema, #{}),
     Elapsed = erlang:monotonic_time(microsecond) - Start,
     io:format("consolidated (~p) in ~.1f s~n", [Result, Elapsed / 1000000]),
     %% let the LSM digest the maintenance burst before the timed window:
@@ -383,8 +374,9 @@ maybe_compact(_Bookie, _Opts) ->
 
 maybe_bust_cache(_Bookie, #{sentinel := undefined}) ->
     ok;
-maybe_bust_cache(Bookie, #{sentinel := {Bucket, Key, Object, Tag, TTL}}) ->
-    _ = leveled_bookie:book_put(Bookie, Bucket, Key, Object, [], Tag, TTL, false),
+maybe_bust_cache(Bookie, #{sentinel := {Key, Object}, schema := Schema}) ->
+    {ok, Specs} = leveled_fts:derive(Schema, Key, Object),
+    _ = leveled_bookie:book_mput(Bookie, Specs),
     ok;
 maybe_bust_cache(_Bookie, _Opts) ->
     ok.
@@ -401,10 +393,25 @@ trim_newline(Bin) ->
             end
     end.
 
-write_batch(_Bookie, []) ->
+write_batch(_Bookie, [], _Opts) ->
     ok;
-write_batch(Bookie, Batch) ->
-    case leveled_bookie:book_batchput(Bookie, lists:reverse(Batch), false) of
+write_batch(Bookie, Batch, #{schema := Schema} = _Opts) ->
+    %% Library model (docs/FTS.md): each doc's postings/manifest/epoch/
+    %% stats rows come from pure derive/3; the source object rides the
+    %% same batch as a head row; ONE book_mput commits the whole batch
+    %% atomically under one SQN.
+    Bucket = maps:get(index, Schema),
+    Specs =
+        lists:append(
+            lists:map(
+                fun({doc, Key, Object}) ->
+                    {ok, DocSpecs} = leveled_fts:derive(Schema, Key, Object),
+                    [{add, Bucket, <<"src">>, Key, Object} | DocSpecs]
+                end,
+                lists:reverse(Batch)
+            )
+        ),
+    case leveled_bookie:book_mput(Bookie, Specs) of
         ok ->
             ok;
         pause ->
@@ -414,11 +421,11 @@ write_batch(Bookie, Batch) ->
             {error, Reason}
     end.
 
-timed_write_batch(_Bookie, [], Stats) ->
+timed_write_batch(_Bookie, [], Stats, _Opts) ->
     {ok, Stats};
-timed_write_batch(Bookie, Batch, Stats) ->
+timed_write_batch(Bookie, Batch, Stats, Opts) ->
     Start = erlang:monotonic_time(microsecond),
-    Result = write_batch(Bookie, Batch),
+    Result = write_batch(Bookie, Batch, Opts),
     Stop = erlang:monotonic_time(microsecond),
     case Result of
         ok ->
@@ -522,50 +529,38 @@ run_query_1(Bookie, Query, Opts) ->
     Warmup = maps:get(warmup, Opts),
     Runs = maps:get(runs, Opts),
     Limit = maps:get(limit, Opts),
-    Bucket = maps:get(bucket, Opts),
-    Index = maps:get(index, Opts),
+    Schema = maps:get(schema, Opts),
     SearchOpts = search_opts(Limit, Opts),
-    _ = [search_once(Bookie, Bucket, Index, Query, SearchOpts) || _ <- lists:seq(1, Warmup)],
+    _ = [search_once(Bookie, Schema, Query, SearchOpts) || _ <- lists:seq(1, Warmup)],
     Timed =
         [
             begin
-                %% Cache-bust regimes (see bench/README.md):
-                %%   always    (--uncached): bump the FTS write sequence (an
-                %%     idempotent re-put of an existing document) BEFORE the
-                %%     timer, so each timed query misses the per-sequence
-                %%     result, batch-list, and corpus-stats caches and does
-                %%     full posting work. Write-per-query worst case.
-                %%   amortized (--amortized): bump once, then run an untimed
-                %%     ABSORBER query (a distinct nomatch term) at the new
-                %%     sequence, which re-derives the per-sequence batch-list
-                %%     and (when ranked) corpus-stats caches. The timed query
-                %%     is then stats-warm but result-cache-cold: the
-                %%     steady-state cost of a NOVEL query between writes.
-                %% Page/directory caches (immutable per batch) stay warm in
-                %% both regimes, matching SQLite's warm page cache.
-                %%   stable (--stable): NO writes — novel-query cost against
-                %%     a write-quiescent store, with the per-sequence result
-                %%     cache disabled for the timed query (result_cache =>
-                %%     false); batch-list, stats, directory, and page caches
-                %%     stay warm exactly as a stable store would hold them.
+                %% Cache-bust regimes under the LIBRARY model (docs/FTS.md):
+                %% there is NO result cache - every query evaluates from
+                %% per-shard cached states validated by epoch-row SQNs.
+                %%   always    (--uncached): an idempotent re-derive+mput of
+                %%     an existing document BEFORE the timer bumps the epoch
+                %%     rows of every shard it touches, so the timed query
+                %%     refolds those shards from a snapshot and then
+                %%     evaluates. Write-per-query worst case.
+                %%   amortized (--amortized): bump once, then run the SAME
+                %%     query untimed to refold its shards; the timed run is
+                %%     then epoch-check + evaluation - the steady-state cost
+                %%     of a novel query between writes.
+                %%   stable (--stable): NO writes - epoch-check + evaluation
+                %%     against a write-quiescent store (equivalent to
+                %%     amortized without the write; kept for ladder compat).
                 _ = maybe_bust_cache(Bookie, Opts),
                 BustMode = maps:get(bust_mode, Opts, none),
                 _ =
                     case BustMode of
                         amortized ->
-                            search_once(
-                                Bookie, Bucket, Index, <<"zzabsorberstatswarm">>, SearchOpts
-                            );
+                            search_once(Bookie, Schema, Query, SearchOpts);
                         _ ->
                             ok
                     end,
-                TimedOpts =
-                    case BustMode of
-                        stable -> SearchOpts#{result_cache => false};
-                        _ -> SearchOpts
-                    end,
                 Start = erlang:monotonic_time(microsecond),
-                Result = search_once(Bookie, Bucket, Index, Query, TimedOpts),
+                Result = search_once(Bookie, Schema, Query, SearchOpts),
                 Stop = erlang:monotonic_time(microsecond),
                 {Stop - Start, result_summary(Result)}
             end
@@ -577,9 +572,9 @@ run_query_1(Bookie, Query, Opts) ->
             [] -> result_summary({error, no_timed_runs});
             _ -> lists:last(Summaries)
         end,
-    TotalSearchOpts = SearchOpts#{result => summary},
+    TotalSearchOpts = SearchOpts#{limit => maps:get(total_limit, Opts, 1000000)},
     TotalStart = erlang:monotonic_time(microsecond),
-    TotalResult = search_once(Bookie, Bucket, Index, Query, TotalSearchOpts),
+    TotalResult = search_once(Bookie, Schema, Query, TotalSearchOpts),
     TotalStop = erlang:monotonic_time(microsecond),
     TotalCount = result_total_count(TotalResult),
     TotalError = result_error(total_count, TotalResult),
@@ -618,7 +613,7 @@ result_full_keys_sha256({error, _Reason}) ->
 
 result_summary({ok, Hits}) ->
     Keys = [maps:get(key, Hit) || Hit <- Hits],
-    Scores = [maps:get(rank, Hit, 0.0) || Hit <- Hits],
+    Scores = [maps:get(score, Hit, 0.0) || Hit <- Hits],
     #{count => length(Keys), keys => Keys, scores => Scores, error => none,
         signature => {ok, Keys}};
 result_summary({error, Reason}) ->
@@ -661,17 +656,15 @@ first_error([none | Rest]) ->
 first_error([Error | _Rest]) ->
     Error.
 
-search_once(Bookie, Bucket, Index, Query, SearchOpts) ->
-    {async, Runner} = leveled_bookie:book_ftssearch(Bookie, Bucket, Index, Query, SearchOpts),
-    Runner().
+search_once(Bookie, Schema, Query, SearchOpts) ->
+    leveled_fts:search(Bookie, Schema, Query, SearchOpts).
 
 search_opts(Limit, Opts) ->
+    %% tokenizer/prefix settings are schema-level in the library model
     #{
         rank => maps:get(rank, Opts, none),
         limit => Limit,
-        columns => [title, body],
-        prefixes => [5, 11],
-        remove_diacritics => 2
+        columns => [title, body]
     }.
 
 write_results(Path, DocCount, TextBytes, LoadUs, LoadStats, QueryCount, QuerySha, QueryRowsPath, Opts) ->
