@@ -54,6 +54,15 @@ rows and manifest in one batch; deleting removes them. There is no
 sequence to allocate, stamp, or reseed — the audit's L2-F3 class cannot
 be expressed.
 
+**Doc-version stamp.** Every posting row and the manifest of one derive
+batch share an 8-byte content-derived stamp (pure, idempotent). The
+search merge keys each shard's contribution by stamp and admits ONLY
+the contribution matching the CURRENT manifest's stamp — so shard
+states read at different instants can never assemble two document
+versions into one match (cross-shard read skew), and a query concurrent
+with an update degrades to a legal pre- or post-state outcome, never a
+chimera. Consolidated bases carry the stamp per document.
+
 ## 3. Writing
 
 `derive(Schema, DocKey, Object)` is a pure function (tokenise, group by
