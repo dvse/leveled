@@ -160,7 +160,8 @@ when is_binary(DocKey), is_binary(Fingerprint) ->
             [
                 {add, Bucket, <<"doc">>, DocKey, Manifest},
                 {add, Bucket, <<"stats">>, DocKey,
-                    client_encode_stats(DocLength)}
+                    client_encode_stats(DocLength)},
+                client_docs_epoch_spec(Bucket)
             ] ++ EpochSpecs};
 derive(_Schema, DocKey, _Object) ->
     erlang:error({invalid_fts_derive, DocKey}).
@@ -176,7 +177,8 @@ when is_binary(DocKey) ->
     ] ++
         [
             {remove, Bucket, <<"doc">>, DocKey, <<>>},
-            {remove, Bucket, <<"stats">>, DocKey, <<>>}
+            {remove, Bucket, <<"stats">>, DocKey, <<>>},
+            client_docs_epoch_spec(Bucket)
         ] ++
         [client_epoch_spec(Bucket, Shard) || Shard <- Shards].
 
@@ -240,6 +242,42 @@ client_shard_id(Token, Shards) ->
 
 client_epoch_spec(Bucket, Shard) ->
     {add, Bucket, client_shard_key(Shard), <<"epoch">>, <<1>>}.
+
+%% Index-level epoch row rewritten by EVERY doc write/remove: its SQN is
+%% the validity token for the cached manifest map (docs/FTS.md §4 - the
+%% same admission law as shard states, one plane up). Eliminates the
+%% per-matched-doc manifest point-read at query time.
+client_docs_epoch_spec(Bucket) ->
+    {add, Bucket, <<"docs_epoch">>, <<"epoch">>, <<1>>}.
+
+client_docs_epoch_sqn(Bookie, Schema) ->
+    leveled_bookie:book_sqn(
+        Bookie, maps:get(index, Schema), {<<"docs_epoch">>, <<"epoch">>},
+        ?HEAD_TAG
+    ).
+
+%% Cached manifest map: DocKey => compact {Version, DocLength} for docs
+%% matching the schema fingerprint. Serve/install only with a token
+%% equal to the CURRENT docs-epoch SQN; a raced fill is discarded.
+client_cached_manifests(Bookie, Schema, Table) ->
+    Epoch0 = client_docs_epoch_sqn(Bookie, Schema),
+    case ets:lookup(Table, manifests) of
+        [{manifests, {Epoch0, Map}}] ->
+            Map;
+        _ ->
+            client_fill_manifests(Bookie, Schema, Table, Epoch0)
+    end.
+
+client_fill_manifests(Bookie, Schema, Table, Epoch0) ->
+    Map = client_fold_manifests(Bookie, Schema),
+    Epoch1 = client_docs_epoch_sqn(Bookie, Schema),
+    case Epoch1 =:= Epoch0 of
+        true ->
+            true = ets:insert(Table, {manifests, {Epoch1, Map}}),
+            Map;
+        false ->
+            client_fill_manifests(Bookie, Schema, Table, Epoch1)
+    end.
 
 client_guard(_What, Value, Max) when is_integer(Value), Value >= 0, Value =< Max ->
     ok;
@@ -431,8 +469,13 @@ client_take_option(Key, Opts) when is_list(Opts) ->
     {proplists:get_value(Key, Opts, undefined), proplists:delete(Key, Opts)}.
 
 client_search(Bookie, Schema, {all_docs} = AST, Opts, _Hook) ->
-    Manifests = client_fold_manifests(Bookie, Schema),
-    Metas = maps:map(fun(Key, M) -> client_empty_meta(Key, M) end, Manifests),
+    Table = cache_table(Bookie, Schema),
+    Manifests = client_cached_manifests(Bookie, Schema, Table),
+    Metas =
+        maps:map(
+            fun(Key, {_V, DocLength}) -> client_empty_meta(Key, DocLength) end,
+            Manifests
+        ),
     client_evaluate(AST, Metas, Bookie, Schema, Opts);
 client_search(Bookie, Schema, AST, Opts, Hook) ->
     Shards = client_ast_shards(AST, Schema),
@@ -440,36 +483,29 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
     States = [client_cached_shard(Bookie, Schema, Table, Shard, Hook)
         || Shard <- Shards],
     Raw = lists:foldl(fun client_merge_shard_docs/2, #{}, States),
+    %% Manifests come from the docs-epoch-validated cache (one book_sqn
+    %% per query, never a per-doc point read). Version-stamp admission:
+    %% only the contribution matching the CURRENT manifest merges, so
+    %% shard states read at different instants can never assemble two
+    %% document versions into one match.
+    Manifests = client_cached_manifests(Bookie, Schema, Table),
     Metas = maps:fold(
         fun(DocKey, ByVersion, Acc) ->
-            case leveled_bookie:book_headonly(
-                Bookie, maps:get(index, Schema), <<"doc">>, DocKey
-            ) of
-                {ok, ManifestBin} ->
-                    Manifest = client_decode_manifest_value(ManifestBin),
-                    %% admit only the contribution whose version stamp
-                    %% matches the CURRENT manifest: shard states read
-                    %% at different instants can never assemble two
-                    %% document versions into one match
-                    Posting =
-                        maps:get(
-                            maps:get(version, Manifest), ByVersion, none
-                        ),
-                    FpOk =
-                        maps:get(fingerprint, Manifest) =:=
-                            maps:get(fingerprint, Schema),
-                    case FpOk andalso Posting =/= none of
-                        true ->
+            case maps:get(DocKey, Manifests, none) of
+                {Version, DocLength} ->
+                    case maps:get(Version, ByVersion, none) of
+                        none ->
+                            Acc;
+                        Posting ->
                             Acc#{
                                 DocKey =>
                                     client_meta(
-                                        DocKey, Manifest, Posting, Schema
+                                        DocKey, DocLength, Posting, Schema
                                     )
-                            };
-                        false ->
-                            Acc
+                            }
                     end;
-                not_found -> Acc
+                none ->
+                    Acc
             end
         end,
         #{}, Raw
@@ -552,7 +588,7 @@ client_merge_posting(A, B) ->
         Acc#{Col => maps:merge(maps:get(Col, Acc, #{}), Tokens)}
     end, A, B).
 
-client_meta(Key, Manifest, Posting, Schema) ->
+client_meta(Key, DocLength, Posting, Schema) ->
     Columns = maps:get(columns, Schema),
     Positions = maps:from_list([{lists:nth(ColId + 1, Columns),
         maps:map(fun(_Token, Entry) -> maps:get(positions, Entry) end, Tokens)}
@@ -560,11 +596,11 @@ client_meta(Key, Manifest, Posting, Schema) ->
     Counts = maps:from_list([{lists:nth(ColId + 1, Columns),
         maps:map(fun(_Token, Entry) -> maps:get(count, Entry) end, Tokens)}
         || {ColId, Tokens} <- maps:to_list(Posting)]),
-    #{key => Key, doc_length => maps:get(doc_length, Manifest),
+    #{key => Key, doc_length => DocLength,
         positions => Positions, counts => Counts}.
 
-client_empty_meta(Key, Manifest) ->
-    #{key => Key, doc_length => maps:get(doc_length, Manifest),
+client_empty_meta(Key, DocLength) ->
+    #{key => Key, doc_length => DocLength,
         positions => #{}, counts => #{}}.
 
 client_ast_shards(AST, Schema) ->
@@ -636,8 +672,13 @@ client_fold_manifests(Bookie, Schema) ->
         (B, {<<"doc">>, DocKey}, Value, Acc) when B =:= Bucket ->
             M = client_decode_manifest_value(Value),
             case maps:get(fingerprint, M) =:= Fingerprint of
-                true -> Acc#{DocKey => M};
-                false -> Acc
+                true ->
+                    Acc#{
+                        DocKey =>
+                            {maps:get(version, M), maps:get(doc_length, M)}
+                    };
+                false ->
+                    Acc
             end;
         (_B, _K, _V, Acc) -> Acc
     end,
@@ -2431,7 +2472,10 @@ cache_admission_tester() ->
         {ok, Hits} = search(Bookie, Schema, <<"common">>, #{cache_fill_hook => Hook}),
         ?assertEqual([<<"racer">>, <<"seed">>], [maps:get(key, H) || H <- Hits]),
         Table = cache_table(Bookie, Schema),
-        ?assertEqual(1, ets:info(Table, size))
+        %% exactly one shard-state entry (the raced fill was discarded
+        %% and refilled once) plus the docs-epoch-validated manifest map
+        ?assertEqual(1, length(ets:select(Table, [{{{shard, '_'}, '_'}, [], [true]}]))),
+        ?assertMatch([{manifests, {_Epoch, _Map}}], ets:lookup(Table, manifests))
     end).
 
 bm25_true_count_at_cap_test_() ->
