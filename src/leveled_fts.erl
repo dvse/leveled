@@ -645,10 +645,251 @@ client_search_direct_phrase_store(Bookie, Schema,
     ).
 
 client_search_direct_near_store(Bookie, Schema,
+        {near, [
+            {term, _TokenA, false, _ColumnsA},
+            {term, _TokenB, false, _ColumnsB}
+        ] = Items, Distance, Columns}, Opts) ->
+    client_search_direct_binary_near_store(
+        Bookie, Schema, Items, Columns, Distance, Opts
+    );
+client_search_direct_near_store(Bookie, Schema,
         {near, Items, Distance, Columns}, Opts) ->
     client_search_direct_position_store(
         Bookie, Schema, Items, Columns, Opts, {near, Distance}
     ).
+
+client_search_direct_binary_near_store(Bookie, Schema,
+        [{term, TokenA, false, _ColumnsA},
+            {term, TokenB, false, _ColumnsB}] = Items,
+        Columns, Distance, Opts) ->
+    ColumnIds = client_selector_column_ids(Columns, Schema),
+    Ranked = maps:get(rank, Opts, none) =:= bm25,
+    ReturnPositions = maps:get(return_positions, Opts, false),
+    {Matches, SourcesByColumn, GlobalNHits} = lists:foldl(
+        fun(Column, {MatchAcc, SourceAcc, NHitAcc}) ->
+            {Candidates, ColumnNHits} = client_direct_binary_near_candidates(
+                Bookie, Schema, Items, Column
+            ),
+            NHits = lists:zipwith(
+                fun erlang:max/2, NHitAcc, ColumnNHits
+            ),
+            case map_size(Candidates) of
+                0 -> {MatchAcc, SourceAcc, NHits};
+                _ ->
+                    {SourceA, SourceB} =
+                        client_read_two_position_binary_sources(
+                            Bookie, Schema, TokenA, TokenB,
+                            Column, Candidates
+                        ),
+                    ColumnMatches = client_fold_binary_near_candidates(
+                        maps:to_list(Candidates), SourceA, SourceB,
+                        Ranked, Distance, Column, MatchAcc
+                    ),
+                    {ColumnMatches,
+                        SourceAcc#{Column => {SourceA, SourceB}}, NHits}
+            end
+        end,
+        {#{}, #{}, [0, 0]},
+        ColumnIds
+    ),
+    {DocCount, TotalLength} = case Ranked of
+        true -> client_corpus_stats(Bookie, Schema);
+        false -> {0, 0}
+    end,
+    AvgLength = case DocCount of
+        0 -> 0.0;
+        _ -> TotalLength / DocCount
+    end,
+    NearIdfs = case Ranked of
+        true -> client_direct_near_idfs(GlobalNHits, DocCount);
+        false -> []
+    end,
+    HitRows = [
+        begin
+            Score = case Ranked of
+                true -> client_direct_near_bm25_score(
+                    Tfs, NearIdfs, AvgLength, Length
+                );
+                false -> 0.0
+            end,
+            {#{key => DocKey, score => Score, doc_length => Length},
+                DocKey, Version, MatchColumns}
+        end
+     || {DocKey, {Version, Length, Tfs, MatchColumns}} <-
+            maps:to_list(Matches)
+    ],
+    SortedRows = case Ranked of
+        true -> lists:sort(fun({A, _, _, _}, {B, _, _, _}) ->
+            {-maps:get(score, A), maps:get(key, A)} =<
+                {-maps:get(score, B), maps:get(key, B)}
+        end, HitRows);
+        false -> lists:sort(fun({A, _, _, _}, {B, _, _, _}) ->
+            maps:get(key, A) =< maps:get(key, B)
+        end, HitRows)
+    end,
+    PagedRows = lists:sublist(
+        drop(maps:get(offset, Opts, 0), SortedRows),
+        maps:get(limit, Opts, ?DEFAULT_LIMIT)
+    ),
+    Hits = case ReturnPositions of
+        false -> [Hit || {Hit, _DocKey, _Version, _Columns} <- PagedRows];
+        true -> [
+            Hit#{positions => #{near => client_materialize_binary_near(
+                DocKey, Version, MatchColumns, SourcesByColumn, Distance
+            )}}
+         || {Hit, DocKey, Version, MatchColumns} <- PagedRows
+        ]
+    end,
+    {ok, Hits}.
+
+client_direct_near_idfs(NHits, DocCount) ->
+    [begin
+        Idf0 = math:log(
+            (DocCount - NHit + 0.5) / (NHit + 0.5)
+        ),
+        case Idf0 > 0.0 of
+            true -> Idf0;
+            false -> 1.0e-6
+        end
+    end || NHit <- NHits].
+
+client_direct_near_bm25_score(Tfs, Idfs, AvgLength, DocLength) ->
+    LenRatio = case AvgLength > 0.0 of
+        true -> DocLength / AvgLength;
+        false -> 1.0
+    end,
+    lists:sum([
+        Idf * (Tf * 2.2) /
+            (Tf + 1.2 * (0.25 + 0.75 * LenRatio))
+     || {Tf, Idf} <- lists:zip(Tfs, Idfs), Tf > 0
+    ]).
+
+client_fold_binary_near_candidates([], _SourceA, _SourceB, _Ranked,
+        _Distance, _Column, Acc) -> Acc;
+client_fold_binary_near_candidates(
+        [{DocKey, {Version, Length}} | Rest], SourceA, SourceB,
+        Ranked, Distance, Column, Acc) ->
+    Hash = client_docid_hash(DocKey),
+    Acc1 = case {
+        client_direct_position_binary_lookup(
+            SourceA, DocKey, Hash, Version
+        ),
+        client_direct_position_binary_lookup(
+            SourceB, DocKey, Hash, Version
+        )
+    } of
+        {{ok, PositionsA}, {ok, PositionsB}} -> case Ranked of
+            false -> case client_raw_near_any(
+                    PositionsA, PositionsB, Distance
+                ) of
+                true -> client_merge_binary_near_match(
+                    DocKey, Version, Length, [], Column, Acc
+                );
+                false -> Acc
+            end;
+            true ->
+                {Matched, TfA, TfB} = client_raw_near_tfs(
+                    PositionsA, PositionsB, Distance
+                ),
+                case Matched of
+                    true -> client_merge_binary_near_match(
+                        DocKey, Version, Length,
+                        [TfA, TfB], Column, Acc
+                    );
+                    false -> Acc
+                end
+        end;
+        _ -> Acc
+    end,
+    client_fold_binary_near_candidates(
+        Rest, SourceA, SourceB, Ranked, Distance, Column, Acc1
+    ).
+
+client_read_two_position_binary_sources(
+        Bookie, Schema, TokenA, TokenB, Column, Candidates) ->
+    Parent = self(),
+    RefA = make_ref(),
+    RefB = make_ref(),
+    spawn(fun() -> Parent ! {RefA, try
+        {ok, client_read_direct_position_binary_source(
+            Bookie, Schema, TokenA, Column, Candidates
+        )}
+    catch ClassA:ReasonA:StackA ->
+        {error, ClassA, ReasonA, StackA}
+    end} end),
+    spawn(fun() -> Parent ! {RefB, try
+        {ok, client_read_direct_position_binary_source(
+            Bookie, Schema, TokenB, Column, Candidates
+        )}
+    catch ClassB:ReasonB:StackB ->
+        {error, ClassB, ReasonB, StackB}
+    end} end),
+    SourceA = client_receive_position_binary_source(RefA),
+    SourceB = client_receive_position_binary_source(RefB),
+    {SourceA, SourceB}.
+
+client_receive_position_binary_source(Ref) ->
+    receive
+        {Ref, {ok, Source}} -> Source;
+        {Ref, {error, Class, Reason, Stack}} ->
+            erlang:raise(Class, Reason, Stack)
+    end.
+
+client_direct_binary_near_candidates(Bookie, Schema, Items, Column) ->
+    TokenHeads = [
+        {Token, client_read_boolean_head(Bookie, Schema, Token, Column)}
+     || {term, Token, false, _ItemColumns} <- Items
+    ],
+    ColumnNHits = [case Head of
+        not_found -> 0;
+        {ok, Value} -> client_page_global_docs(Value)
+    end || {_Token, Head} <- TokenHeads],
+    Ordered = lists:sort(
+        fun({_TokenA, HeadA}, {_TokenB, HeadB}) ->
+            client_boolean_head_total(HeadA) =<
+                client_boolean_head_total(HeadB)
+        end,
+        TokenHeads
+    ),
+    Candidates = case Ordered of
+        [{_Token, not_found} | _] -> #{};
+        [{TokenA, HeadA}, {TokenB, HeadB}] ->
+            {ValuesA, ValuesB} = client_read_two_boolean_values(
+                Bookie, Schema, TokenA, HeadA, TokenB, HeadB, Column
+            ),
+            client_intersect_boolean_values(ValuesA, ValuesB)
+    end,
+    {Candidates, ColumnNHits}.
+
+client_read_two_boolean_values(
+        Bookie, Schema, TokenA, HeadA, TokenB, HeadB, Column) ->
+    Parent = self(),
+    RefA = make_ref(),
+    RefB = make_ref(),
+    spawn(fun() -> Parent ! {RefA, try
+        {ok, client_read_boolean_values_from_head(
+            Bookie, Schema, TokenA, Column, all, HeadA
+        )}
+    catch ClassA:ReasonA:StackA ->
+        {error, ClassA, ReasonA, StackA}
+    end} end),
+    spawn(fun() -> Parent ! {RefB, try
+        {ok, client_read_boolean_values_from_head(
+            Bookie, Schema, TokenB, Column, all, HeadB
+        )}
+    catch ClassB:ReasonB:StackB ->
+        {error, ClassB, ReasonB, StackB}
+    end} end),
+    ValuesA = client_receive_parallel_value(RefA),
+    ValuesB = client_receive_parallel_value(RefB),
+    {ValuesA, ValuesB}.
+
+client_receive_parallel_value(Ref) ->
+    receive
+        {Ref, {ok, Value}} -> Value;
+        {Ref, {error, Class, Reason, Stack}} ->
+            erlang:raise(Class, Reason, Stack)
+    end.
 
 client_search_direct_position_store(Bookie, Schema,
         Items, Columns, Opts, MatchSpec) ->
@@ -769,7 +1010,8 @@ client_search_direct_position_store(Bookie, Schema,
                 );
                 false -> 0.0
             end,
-            Base = #{key => DocKey, score => Score, doc_length => Length},
+            Base = #{key => DocKey, score => Score, doc_length => Length,
+                match_count => position_count(NearPositions)},
             case maps:get(return_positions, Opts, false) of
                 true -> Base#{positions => #{
                     client_direct_match_key(MatchSpec) => NearPositions
@@ -1153,6 +1395,327 @@ client_direct_position_lookup({decoded, PositionsByDoc}, DocKey, Version) ->
     case maps:get(DocKey, PositionsByDoc, none) of
         {Version, Positions} -> Positions;
         _ -> none
+    end.
+
+client_read_direct_position_binary_source(
+        Bookie, Schema, Token, Column, Candidates) ->
+    Bucket = maps:get(index, Schema),
+    Key = client_token_key(Token),
+    case leveled_bookie:book_headonly(
+            Bookie, Bucket, Key,
+            client_page_subkey(?POSITION_PLANE, Column, 0)
+        ) of
+        not_found -> missing;
+        {ok, Value0} ->
+            PageNumbers = client_candidate_page_numbers(
+                Value0, Candidates
+            ),
+            OverflowPages = [PageNo || PageNo <- PageNumbers, PageNo > 0],
+            OverflowValues = client_read_parallel_position_pages(
+                Bookie, Bucket, Key, Column, OverflowPages
+            ),
+            Pages = maps:from_list([
+                {PageNo, client_prepare_position_binary_page(case PageNo of
+                    0 -> Value0;
+                    _ -> maps:get(PageNo, OverflowValues)
+                end)}
+             || PageNo <- PageNumbers
+            ]),
+            {binary_positions, client_page_boundaries(Value0), Pages}
+    end.
+
+client_read_parallel_position_pages(
+        _Bookie, _Bucket, _Key, _Column, []) -> #{};
+client_read_parallel_position_pages(
+        Bookie, Bucket, Key, Column, PageNumbers) ->
+    Parent = self(),
+    PageRefs = [
+        begin
+            Ref = make_ref(),
+            spawn(fun() -> Parent ! {Ref, try
+                leveled_bookie:book_headonly(
+                    Bookie, Bucket, Key,
+                    client_page_subkey(
+                        ?POSITION_PLANE, Column, PageNo
+                    )
+                )
+            of
+                {ok, Value} -> {ok, Value};
+                not_found -> {error, error,
+                    {missing_fts_position_page, PageNo}, []}
+            catch Class:Reason:Stack ->
+                {error, Class, Reason, Stack}
+            end} end),
+            {PageNo, Ref}
+        end
+     || PageNo <- PageNumbers
+    ],
+    maps:from_list([
+        {PageNo, client_receive_parallel_value(Ref)}
+     || {PageNo, Ref} <- PageRefs
+    ]).
+
+client_prepare_position_binary_page(
+        <<?PAGE_VERSION:8, ?POSITION_PLANE:8,
+            _PageCount:16/unsigned-big, _TotalDocs:32/unsigned-big,
+            N:32/unsigned-big, DirBytes:32/unsigned-big,
+            PageDirBytes:32/unsigned-big, Directory:DirBytes/binary,
+            _PageDirectory:PageDirBytes/binary, Payload/binary>>) ->
+    {N, Directory, Payload}.
+
+client_direct_position_binary_lookup(
+        missing, _DocKey, _Hash, _Version) -> none;
+client_direct_position_binary_lookup(
+        {binary_positions, Boundaries, Pages}, DocKey, Hash, Version) ->
+    PageNo = client_page_for_doc(DocKey, Boundaries),
+    case maps:find(PageNo, Pages) of
+        error -> none;
+        {ok, Page} -> client_lookup_position_binary_page(
+            Page, DocKey, Hash, Version
+        )
+    end.
+
+client_lookup_position_binary_page(
+        {N, Directory, Payload}, DocKey, Hash, Version) ->
+    Index = client_position_directory_lower_bound(
+        Directory, Hash, 0, N
+    ),
+    client_lookup_position_binary_hash(
+        DocKey, Version, Hash, Index, N, Directory, Payload
+    ).
+
+client_lookup_position_binary_hash(
+        _DocKey, _Version, _Hash, Index, N, _Directory, _Payload)
+when Index >= N -> none;
+client_lookup_position_binary_hash(
+        DocKey, Version, Hash, Index, N, Directory, Payload) ->
+    DirectoryOffset = Index * ?PAGE_DIR_STRIDE,
+    <<_:DirectoryOffset/binary, RowHash:32/unsigned-big,
+        Offset:32/unsigned-big, _/binary>> = Directory,
+    case RowHash =:= Hash of
+        false -> none;
+        true ->
+    {StoredKey, StoredVersion, Positions} =
+        client_decode_position_binary_entry(Payload, Offset),
+            case client_page_entry_matches(
+                    ?POSITION_PLANE, StoredKey, DocKey
+                ) andalso StoredVersion =:= Version of
+                true -> {ok, Positions};
+                false -> client_lookup_position_binary_hash(
+                    DocKey, Version, Hash, Index + 1, N,
+                    Directory, Payload
+                )
+            end
+    end.
+
+client_position_directory_lower_bound(_Directory, _Hash, Lo, Lo) -> Lo;
+client_position_directory_lower_bound(Directory, Hash, Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    DirectoryOffset = Mid * ?PAGE_DIR_STRIDE,
+    <<_:DirectoryOffset/binary, MidHash:32/unsigned-big,
+        _RowOffset:32/unsigned-big, _/binary>> = Directory,
+    case MidHash < Hash of
+        true -> client_position_directory_lower_bound(
+            Directory, Hash, Mid + 1, Hi
+        );
+        false -> client_position_directory_lower_bound(
+            Directory, Hash, Lo, Mid
+        )
+    end.
+
+client_decode_position_binary_entry(Payload, Offset) ->
+    case Payload of
+        <<_:Offset/binary, _EntryBytes:32/unsigned-big,
+                0:8, Version:8/binary, PosBytes:16/unsigned-big,
+                Positions:PosBytes/binary, _/binary>> ->
+            {no_key, Version, Positions};
+        <<_:Offset/binary, _EntryBytes:32/unsigned-big,
+                1:8, KeyBytes:16/unsigned-big, DocKey:KeyBytes/binary,
+                Version:8/binary, PosBytes:16/unsigned-big,
+                Positions:PosBytes/binary, _/binary>> ->
+            {DocKey, Version, Positions}
+    end.
+
+client_raw_near_any(PositionsA, PositionsB, Distance) ->
+    case {
+        client_raw_position_start(PositionsA),
+        client_raw_position_start(PositionsB)
+    } of
+        {done, _} -> false;
+        {_, done} -> false;
+        {{PositionA, <<>>}, {PositionB, <<>>}} ->
+            abs(PositionA - PositionB) =< Distance + 1;
+        {CursorA, CursorB} ->
+            client_raw_near_any_loop(
+                CursorA, CursorB, Distance + 1
+            )
+    end.
+
+client_raw_near_any_loop({PositionA, _RestA}, {PositionB, _RestB},
+        Window) when
+        PositionA >= PositionB - Window,
+        PositionA =< PositionB + Window ->
+    true;
+client_raw_near_any_loop({PositionA, RestA}, CursorB = {PositionB, _},
+        Window) when PositionA < PositionB ->
+    case client_raw_position_next(RestA, PositionA) of
+        done -> false;
+        NextA -> client_raw_near_any_loop(
+            NextA, CursorB, Window
+        )
+    end;
+client_raw_near_any_loop(CursorA, {PositionB, RestB}, Window) ->
+    case client_raw_position_next(RestB, PositionB) of
+        done -> false;
+        NextB -> client_raw_near_any_loop(
+            CursorA, NextB, Window
+        )
+    end.
+
+client_raw_near_tfs(PositionsA, PositionsB, Distance) ->
+    case {
+        client_raw_position_start(PositionsA),
+        client_raw_position_start(PositionsB)
+    } of
+        {done, _} -> {false, 0, 0};
+        {_, done} -> {false, 0, 0};
+        {{PositionA, <<>>}, {PositionB, <<>>}} ->
+            case abs(PositionA - PositionB) =< Distance + 1 of
+                true -> {true, 1, 1};
+                false -> {false, 0, 0}
+            end;
+        {CursorA, CursorB} ->
+            client_raw_near_tfs_loop(
+                CursorA, CursorB, none, none,
+                Distance + 1, 0, 0
+            )
+    end.
+
+client_raw_near_tfs_loop(done, done, _PreviousA, _PreviousB,
+        _Window, CountA, CountB) ->
+    {CountA > 0, CountA, CountB};
+client_raw_near_tfs_loop(done, CursorB, PreviousA, _PreviousB,
+        Window, CountA, CountB) ->
+    FinalCountB = client_raw_near_remaining(
+        CursorB, PreviousA, Window, CountB
+    ),
+    {CountA > 0, CountA, FinalCountB};
+client_raw_near_tfs_loop(CursorA, done, _PreviousA, PreviousB,
+        Window, CountA, CountB) ->
+    FinalCountA = client_raw_near_remaining(
+        CursorA, PreviousB, Window, CountA
+    ),
+    {FinalCountA > 0, FinalCountA, CountB};
+client_raw_near_tfs_loop(
+        {PositionA, RestA}, CursorB = {PositionB, _RestB},
+        _PreviousA, PreviousB, Window, CountA, CountB)
+when PositionA =< PositionB ->
+    CountA1 = case PositionB - PositionA =< Window of
+        true -> CountA + 1;
+        false -> case PreviousB of
+            none -> CountA;
+            _ when PositionA - PreviousB =< Window -> CountA + 1;
+            _ -> CountA
+        end
+    end,
+    NextA = client_raw_position_next(RestA, PositionA),
+    client_raw_near_tfs_loop(
+        NextA, CursorB, PositionA, PreviousB, Window,
+        CountA1, CountB
+    );
+client_raw_near_tfs_loop(
+        CursorA = {_PositionA, _RestA}, {PositionB, RestB},
+        PreviousA, _PreviousB, Window, CountA, CountB) ->
+    {PositionA, _} = CursorA,
+    CountB1 = case PositionA - PositionB =< Window of
+        true -> CountB + 1;
+        false -> case PreviousA of
+            none -> CountB;
+            _ when PositionB - PreviousA =< Window -> CountB + 1;
+            _ -> CountB
+        end
+    end,
+    NextB = client_raw_position_next(RestB, PositionB),
+    client_raw_near_tfs_loop(
+        CursorA, NextB, PreviousA, PositionB, Window,
+        CountA, CountB1
+    ).
+
+client_raw_near_remaining(done, _PreviousOther, _Window, Count) ->
+    Count;
+client_raw_near_remaining({Position, Rest}, PreviousOther,
+        Window, Count) ->
+    Count1 = case PreviousOther of
+        none -> Count;
+        _ when Position - PreviousOther =< Window -> Count + 1;
+        _ -> Count
+    end,
+    Next = client_raw_position_next(Rest, Position),
+    client_raw_near_remaining(
+        Next, PreviousOther, Window, Count1
+    ).
+
+client_raw_position_start(Bin) ->
+    client_raw_position_next(Bin, 0).
+
+client_raw_position_next(<<>>, _Last) -> done;
+client_raw_position_next(<<Byte:8, Rest/binary>>, Last) when Byte < 128 ->
+    {Last + Byte, Rest};
+client_raw_position_next(<<Byte:8, Rest/binary>> = Bin, Last) ->
+    client_raw_position_varint(
+        Rest, Last, 7, Byte band 16#7F, Bin
+    ).
+
+client_raw_position_varint(
+        <<Byte:8, Rest/binary>>, Last, Shift, Acc, Original)
+when Shift =< 63 ->
+    Value = Acc bor ((Byte band 16#7F) bsl Shift),
+    case Byte band 16#80 of
+        0 -> {Last + Value, Rest};
+        _ -> client_raw_position_varint(
+            Rest, Last, Shift + 7, Value, Original
+        )
+    end;
+client_raw_position_varint(_Bin, _Last, _Shift, _Acc, Original) ->
+    erlang:error({invalid_fts_positions, Original}).
+
+client_merge_binary_near_match(
+        DocKey, Version, Length, Tfs, Column, Acc) ->
+    case maps:find(DocKey, Acc) of
+        error -> Acc#{DocKey => {Version, Length, Tfs, [Column]}};
+        {ok, {Version, ExistingLength, ExistingTfs, Columns}} ->
+            MergedTfs = case {ExistingTfs, Tfs} of
+                {[], []} -> [];
+                _ -> lists:zipwith(
+                    fun(A, B) -> A + B end, ExistingTfs, Tfs
+                )
+            end,
+            Acc#{DocKey => {Version, ExistingLength, MergedTfs,
+                [Column | Columns]}};
+        {ok, {_OtherVersion, _Length, _Tfs, _Columns}} -> Acc
+    end.
+
+client_materialize_binary_near(
+        DocKey, Version, Columns, SourcesByColumn, Distance) ->
+    Hash = client_docid_hash(DocKey),
+    Positions = lists:append([
+        begin
+            {SourceA, SourceB} = maps:get(Column, SourcesByColumn),
+            {ok, BinaryA} = client_direct_position_binary_lookup(
+                SourceA, DocKey, Hash, Version
+            ),
+            {ok, BinaryB} = client_direct_position_binary_lookup(
+                SourceB, DocKey, Hash, Version
+            ),
+            {ok, ListA} = decode_positions(BinaryA, 0, []),
+            {ok, ListB} = decode_positions(BinaryB, 0, []),
+            client_direct_near_positions([ListA, ListB], Distance)
+        end
+     || Column <- Columns
+    ]),
+    case length(Positions) =< ?MAX_RETURN_POSITIONS of
+        true -> Positions;
+        false -> throw({fts_error, fts_query_positions_limit_exceeded})
     end.
 
 client_page_count(
@@ -2206,7 +2769,8 @@ client_evaluate(AST, Metas, Bookie, Schema, Opts) ->
 
 client_hit(Meta, MatchPositions, Opts, Score) ->
     Base = #{key => maps:get(key, Meta), score => Score,
-        doc_length => maps:get(doc_length, Meta)},
+        doc_length => maps:get(doc_length, Meta),
+        match_count => position_count(MatchPositions)},
     case maps:get(return_positions, Opts, false) of
         true ->
             case position_count(MatchPositions) =< ?MAX_RETURN_POSITIONS of
@@ -4611,6 +5175,38 @@ client_codec_and_capacity_test() ->
         client_encode_posting(
             {<<0:64>>, #{255 => #{<<"x">> => #{count => 1, positions => [0]}}}}
         )).
+
+raw_near_zipper_equivalence_test() ->
+    Cases = [
+        {[], [], 10},
+        {[1], [13], 10},
+        {[1], [12], 10},
+        {[1, 20, 40], [8, 32, 60], 6},
+        {[0, 130, 260, 1000], [128, 261, 900], 1},
+        {lists:seq(0, 200, 7), lists:seq(3, 200, 11), 4}
+    ],
+    lists:foreach(
+        fun({PositionsA, PositionsB, Distance}) ->
+            BinaryA = client_encode_positions(PositionsA),
+            BinaryB = client_encode_positions(PositionsB),
+            ExpectedPositions = client_direct_near_positions(
+                [PositionsA, PositionsB], Distance
+            ),
+            ExpectedTfs = client_direct_near_tfs(
+                [PositionsA, PositionsB], Distance
+            ),
+            Matched = client_raw_near_any(
+                BinaryA, BinaryB, Distance
+            ),
+            ?assertEqual(ExpectedPositions =/= [], Matched),
+            {TfMatched, TfA, TfB} = client_raw_near_tfs(
+                BinaryA, BinaryB, Distance
+            ),
+            ?assertEqual(ExpectedPositions =/= [], TfMatched),
+            ?assertEqual(ExpectedTfs, [TfA, TfB])
+        end,
+        Cases
+    ).
 
 derive_remove_update_shape_test() ->
     {ok, Schema} = schema(#{index => <<"shape-unit">>, columns => [body]}),
