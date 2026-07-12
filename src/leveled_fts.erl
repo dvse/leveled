@@ -22,11 +22,9 @@
     update/4,
     search/4,
     consolidate/3,
-    cache_table/2,
-    shard_id/1
+    cache_table/2
 ]).
 
--define(VERSION, 1).
 -define(DEFAULT_LIMIT, 10000).
 -define(MAX_LIMIT, 20000).
 -define(MAX_WINDOW, 20000).
@@ -735,17 +733,7 @@ client_call_hook(undefined, _Arg) -> ok;
 client_call_hook(Fun, Arg) when is_function(Fun, 1) -> Fun(Arg);
 client_call_hook(Fun, _Arg) when is_function(Fun, 0) -> Fun().
 
--define(FTS_PMAP_MIN, 8).
--define(FTS_CHUNKS, 16).
--define(FTS_PAGE_TARGET_BYTES, 8192).
 %% Persisted page entries carry a 16-bit doc count.
--define(FTS_MAX_ENTRY_DOCS, 65535).
--define(FTS_MARKER_SEEK_MAX, 64).
--define(FTS_RESULT_CACHE_MAX, 1024).
--define(FTS_GRID_BITS, 10).
--define(FTS_SHARDS, 1024).
--define(FTS_BASE_PROBE_BYTES, 10).
--define(FTS_CACHE_MAX_WORDS, 33554432).
 
 normalise_column_specs(Columns) when is_list(Columns), Columns =/= [] ->
     try
@@ -1075,25 +1063,12 @@ validate_search_option_list([{rank, bm25} | Rest]) ->
     validate_search_option_list(Rest);
 validate_search_option_list([{rank, _Other} | _Rest]) ->
     {error, invalid_rank_option};
-validate_search_option_list([{result_cache, B} | Rest]) when is_boolean(B) ->
-    validate_search_option_list(Rest);
-validate_search_option_list([{stats_staleness, W} | Rest]) when is_integer(W), W >= 0 ->
-    validate_search_option_list(Rest);
-validate_search_option_list([{stats_staleness, _Other} | _Rest]) ->
-    {error, invalid_stats_staleness_option};
 validate_search_option_list([{limit, Limit} | Rest]) when is_integer(Limit), Limit >= 0 ->
     validate_search_option_list(Rest);
 validate_search_option_list([{offset, Offset} | Rest]) when is_integer(Offset), Offset >= 0 ->
     validate_search_option_list(Rest);
 validate_search_option_list([{return_positions, Bool} | Rest]) when is_boolean(Bool) ->
     validate_search_option_list(Rest);
-validate_search_option_list([{result, summary} | Rest]) ->
-    validate_search_option_list(Rest);
-validate_search_option_list([{filter, Filter} | Rest]) ->
-    case valid_filter_option(Filter) of
-        true -> validate_search_option_list(Rest);
-        false -> error
-    end;
 validate_search_option_list([{_Other, _Value} | _Rest]) ->
     error.
 
@@ -1129,21 +1104,6 @@ normalise_text(T) ->
 valid_columns(Columns) when is_list(Columns), Columns =/= [] ->
     true;
 valid_columns(_Columns) ->
-    false.
-
-valid_filter_option([]) ->
-    true;
-valid_filter_option(Filter) when is_list(Filter) ->
-    lists:all(
-        fun
-            ({_Col, Values}) when is_list(Values), Values =/= [] ->
-                lists:all(fun is_binary/1, Values);
-            (_Other) ->
-                false
-        end,
-        Filter
-    );
-valid_filter_option(_Filter) ->
     false.
 
 valid_prefixes(Prefixes) when is_list(Prefixes) ->
@@ -2082,24 +2042,6 @@ unicode_chars_with_boundaries(Bin) when is_binary(Bin) ->
     end.
 
 
-%% ============================================================================
-%% Grid storage (v2, docs/FTS.md "Storage Shape").
-%%
-%% Token space is partitioned into a fixed, order-preserving prefix grid.
-%% Every posting fact belongs to exactly one shard forever: write batches
-%% emit per-shard DELTA rows, consolidation folds deltas into the shard's
-%% BASE object (journal value), and a SUMMARY row carries the
-%% consolidated-through sequence and a token bloom. Doc frames are stamped
-%% with their write sequence, so liveness (frame seq =:= marker seq)
-%% travels with the posting wherever consolidation copies it.
-
-shard_id(<<>>) ->
-    0;
-shard_id(<<B1:8>>) ->
-    (B1 bsl 8) bsr (16 - ?FTS_GRID_BITS);
-shard_id(<<B1:8, B2:8, _/binary>>) ->
-    ((B1 bsl 8) bor B2) bsr (16 - ?FTS_GRID_BITS).
-
 scoring_phrases({term, _Token, _Prefix, _Cols} = Leaf) -> [Leaf];
 scoring_phrases({phrase, _Specs, _Cols} = Leaf) -> [Leaf];
 scoring_phrases({near, Items, Distance, Cols}) ->
@@ -2216,7 +2158,6 @@ bm25_score(Meta, Leaves, Np, DocCount, AvgDl) ->
         Leaves
     ).
 
--define(MAX_POSITIONS_BYTES, 65525).
 
 decode_positions(<<>>, _Last, Acc) ->
     {ok, lists:reverse(Acc)};
