@@ -43,7 +43,12 @@ index's bucket. For index `I`:
   it is the "indexed" fact for pipeline idempotency.
 - **Epoch rows** — one row per shard: `{I, ShardId, <<"epoch">>}` →
   small counter value. Rewritten in EVERY batch that touches the shard;
-  its SQN is the shard's version token (§4).
+  its SQN is the condition consolidation's casmput commits against (§5).
+- **Tail summary** — one small row per shard:
+  `{I, ShardId, <<"tailsum">>}` → token bloom + doc count of the
+  shard's unconsolidated tail, rewritten with every tail write. Lets a
+  query decide with ONE point read whether the tail can contain its
+  tokens; a selective or missing term never folds anything.
 - **Token pages (consolidated)** — the at-rest read format, chosen for
   stock leveled's strengths (bloom-guarded point reads; ordered-key
   range folds; journal for big values): one row per (token, page),
@@ -89,34 +94,42 @@ An update first reads the doc manifest to compute removed shards.
 Derivation is embarrassingly parallel across docs/workers; the store
 sees only ordinary mput batches.
 
-## 4. Reading and the cache admission law
+## 4. Reading: store-direct, no library caches
 
-Query flow: parse → per-shard reads → merge → BM25 rank (scores use the
-TRUE occurrence counts persisted in posting rows — the positions cap
-never feeds ranking).
+The library maintains NO caches (settled 2026-07-12): every query reads
+the store directly, and the only warmth is leveled's own ledger/page
+caches. Query flow per token: point-read the token's pages
+(`{I, <<"t:", Token>>, PageNo}` — a missing term is a bloom miss inside
+leveled, tens of µs) and point-read the token's shard `tailsum`; only
+when the tail bloom admits the token, fold that shard's (small)
+doc-major tail. Prefix expansion is a bounded ordered range fold over
+the token-page key space plus the tailsum check. Merge → BM25 rank
+(true counts; the positions cap never feeds ranking).
 
-A per-shard read: `book_sqn` of the shard's epoch row (one cheap head
-read) → if a cached shard state carries the same epoch SQN, serve it;
-otherwise fold the shard's rows (base + per-doc postings) from a
-snapshot, then re-read the epoch SQN and install the rebuilt state ONLY
-if it is unchanged (discard on mismatch — correctness over warmth).
+Correctness without cache admission:
 
-The law: no cache entry is served or installed without a token equal to
-the CURRENT epoch-row SQN, and the epoch row is bumped atomically with
-every write it describes. Stamp-trust, fill races, and repair
-invalidation (audit L5-F2/F3/F4) are unrepresentable. The same rule
-keys the query/result cache.
+- Reads are snapshot-consistent per read by leveled itself; there is no
+  cache to admit, so the audit's stamp-trust/fill-race classes have no
+  carrier.
+- The tail MASKS consolidated pages per doc (segment semantics): an
+  updated or removed doc's tail entry supersedes its baked page
+  entries, so single-token queries never serve superseded versions.
+- Multi-token assembly uses stamp MUTUAL CONSISTENCY: a doc matches
+  only if every contribution (pages and tail) carries the same version
+  stamp; mixed-stamp assemblies drop — the legal concurrent outcome.
+  No manifest read is needed at query time.
 
 ## 5. Consolidation
 
 A maintenance fold (caller-scheduled, per shard): read the shard's
-per-doc rows from a snapshot, merge into a base row, then commit
-`base' + removals of merged per-doc rows` via `book_casmput` CONDITIONED
-on `{epoch row, {sqn, ObservedSQN}}`. A write that raced the fold fails
-the condition and the shard is retried later — linearizable
-consolidation from the public CAS, with no special concurrency
-machinery. Queries see either the pre- or post-consolidation row set,
-both complete.
+doc-major tail from a snapshot, merge into token pages (the inverter),
+then commit `pages' + tail removals + tailsum'` via `book_casmput`
+CONDITIONED on `{epoch row, {sqn, ObservedSQN}}`. A write that raced
+the fold fails the condition and the shard is retried later —
+linearizable consolidation from the public CAS. Queries see either the
+pre- or post-consolidation row set, both complete. Because reads are
+store-direct, consolidation frequency is the read-performance knob:
+the tail is the only part of a query that is not a point read.
 
 ## 6. Boundaries and parity (the audit's Law 5, built in)
 
