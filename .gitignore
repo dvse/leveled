@@ -14,7 +14,3 @@ compile_commands.json
 *lexer.erl
 elp
 current_counterexample.eqc
-erl_crash.dump
-__pycache__/
-/backups/
-/bench_corpus/

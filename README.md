@@ -40,8 +40,6 @@ For more details on the store:
 
 - The [design overview](docs/DESIGN.md) explains the actor model used and the basic flow of requests through the store.
 
-- [Native full-text search](docs/FTS.md) documents the current FTS API, storage model, query syntax, and operational behavior.
-
 - [Future work](docs/FUTURE.md) covers new features being implemented at present, and improvements necessary to make the system production ready.
 
 - There is also a ["Why"](docs/WHY.md) section looking at lower level design choices and the rationale that supports them.

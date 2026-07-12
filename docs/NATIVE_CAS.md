@@ -1,211 +1,151 @@
 # NATIVE CAS — leveled's transactional write protocol
 
 Status: design authority (2026-07-12). This document and FTS.md are the
-only fork documents beyond stock leveled; it consolidates and supersedes
-TARGET_API.md, the earlier NATIVE_CAS.md, STANDARD_BATCHPUT.md,
-STOCK_PLUS.md and SQN_ENGINE_REDESIGN.md (history in git). The audit
-evidence behind its design verdicts lives in audit/.
+only fork documents beyond stock leveled. Audit evidence behind the
+design verdicts lives in audit/; superseded design documents are in git
+history.
 
-## 1. Purpose and scope
+## 1. Purpose
 
-This fork is upstream leveled plus the SMALLEST patch that turns the
-store into a transactional substrate: atomic multi-key commits,
-conditional commits, and version reads. Nothing here is specific to any
-consumer; the reference consumer is ash_leveled, which builds full
-`Ash.DataLayer.transaction` support (§6) from these primitives without
-any further store changes. Full-text search is a separate, orthogonal
-addition documented in FTS.md.
+The smallest patch that turns stock leveled into a transactional
+substrate. Upstream already contains the hard part: `book_mput` commits
+N object-spec rows through ONE journal record — atomic and torn-safe by
+CDB's existing CRC recovery, replayed and compacted by existing code
+(introduced upstream in 2018 for head_only stores). The fork adds
+exactly three things:
 
-The patch inventory over upstream, in full:
+1. `book_mput` is allowed in standard-mode stores (one guard removed);
+2. a conditional form of it: `book_casmput`;
+3. a read-correctness fix: `?HEAD_TAG` rows resolve purely from ledger
+   state (they are `no_lookup` changes journaled under `?DUMMY`, so
+   reads must bypass the penciller L0 index and the journal probe in
+   every store mode).
 
-| unit | kind | section |
-|---|---|---|
-| `ink_batchput` + standard-mode `book_mput` | transactional core | §3 |
-| `book_casmput` | transactional core | §4 |
-| `book_get_sqn`, `book_head_sqn` | transactional core | §5 |
-| `book_mget`, `book_mhead`, fetchspec reads | read performance | §7 |
-| SQN-keyed caller-side value cache | read performance | §7 |
-| FTS engine (leveled_fts) + write/search integration | search | FTS.md |
+Everything else — version reads, head reads, folds, snapshots — is
+upstream, untouched. Full-text search consumes ONLY this public surface
+(FTS.md): the store carries zero FTS hooks, zero FTS configuration, and
+no knowledge that FTS exists.
 
-Everything else is upstream behaviour.
+## 2. The two planes
 
-## 2. Design principle: one serialized order
+**Transactional plane — head rows.** Transactional state (records,
+uniqueness reservations, fences, join rows, projections) is stored as
+object-spec rows: `{add | remove, Bucket, Key, SubKey, Value}`, values
+living in the ledger under `?HEAD_TAG`. A commit writes any number of
+rows in one `book_mput`/`book_casmput` call = one journal record = one
+SQN. Values ride the penciller, so this plane is for row-sized values,
+not blobs.
 
-The Bookie stays serialized, as upstream: mailbox order = journal order =
-visibility order = replay order. Every write executes entirely inside one
-Bookie callback (validate → journal append → ledger insert → reply), so:
+**Bulk plane — standard objects.** Large-bodied objects (documents,
+extracted text) remain ordinary `book_put` standard objects: per-record
+atomic, journal-bodied, non-transactional. The indexing pipeline lives
+here and needs no transactions. Cross-plane consistency is by ordering:
+write the bulk object first, then commit the head rows that reference
+it (the head-row commit is the authoritative fact; a crash between the
+two leaves an unreferenced bulk object for idempotent redo).
 
-- an acknowledged write is durable, visible, and restart-stable at the
-  moment of its reply;
-- live state is always exactly the state journal replay rebuilds;
-- a conditional write's evaluation and commit share one callback, which
-  makes it linearizable with no further machinery (§4).
+Consumers scale by running MORE bookies (per resource group, or hash-
+sharded), not by weakening one bookie's serialization: a transaction's
+write-set must map to one bookie, and the reference topology lives in
+the ash_leveled target spec.
 
-This fork previously moved journal writes into caller processes for
-throughput. A five-layer adversarial audit (audit/REVIEW.md) traced every
-severe defect to the durable-but-unpublished window that protocol
-created, and its throughput decomposition showed the window bought almost
-nothing: journal appends serialize at the Inker either way, and the real
-CPU win — FTS augmentation — is a pure function that can run caller-side
-as mere PREPARATION feeding ordinary direct calls (FTS.md). The window is
-therefore removed, not fenced. The scaling lever beyond one serialized
-engine is running more engines (sharding by entity), not weakening the
-engine's order.
+## 3. The patch
 
-## 3. book_mput — atomic plural put
+### 3.1 book_mput in standard mode
 
-`book_mput(Pid, Entries)` · `book_mput(Pid, Entries, Third)`
+Upstream semantics, unchanged: `book_mput(Pid, ObjectSpecs[, TTL])`,
+object_specs as upstream defines them, one `INKT_MPUT` journal record,
+ledger rows via `gen_headspec`. The only change is removing the
+`head_only == true` guard: the flow (ink_mput → preparefor_ledgercache →
+ledger insert → reply) is already mode-agnostic, as are replay and
+compaction of `INKT_MPUT` records.
 
-The client passes `Third` through verbatim; the mode-guarded server
-handlers interpret it:
+### 3.2 book_casmput — the commit primitive
 
-- **head_only mode** — unchanged upstream semantics: Entries are
-  object_specs, `Third` is a TTL (`infinity | integer()`).
-- **standard mode** — Entries are
-  `{put, Bucket, Key, Object, IndexSpecs, Tag, TTL}` or
-  `{delete, Bucket, Key, Tag}`; `Third` is `#{sync => boolean()}`
-  (default `#{}`).
+`book_casmput(Pid, ObjectSpecs, Conditions)` ·
+`book_casmput(Pid, ObjectSpecs, Conditions, TTL)`
 
-Standard-mode contract:
+    Conditions :: [{Bucket, Key, SubKey, absent | present | {sqn, SQN}}]
 
-- **Atomic durability.** All entries are appended to the journal under
-  ONE SQN. After a crash, either every entry is recoverable or none is.
-- **Per-entry equivalence.** Each entry behaves exactly as the
-  corresponding `book_put`/`book_delete` would: same validation (forged
-  internal index specs rejected), same FTS augmentation for indexed
-  buckets, same TTL and tombstone semantics.
-- **Backpressure.** `pause` means the batch was accepted and the caller
-  should back off, exactly as for `book_put`.
-- Returns `ok | pause | {error, term()}`.
+Evaluate all conditions against current head state; if every condition
+holds, execute exactly the `book_mput` flow on ObjectSpecs; otherwise
+write nothing (no journal append) and reply
+`{error, {precondition_failed, Failures}}`, where Failures lists each
+failed condition with its observed state (`absent | {present, SQN}`).
 
-## 4. book_casmput — conditional atomic plural put
+- Condition keys address head rows (the transactional plane) and may be
+  inside or outside the write set.
+- Lifecycle: `present` sees live rows only — a tombstoned (`remove`d)
+  or TTL-expired row is `absent`; `{sqn, N}` matches a live row's SQN
+  exactly.
+- Linearizability: evaluation and commit share one serialized Bookie
+  callback — the callback is the commit point, and there is no other
+  write path that could make durable-but-invisible state race the
+  evaluation.
+- Requires `head_lookup` (standard stores, and head_only stores started
+  `with_lookup`).
 
-`book_casmput(Pid, Entries, Conditions)` ·
-`book_casmput(Pid, Entries, Conditions, #{sync => boolean()})`
+### 3.3 Version reads (upstream)
 
-Conditions are `[{Bucket, Key, Tag, Condition}]` with
+`book_sqn/3,4` returns a live row's SQN — the version token; pairs with
+`{sqn, N}`. `not_found` pairs with `absent`. `book_headonly/4` /
+`book_head/3,4` read row values. Nothing added.
 
-    Condition :: absent | present | {sqn, non_neg_integer()}
+## 4. Building transactions (the OCC recipe)
 
-- Condition keys may be inside or outside the write set, in any bucket
-  or tag.
-- Duplicate condition keys and unrecognised condition terms are
-  validation errors (`{error, ...}` without evaluation).
+Full interactive transactions are an optimistic-concurrency layer in
+the consumer; the reference implementation is ash_leveled's
+`Ash.DataLayer.transaction` (`can?(_, :transact) -> true`). No store
+support beyond §3 exists or is needed.
 
-**Whole-batch contract.** ALL conditions are evaluated against current
-store state before ANY entry is accepted. On any failure nothing is
-written — no journal append, journal SQN unchanged — and the reply is
-`{error, {precondition_failed, Failures}}`, listing every failed
-condition with its observed state. On success the batch commits
-atomically under one SQN, exactly as `book_mput`.
+- `transaction(fun)` opens a process-scoped context
+  `{depth, write_stage, read_set}`.
+- Reads overlay `write_stage` (read-your-writes); every point read
+  records `{row, sqn | absent}` in `read_set`.
+- Writes stage object-spec rows; the store is untouched.
+- Commit (outermost only) is one call:
+  `book_casmput(staged_specs, read_set_conditions)`. Success = all
+  effects visible atomically; release notifications after it.
+  `precondition_failed` = a conflicting commit interleaved: retry `fun`
+  with a fresh context (bounded), then surface a concurrency error.
+- Rollback drops the context; nothing to undo. Nesting is a depth
+  counter; inner rollback propagates.
+- Isolation: no dirty reads; serializable over the observed point-read
+  footprint (validation happens at the serialized commit point).
+  Range/query reads are not footprint-validated — the phantom caveat.
+  Query-dependent transactions add a fence: every commit touching
+  resource R also writes row `fence(R)`, and the transaction conditions
+  on `{fence(R), {sqn, Observed}}`.
+- No locks, so no deadlocks; contention costs retries only.
+- Uniqueness reservations commit in the same call as the record
+  claiming them — crash-orphaned reservations cannot exist for
+  single-action writes.
 
-**Lifecycle semantics.** `present` sees live objects only: tombstoned
-and TTL-expired objects are `absent`. `{sqn, N}` matches the current
-object's SQN exactly, and fails against absent, tombstoned, or expired
-objects.
+## 5. What was deliberately not built
 
-**Linearizability.** Evaluation and commit run in ONE serialized Bookie
-callback; the callback is the commit point and no other write can
-interleave. There is no caller-side write path, so no
-journal-durable-but-invisible state can race the evaluation (the audit's
-L3-F1 class is structurally impossible).
+The previous fork implemented multi-record standard-object batches
+(`book_mput_std`), a caller-side three-phase write protocol, batch
+key-change wrappers with torn-tail replay detection, and a CAS variant
+over journal-bodied objects. The audit (audit/REVIEW.md,
+audit/QUALITY_SYNTHESIS.md) traced every severe defect to that
+machinery's ordering windows, and the two-plane model makes it
+unnecessary: transactional state is row-sized and belongs in head rows,
+where upstream's single-record commit already provides atomicity; bulk
+objects don't need transactions. A transaction that must atomically
+rewrite several large journal-bodied objects is out of scope by design
+— store references to bulk objects in head rows and commit the
+references.
 
-A single conditional put is a casmput of one entry; no separate singular
-API exists.
+## 6. Verification gates
 
-## 5. Version reads
-
-`book_get_sqn/3,4` and `book_head_sqn/3,4` return
-`{ok, Value | Head, SQN} | not_found`. The SQN is the store's version
-token: monotonic, allocated by the journal, never reused. A successful
-read pairs with a later `{sqn, N}` condition; a `not_found` observation
-pairs with `absent`. Together with §4 this is the complete
-optimistic-concurrency surface.
-
-## 6. Building transactions on the protocol
-
-The protocol above is sufficient for full interactive transactions via
-optimistic concurrency control, implemented entirely in the consumer.
-The reference implementation is ash_leveled's `Ash.DataLayer.transaction`
-support (`can?(_, :transact) -> true`); any consumer can follow the same
-recipe:
-
-**Context.** `transaction(fun)` establishes a process-scoped context
-`{depth, write_stage, read_set, fences}` and runs `fun`.
-
-**Reads** overlay `write_stage` over store reads (read-your-writes).
-Every point read records `{key, sqn | absent}` in `read_set`.
-
-**Writes** stage into `write_stage` — with their FTS preparation — and
-do not touch the store.
-
-**Commit** (outermost only) is ONE call:
-
-    book_casmput(staged_entries, read_set_conditions ++ fence_conditions)
-
-Success makes all effects visible atomically (release notifications
-here). `precondition_failed` means a conflicting commit interleaved:
-retry `fun` with a fresh context a bounded number of times, then surface
-a concurrency error (Ash: stale/conflict).
-
-**Rollback** drops the context; no store effects exist to undo, so
-exceptions and timeouts cannot leak partial state. **Nesting** is a
-depth counter — inner transactions join the outer context and inner
-rollback propagates. `in_transaction?` is context presence.
-
-**Isolation contract.** No dirty reads (staging). Serializable over the
-observed point-read footprint: validation runs at the serialized commit
-point, so two conflicting commits cannot both pass. Range and query
-reads are NOT footprint-validated — the phantom caveat. Query-dependent
-transactions opt into per-resource **fence keys**: every write batch
-touching resource R also puts `fence(R)` (an ordinary key), and the
-transaction adds `{fence(R), {sqn, Observed}}` to its conditions,
-buying coarse per-resource serializability from the same primitives.
-
-**Liveness.** No locks anywhere, so no deadlocks; contention costs
-retries, paid by the conflicting transaction.
-
-**Identity pattern.** Uniqueness reservations commit in the same
-casmput as the record that claims them, so crash-orphaned reservations
-are impossible for single-action writes; reclaim logic remains only for
-multi-action workflows.
-
-## 7. Read-side additions (non-transactional)
-
-Performance additions used by the ash_leveled planner; none participate
-in the write protocol:
-
-- `book_mget`, `book_mhead`, and fetchspec reads — plural reads that
-  plan in the Bookie and fetch in the caller. `book_mhead` resolves
-  purely from ledger state and deliberately omits the singular head's
-  frequency-gated journal_notfound probe.
-- The caller-side value cache (opt-in, `{value_cache_size, Bytes}`):
-  entries are keyed `{LedgerKey, SQN}`, so a hit is provably current —
-  an overwrite allocates a new SQN and old entries become unreachable.
-
-## 8. Name/compat map
-
-| before | after |
-|---|---|
-| book_mput_std/2,3 | book_mput/2,3 (standard mode) |
-| book_mput_std_direct/3 | book_mput (single direct path) |
-| book_casmput/4 (boolean) | book_casmput/3,4 (opts map) |
-| book_casput/9 | removed — casmput of one entry |
-| book_put_direct/8 | book_put/8 (single direct path) |
-| write_refs / {publish} / {publish_fts} / {fts_put_intent} | removed |
-| absorption frontier / journal voids | removed (nothing to fence) |
-
-## 9. Verification gates
-
-1. leveled eunit + CT green; the audit's CAS contract matrix and FTS
-   positive-control scripts pass against the protocol names.
-2. Every audit repro (audit/) flips to non-reproduction or is N/A with
-   its API removed — dispositions recorded in audit/REVIEW.md.
-3. Restart-equivalence and concurrent-writer invariant tests live in
-   eunit using the public API only.
-4. ash_leveled suite green with the OCC transaction layer; transaction
-   tests cover commit, rollback, nesting, retry-on-conflict,
-   read-your-writes, fences, and notification timing.
-5. vfs e2e benchmarks (indexing + search) within noise of the pre-cut
+1. leveled eunit + CT green on the patched surface (casmput condition
+   matrix: absent/present/sqn against live/tomb/expired/missing rows,
+   whole-batch rejection with unchanged journal SQN, restart
+   equivalence, concurrent single-winner).
+2. Audit repro dispositions recorded in audit/REVIEW.md (each repro
+   flips to non-reproduction or is N/A with its API removed).
+3. ash_leveled suite green on the OCC layer (commit, rollback, nesting,
+   retry-on-conflict, read-your-writes, fences, notification timing).
+4. vfs e2e benchmarks (indexing + search) within noise of the pre-cut
    baseline.
-6. Two rounds of adversarial Codex review.
+5. Two rounds of adversarial Codex review.
