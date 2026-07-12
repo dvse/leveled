@@ -5,20 +5,21 @@ set -e
 export PATH="$HOME/.local/share/mise/shims:$PATH"
 RANK=${1:-none}
 W=/tmp/leveled_fts_bench
+FAST=${FTS_FAST_DIR:-$W/fast}
 Q=bench/fts_gate_queries.txt
-SQL_R=$W/results/fast/sqlite-s10m-$RANK.tsv
-LEV_R=$W/results/fast/leveled-s10m-$RANK.tsv
-mkdir -p $W/results/fast
+SQL_R=$W/results/fast/sqlite-s10m-$RANK.tsv   # shared baseline (read-only reuse)
+LEV_R=$FAST/leveled-s10m-$RANK.tsv
+mkdir -p $W/results/fast $FAST $FAST/ebin
 # SQLite side: run once, cache (delete the TSV to re-measure)
 if [ ! -f "$SQL_R" ]; then
   $W/gate/sqlite_fts_bench --tsv $W/docs-s10m.tsv --db $W/fast-sqlite.db \
     --queries $Q --result $SQL_R --rank $RANK --runs 9 --warmup 3 2>&1 | tail -1
 fi
 # Leveled side: recompile bench + library, fresh store, no settle sleep
-erlc -o $W/ebin -I include -pa _build/default/lib/leveled/ebin bench/leveled_fts_bench.erl 2>/dev/null
-rm -rf $W/fast-store
-erl -noshell -pa $W/ebin -pa _build/default/lib/leveled/ebin -pa _build/default/lib/lz4/ebin -pa _build/default/lib/zstd/ebin -eval "
-Args = [\"--tsv\",\"$W/docs-s10m.tsv\",\"--root\",\"$W/fast-store\",
+erlc -o $FAST/ebin -I include -pa _build/default/lib/leveled/ebin bench/leveled_fts_bench.erl 2>/dev/null
+rm -rf $FAST/fast-store
+erl -noshell -pa $FAST/ebin -pa _build/default/lib/leveled/ebin -pa _build/default/lib/lz4/ebin -pa _build/default/lib/zstd/ebin -eval "
+Args = [\"--tsv\",\"$W/docs-s10m.tsv\",\"--root\",\"$FAST/fast-store\",
         \"--queries\",\"$Q\",\"--result\",\"$LEV_R\",
         \"--rank\",\"$RANK\",\"--runs\",\"9\",\"--warmup\",\"3\",
         \"--amortized\",\"--compact\",\"--settle-ms\",\"0\"],
