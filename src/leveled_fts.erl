@@ -1,38 +1,29 @@
-%% -------- Native full-text search ---------
+%% -------- Full-text search: a pure client library ---------
 %%
-%% FTS is implemented as ordinary secondary index rows on the indexed object.
-%% There are no companion objects, hidden buckets, segments, or side stores.
+%% leveled_fts consumes ONLY the public store surface (docs/FTS.md):
+%% book_mput/book_casmput/book_sqn/book_headonly/folds/snapshots. The
+%% store carries no FTS hooks; all index state is ordinary HEAD_TAG
+%% object-spec rows (postings, doc manifests, per-shard epoch rows,
+%% consolidated bases, stats), committed in the caller's own batches.
 
 -module(leveled_fts).
 
 -include("leveled.hrl").
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
 -export([
-    normalise_indexes/1,
-    has_matching_index/3,
-    augment_object_changes/3,
-    marker_cache_updates/2,
-    advance_marker_cache/3,
-    advance_shard_cache/3,
-    consolidate_shard_cache/5,
-    reset_fts_caches/1,
-    split_include_docs/1,
-    consolidate_plan/3,
-    consolidate_shard/5,
-    base_object_key/2,
-    delta_carrier_key/2,
-    shard_id/1,
-    summary_term/1,
-    delta_term/2,
-    find_schema/3,
-    bucket_has_schema/2,
-    index_ref/1,
-    normalise_index/1,
-    spec_token_entries/3,
-    book_ftssearch/5,
-    cached_search/5,
-    search/6,
-    search/7
+    schema/1,
+    capacities/0,
+    derive/3,
+    remove/3,
+    update/4,
+    search/4,
+    consolidate/3,
+    cache_table/2,
+    shard_id/1
 ]).
 
 -define(VERSION, 1).
@@ -47,74 +38,657 @@
 -define(MAX_RETURN_POSITIONS, 4096).
 -define(DEFAULT_NEAR, 10).
 
-normalise_indexes(Indexes) when is_list(Indexes) ->
-    normalise_indexes(Indexes, []);
-normalise_indexes(_Indexes) ->
-    {error, invalid_fts_indexes}.
+%% Client-library wire format capacities.  These are deliberately exported by
+%% capacities/0 and consumed by schema/1.  Every fixed-width writer below also
+%% checks the same bound immediately before constructing a bit syntax.
+-define(POSTING_VERSION, 1).
+-define(BASE_VERSION, 1).
+-define(MANIFEST_VERSION, 1).
+-define(STATS_VERSION, 1).
+-define(MAX_COLUMNS, 255).
+-define(MAX_COLUMN_ID, 254).
+-define(MAX_TOKEN_BYTES, 65535).
+-define(MAX_POSITION_BYTES, 65535).
+-define(MAX_POSITION_PREFIX_BYTES, 65525).
+-define(MAX_DOC_KEY_BYTES, 65533).
+-define(MAX_SHARDS, 65536).
+-define(DEFAULT_SHARDS, 256).
+-define(MAX_U16, 16#FFFF).
+-define(MAX_U32, 16#FFFFFFFF).
+-define(MAX_U64, 16#FFFFFFFFFFFFFFFF).
+-define(CLIENT_CACHE_REGISTRY, leveled_fts_cache_registry).
 
-normalise_indexes([], Acc) ->
-    Normal = lists:reverse(Acc),
-    case duplicate_search_names(Normal) of
-        false -> {ok, Normal};
-        true -> {error, ambiguous_fts_schema}
+%% ---------------------------------------------------------------------------
+%% Pure client API (docs/FTS.md).
+%%
+%% All persisted state is made from ordinary HEAD_TAG object specs.  The store
+%% has no FTS callback, configuration, or privileged payload.  The logical
+%% stats row is a row family keyed by document: {Index, <<"stats">>, DocKey}.
+%% LWW replacement of that contribution makes blind derive/update/remove exact;
+%% ranked reads fold the family to {document_count,total_length}.
+%% ---------------------------------------------------------------------------
+
+-spec capacities() -> map().
+capacities() ->
+    #{
+        columns => ?MAX_COLUMNS,
+        column_id => ?MAX_COLUMN_ID,
+        token_bytes => ?MAX_TOKEN_BYTES,
+        position_bytes => ?MAX_POSITION_BYTES,
+        doc_key_bytes => ?MAX_DOC_KEY_BYTES,
+        shards => ?MAX_SHARDS,
+        true_occurrences => ?MAX_U64
+    }.
+
+-spec schema(map()) -> {ok, map()} | {error, term()}.
+schema(Definition) when is_map(Definition) ->
+    try
+        Index = normalise_index(maps:get(index, Definition)),
+        true = is_binary(Index) andalso Index =/= <<>>,
+        {ok, ColumnSpecs} = normalise_column_specs(maps:get(columns, Definition)),
+        ColumnCount = length(ColumnSpecs),
+        client_guard(columns, ColumnCount, maps:get(columns, capacities())),
+        Shards = maps:get(shards, Definition, ?DEFAULT_SHARDS),
+        true = is_integer(Shards) andalso Shards > 0 andalso
+            Shards =< maps:get(shards, capacities()) andalso
+            (Shards band (Shards - 1)) =:= 0,
+        Opts0 = maps:with(
+            [tokenizer, remove_diacritics, tokenchars, separators, stopwords,
+                decode, prefixes],
+            Definition
+        ),
+        true = valid_tokenizer(maps:get(tokenizer, Opts0, unicode61)),
+        true = valid_remove_diacritics(
+            maps:get(remove_diacritics, Opts0, 1)
+        ),
+        true = valid_char_option(maps:get(tokenchars, Opts0, [])),
+        true = valid_char_option(maps:get(separators, Opts0, [])),
+        Opts1 = normalise_options(
+            Opts0#{remove_diacritics => client_rd_mode(
+                maps:get(remove_diacritics, Opts0, 1)
+            )}
+        ),
+        Columns = [Column || {Column, _Path, _Mode} <- ColumnSpecs],
+        Canonical = #{
+            index => Index,
+            columns => Columns,
+            column_specs => ColumnSpecs,
+            column_modes => maps:from_list([
+                {Column, Mode} || {Column, _Path, Mode} <- ColumnSpecs
+            ]),
+            options => Opts1,
+            tokenizer => tokenizer_description(Opts1),
+            prefixes => maps:get(prefixes, Opts1, []),
+            shards => Shards
+        },
+        Fingerprint = crypto:hash(sha256, term_to_binary(Canonical, [deterministic])),
+        {ok, Canonical#{fingerprint => Fingerprint}}
+    catch
+        error:{fts_capacity_exceeded, _, _, _} = Reason -> {error, Reason};
+        _:_ -> {error, invalid_fts_schema}
     end;
-normalise_indexes([Index | Rest], Acc) ->
-    case normalise_index_definition(Index) of
-        {ok, Normal} -> normalise_indexes(Rest, [Normal | Acc]);
-        {error, Reason} -> {error, Reason}
+schema(_Definition) ->
+    {error, invalid_fts_schema}.
+
+client_rd_mode(false) -> 0;
+client_rd_mode(true) -> 1;
+client_rd_mode(Mode) -> Mode.
+
+-spec derive(map(), binary(), term()) -> {ok, [leveled_codec:object_spec()]}.
+derive(#{fingerprint := Fingerprint} = Schema, DocKey, Object)
+when is_binary(DocKey), is_binary(Fingerprint) ->
+    client_guard(doc_key_bytes, byte_size(DocKey), maps:get(doc_key_bytes, capacities())),
+    Fields = extract_fields(maybe_decode_object(Object, Schema), maps:get(column_specs, Schema)),
+    ColTerms = build_column_terms(Fields, maps:get(options, Schema)),
+    {ByShard, DocLength} = client_group_postings(ColTerms, Schema),
+    Touched = lists:sort(maps:keys(ByShard)),
+    Bucket = maps:get(index, Schema),
+    PostingSpecs = [
+        {add, Bucket, client_shard_key(Shard), client_doc_subkey(DocKey),
+            client_encode_posting(maps:get(Shard, ByShard))}
+     || Shard <- Touched
+    ],
+    Manifest = client_encode_manifest(Touched, DocLength, Fingerprint),
+    EpochSpecs = [client_epoch_spec(Bucket, Shard) || Shard <- Touched],
+    {ok,
+        PostingSpecs ++
+            [
+                {add, Bucket, <<"doc">>, DocKey, Manifest},
+                {add, Bucket, <<"stats">>, DocKey,
+                    client_encode_stats(DocLength)}
+            ] ++ EpochSpecs};
+derive(_Schema, DocKey, _Object) ->
+    erlang:error({invalid_fts_derive, DocKey}).
+
+-spec remove(map(), binary(), binary() | map()) -> [leveled_codec:object_spec()].
+remove(#{index := Bucket, fingerprint := Fingerprint}, DocKey, Manifest0)
+when is_binary(DocKey) ->
+    #{shards := Shards, fingerprint := Fingerprint} =
+        client_decode_manifest_value(Manifest0),
+    [
+        {remove, Bucket, client_shard_key(Shard), client_doc_subkey(DocKey), <<>>}
+     || Shard <- Shards
+    ] ++
+        [
+            {remove, Bucket, <<"doc">>, DocKey, <<>>},
+            {remove, Bucket, <<"stats">>, DocKey, <<>>}
+        ] ++
+        [client_epoch_spec(Bucket, Shard) || Shard <- Shards].
+
+-spec update(map(), binary(), term(), binary() | map()) ->
+    {ok, [leveled_codec:object_spec()]}.
+update(Schema, DocKey, Object, OldManifest) ->
+    {ok, NewSpecs} = derive(Schema, DocKey, Object),
+    {ok, client_dedupe_specs(remove(Schema, DocKey, OldManifest) ++ NewSpecs)}.
+
+client_dedupe_specs(Specs) ->
+    {_Seen, Kept} = lists:foldl(
+        fun({_, B, K, SK, _} = Spec, {Seen, Acc}) ->
+            Id = {B, K, SK},
+            case sets:is_element(Id, Seen) of
+                true -> {Seen, Acc};
+                false -> {sets:add_element(Id, Seen), [Spec | Acc]}
+            end
+        end,
+        {sets:new(), []},
+        lists:reverse(Specs)
+    ),
+    Kept.
+
+client_group_postings(ColTerms, Schema) ->
+    lists:foldl(
+        fun({ColId, {_Column, TokenPositions}}, {ShardAcc, LengthAcc}) ->
+            client_guard(column_id, ColId, maps:get(column_id, capacities())),
+            lists:foldl(
+                fun({Token, Positions}, {SA, LA}) ->
+                    client_guard(token_bytes, byte_size(Token), maps:get(token_bytes, capacities())),
+                    Count = length(Positions),
+                    client_guard(true_occurrences, Count, maps:get(true_occurrences, capacities())),
+                    Shard = client_shard_id(Token, maps:get(shards, Schema)),
+                    ByCol = maps:get(Shard, SA, #{}),
+                    ByToken = maps:get(ColId, ByCol, #{}),
+                    Entry = #{count => Count, positions => Positions},
+                    {SA#{Shard => ByCol#{ColId => ByToken#{Token => Entry}}}, LA + Count}
+                end,
+                {ShardAcc, LengthAcc},
+                TokenPositions
+            )
+        end,
+        {#{}, 0},
+        lists:zip(lists:seq(0, length(ColTerms) - 1), ColTerms)
+    ).
+
+client_doc_subkey(DocKey) ->
+    <<"d:", DocKey/binary>>.
+
+client_shard_key(Shard) ->
+    client_guard(shard_id, Shard, ?MAX_U16),
+    <<Shard:16/unsigned-big>>.
+
+client_shard_id(Token, Shards) ->
+    Raw = case Token of
+        <<>> -> 0;
+        <<B1:8>> -> B1 bsl 8;
+        <<B1:8, B2:8, _/binary>> -> (B1 bsl 8) bor B2
+    end,
+    (Raw * Shards) bsr 16.
+
+client_epoch_spec(Bucket, Shard) ->
+    {add, Bucket, client_shard_key(Shard), <<"epoch">>, <<1>>}.
+
+client_guard(_What, Value, Max) when is_integer(Value), Value >= 0, Value =< Max ->
+    ok;
+client_guard(What, Value, Max) ->
+    erlang:error({fts_capacity_exceeded, What, Value, Max}).
+
+client_encode_posting(ByColumn) ->
+    Columns = lists:sort(maps:to_list(ByColumn)),
+    client_guard(columns, length(Columns), ?MAX_COLUMNS),
+    Body = iolist_to_binary([client_encode_column(C, T) || {C, T} <- Columns]),
+    <<?POSTING_VERSION:8, (length(Columns)):8, Body/binary>>.
+
+client_encode_column(ColumnId, ByToken) ->
+    client_guard(column_id, ColumnId, ?MAX_COLUMN_ID),
+    Tokens = lists:sort(maps:to_list(ByToken)),
+    client_guard(tokens_per_column, length(Tokens), ?MAX_U32),
+    Body = iolist_to_binary([
+        client_encode_token(Token, Entry) || {Token, Entry} <- Tokens
+    ]),
+    <<ColumnId:8, (length(Tokens)):32/unsigned-big, Body/binary>>.
+
+client_encode_token(Token, #{count := Count, positions := Positions}) ->
+    TokenBytes = byte_size(Token),
+    client_guard(token_bytes, TokenBytes, ?MAX_TOKEN_BYTES),
+    client_guard(true_occurrences, Count, ?MAX_U64),
+    PosBin = client_encode_positions(Positions),
+    PosBytes = byte_size(PosBin),
+    client_guard(position_bytes, PosBytes, ?MAX_POSITION_BYTES),
+    <<TokenBytes:16/unsigned-big, Token/binary, Count:64/unsigned-big,
+        PosBytes:16/unsigned-big, PosBin/binary>>.
+
+client_encode_positions(Positions) ->
+    client_encode_positions(Positions, 0, <<>>).
+
+client_encode_positions([], _Last, Acc) ->
+    Acc;
+client_encode_positions(_Positions, _Last, Acc)
+when byte_size(Acc) >= ?MAX_POSITION_PREFIX_BYTES ->
+    Acc;
+client_encode_positions([Position | Rest], Last, Acc)
+when is_integer(Position), Position >= Last ->
+    client_encode_positions(Rest, Position, varint_append(Position - Last, Acc));
+client_encode_positions(Bad, _Last, _Acc) ->
+    erlang:error({invalid_fts_positions, Bad}).
+
+client_decode_posting(<<?POSTING_VERSION:8, NCols:8, Rest/binary>>) ->
+    client_decode_columns(NCols, Rest, #{});
+client_decode_posting(Bad) ->
+    erlang:error({invalid_fts_posting, Bad}).
+
+client_decode_columns(0, <<>>, Acc) -> Acc;
+client_decode_columns(N, <<ColId:8, NTokens:32/unsigned-big, Rest/binary>>, Acc)
+when N > 0 ->
+    {ByToken, Tail} = client_decode_tokens(NTokens, Rest, #{}),
+    client_decode_columns(N - 1, Tail, Acc#{ColId => ByToken});
+client_decode_columns(_N, Bad, _Acc) ->
+    erlang:error({invalid_fts_posting_columns, Bad}).
+
+client_decode_tokens(0, Rest, Acc) -> {Acc, Rest};
+client_decode_tokens(N,
+    <<TokenBytes:16/unsigned-big, Token:TokenBytes/binary,
+        Count:64/unsigned-big, PosBytes:16/unsigned-big,
+        PosBin:PosBytes/binary, Rest/binary>>, Acc) when N > 0 ->
+    Positions = case decode_positions(PosBin, 0, []) of
+        {ok, Ps} -> Ps;
+        error -> erlang:error({invalid_fts_positions, PosBin})
+    end,
+    client_decode_tokens(N - 1, Rest,
+        Acc#{Token => #{count => Count, positions => Positions}});
+client_decode_tokens(_N, Bad, _Acc) ->
+    erlang:error({invalid_fts_posting_tokens, Bad}).
+
+client_encode_manifest(Shards, DocLength, Fingerprint) ->
+    client_guard(manifest_shards, length(Shards), ?MAX_U16),
+    client_guard(doc_length, DocLength, ?MAX_U64),
+    32 = byte_size(Fingerprint),
+    ShardBin = iolist_to_binary([client_encode_shard_id(S) || S <- Shards]),
+    <<?MANIFEST_VERSION:8, (length(Shards)):16/unsigned-big,
+        ShardBin/binary, DocLength:64/unsigned-big, Fingerprint/binary>>.
+
+client_decode_manifest_value(#{shards := _, doc_length := _, fingerprint := _} = M) -> M;
+client_decode_manifest_value(<<?MANIFEST_VERSION:8, N:16/unsigned-big, Rest/binary>>) ->
+    ShardBytes = N * 2,
+    case Rest of
+        <<ShardBin:ShardBytes/binary, DocLength:64/unsigned-big,
+            Fingerprint:32/binary>> ->
+            #{shards => [S || <<S:16/unsigned-big>> <= ShardBin],
+                doc_length => DocLength, fingerprint => Fingerprint};
+        _ -> erlang:error({invalid_fts_manifest, Rest})
+    end;
+client_decode_manifest_value(Bad) ->
+    erlang:error({invalid_fts_manifest, Bad}).
+
+client_encode_shard_id(Shard) ->
+    client_guard(shard_id, Shard, ?MAX_U16),
+    <<Shard:16/unsigned-big>>.
+
+client_encode_stats(DocLength) ->
+    client_guard(doc_length, DocLength, ?MAX_U64),
+    <<?STATS_VERSION:8, DocLength:64/unsigned-big>>.
+
+client_decode_stats(<<?STATS_VERSION:8, DocLength:64/unsigned-big>>) -> DocLength;
+client_decode_stats(Bad) -> erlang:error({invalid_fts_stats, Bad}).
+
+%% cache_table/2 returns a public ETS table owned by the process that won its
+%% lazy creation.  The table (and the small registry) therefore lives exactly
+%% as long as that owner.  Callers wanting cache lifetime independent of a
+%% request should first call this function from their own supervisor process.
+-spec cache_table(pid(), map()) -> ets:tid().
+cache_table(Bookie, #{index := Index}) when is_pid(Bookie) ->
+    Registry = client_cache_registry(),
+    CacheKey = {Bookie, Index},
+    case ets:lookup(Registry, CacheKey) of
+        [{CacheKey, Table}] ->
+            case ets:info(Table) of
+                undefined -> client_new_cache(Registry, CacheKey);
+                _ -> Table
+            end;
+        [] -> client_new_cache(Registry, CacheKey)
     end.
 
-%% Two definitions sharing an index name must not be able to match the same
-%% bucket, whatever their tags: searches address {Bucket, Index} without a
-%% tag, and same-tag overlap would also make write-side derivation emit
-%% duplicate marker and page rows under one {Index, Tag} field. Exact
-%% duplicates, a prefix covering an exact bucket, and nested prefixes are
-%% all rejected.
-duplicate_search_names(Schemas) ->
-    length(Schemas) =/= length(lists:usort(Schemas)) orelse
-        overlapping_search_names(Schemas).
+client_cache_registry() ->
+    case ets:whereis(?CLIENT_CACHE_REGISTRY) of
+        undefined ->
+            try ets:new(?CLIENT_CACHE_REGISTRY,
+                [named_table, public, set, {read_concurrency, true},
+                    {write_concurrency, true}])
+            catch error:badarg -> ets:whereis(?CLIENT_CACHE_REGISTRY)
+            end;
+        Table -> Table
+    end.
 
-overlapping_search_names(Schemas) ->
-    Pairs = [
-        {A, B}
-     || A <- Schemas,
-        B <- Schemas,
-        A =/= B,
-        maps:get(index, A) =:= maps:get(index, B)
-    ],
-    lists:any(
-        fun({#{bucket := BA}, #{bucket := BB}}) ->
-            buckets_overlap(BA, BB)
+client_new_cache(Registry, CacheKey) ->
+    Table = ets:new(leveled_fts_cache,
+        [public, set, {read_concurrency, true}, {write_concurrency, true}]),
+    case ets:insert_new(Registry, {CacheKey, Table}) of
+        true -> Table;
+        false ->
+            ets:delete(Table),
+            [{CacheKey, Existing}] = ets:lookup(Registry, CacheKey),
+            Existing
+    end.
+
+-spec search(pid(), map(), binary() | list() | all_docs, map() | list()) ->
+    {ok, [map()]} | {error, term()}.
+search(Bookie, #{fingerprint := _} = Schema, Query, Opts0) when is_pid(Bookie) ->
+    try
+        {Hook, Opts1} = client_take_option(cache_fill_hook, Opts0),
+        case normalise_search_options(Opts1, Schema) of
+            {ok, Opts} ->
+                case parse(Query, Opts) of
+                    {ok, AST0} ->
+                        Columns = option_columns(Opts, Schema),
+                        case validate_ast_columns(AST0, Columns) of
+                            ok ->
+                                AST = canonicalise_ast_columns(
+                                    restrict_ast_columns(AST0, Columns)
+                                ),
+                                client_search(Bookie, Schema, AST, Opts, Hook);
+                            Error -> Error
+                        end;
+                    Error -> Error
+                end;
+            Error -> Error
+        end
+    catch
+        error:Reason -> {error, Reason};
+        throw:{fts_error, Reason} -> {error, Reason}
+    end.
+
+client_take_option(Key, Opts) when is_map(Opts) ->
+    {maps:get(Key, Opts, undefined), maps:remove(Key, Opts)};
+client_take_option(Key, Opts) when is_list(Opts) ->
+    {proplists:get_value(Key, Opts, undefined), proplists:delete(Key, Opts)}.
+
+client_search(Bookie, Schema, {all_docs} = AST, Opts, _Hook) ->
+    Manifests = client_fold_manifests(Bookie, Schema),
+    Metas = maps:map(fun(Key, M) -> client_empty_meta(Key, M) end, Manifests),
+    client_evaluate(AST, Metas, Bookie, Schema, Opts);
+client_search(Bookie, Schema, AST, Opts, Hook) ->
+    Shards = client_ast_shards(AST, Schema),
+    Table = cache_table(Bookie, Schema),
+    States = [client_cached_shard(Bookie, Schema, Table, Shard, Hook)
+        || Shard <- Shards],
+    Raw = lists:foldl(fun client_merge_shard_docs/2, #{}, States),
+    Metas = maps:fold(
+        fun(DocKey, Posting, Acc) ->
+            case leveled_bookie:book_headonly(
+                Bookie, maps:get(index, Schema), <<"doc">>, DocKey
+            ) of
+                {ok, ManifestBin} ->
+                    Manifest = client_decode_manifest_value(ManifestBin),
+                    case maps:get(fingerprint, Manifest) =:= maps:get(fingerprint, Schema) of
+                        true -> Acc#{DocKey => client_meta(DocKey, Manifest, Posting, Schema)};
+                        false -> Acc
+                    end;
+                not_found -> Acc
+            end
         end,
-        Pairs
-    ).
+        #{}, Raw
+    ),
+    client_evaluate(AST, Metas, Bookie, Schema, Opts).
 
-buckets_overlap(Bucket, Bucket) ->
-    true;
-buckets_overlap({prefix, P1}, {prefix, P2}) ->
-    bucket_matches({prefix, P1}, P2) orelse bucket_matches({prefix, P2}, P1);
-buckets_overlap({prefix, P}, Bucket) ->
-    bucket_matches({prefix, P}, Bucket);
-buckets_overlap(Bucket, {prefix, P}) ->
-    bucket_matches({prefix, P}, Bucket);
-buckets_overlap(_BucketA, _BucketB) ->
-    false.
+client_cached_shard(Bookie, Schema, Table, Shard, Hook) ->
+    Epoch0 = client_epoch_sqn(Bookie, Schema, Shard),
+    case ets:lookup(Table, {shard, Shard}) of
+        [{{shard, Shard}, {Epoch0, State}}] -> State;
+        _ -> client_fill_shard(Bookie, Schema, Table, Shard, Epoch0, Hook)
+    end.
 
-book_ftssearch(Pid, Bucket, Index0, Query, Opts) ->
-    Index = normalise_index(Index0),
-    leveled_bookie:book_returnfolder(Pid, {fts_query, Bucket, Index, Query, Opts}).
+client_fill_shard(Bookie, Schema, Table, Shard, Epoch0, Hook) ->
+    State = client_fold_shard(Bookie, Schema, Shard),
+    client_call_hook(Hook, {Shard, Epoch0, State}),
+    Epoch1 = client_epoch_sqn(Bookie, Schema, Shard),
+    case Epoch1 =:= Epoch0 of
+        true ->
+            true = ets:insert(Table, {{shard, Shard}, {Epoch1, State}}),
+            State;
+        false ->
+            %% The snapshot is stale.  It is neither installed nor served;
+            %% refill once without the test/coordination hook.
+            client_fill_shard(Bookie, Schema, Table, Shard, Epoch1, undefined)
+    end.
 
-%% Cheap membership check used by the Bookie write path to decide whether an
-%% object's bucket/tag has any configured FTS index. Writes to non-matching
-%% bucket/tag pairs skip the read-before-write entirely and behave exactly as a
-%% non-FTS Leveled store.
-has_matching_index(Bucket, Tag, Indexes) ->
-    lists:any(
-        fun(#{bucket := Bucket0, tag := Tag0}) ->
-            Tag0 =:= Tag andalso bucket_matches(Bucket0, Bucket)
+client_epoch_sqn(Bookie, Schema, Shard) ->
+    leveled_bookie:book_sqn(Bookie, maps:get(index, Schema),
+        {client_shard_key(Shard), <<"epoch">>}, ?HEAD_TAG).
+
+client_fold_shard(Bookie, Schema, Shard) ->
+    Bucket = maps:get(index, Schema),
+    ShardKey = client_shard_key(Shard),
+    Fold = fun
+        (B, {K, <<"base">>}, Value, {_Base, Docs, Keys})
+        when B =:= Bucket, K =:= ShardKey ->
+            {client_decode_base(Value), Docs, Keys};
+        (B, {K, <<"d:", DocKey/binary>> = SubKey}, Value,
+            {Base, Docs, Keys}) when B =:= Bucket, K =:= ShardKey ->
+            {Base, Docs#{DocKey => client_decode_posting(Value)}, [SubKey | Keys]};
+        (_B, _K, _V, Acc) -> Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(Bookie, ?HEAD_TAG,
+        {range, Bucket, {{ShardKey, <<>>}, {ShardKey, <<255>>}}},
+        {Fold, {#{}, #{}, []}}, false, true, false),
+    {Base, Docs, _Keys} = Runner(),
+    maps:merge(Base, Docs).
+
+client_fold_shard_rows(Bookie, Schema, Shard) ->
+    Bucket = maps:get(index, Schema),
+    ShardKey = client_shard_key(Shard),
+    Fold = fun
+        (B, {K, <<"base">>}, Value, {_Base, Docs, Keys})
+        when B =:= Bucket, K =:= ShardKey ->
+            {client_decode_base(Value), Docs, Keys};
+        (B, {K, <<"d:", DocKey/binary>> = SubKey}, Value,
+            {Base, Docs, Keys}) when B =:= Bucket, K =:= ShardKey ->
+            {Base, Docs#{DocKey => client_decode_posting(Value)}, [SubKey | Keys]};
+        (_B, _K, _V, Acc) -> Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(Bookie, ?HEAD_TAG,
+        {range, Bucket, {{ShardKey, <<>>}, {ShardKey, <<255>>}}},
+        {Fold, {#{}, #{}, []}}, false, true, false),
+    {Base, Docs, Keys} = Runner(),
+    {maps:merge(Base, Docs), Keys}.
+
+client_merge_shard_docs(State, Acc) ->
+    maps:fold(fun(Key, Posting, A) ->
+        A#{Key => client_merge_posting(maps:get(Key, A, #{}), Posting)}
+    end, Acc, State).
+
+client_merge_posting(A, B) ->
+    maps:fold(fun(Col, Tokens, Acc) ->
+        Acc#{Col => maps:merge(maps:get(Col, Acc, #{}), Tokens)}
+    end, A, B).
+
+client_meta(Key, Manifest, Posting, Schema) ->
+    Columns = maps:get(columns, Schema),
+    Positions = maps:from_list([{lists:nth(ColId + 1, Columns),
+        maps:map(fun(_Token, Entry) -> maps:get(positions, Entry) end, Tokens)}
+        || {ColId, Tokens} <- maps:to_list(Posting)]),
+    Counts = maps:from_list([{lists:nth(ColId + 1, Columns),
+        maps:map(fun(_Token, Entry) -> maps:get(count, Entry) end, Tokens)}
+        || {ColId, Tokens} <- maps:to_list(Posting)]),
+    #{key => Key, doc_length => maps:get(doc_length, Manifest),
+        positions => Positions, counts => Counts}.
+
+client_empty_meta(Key, Manifest) ->
+    #{key => Key, doc_length => maps:get(doc_length, Manifest),
+        positions => #{}, counts => #{}}.
+
+client_ast_shards(AST, Schema) ->
+    lists:usort(lists:append([
+        client_token_shards(Token, Prefix, maps:get(shards, Schema))
+     || {Token, Prefix} <- client_ast_tokens(AST)
+    ])).
+
+client_ast_tokens({term, Token, Prefix, _Cols}) -> [{Token, Prefix}];
+client_ast_tokens({phrase, Specs, _Cols}) -> [{T, P} || {T, P, _} <- Specs];
+client_ast_tokens({near, Items, _D, _Cols}) ->
+    lists:append([client_ast_tokens(I) || I <- Items]);
+client_ast_tokens({anchor, A}) -> client_ast_tokens(A);
+client_ast_tokens({'and', A, B}) -> client_ast_tokens(A) ++ client_ast_tokens(B);
+client_ast_tokens({'or', A, B}) -> client_ast_tokens(A) ++ client_ast_tokens(B);
+client_ast_tokens({'not', A, B}) -> client_ast_tokens(A) ++ client_ast_tokens(B);
+client_ast_tokens(_) -> [].
+
+client_token_shards(Token, false, Shards) -> [client_shard_id(Token, Shards)];
+client_token_shards(<<>>, true, Shards) -> lists:seq(0, Shards - 1);
+client_token_shards(Token, true, Shards) ->
+    Lo = client_shard_id(Token, Shards),
+    HiToken = case Token of
+        <<B:8>> -> <<B, 255>>;
+        <<B1:8, B2:8, _/binary>> -> <<B1, B2>>
+    end,
+    lists:seq(Lo, client_shard_id(HiToken, Shards)).
+
+client_evaluate(AST, Metas, Bookie, Schema, Opts) ->
+    Matches = [Meta || {_K, Meta} <- maps:to_list(Metas), eval(AST, Meta) =/= false],
+    Ranked = maps:get(rank, Opts, none) =:= bm25,
+    Hits0 = case Ranked of
+        false -> [client_hit(AST, Meta, Opts, 0.0) || Meta <- Matches];
+        true ->
+            Stats = client_corpus_stats(Bookie, Schema),
+            Leaves = scoring_phrases(AST),
+            Np = np_map(Leaves, maps:values(Metas)),
+            {DocCount, TotalLength} = Stats,
+            Avg = case DocCount of 0 -> 0.0; _ -> TotalLength / DocCount end,
+            [client_hit(AST, Meta, Opts,
+                bm25_score(Meta, Leaves, Np, DocCount, Avg)) || Meta <- Matches]
+    end,
+    Hits1 = case Ranked of
+        true -> lists:sort(fun(A, B) ->
+            {-maps:get(score, A), maps:get(key, A)} =<
+                {-maps:get(score, B), maps:get(key, B)}
+        end, Hits0);
+        false -> lists:sort(fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end, Hits0)
+    end,
+    {ok, page_hits(Hits1, Opts)}.
+
+client_hit(AST, Meta, Opts, Score) ->
+    {true, MatchPositions} = eval(AST, Meta),
+    Base = #{key => maps:get(key, Meta), score => Score,
+        doc_length => maps:get(doc_length, Meta)},
+    case maps:get(return_positions, Opts, false) of
+        true ->
+            case position_count(MatchPositions) =< ?MAX_RETURN_POSITIONS of
+                true -> Base#{positions => MatchPositions};
+                false -> throw({fts_error, fts_query_positions_limit_exceeded})
+            end;
+        false -> Base
+    end.
+
+client_fold_manifests(Bookie, Schema) ->
+    Bucket = maps:get(index, Schema),
+    Fingerprint = maps:get(fingerprint, Schema),
+    Fold = fun
+        (B, {<<"doc">>, DocKey}, Value, Acc) when B =:= Bucket ->
+            M = client_decode_manifest_value(Value),
+            case maps:get(fingerprint, M) =:= Fingerprint of
+                true -> Acc#{DocKey => M};
+                false -> Acc
+            end;
+        (_B, _K, _V, Acc) -> Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(Bookie, ?HEAD_TAG,
+        {range, Bucket, all},
+        {Fold, #{}}, false, true, false),
+    Runner().
+
+client_corpus_stats(Bookie, Schema) ->
+    Bucket = maps:get(index, Schema),
+    Fold = fun
+        (B, {<<"stats">>, _DocKey}, Value, {N, L}) when B =:= Bucket ->
+            {N + 1, L + client_decode_stats(Value)};
+        (_B, _K, _V, Acc) -> Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(Bookie, ?HEAD_TAG,
+        {range, Bucket, all},
+        {Fold, {0, 0}}, false, true, false),
+    Runner().
+
+client_encode_base(Docs) ->
+    Rows = lists:sort(maps:to_list(Docs)),
+    client_guard(base_documents, length(Rows), ?MAX_U32),
+    Body = iolist_to_binary([client_encode_base_doc(K, P) || {K, P} <- Rows]),
+    <<?BASE_VERSION:8, (length(Rows)):32/unsigned-big, Body/binary>>.
+
+client_encode_base_doc(DocKey, Posting) ->
+    KeyBytes = byte_size(DocKey),
+    client_guard(base_doc_key_bytes, KeyBytes, ?MAX_U16),
+    PostingBin = client_encode_posting(Posting),
+    PostingBytes = byte_size(PostingBin),
+    client_guard(base_posting_bytes, PostingBytes, ?MAX_U32),
+    <<KeyBytes:16/unsigned-big, DocKey/binary,
+        PostingBytes:32/unsigned-big, PostingBin/binary>>.
+
+client_decode_base(<<?BASE_VERSION:8, N:32/unsigned-big, Rest/binary>>) ->
+    client_decode_base_docs(N, Rest, #{});
+client_decode_base(Bad) -> erlang:error({invalid_fts_base, Bad}).
+
+client_decode_base_docs(0, <<>>, Acc) -> Acc;
+client_decode_base_docs(N,
+    <<KeyBytes:16/unsigned-big, DocKey:KeyBytes/binary,
+        PostingBytes:32/unsigned-big, Posting:PostingBytes/binary, Rest/binary>>, Acc)
+when N > 0 ->
+    client_decode_base_docs(N - 1, Rest,
+        Acc#{DocKey => client_decode_posting(Posting)});
+client_decode_base_docs(_N, Bad, _Acc) ->
+    erlang:error({invalid_fts_base_rows, Bad}).
+
+-spec consolidate(pid(), map(), map() | list()) -> {ok, map()} | {error, term()}.
+consolidate(Bookie, #{fingerprint := _} = Schema, Opts0) when is_pid(Bookie) ->
+    try
+        {Hook, Opts} = client_take_option(before_consolidate_commit, Opts0),
+        Shards = case client_option(shards, Opts, all) of
+            all -> lists:seq(0, maps:get(shards, Schema) - 1);
+            L when is_list(L) -> L
         end,
-        Indexes
-    ).
+        Result = lists:foldl(fun(Shard, Acc) ->
+            client_consolidate_shard(Bookie, Schema, Shard, Hook, Acc)
+        end, #{consolidated => [], skipped => []}, Shards),
+        {ok, maps:map(fun(_K, V) -> lists:reverse(V) end, Result)}
+    catch error:Reason -> {error, Reason} end.
+
+client_option(Key, Opts, Default) when is_map(Opts) -> maps:get(Key, Opts, Default);
+client_option(Key, Opts, Default) when is_list(Opts) -> proplists:get_value(Key, Opts, Default).
+
+client_consolidate_shard(Bookie, Schema, Shard, Hook, Acc) ->
+    case client_epoch_sqn(Bookie, Schema, Shard) of
+        not_found -> Acc;
+        {ok, ObservedSQN} ->
+            {Docs, DocRows} = client_fold_shard_rows(Bookie, Schema, Shard),
+            case DocRows of
+                [] -> Acc;
+                _ ->
+                    client_call_hook(Hook, {Shard, ObservedSQN}),
+                    Bucket = maps:get(index, Schema),
+                    ShardKey = client_shard_key(Shard),
+                    Specs = [{add, Bucket, ShardKey, <<"base">>, client_encode_base(Docs)}] ++
+                        [{remove, Bucket, ShardKey, SubKey, <<>>} || SubKey <- DocRows] ++
+                        [client_epoch_spec(Bucket, Shard)],
+                    Condition = [{Bucket, ShardKey, <<"epoch">>, {sqn, ObservedSQN}}],
+                    case leveled_bookie:book_casmput(Bookie, Specs, Condition) of
+                        ok -> Acc#{consolidated := [Shard | maps:get(consolidated, Acc)]};
+                        pause -> Acc#{consolidated := [Shard | maps:get(consolidated, Acc)]};
+                        {error, {precondition_failed, _}} ->
+                            Acc#{skipped := [Shard | maps:get(skipped, Acc)]};
+                        {error, Reason} -> erlang:error({fts_consolidation_failed, Reason})
+                    end
+            end
+    end.
+
+client_call_hook(undefined, _Arg) -> ok;
+client_call_hook(Fun, Arg) when is_function(Fun, 1) -> Fun(Arg);
+client_call_hook(Fun, _Arg) when is_function(Fun, 0) -> Fun().
 
 -define(FTS_PMAP_MIN, 8).
 -define(FTS_CHUNKS, 16).
@@ -127,680 +701,6 @@ has_matching_index(Bucket, Tag, Indexes) ->
 -define(FTS_SHARDS, 1024).
 -define(FTS_BASE_PROBE_BYTES, 10).
 -define(FTS_CACHE_MAX_WORDS, 33554432).
-
-%% ----------------------------------------------------------------------------
-%% Write-side derivation.
-%%
-%% Documents in a write batch are tokenised, grouped into token-sorted pages
-%% per column, and attached to the batch as payload-bearing secondary index
-%% specs alongside a per-document marker:
-%%
-%%   {fts_doc, Index, Tag} / doc / Key            -> <<BatchSeq:64, DocLength:32>>
-%%   {fts_term, Index, Tag} / <<0, BatchSeq:64>>  -> page directory for batch
-%%   {fts_term, Index, Tag} / <<1, BatchSeq:64, PageNo:16>> -> packed page
-%%
-%% A document's live postings are exactly those written in the batch recorded
-%% by its marker; entries from older batches are filtered out at read time, so
-%% updates and deletes never read or rewrite earlier postings.
-%% ----------------------------------------------------------------------------
-
-augment_object_changes(ObjectChanges, Indexes, BatchSeq) ->
-    %% The packed page format frames document keys with 16-bit lengths, so
-    %% only binary keys up to 65535 bytes can carry postings. Reject
-    %% unsupported keys with an error before any worker is spawned or
-    %% sequence consumed, rather than crashing the linked derivation path.
-    Invalid =
-        lists:search(
-            fun({{Tag, Bucket, Key, null}, _Obj, _SpecsTTL}) ->
-                has_matching_index(Bucket, Tag, Indexes) andalso
-                    not (is_binary(Key) andalso byte_size(Key) =< 65535)
-            end,
-            ObjectChanges
-        ),
-    Matching =
-        lists:any(
-            fun({{Tag, Bucket, _Key, null}, _Obj, _SpecsTTL}) ->
-                has_matching_index(Bucket, Tag, Indexes)
-            end,
-            ObjectChanges
-        ),
-    case {Invalid, Matching} of
-        {{value, {{_Tag, _Bucket, BadKey, null}, _Obj, _SpecsTTL}}, _} ->
-            {error, {invalid_fts_key, BadKey}};
-        {false, false} ->
-            {ok, ObjectChanges, []};
-        {false, true} ->
-            %% Run the whole derivation in a short-lived coordinator process:
-            %% tokenisation, merging, and page encoding allocate heavily, and
-            %% doing that on the long-lived caller heap (the bookie) costs
-            %% far more in garbage collection than the one result copy.
-            [Result] = fts_pmap(
-                fun(Cs) -> augment_matching(Cs, Indexes, BatchSeq) end,
-                [ObjectChanges]
-            ),
-            Result
-    end.
-
-augment_matching(ObjectChanges, Indexes, BatchSeq) ->
-    Flagged = flag_superseded(ObjectChanges),
-            Chunks = chunk_changes(Flagged),
-            Results =
-                case Chunks of
-                    [Single] ->
-                        [derive_chunk(Single, Indexes, BatchSeq)];
-                    _ ->
-                        fts_pmap(
-                            fun(Chunk) -> derive_chunk(Chunk, Indexes, BatchSeq) end,
-                            Chunks
-                        )
-                end,
-            Changes1 = lists:append([Cs || {Cs, _Rows} <- Results]),
-            MergedRows = merge_chunk_rows([Rows || {_Cs, Rows} <- Results]),
-            %% One injected change per touched (bucket, ref, shard): the
-            %% shard's delta row rides its reserved carrier key, so its
-            %% exact row identity is known to consolidation later.
-            %% Touched carries the delta payloads for the write-through
-            %% shard-state cache.
-            {InjectedRev, TouchedRev} =
-                maps:fold(
-                    fun({Bucket, {Index, Tag} = Ref}, ByShard, Acc0) ->
-                        maps:fold(
-                            fun(Shard, ByCol, {InjAcc, TouchAcc}) ->
-                                ColStreams =
-                                    [
-                                        {ColId,
-                                            merge_streams_to_stream(
-                                                lists:reverse(Streams)
-                                            )}
-                                     || {ColId, Streams} <-
-                                            lists:sort(maps:to_list(ByCol))
-                                    ],
-                                Delta = encode_delta(ColStreams),
-                                %% reserved objects live under the STANDARD
-                                %% tag: per-tag head codecs (ash_leveled)
-                                %% must never see engine-internal values.
-                                CarrierLK =
-                                    leveled_codec:to_objectkey(
-                                        Bucket, delta_carrier_key(Index, Shard), ?STD_TAG
-                                    ),
-                                Spec =
-                                    {add_payload, seg_field(Ref),
-                                        delta_term(Shard, BatchSeq), Delta},
-                                Change =
-                                    {CarrierLK, <<0>>, {[Spec], infinity}},
-                                {[Change | InjAcc],
-                                    [{Bucket, Ref, Shard, BatchSeq, Delta} | TouchAcc]}
-                            end,
-                            Acc0,
-                            ByShard
-                        )
-                    end,
-                    {[], []},
-                    MergedRows
-                ),
-            {ok, Changes1 ++ lists:reverse(InjectedRev), lists:reverse(TouchedRev)}.
-
-%% Within one batch, a later write to the same key supersedes earlier ones.
-%% Earlier occurrences must not contribute page rows: they share the batch
-%% sequence, so their tokens would wrongly read as live for the final version.
-%% One reversed pass flags superseded occurrences.
-flag_superseded(ObjectChanges) ->
-    {Flagged, _Seen} =
-        lists:foldl(
-            fun({{Tag, Bucket, Key, null}, _Obj, _SpecsTTL} = Change, {Acc, Seen}) ->
-                Id = {Tag, Bucket, Key},
-                case sets:is_element(Id, Seen) of
-                    true -> {[{Change, true} | Acc], Seen};
-                    false -> {[{Change, false} | Acc], sets:add_element(Id, Seen)}
-                end
-            end,
-            {[], sets:new()},
-            lists:reverse(ObjectChanges)
-        ),
-    Flagged.
-
-chunk_changes(Flagged) ->
-    N = length(Flagged),
-    case N >= ?FTS_PMAP_MIN of
-        false ->
-            [Flagged];
-        true ->
-            Size = max(1, (N + ?FTS_CHUNKS - 1) div ?FTS_CHUNKS),
-            split_chunks(Flagged, Size)
-    end.
-
-split_chunks([], _Size) ->
-    [];
-split_chunks(L, Size) when length(L) =< Size ->
-    [L];
-split_chunks(L, Size) ->
-    {Chunk, Rest} = lists:split(Size, L),
-    [Chunk | split_chunks(Rest, Size)].
-
-%% A chunk worker tokenises its documents, appends marker specs to each
-%% change, and returns its page rows already sorted per (bucket, ref, column),
-%% so the caller only merges a handful of sorted lists.
-derive_chunk(Flagged, Indexes, BatchSeq) ->
-    {ChangesRev, Flat} =
-        lists:foldl(
-            fun({Change, Skip}, {CsAcc, FlatAcc}) ->
-                {{Tag, Bucket, Key, null} = LK, Object, {Specs, TTL}} = Change,
-                Schemas =
-                    case reserved_fts_key(Key) of
-                        true ->
-                            %% engine-internal rows (bases, delta carriers)
-                            %% never derive postings.
-                            [];
-                        false ->
-                            [
-                                Schema
-                             || #{bucket := B0, tag := T0} = Schema <- Indexes,
-                                T0 =:= Tag,
-                                bucket_matches(B0, Bucket)
-                            ]
-                    end,
-                PerSchema = [derive_doc(Schema, Object, BatchSeq) || Schema <- Schemas],
-                MarkerSpecs = [Marker || {_Ref, Marker, _Rows} <- PerSchema],
-                Change1 = {LK, Object, {Specs ++ MarkerSpecs, TTL}},
-                FlatAcc1 =
-                    case Skip of
-                        true ->
-                            FlatAcc;
-                        false ->
-                            lists:foldl(
-                                fun({Ref, _Marker, RowList}, A) ->
-                                    BR = {Bucket, Ref},
-                                    lists:foldl(
-                                        fun({ColId, Token, PosBin}, A1) ->
-                                            [
-                                                {BR, shard_id(Token), ColId, Token,
-                                                    Key, PosBin}
-                                                | A1
-                                            ]
-                                        end,
-                                        A,
-                                        RowList
-                                    )
-                                end,
-                                FlatAcc,
-                                PerSchema
-                            )
-                    end,
-                {[Change1 | CsAcc], FlatAcc1}
-            end,
-            {[], []},
-            Flagged
-        ),
-    %% One sort orders by {Bucket, Ref}, shard, column, token, key: the
-    %% per-(bucket, ref, shard, column) grouping and token order the
-    %% delta entry streams need.
-    {lists:reverse(ChangesRev), group_flat(lists:sort(Flat), BatchSeq)}.
-
-%% Sorted flat rows -> #{{BucketRef, Shard, ColId} => EntryStream}: a
-%% sorted v2 entry stream (frames stamped with the write sequence) built
-%% in the chunk worker. Streams are refc binaries, so returning them to
-%% the coordinator does not copy row data.
-group_flat(SortedFlat, Seq) ->
-    group_flat(SortedFlat, Seq, none, none, 0, <<>>, <<>>, #{}).
-
-group_flat([], _Seq, none, _Tok, _ND, _Frames, _Run, Acc) ->
-    Acc;
-group_flat([], _Seq, GKey, Tok, ND, Frames, Run, Acc) ->
-    Acc#{GKey => <<Run/binary, (encode_entry(Tok, ND, Frames))/binary>>};
-group_flat(
-    [{BR, Shard, ColId, Token, Key, PosBin} | Rest], Seq, GKey, Tok, ND, Frames, Run,
-    Acc
-) ->
-    RowKey = {BR, Shard, ColId},
-    Frame = encode_frame(Seq, Key, PosBin),
-    case {RowKey, Token} of
-        {GKey, Tok} ->
-            group_flat(
-                Rest, Seq, GKey, Tok, ND + 1, <<Frames/binary, Frame/binary>>, Run, Acc
-            );
-        {GKey, _NewTok} ->
-            Run1 = <<Run/binary, (encode_entry(Tok, ND, Frames))/binary>>,
-            group_flat(Rest, Seq, GKey, Token, 1, Frame, Run1, Acc);
-        {_NewKey, _} when GKey =:= none ->
-            group_flat(Rest, Seq, RowKey, Token, 1, Frame, <<>>, Acc);
-        {_NewKey, _} ->
-            Acc1 = Acc#{GKey => <<Run/binary, (encode_entry(Tok, ND, Frames))/binary>>},
-            group_flat(Rest, Seq, RowKey, Token, 1, Frame, <<>>, Acc1)
-    end.
-
-%% Gather the chunks' streams per (bucket, ref, shard, column); same-key
-%% streams from different chunks merge when the delta is assembled.
-merge_chunk_rows(ChunkMaps) ->
-    lists:foldl(
-        fun(ChunkMap, Acc) ->
-            maps:fold(
-                fun({BucketRef, Shard, ColId}, Stream, A) ->
-                    ByShard = maps:get(BucketRef, A, #{}),
-                    ByCol = maps:get(Shard, ByShard, #{}),
-                    Streams = maps:get(ColId, ByCol, []),
-                    A#{
-                        BucketRef =>
-                            ByShard#{Shard => ByCol#{ColId => [Stream | Streams]}}
-                    }
-                end,
-                Acc,
-                ChunkMap
-            )
-        end,
-        #{},
-        ChunkMaps
-    ).
-
-derive_doc(Schema, delete, _BatchSeq) ->
-    Ref = index_ref(Schema),
-    {Ref, {remove, doc_field(Ref), doc}, []};
-derive_doc(Schema, Object0, BatchSeq) ->
-    Ref = index_ref(Schema),
-    Object = maybe_decode_object(Object0, Schema),
-    Fields = extract_fields(Object, maps:get(column_specs, Schema)),
-    ColTerms = build_column_terms(Fields, maps:get(options, Schema)),
-    DocLength =
-        lists:sum([
-            length(Positions)
-         || {_Col, TokenPositions} <- ColTerms, {_Token, Positions} <- TokenPositions
-        ]),
-    Marker = {add_payload, doc_field(Ref), doc, encode_marker(BatchSeq, DocLength)},
-    %% build_column_terms returns columns in schema column order, so the
-    %% position is the column id used by pages and directories. Positions are
-    %% encoded here so the cost lands in the parallel derive workers.
-    Rows =
-        [
-            {ColId, Token, encode_positions(Positions)}
-         || {ColId, {_Col, TokenPositions}} <-
-                lists:zip(lists:seq(0, length(ColTerms) - 1), ColTerms),
-            {Token, Positions} <- TokenPositions
-        ],
-    {Ref, Marker, Rows}.
-
-page_bloom(Tokens) ->
-    N = max(1, length(Tokens)),
-    Bits = bloom_bits(N * 10),
-    Positions =
-        lists:usort(
-            lists:append([bloom_positions(Token, Bits) || Token <- Tokens])
-        ),
-    build_bitset(Positions, Bits).
-
-bloom_bits(Target) ->
-    bloom_bits(64, Target).
-
-bloom_bits(Bits, Target) when Bits >= Target ->
-    Bits;
-bloom_bits(Bits, Target) ->
-    bloom_bits(Bits * 2, Target).
-
-bloom_positions(Token, Bits) ->
-    H1 = erlang:phash2(Token, 1 bsl 27),
-    H2 = erlang:phash2({bloom, Token}, 1 bsl 27),
-    [(H1 + K * H2) rem Bits || K <- [0, 1, 2, 3]].
-
-build_bitset(SortedPositions, Bits) ->
-    build_bitset(SortedPositions, 0, Bits, <<>>).
-
-build_bitset(_Positions, Bit, Bits, Acc) when Bit >= Bits ->
-    Acc;
-build_bitset(Positions, Bit, Bits, Acc) ->
-    {Byte, Rest} = take_byte(Positions, Bit, 0),
-    build_bitset(Rest, Bit + 8, Bits, <<Acc/binary, Byte:8>>).
-
-take_byte([P | Rest], Base, Byte) when P < Base + 8 ->
-    take_byte(Rest, Base, Byte bor (1 bsl (P - Base)));
-take_byte(Positions, _Base, Byte) ->
-    {Byte, Positions}.
-
-bloom_member_at(Blob, Off, Len, Token) ->
-    Bits = Len * 8,
-    lists:all(
-        fun(P) ->
-            Byte = binary:at(Blob, Off + P div 8),
-            (Byte band (1 bsl (P rem 8))) =/= 0
-        end,
-        bloom_positions(Token, Bits)
-    ).
-
-fts_pmap(Fun, List) ->
-    Ref = make_ref(),
-    Parent = self(),
-    %% Workers allocate run binaries immediately; pre-sizing the heap avoids
-    %% several growth collections per worker.
-    Pids =
-        [
-            spawn_opt(
-                fun() -> Parent ! {Ref, self(), Fun(Item)} end,
-                [link, {min_heap_size, 8192}]
-            )
-         || Item <- List
-        ],
-    [
-        receive
-            {Ref, Pid, Result} -> Result
-        end
-     || Pid <- Pids
-    ].
-
-%% Test/debug introspection: extract {Token, Key} pairs carried by page specs
-%% for the given index name and tag (e.g. from journal key changes).
-%% Test helper: the {Token, DocKey} pairs a batch's delta specs carry.
-spec_token_entries(Specs, Index, Tag) ->
-    Field = {fts_term, Index, Tag},
-    lists:append(
-        [
-            [
-                {Token, Key}
-             || {ColId_, Stream} <- decode_delta(Payload),
-                is_integer(ColId_),
-                {Token, Frames} <-
-                    lists:reverse(
-                        fold_entries(
-                            Stream,
-                            fun(T, _ND, F, A) -> [{T, F} | A] end,
-                            []
-                        )
-                    ),
-                Key <- lists:reverse(frame_keys(Frames, []))
-            ]
-         || {add_payload, Field0, <<_Shard:16/unsigned-big, 1:8, _Seq:64/unsigned-big>>,
-                Payload} <- Specs,
-            Field0 =:= Field
-        ]
-    ).
-
-seg_field({Index, Tag}) ->
-    {fts_term, Index, Tag}.
-
-search(FoldSource, Bucket, Index, Query, Opts0, Indexes) ->
-    search(FoldSource, Bucket, Index, Query, Opts0, Indexes, undefined).
-
-%% Pre-snapshot probe of the result cache, so cache hits skip snapshot setup.
-cached_search(undefined, _Bucket, _Index, _Query, _Opts0) ->
-    miss;
-cached_search({Ets, Seq}, Bucket, Index, Query, Opts0) ->
-    case result_cache_enabled(Opts0) of
-        false ->
-            miss;
-        true ->
-            ResKey = {res, Bucket, Index, result_query_key(Query), Opts0, Seq},
-            case ets:lookup(Ets, ResKey) of
-                [{_K, Result}] -> {ok, Result};
-                [] -> miss
-            end
-    end.
-
-%% result_cache => false skips both the read and the write of the query
-%% result cache: the honest cost of a novel query, for one-off queries
-%% and for benchmarking a stable store.
-result_cache_enabled(Opts) ->
-    maps:get(result_cache, Opts, true) =/= false.
-
-%% Cache is undefined or {EtsTable, WriteSeq}. All cached artefacts are either
-%% immutable for the lifetime of the store instance (page directories, page
-%% entries) or keyed by the FTS write sequence (batch lists, query results),
-%% which changes on every FTS write, so cached data is always exact.
-search(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
-    case Cache of
-        {Ets, Seq} ->
-            case result_cache_enabled(Opts0) of
-                false ->
-                    search_uncached(
-                        FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache
-                    );
-                true ->
-                    ResKey =
-                        {res, Bucket, Index, result_query_key(Query), Opts0, Seq},
-                    case ets:lookup(Ets, ResKey) of
-                        [{_K, Result}] ->
-                            Result;
-                        [] ->
-                            Result = search_uncached(
-                                FoldSource, Bucket, Index, Query, Opts0, Indexes,
-                                Cache
-                            ),
-                            cache_result(Ets, ResKey, Result),
-                            Result
-                    end
-            end;
-        undefined ->
-            search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache)
-    end.
-
-result_query_key(Query) when is_binary(Query) -> Query;
-result_query_key(all_docs) -> all_docs;
-result_query_key(Query) ->
-    try unicode:characters_to_binary(Query, utf8) of
-        Bin when is_binary(Bin) -> Bin;
-        _ -> Query
-    catch
-        _:_ -> Query
-    end.
-
-cache_result(Ets, ResKey, Result) ->
-    case ets:info(Ets, size) > ?FTS_RESULT_CACHE_MAX of
-        true ->
-            case ets:first(Ets) of
-                '$end_of_table' -> ok;
-                First -> ets:delete(Ets, First)
-            end;
-        false ->
-            ok
-    end,
-    ets:insert(Ets, {ResKey, Result}).
-
-search_uncached(FoldSource, Bucket, Index, Query, Opts0, Indexes, Cache) ->
-    case find_schema(Bucket, Index, Indexes) of
-        {ok, Schema} ->
-            case normalise_search_options(Opts0, Schema) of
-                {ok, Opts} ->
-                    case parse(Query, Opts) of
-                        {ok, AST0} ->
-                            Columns = option_columns(Opts, Schema),
-                            case validate_ast_columns(AST0, Columns) of
-                                ok ->
-                                    AST1 = restrict_ast_columns(AST0, Columns),
-                                    case
-                                        apply_search_filter(
-                                            AST1, maps:get(filter, Opts, []), Schema
-                                        )
-                                    of
-                                        {ok, EvalAST0, ScoreAST0} ->
-                                            %% Canonicalise column selectors
-                                            %% ONCE: per-document checks then
-                                            %% compare without re-normalising
-                                            %% (the full Unicode lowercasing
-                                            %% in item_allows_column was half
-                                            %% the cost of a NEAR query).
-                                            EvalAST =
-                                                canonicalise_ast_columns(EvalAST0),
-                                            ScoreAST =
-                                                canonicalise_ast_columns(ScoreAST0),
-                                            search_evaluate(
-                                                FoldSource, Bucket, Schema, EvalAST,
-                                                ScoreAST, Columns, Cache, Opts
-                                            );
-                                        {error, Reason} ->
-                                            {error, Reason}
-                                    end;
-                                {error, Reason} ->
-                                    {error, Reason}
-                            end;
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        not_found ->
-            {error, missing_fts_schema};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% EvalAST decides matching (user query AND search filters); ScoreAST is
-%% the user query alone — injected filters must never contribute to BM25
-%% scores, or a tenant filter term would perturb ranking.
-search_evaluate(FoldSource, Bucket, Schema, EvalAST, ScoreAST, Columns, Cache, Opts) ->
-    IndexRef = index_ref(Schema),
-    Ranked = maps:get(rank, Opts, none) =:= bm25,
-    try
-        Leaves =
-            case Ranked of
-                true -> scoring_phrases(ScoreAST);
-                false -> []
-            end,
-        RankMode =
-            case {Ranked, Ranked andalso ranked_fast_df(Leaves)} of
-                {false, _} -> none;
-                {true, true} -> fast;
-                {true, false} -> full
-            end,
-        Metas =
-            collect_metas(
-                FoldSource,
-                Bucket,
-                Schema,
-                EvalAST,
-                Columns,
-                Cache,
-                maps:get(return_positions, Opts, false) orelse Ranked,
-                RankMode
-            ),
-        case Ranked of
-            false ->
-                evaluate_payload_candidates(IndexRef, EvalAST, Opts, Metas);
-            true ->
-                Stats =
-                    corpus_stats(
-                        FoldSource,
-                        Bucket,
-                        Schema,
-                        Cache,
-                        maps:get(stats_staleness, Opts, 0)
-                    ),
-                Np =
-                    case RankMode of
-                        fast ->
-                            fast_np_map(FoldSource, Bucket, Schema, Cache, Leaves);
-                        full ->
-                            positional
-                    end,
-                evaluate_ranked_candidates(
-                    IndexRef, EvalAST, Leaves, Opts, Metas, Np, Stats
-                )
-        end
-    catch
-        throw:{fts_error, Reason} ->
-            {error, Reason}
-    end.
-
-%% A search-time filter is a list of {Column, Values} requirements ANDed
-%% into the query plan after user-column restriction: a document matches a
-%% requirement when Column posts any of Values, and must match every
-%% requirement. Filter terms are composed directly into the AST (never
-%% through the query parser), so a caller can restrict the user query to
-%% content columns via the columns option while filtering on columns the
-%% user cannot reference. Because filter terms are ordinary AND legs, a
-%% selective filter becomes the rarest-leg driver term and the limit
-%% window applies after filtering. Values match as single tokens: a
-%% verbatim column matches the exact field value; a text column requires
-%% the value to normalise to exactly one token.
-apply_search_filter(AST, [], _Schema) ->
-    {ok, AST, AST};
-apply_search_filter(AST, Filter, Schema) ->
-    case build_filter_ast(Filter, Schema) of
-        {ok, FilterAST} -> {ok, {'and', AST, FilterAST}, AST};
-        {error, Reason} -> {error, Reason}
-    end.
-
-build_filter_ast([{Col0, Values} | Rest], Schema) ->
-    Column = normalise_column(Col0),
-    case lists:member(Column, maps:get(columns, Schema)) of
-        false ->
-            {error, {invalid_fts_filter, unknown_column, Column}};
-        true ->
-            case filter_value_tokens(Column, Values, Schema, []) of
-                {ok, Tokens} ->
-                    ColAST = filter_or_terms(Tokens, Column),
-                    case Rest of
-                        [] ->
-                            {ok, ColAST};
-                        _ ->
-                            case build_filter_ast(Rest, Schema) of
-                                {ok, RestAST} -> {ok, {'and', ColAST, RestAST}};
-                                {error, _Reason} = Error -> Error
-                            end
-                    end;
-                {error, _Reason} = Error ->
-                    Error
-            end
-    end.
-
-filter_value_tokens(_Column, [], _Schema, Acc) ->
-    {ok, lists:reverse(Acc)};
-filter_value_tokens(Column, [Value | Rest], Schema, Acc) ->
-    case filter_value_token(Column, Value, Schema) of
-        {ok, Token} -> filter_value_tokens(Column, Rest, Schema, [Token | Acc]);
-        {error, _Reason} = Error -> Error
-    end.
-
-filter_value_token(Column, Value, Schema) when is_binary(Value) ->
-    case maps:get(Column, maps:get(column_modes, Schema, #{}), text) of
-        verbatim when Value =/= <<>>, byte_size(Value) =< 65535 ->
-            {ok, Value};
-        verbatim ->
-            {error, {invalid_fts_filter, invalid_value, Column}};
-        text ->
-            case tokenize(Value, maps:get(options, Schema)) of
-                [{Token, _Pos}] -> {ok, Token};
-                _ZeroOrMany -> {error, {invalid_fts_filter, not_single_token, Column}}
-            end
-    end;
-filter_value_token(Column, _Value, _Schema) ->
-    {error, {invalid_fts_filter, invalid_value, Column}}.
-
-filter_or_terms([Token], Column) ->
-    {term, Token, false, [Column]};
-filter_or_terms([Token | Rest], Column) ->
-    {'or', {term, Token, false, [Column]}, filter_or_terms(Rest, Column)}.
-
-normalise_index_definition(#{bucket_prefix := Prefix} = Def) when
-    is_binary(Prefix), Prefix =/= <<>>, not is_map_key(bucket, Def)
-->
-    normalise_index_definition(
-        maps:put(bucket, {prefix, Prefix}, maps:remove(bucket_prefix, Def))
-    );
-normalise_index_definition(#{bucket_prefix := _Prefix} = _Def) ->
-    {error, invalid_fts_index};
-normalise_index_definition(#{decode := Decode} = _Def) when
-    Decode =/= external_term
-->
-    {error, invalid_fts_decode_option};
-normalise_index_definition(#{bucket := Bucket, index := Index0, columns := Columns0} = Def) ->
-    Opts = normalise_options(Def),
-    case normalise_column_specs(Columns0) of
-        {ok, ColumnSpecs} ->
-            Columns = [Column || {Column, _Path, _Mode} <- ColumnSpecs],
-            Index = normalise_index(Index0),
-            {ok, #{
-                bucket => Bucket,
-                tag => maps:get(tag, Def, ?STD_TAG),
-                index => Index,
-                columns => Columns,
-                column_specs => ColumnSpecs,
-                column_modes =>
-                    maps:from_list([{C, M} || {C, _P, M} <- ColumnSpecs]),
-                prefixes => maps:get(prefixes, Opts, []),
-                tokenizer => tokenizer_description(Opts),
-                options => Opts
-            }};
-        {error, Reason} ->
-            {error, Reason}
-    end;
-normalise_index_definition(_Def) ->
-    {error, invalid_fts_index}.
 
 normalise_column_specs(Columns) when is_list(Columns), Columns =/= [] ->
     try
@@ -840,64 +740,6 @@ normalise_column_mode(<<"verbatim">>) -> verbatim.
 duplicate_columns(Specs) ->
     Columns = [Column || {Column, _Path, _Mode} <- Specs],
     length(Columns) =/= length(lists:usort(Columns)).
-
--spec bucket_has_schema(term(), list()) -> boolean().
-%% @doc True when any configured FTS schema applies to writes in Bucket
-%% (exact or prefix match). Used by the Bookie's write_refs RESOLVE so
-%% callers can route FTS-clean puts through the caller-side write path
-%% and FTS-affected puts through the direct in-Bookie path.
-bucket_has_schema(Bucket, Indexes) ->
-    lists:any(
-        fun(#{bucket := Bucket0}) -> bucket_matches(Bucket0, Bucket) end,
-        Indexes
-    ).
-
-find_schema(Bucket, Index, Indexes) ->
-    Matching =
-        [
-            Schema
-         || #{bucket := Bucket0, index := Index0} = Schema <- Indexes,
-            Index0 =:= Index,
-            bucket_matches(Bucket0, Bucket)
-        ],
-    case lists:partition(fun(#{bucket := B}) -> B =:= Bucket end, Matching) of
-        {[Schema], _Prefixed} ->
-            {ok, Schema};
-        {[], []} ->
-            not_found;
-        {[], Prefixed} ->
-            %% Distinct prefixes matching the same bucket cannot share a
-            %% length, so taking the longest prefix is deterministic.
-            [{_Len, Schema} | _Rest] =
-                lists:reverse(
-                    lists:keysort(1, [
-                        {byte_size(P), S}
-                     || #{bucket := {prefix, P}} = S <- Prefixed
-                    ])
-                ),
-            {ok, Schema};
-        {_Exact, _Prefixed} ->
-            {error, ambiguous_fts_schema}
-    end.
-
-%% A schema bucket is either an exact bucket term or {prefix, Prefix},
-%% authored as bucket_prefix, matching every binary bucket sharing the
-%% prefix (one schema covering all tenant-prefixed buckets). Postings,
-%% markers and caches are still kept per actual bucket, so tenants stay
-%% isolated at both write and query time.
-bucket_matches({prefix, Prefix}, Bucket) when
-    is_binary(Prefix), is_binary(Bucket)
-->
-    Size = byte_size(Prefix),
-    case Bucket of
-        <<Head:Size/binary, _Rest/binary>> -> Head =:= Prefix;
-        _Shorter -> false
-    end;
-bucket_matches(Bucket, Bucket) ->
-    true;
-bucket_matches(_SchemaBucket, _Bucket) ->
-    false.
-
 
 extract_fields(Object, ColumnSpecs) ->
     [
@@ -1037,495 +879,6 @@ group_positions([], Acc) ->
 group_positions([{Token, Pos} | Rest], Acc) ->
     group_positions(Rest, maps:update_with(Token, fun(Ps) -> [Pos | Ps] end, [Pos], Acc)).
 
-%% ----------------------------------------------------------------------------
-%% Query-side reading of the packed posting representation (layout described
-%% above augment_object_changes/3). Query terms are located through the page
-%% directories, pages are point-read and cached for the query, and entries are
-%% filtered against each document's marker batch sequence so stale postings
-%% from superseded writes are invisible.
-%% ----------------------------------------------------------------------------
-
-collect_metas(FoldSource, Bucket, Schema, AST, Columns, Cache, ReturnPositions, Ranked) ->
-    Ctx0 = query_ctx(FoldSource, Bucket, Schema, Cache, ReturnPositions),
-    case AST of
-        {all_docs} ->
-            all_doc_metas(Ctx0);
-        %% fast ranked mode: exact df for term-shaped scoring leaves
-        %% comes from a keys-only pass (fast_np_map), so candidates load
-        %% through the same driver flow as unranked queries — positions
-        %% on candidates only. Positional-df leaves (phrases) use the
-        %% full mode: every scoring term loaded whole, with positions.
-        _ when Ranked =:= fast ->
-            term_metas(Ctx0, AST, query_terms(AST, Columns));
-        _ when Ranked =:= full ->
-            ranked_term_metas(Ctx0, query_terms(AST, Columns));
-        _ ->
-            term_metas(Ctx0, AST, query_terms(AST, Columns))
-    end.
-
-%% Ranked queries need exact per-term document frequencies and term
-%% frequencies for every matching document, so the driver-term
-%% optimisation (loading non-driver terms only for driver candidates)
-%% does not apply: every query term is loaded in full, with positions,
-%% and metas are built for every document carrying a live posting.
-ranked_term_metas(_Ctx0, []) ->
-    #{};
-ranked_term_metas(Ctx0, Terms) ->
-    {Ctx1, RawAll} =
-        lists:foldl(
-            fun({Col, Token, Prefix}, {CtxA, RawA}) ->
-                load_term(CtxA, Col, Token, Prefix, all, true, RawA)
-            end,
-            {Ctx0, #{}},
-            lists:usort(Terms)
-        ),
-    case maps:size(RawAll) of
-        0 ->
-            #{};
-        _ ->
-            {Ctx2, Markers} = load_markers(Ctx1, maps:keys(RawAll)),
-            build_metas(RawAll, Markers, maps:get(ref, Ctx2))
-    end.
-
-all_doc_metas(#{fold := FoldSource, bucket := Bucket, ref := Ref}) ->
-    Fold =
-        fun(_B, {_Term, Key, Payload}, Acc) ->
-            case decode_marker(Payload) of
-                {ok, _BatchSeq, DocLength} ->
-                    Acc#{Key => empty_meta(Ref, Key, DocLength)};
-                error ->
-                    Acc
-            end
-        end,
-    index_fold(
-        FoldSource,
-        {Bucket, null},
-        {Fold, #{}},
-        {doc_field(Ref), doc, doc},
-        {payload, undefined}
-    ).
-
-%% Query terms are loaded in two phases. The driver terms -- a minimal set of
-%% leaves that every possible match must satisfy, chosen rarest-first by
-%% covering-page count -- are loaded in full. The remaining terms then only
-%% need postings for the surviving candidate documents, so their page reads
-%% are restricted to the batches named by the candidates' markers. This gives
-%% phrase, NEAR, and AND queries over hot tokens a cost proportional to the
-%% rarest leg rather than the hottest.
-%% Cheap per-term cardinality for driver selection: base entry doc
-%% counts through the shard probe plus pending delta counts — no frame
-%% decodes. Loading shard state and bases here pre-warms exactly what
-%% the query reads next.
-term_costs(Ctx0, Terms) ->
-    lists:foldl(
-        fun({Col, Token, Prefix} = T, {CtxA, Acc}) ->
-            ColId = column_id(maps:get(columns, CtxA), Col, 0),
-            Shards =
-                case Prefix of
-                    false ->
-                        [shard_id(Token)];
-                    true ->
-                        {Lo, Hi} = prefix_shard_range(Token),
-                        lists:seq(Lo, Hi)
-                end,
-            {CtxB, N} =
-                lists:foldl(
-                    fun(Shard, {CtxI, NAcc}) ->
-                        {CtxI1, Entries} =
-                            shard_token_counts(CtxI, Shard, ColId, Token, Prefix),
-                        {CtxI1, NAcc + Entries}
-                    end,
-                    {CtxA, 0},
-                    Shards
-                ),
-            {CtxB, Acc#{T => N}}
-        end,
-        {Ctx0, #{}},
-        lists:usort(Terms)
-    ).
-
-shard_token_counts(Ctx0, Shard, ColId, Token, Prefix) ->
-    {Ctx1, Entries} = shard_token_entries(Ctx0, Shard, ColId, Token, Prefix),
-    {Ctx1,
-        lists:sum([count_frames(Frames) || {_Tok, Frames} <- Entries])}.
-
-count_frames(FramesBin) ->
-    count_frames(FramesBin, 0).
-
-count_frames(<<>>, N) ->
-    N;
-count_frames(
-    <<_Seq:64/unsigned-big, KeyLen:16/unsigned-big, _K:KeyLen/binary,
-        PosLen:16/unsigned-big, _P:PosLen/binary, Rest/binary>>,
-    N
-) ->
-    count_frames(Rest, N + 1);
-count_frames(Bad, N) ->
-    throw({fts_error, {invalid_fts_payload, count_frames, N, byte_size(Bad)}}).
-
-term_metas(_Ctx, _AST, []) ->
-    #{};
-term_metas(Ctx0, AST, Terms) ->
-    PosNeeded =
-        case maps:get(return_positions_opt, Ctx0, false) of
-            true -> all;
-            false -> positional_terms(AST, Ctx0)
-        end,
-    {Ctx1, CostMap} = term_costs(Ctx0, Terms),
-    Cost = fun(T) -> maps:get(T, CostMap, 0) end,
-    Drivers = lists:usort(driver_terms(AST, Cost)),
-    Rest = [T || T <- Terms, not lists:member(T, Drivers)],
-    {Ctx2, RawDrivers} =
-        lists:foldl(
-            fun({Col, Token, Prefix} = T, {CtxA, RawA}) ->
-                load_term(CtxA, Col, Token, Prefix, all, need_pos(T, PosNeeded), RawA)
-            end,
-            {Ctx1, #{}},
-            Drivers
-        ),
-    case maps:size(RawDrivers) of
-        0 ->
-            #{};
-        _ ->
-            {Ctx3, Markers} = load_markers(Ctx2, maps:keys(RawDrivers)),
-            DriverMetas = build_metas(RawDrivers, Markers, maps:get(ref, Ctx3)),
-            case maps:size(DriverMetas) of
-                0 ->
-                    #{};
-                _ ->
-                    CandKeys = sets:from_list(maps:keys(DriverMetas)),
-                    {_Ctx4, RawAll} =
-                        lists:foldl(
-                            fun({Col, Token, Prefix} = T, {CtxA, RawA}) ->
-                                load_term(
-                                    CtxA,
-                                    Col,
-                                    Token,
-                                    Prefix,
-                                    {candidates, CandKeys},
-                                    need_pos(T, PosNeeded),
-                                    RawA
-                                )
-                            end,
-                            {Ctx3, RawDrivers},
-                            Rest
-                        ),
-                    build_metas(
-                        maps:with(sets:to_list(CandKeys), RawAll),
-                        Markers,
-                        maps:get(ref, Ctx3)
-                    )
-            end
-    end.
-
-%% A minimal set of leaves such that every document matching the AST matches
-%% at least one driver leaf: both sides of OR, the cheaper side of AND, the
-%% left of NOT, the rarest leg of phrase/NEAR.
-driver_terms({term, Token, Prefix, Cols}, _Cost) ->
-    [{Col, Token, Prefix} || Col <- concrete_columns(Cols)];
-driver_terms({phrase, Specs, Cols}, Cost) ->
-    Legs =
-        [
-            [{Col, Token, Prefix} || Col <- concrete_columns(Cols)]
-         || {Token, Prefix, _Offset} <- lists:ukeysort(1, Specs)
-        ],
-    cheapest_leg(Legs, Cost);
-driver_terms({near, Items, _Distance, _Cols}, Cost) ->
-    Legs = [driver_terms(Item, Cost) || Item <- Items],
-    cheapest_leg([Leg || Leg <- Legs, Leg =/= []], Cost);
-driver_terms({anchor, AST}, Cost) ->
-    driver_terms(AST, Cost);
-driver_terms({'and', A, B}, Cost) ->
-    %% A leg with no driver terms (e.g. an all_docs leg under a search
-    %% filter) cannot drive candidate loading; every match of the
-    %% conjunction still satisfies the other leg's drivers, so drive from
-    %% the non-empty legs only.
-    cheapest_leg(
-        [Leg || Leg <- [driver_terms(A, Cost), driver_terms(B, Cost)], Leg =/= []],
-        Cost
-    );
-driver_terms({'or', A, B}, Cost) ->
-    driver_terms(A, Cost) ++ driver_terms(B, Cost);
-driver_terms({'not', A, _B}, Cost) ->
-    driver_terms(A, Cost);
-driver_terms(_Other, _Cost) ->
-    [].
-
-cheapest_leg([], _Cost) ->
-    [];
-cheapest_leg(Legs, Cost) ->
-    {_C, Leg} =
-        lists:min([
-            {lists:sum([Cost(T) || T <- Leg]), Leg}
-         || Leg <- Legs
-        ]),
-    Leg.
-
-%% Terms that appear under phrase, NEAR, or anchor need their positions for
-%% evaluation; terms in purely boolean context only need membership, so their
-%% position decode is skipped (a sentinel keeps the membership check truthy).
-positional_terms(AST, Ctx) ->
-    Columns = maps:get(columns, Ctx),
-    Sub = positional_subtrees(AST),
-    sets:from_list(
-        lists:append([query_terms(S, Columns) || S <- Sub])
-    ).
-
-positional_subtrees({phrase, _Specs, _Cols} = AST) -> [AST];
-positional_subtrees({near, _Items, _D, _Cols} = AST) -> [AST];
-positional_subtrees({anchor, A}) -> [{anchor, A}];
-positional_subtrees({'and', A, B}) -> positional_subtrees(A) ++ positional_subtrees(B);
-positional_subtrees({'or', A, B}) -> positional_subtrees(A) ++ positional_subtrees(B);
-positional_subtrees({'not', A, B}) -> positional_subtrees(A) ++ positional_subtrees(B);
-positional_subtrees(_Other) -> [].
-
-need_pos(_Term, all) -> true;
-need_pos(Term, PosNeeded) -> sets:is_element(Term, PosNeeded).
-
-%% Raw :: #{Key => #{Column => #{Token => {BatchSeq, Positions | present}}}}
-%% Restrict is `all` or {CandSeqs, CandKeys}: when restricted, only pages in
-%% candidate batches are read and only candidate keys are accumulated.
-load_term(Ctx0, Col, Token, Prefix, Restrict, NeedPos, Raw0) ->
-    ColId = column_id(maps:get(columns, Ctx0), Col, 0),
-    KeyFilter =
-        case Restrict of
-            all -> all;
-            {candidates, CandKeys} -> CandKeys
-        end,
-    Shards =
-        case Prefix of
-            false ->
-                [shard_id(Token)];
-            true ->
-                {Lo, Hi} = prefix_shard_range(Token),
-                lists:seq(Lo, Hi)
-        end,
-    lists:foldl(
-        fun(Shard, {CtxA, RawA}) ->
-            {CtxB, TokenEntries} =
-                shard_token_entries(CtxA, Shard, ColId, Token, Prefix),
-            Wanted =
-                [
-                    {T, extract_frames(Frames, KeyFilter, NeedPos)}
-                 || {T, Frames} <- TokenEntries
-                ],
-            {CtxB, add_raw_entries(RawA, Col, Wanted)}
-        end,
-        {Ctx0, Raw0},
-        Shards
-    ).
-
-
-add_raw_entries(Raw, Col, TokenEntries) ->
-    lists:foldl(
-        fun({Token, Frames}, RawA) ->
-            lists:foldl(
-                fun({Key, Seq, Positions}, RawB) ->
-                    ByCol = maps:get(Key, RawB, #{}),
-                    ByTok = maps:get(Col, ByCol, #{}),
-                    case maps:get(Token, ByTok, undefined) of
-                        {Seq0, _P} when Seq0 >= Seq ->
-                            RawB;
-                        _Stale ->
-                            RawB#{
-                                Key =>
-                                    ByCol#{Col => ByTok#{Token => {Seq, Positions}}}
-                            }
-                    end
-                end,
-                RawA,
-                Frames
-            )
-        end,
-        Raw,
-        TokenEntries
-    ).
-
-%% A posting frame is live when its stamped sequence is the one the
-%% doc's marker references — the stamp travels with the frame wherever
-%% consolidation copies it, so no alias indirection exists.
-build_metas(Raw, Markers, Ref) ->
-    maps:fold(
-        fun(Key, ByCol, Acc) ->
-            case maps:get(Key, Markers, undefined) of
-                undefined ->
-                    Acc;
-                {MarkerSeq, DocLength} ->
-                    Positions =
-                        maps:filtermap(
-                            fun(_Col, ByTok) ->
-                                Live =
-                                    maps:filtermap(
-                                        fun
-                                            (_T, {BS, present}) when BS =:= MarkerSeq ->
-                                                %% membership-only term; any
-                                                %% non-empty value satisfies
-                                                %% boolean evaluation
-                                                {true, [0]};
-                                            (_T, {BS, P}) when BS =:= MarkerSeq ->
-                                                {true, P};
-                                            (_T, _Stale) ->
-                                                false
-                                        end,
-                                        ByTok
-                                    ),
-                                case maps:size(Live) of
-                                    0 -> false;
-                                    _ -> {true, Live}
-                                end
-                            end,
-                            ByCol
-                        ),
-                    case maps:size(Positions) of
-                        0 ->
-                            Acc;
-                        _ ->
-                            Meta = empty_meta(Ref, Key, DocLength),
-                            Acc#{Key => Meta#{positions => Positions}}
-                    end
-            end
-        end,
-        #{},
-        Raw
-    ).
-
-column_id([Col | _Rest], Col, N) -> N;
-column_id([_Other | Rest], Col, N) -> column_id(Rest, Col, N + 1);
-column_id([], _Col, _N) -> -1.
-
-%% Write-through shard-state cache advance: append the write's delta to
-%% every touched shard's cached entry. Entries are "true as of" their
-%% stamp — a shard untouched by later writes stays valid, so only
-%% written shards are touched (marker-cache discipline, not the equality
-%% stamping of the old batch-list cache).
-advance_shard_cache(undefined, _Touched, _NewSeq) ->
-    ok;
-advance_shard_cache(_Ets, [], _NewSeq) ->
-    ok;
-advance_shard_cache(Ets, Touched, NewSeq) ->
-    UnderCap = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
-    lists:foreach(
-        fun({Bucket, Ref, Shard, Seq, Delta}) ->
-            CKey = {shard, Bucket, Ref, Shard},
-            case {UnderCap, ets:lookup(Ets, CKey)} of
-                {true, [{_K, {_Stamp, ConsSeq, Bloom, Deltas}}]} ->
-                    ets:insert(
-                        Ets,
-                        {CKey, {NewSeq, ConsSeq, Bloom, Deltas ++ [{Seq, Delta}]}}
-                    );
-                {true, []} ->
-                    %% never queried: the first query seeds from a fold.
-                    ok;
-                {false, _} ->
-                    ets:delete(Ets, CKey)
-            end
-        end,
-        Touched
-    ),
-    ok.
-
-%% Consolidation cache application: consumed deltas leave the cached
-%% entry, the new consolidated sequence and bloom install, and the
-%% decoded base drops (refetched lazily).
-consolidate_shard_cache(undefined, _Bucket, _Ref, _Updates, _NewSeq) ->
-    ok;
-consolidate_shard_cache(Ets, Bucket, Ref, Updates, _NewSeq) ->
-    lists:foreach(
-        fun({Shard, ConsSeq, Consumed}) ->
-            CKey = {shard, Bucket, Ref, Shard},
-            case ets:lookup(Ets, CKey) of
-                [{_K, {_Stamp, _OldCS, _OldBloom, Deltas}}] ->
-                    Pending =
-                        [D || {Seq, _P} = D <- Deltas, not lists:member(Seq, Consumed)],
-                    %% the new bloom is not in hand here; drop the entry and
-                    %% let the next query reseed summary + pending deltas.
-                    _ = Pending,
-                    ets:delete(Ets, CKey);
-                [] ->
-                    ok
-            end,
-            _ = ConsSeq,
-            ets:delete(Ets, {base, Bucket, Ref, Shard})
-        end,
-        Updates
-    ),
-    ok.
-
-%% Drop every cached shard/base/marker entry (journal error resync).
-reset_fts_caches(undefined) ->
-    ok;
-reset_fts_caches(Ets) ->
-    ets:match_delete(Ets, {{shard, '_', '_', '_'}, '_'}),
-    ets:match_delete(Ets, {{base, '_', '_', '_'}, '_'}),
-    ets:match_delete(Ets, {{marker, '_', '_', '_'}, '_'}),
-    ok.
-
-%% Strip the include_docs option before the engine sees it: results
-%% cache on keys/ranks only; documents attach in the bookie runner.
-split_include_docs(Opts) when is_map(Opts) ->
-    {maps:get(include_docs, Opts, false) =:= true,
-        maps:remove(include_docs, Opts)};
-split_include_docs(Opts) ->
-    {false, Opts}.
-
-%% Extract per-doc marker updates from augmented object changes: the
-%% bookie applies them to the marker cache after journal success, so
-%% cached markers are always authoritative as of the write that set
-%% them (query-side fills never overwrite writer entries — insert_new).
-marker_cache_updates(_ObjectChanges, []) ->
-    [];
-marker_cache_updates(ObjectChanges, Indexes) ->
-    lists:append([change_marker_updates(Change, Indexes) || Change <- ObjectChanges]).
-
-change_marker_updates({{Tag, Bucket, Key, null}, _Obj, {Specs, _TTL}}, Indexes) ->
-    [
-        Update
-     || #{bucket := B0, tag := T0} = Schema <- Indexes,
-        T0 =:= Tag,
-        bucket_matches(B0, Bucket),
-        Update <- spec_marker_updates(Specs, index_ref(Schema), Bucket, Key)
-    ].
-
-spec_marker_updates(Specs, Ref, Bucket, Key) ->
-    Field = doc_field(Ref),
-    lists:filtermap(
-        fun
-            ({add_payload, F, doc, Payload}) when F =:= Field ->
-                case decode_marker(Payload) of
-                    {ok, BatchSeq, DocLength} ->
-                        {true, {Bucket, Ref, Key, {BatchSeq, DocLength}}};
-                    error ->
-                        false
-                end;
-            ({remove, F, doc}) when F =:= Field ->
-                {true, {Bucket, Ref, Key, not_found}};
-            (_Other) ->
-                false
-        end,
-        Specs
-    ).
-
-%% Writer-side marker cache application: authoritative replacement,
-%% stamped with the post-write sequence. Over the cache budget the key
-%% is deleted instead — absence is always safe (queries fold).
-advance_marker_cache(undefined, _Updates, _NewSeq) ->
-    ok;
-advance_marker_cache(_Ets, [], _NewSeq) ->
-    ok;
-advance_marker_cache(Ets, Updates, NewSeq) ->
-    UnderCap = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
-    lists:foreach(
-        fun({Bucket, Ref, Key, Value}) ->
-            MarkerKey = {marker, Bucket, Ref, Key},
-            case UnderCap of
-                true -> ets:insert(Ets, {MarkerKey, {NewSeq, Value}});
-                false -> ets:delete(Ets, MarkerKey)
-            end
-        end,
-        Updates
-    ),
-    ok.
-
 near_positions([LegA, LegB], Distance) ->
     [Start || {Start, _End} <- near_sweep(LegA, LegB, Distance)];
 near_positions([First | Rest], Distance) ->
@@ -1598,79 +951,6 @@ page_hits(Hits, Opts) ->
     Offset = maps:get(offset, Opts, 0),
     Limit = maps:get(limit, Opts, ?DEFAULT_LIMIT),
     lists:sublist(drop(Offset, Hits), Limit).
-
-hit_list_result(Hits, #{result := summary}) ->
-    key_summary([maps:get(key, Hit) || Hit <- Hits]);
-hit_list_result(Hits, Opts) ->
-    page_hits(Hits, Opts).
-
-key_summary(Keys) ->
-    {Count, Hash} = json_key_list_sha256(Keys),
-    #{total_count => Count, full_keys_sha256 => Hash}.
-
-json_key_list_sha256(Keys) ->
-    Ctx0 = crypto:hash_init(sha256),
-    Ctx1 = crypto:hash_update(Ctx0, <<"[">>),
-    {Count, Ctx2} = json_key_items_sha256(Keys, 0, Ctx1),
-    {Count, hash_hex(crypto:hash_final(crypto:hash_update(Ctx2, <<"]">>)))}.
-
-json_key_items_sha256([], Count, Ctx) ->
-    {Count, Ctx};
-json_key_items_sha256([Key | Rest], 0, Ctx0) ->
-    Ctx1 = crypto:hash_update(Ctx0, json_key(Key)),
-    json_key_items_sha256(Rest, 1, Ctx1);
-json_key_items_sha256([Key | Rest], Count, Ctx0) ->
-    Ctx1 = crypto:hash_update(crypto:hash_update(Ctx0, <<",">>), json_key(Key)),
-    json_key_items_sha256(Rest, Count + 1, Ctx1).
-
-json_key(Key) ->
-    %% Keys that are not valid UTF-8 (e.g. order-preserving encoded
-    %% composite keys) cannot be JSON text; hash them as framed base64
-    %% instead. Valid UTF-8 keys keep the JSON form, preserving the
-    %% cross-engine summary hash for text-keyed corpora.
-    case unicode:characters_to_binary(Key) of
-        Bin when is_binary(Bin) ->
-            [$", json_key_chars(Bin, []), $"];
-        _NotUnicode ->
-            [<<"b64:">>, base64:encode(iolist_to_binary([Key]))]
-    end.
-
-json_key_chars(<<>>, Acc) ->
-    lists:reverse(Acc);
-json_key_chars(<<$", Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$", $\\ | Acc]);
-json_key_chars(<<$\\, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$\\, $\\ | Acc]);
-json_key_chars(<<$\b, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$b, $\\ | Acc]);
-json_key_chars(<<$\f, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$f, $\\ | Acc]);
-json_key_chars(<<$\n, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$n, $\\ | Acc]);
-json_key_chars(<<$\r, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$r, $\\ | Acc]);
-json_key_chars(<<$\t, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [$t, $\\ | Acc]);
-json_key_chars(<<C, Rest/binary>>, Acc) when C < 16#20 ->
-    Hex = io_lib:format("\\u~4.16.0B", [C]),
-    json_key_chars(Rest, lists:reverse(Hex) ++ Acc);
-json_key_chars(<<C, Rest/binary>>, Acc) ->
-    json_key_chars(Rest, [C | Acc]).
-
-hash_hex(Hash) ->
-    Hex = [
-        begin
-            <<Hi:4, Lo:4>> = <<Byte>>,
-            [hex_digit(Hi), hex_digit(Lo)]
-        end
-     || <<Byte>> <= Hash
-    ],
-    list_to_binary(Hex).
-
-hex_digit(N) when N < 10 ->
-    $0 + N;
-hex_digit(N) ->
-    $a + (N - 10).
 
 drop(0, List) ->
     List;
@@ -1799,7 +1079,7 @@ normalise_text(T) when is_binary(T) ->
 normalise_text(T) when is_list(T) ->
     unicode:characters_to_binary(T, utf8);
 normalise_text(T) ->
-    leveled_util:t2b(T).
+    client_term_binary(T).
 
 valid_columns(Columns) when is_list(Columns), Columns =/= [] ->
     true;
@@ -1882,7 +1162,7 @@ normalise_column(C) when is_atom(C) ->
 normalise_column(C) when is_list(C) ->
     normalise_column_binary(unicode:characters_to_binary(C, utf8));
 normalise_column(C) ->
-    normalise_column_binary(leveled_util:t2b(C)).
+    normalise_column_binary(client_term_binary(C)).
 
 normalise_column_binary(Bin) ->
     unicode:characters_to_binary(lower_chars(unicode_chars(Bin)), utf8).
@@ -1890,7 +1170,10 @@ normalise_column_binary(Bin) ->
 normalise_index(I) when is_binary(I) -> I;
 normalise_index(I) when is_atom(I) -> atom_to_binary(I, utf8);
 normalise_index(I) when is_list(I) -> unicode:characters_to_binary(I, utf8);
-normalise_index(I) -> leveled_util:t2b(I).
+normalise_index(I) -> client_term_binary(I).
+
+client_term_binary(Term) ->
+    iolist_to_binary(io_lib:format("~0p", [Term])).
 
 first_unknown([], _Known) ->
     none;
@@ -1900,29 +1183,41 @@ first_unknown([Item | Rest], Known) ->
         false -> {unknown, Item}
     end.
 
-index_ref(#{index := Index, tag := Tag}) ->
-    {Index, Tag}.
-
-doc_field({Index, Tag}) ->
-    {fts_doc, Index, Tag};
-doc_field(Index) ->
-    {fts_doc, Index}.
-
 tokenize(Text0, Opts) ->
+    Text = sqlite_utf8_compat(normalise_text(Text0)),
     case maps:get(tokenchars, Opts, []) =:= [] andalso maps:get(separators, Opts, []) =:= [] of
         true ->
             Stopwords = maps:get(stopwords, Opts, []),
-            fast_tokens(normalise_text(Text0), Opts, Stopwords, <<>>, false, 0, []);
+            fast_tokens(Text, Opts, Stopwords, <<>>, false, 0, []);
         false ->
-            tokenize_unicode(Text0, Opts)
+            tokenize_unicode(Text, Opts)
     end.
 
+%% SQLite's UTF-8 reader has one long-standing compatibility quirk included in
+%% the differential corpus: a truncated F0 9F 92 sequence is decoded as U+07D2
+%% (DF 92) when the following byte is not a continuation.  Preserve that exact
+%% behaviour; all other malformed bytes remain hard token boundaries.
+sqlite_utf8_compat(Bin) when is_binary(Bin) ->
+    sqlite_utf8_compat(Bin, <<>>).
+
+sqlite_utf8_compat(<<16#F0, 16#9F, 16#92, Next, Rest/binary>>, Acc)
+when Next band 16#C0 =/= 16#80 ->
+    sqlite_utf8_compat(<<Next, Rest/binary>>, <<Acc/binary, 16#DF, 16#92>>);
+sqlite_utf8_compat(<<Byte, Rest/binary>>, Acc) ->
+    sqlite_utf8_compat(Rest, <<Acc/binary, Byte>>);
+sqlite_utf8_compat(<<>>, Acc) ->
+    Acc.
+
 tokenize_unicode(Text0, Opts) ->
-    Text = unicode_chars(normalise_text(Text0)),
+    %% Keep malformed input explicit.  Dropping a bad byte before this fold
+    %% concatenates the valid runs on either side and changes token identity.
+    Text = unicode_chars_with_boundaries(normalise_text(Text0)),
     Stopwords = maps:get(stopwords, Opts, []),
     {Tokens, Current, Pos} =
         lists:foldl(
-            fun(Char, {Acc, Current, Pos}) ->
+            fun(invalid_utf8, {Acc, Current, Pos}) ->
+                    finish_token(Acc, Current, Pos, Stopwords, Opts);
+               (Char, {Acc, Current, Pos}) ->
                 case token_char(Char, Opts) of
                     true -> {Acc, lists:reverse(normalise_char(Char, Opts)) ++ Current, Pos};
                     false -> finish_token(Acc, Current, Pos, Stopwords, Opts)
@@ -1976,18 +1271,20 @@ fast_flush(Tok, false, _Opts, SW, Pos, Acc) ->
     end;
 fast_flush(Tok, true, Opts, SW, Pos, Acc) ->
     Norm = normalise_token(Tok, Opts),
-    case Norm =:= <<>> orelse lists:member(Norm, SW) of
-        true -> {Pos + 1, Acc};
-        false -> {Pos + 1, [{Norm, Pos} | Acc]}
+    case {Norm =:= <<>>, lists:member(Norm, SW)} of
+        {true, _} -> {Pos, Acc};
+        {false, true} -> {Pos + 1, Acc};
+        {false, false} -> {Pos + 1, [{Norm, Pos} | Acc]}
     end.
 
 finish_token(Acc, [], Pos, _Stopwords, _Opts) ->
     {Acc, [], Pos};
 finish_token(Acc, Current, Pos, Stopwords, Opts) ->
     Token = normalise_token(unicode:characters_to_binary(lists:reverse(Current), utf8), Opts),
-    case Token =:= <<>> orelse lists:member(Token, Stopwords) of
-        true -> {Acc, [], Pos + 1};
-        false -> {[{Token, Pos} | Acc], [], Pos + 1}
+    case {Token =:= <<>>, lists:member(Token, Stopwords)} of
+        {true, _} -> {Acc, [], Pos};
+        {false, true} -> {Acc, [], Pos + 1};
+        {false, false} -> {[{Token, Pos} | Acc], [], Pos + 1}
     end.
 
 token_char(Char, Opts) ->
@@ -2108,30 +1405,57 @@ normalise_token(Token0, Opts) ->
     case maps:get(remove_diacritics, Opts, false) of
         false -> Lower;
         0 -> Lower;
-        _ -> strip_diacritics(Lower)
+        true -> strip_diacritics(Lower, 1);
+        1 -> strip_diacritics(Lower, 1);
+        2 -> strip_diacritics(Lower, 2)
     end.
 
 lower_chars(Chars) ->
-    lists:flatten([unicode_util:lowercase([Char]) || Char <- lists:flatten(Chars)]).
+    [client_simple_fold(Char) || Char <- lists:flatten(
+        [unicode_util:lowercase([C]) || C <- lists:flatten(Chars)]
+    )].
+
+%% SQLite's Unicode-6.1 simple fold places both Greek sigma forms in the same
+%% equivalence class.  OTP's context-sensitive lowercase retains final sigma.
+client_simple_fold(16#03C2) -> 16#03C3;
+client_simple_fold(Char) -> Char.
 
 %% NFD exposes each character's combining marks so the SQLite diacritic
 %% mask can drop them; recomposing with NFC afterwards restores every
 %% decomposition the mask did not consume (Hangul syllables decompose to
 %% Jamo under NFD, and FTS5 — which never decomposes — keeps them
 %% precomposed; marks outside the mask likewise recompose back).
-strip_diacritics(Token) ->
-    Chars =
-        lists:flatten([
-            unicode_util:nfd([Char])
-         || Char <- lists:flatten(unicode_chars(Token))
-        ]),
-    Kept =
-        [
-            Char
-         || Char <- Chars,
-            not sqlite_diacritic_mark(Char)
-        ],
+strip_diacritics(Token, Mode) ->
+    Kept = lists:append([
+        sqlite_fold_diacritic(Char, Mode)
+     || Char <- lists:flatten(unicode_chars(Token))
+    ]),
     unicode:characters_to_nfc_binary(Kept).
+
+%% unicode61 drops combining marks from decomposed input, but its precomposed
+%% fold table is Latin-only.  Mode 1 deliberately leaves a Latin codepoint
+%% carrying multiple combining marks unchanged; mode 2 folds it to its ASCII
+%% base.  Testing the NFD base reproduces the generated SQLite table without
+%% applying the incorrect Greek/Cyrillic-wide NFD transform.
+sqlite_fold_diacritic(Char, _Mode) when Char >= 16#0300, Char =< 16#036F ->
+    case sqlite_diacritic_mark(Char) of true -> []; false -> [Char] end;
+sqlite_fold_diacritic(Char, Mode) ->
+    Decomposed = lists:flatten(unicode_util:nfd([Char])),
+    case Decomposed of
+        [Base | Marks] when
+            (Base >= $a andalso Base =< $z) orelse
+                (Base >= $A andalso Base =< $Z)
+        ->
+            Removable = [M || M <- Marks, sqlite_diacritic_mark(M)],
+            case {Mode, length(Removable), length(Removable) =:= length(Marks)} of
+                {_Any, 0, _} -> [Char];
+                {1, N, true} when N > 1 -> [Char];
+                {_Any, _N, true} -> [Base];
+                {_Any, _N, false} ->
+                    [Base | [M || M <- Marks, not sqlite_diacritic_mark(M)]]
+            end;
+        _ -> [Char]
+    end.
 
 remove_diacritics_enabled(Opts) ->
     case maps:get(remove_diacritics, Opts, false) of
@@ -2198,7 +1522,7 @@ bounded_query(Query) when is_list(Query) ->
         _:_ -> {error, invalid_fts_query}
     end;
 bounded_query(Query) ->
-    bounded_query(leveled_util:t2b(Query)).
+    bounded_query(client_term_binary(Query)).
 
 blank(Query) ->
     lists:all(fun(C) -> lists:member(C, " \t\r\n") end, unicode_chars(Query)).
@@ -2675,19 +1999,6 @@ binary_prefix(Bin, Prefix) when is_binary(Bin), is_binary(Prefix), byte_size(Bin
 binary_prefix(_Bin, _Prefix) ->
     false.
 
-next_prefix(Prefix) when is_binary(Prefix) ->
-    next_prefix(Prefix, byte_size(Prefix) - 1).
-
-next_prefix(_Prefix, Pos) when Pos < 0 ->
-    none;
-next_prefix(Prefix, Pos) ->
-    case binary:at(Prefix, Pos) of
-        255 ->
-            next_prefix(Prefix, Pos - 1);
-        Byte ->
-            {ok, <<(binary:part(Prefix, 0, Pos))/binary, (Byte + 1)>>}
-    end.
-
 unicode_chars(Bin) when is_binary(Bin) ->
     case unicode:characters_to_list(Bin, utf8) of
         {error, Good, <<_Bad, Rest/binary>>} ->
@@ -2711,6 +2022,20 @@ unicode_chars(List) when is_list(List) ->
             Chars
     end.
 
+unicode_chars_with_boundaries(Bin) when is_binary(Bin) ->
+    case unicode:characters_to_list(Bin, utf8) of
+        {error, Good, <<_Bad, Rest/binary>>} ->
+            Good ++ [invalid_utf8 | unicode_chars_with_boundaries(Rest)];
+        {error, Good, _Rest} ->
+            Good ++ [invalid_utf8];
+        {incomplete, Good, <<>>} ->
+            Good;
+        {incomplete, Good, _Rest} ->
+            Good ++ [invalid_utf8];
+        Chars ->
+            Chars
+    end.
+
 
 %% ============================================================================
 %% Grid storage (v2, docs/FTS.md "Storage Shape").
@@ -2730,944 +2055,6 @@ shard_id(<<B1:8>>) ->
 shard_id(<<B1:8, B2:8, _/binary>>) ->
     ((B1 bsl 8) bor B2) bsr (16 - ?FTS_GRID_BITS).
 
-%% The shard range covered by a prefix (order-preserving grid).
-prefix_shard_range(Prefix) ->
-    {shard_id(Prefix), shard_id(prefix_hi2(Prefix))}.
-
-prefix_hi2(<<>>) -> <<255, 255>>;
-prefix_hi2(<<B1:8>>) -> <<B1, 255>>;
-prefix_hi2(<<B1:8, B2:8, _/binary>>) -> <<B1, B2>>.
-
-%% Shard-first terms keep one shard's whole state (summary then deltas)
-%% contiguous, and shard order contiguous for prefix ranges.
-summary_term(Shard) ->
-    <<Shard:16/unsigned-big, 0:8>>.
-
-delta_term(Shard, Seq) ->
-    <<Shard:16/unsigned-big, 1:8, Seq:64/unsigned-big>>.
-
-shard_term_range(Shard) ->
-    {summary_term(Shard),
-        <<Shard:16/unsigned-big, 1:8, 16#FFFFFFFFFFFFFFFF:64/unsigned-big>>}.
-
-%% Reserved object keys: the base object per shard and the carrier the
-%% delta rows ride. The write path never derives postings from reserved
-%% keys; application folds should skip them.
-base_object_key(Index, Shard) ->
-    <<"$fts$", Index/binary, Shard:16/unsigned-big>>.
-
-delta_carrier_key(Index, Shard) ->
-    <<"$fts_d$", Index/binary, Shard:16/unsigned-big>>.
-
-reserved_fts_key(<<"$fts", _/binary>>) -> true;
-reserved_fts_key(_Key) -> false.
-
-%% Doc frame: the posting's write sequence travels with it.
-%%   <<Seq:64, KeyLen:16, Key, PosLen:16, PosBin>>
-%% Both length fields are 16-bit: a size at or above 2^16 would wrap
-%% modulo 2^16 in the binary construction and desynchronise the frame
-%% walk at rest. Keys are bounded by the write path and positions by
-%% ?MAX_POSITIONS_BYTES (encode_positions); the guards make any future
-%% breach a loud error instead of silent index corruption.
-encode_frame(Seq, Key, PosBin) when
-    byte_size(Key) < 65536, byte_size(PosBin) < 65536
-->
-    <<Seq:64/unsigned-big, (byte_size(Key)):16/unsigned-big, Key/binary,
-        (byte_size(PosBin)):16/unsigned-big, PosBin/binary>>;
-encode_frame(_Seq, Key, PosBin) ->
-    throw(
-        {fts_error,
-            {frame_field_overflow, byte_size(Key), byte_size(PosBin)}}
-    ).
-
-%% Walk frames, decoding positions only for wanted keys.
-extract_frames(FramesBin, KeyFilter, NeedPos) ->
-    extract_frames(FramesBin, KeyFilter, NeedPos, []).
-
-extract_frames(<<>>, _KeyFilter, _NeedPos, Acc) ->
-    lists:reverse(Acc);
-extract_frames(
-    <<Seq:64/unsigned-big, KeyLen:16/unsigned-big, Key:KeyLen/binary,
-        PosLen:16/unsigned-big, PosBin:PosLen/binary, Rest/binary>>,
-    KeyFilter,
-    NeedPos,
-    Acc
-) ->
-    Wanted = KeyFilter =:= all orelse sets:is_element(Key, KeyFilter),
-    case Wanted of
-        false ->
-            extract_frames(Rest, KeyFilter, NeedPos, Acc);
-        true ->
-            Value =
-                case NeedPos of
-                    true ->
-                        case decode_positions(PosBin, 0, []) of
-                            {ok, Positions} -> Positions;
-                            error -> throw({fts_error, {invalid_fts_payload, positions, byte_size(PosBin)}})
-                        end;
-                    false ->
-                        present
-                end,
-            extract_frames(Rest, KeyFilter, NeedPos, [{Key, Seq, Value} | Acc])
-    end;
-extract_frames(Bad, _KeyFilter, _NeedPos, _Acc) ->
-    throw({fts_error, {invalid_fts_payload, frames, byte_size(Bad)}}).
-
-%% Entry: <<TokLen:16, Token, NDocs:32, FramesLen:32, Frames>> — the
-%% frames length makes entry walking O(1) per entry.
-encode_entry(Token, NDocs, FramesBin) ->
-    <<(byte_size(Token)):16/unsigned-big, Token/binary, NDocs:32/unsigned-big,
-        (byte_size(FramesBin)):32/unsigned-big, FramesBin/binary>>.
-
-%% Fold token entries of a stream: Fun(Token, NDocs, FramesBin, Acc).
-fold_entries(<<>>, _Fun, Acc) ->
-    Acc;
-fold_entries(
-    <<TokLen:16/unsigned-big, Token:TokLen/binary, NDocs:32/unsigned-big,
-        FLen:32/unsigned-big, Frames:FLen/binary, Rest/binary>>,
-    Fun,
-    Acc
-) ->
-    fold_entries(Rest, Fun, Fun(Token, NDocs, Frames, Acc));
-fold_entries(Bad, _Fun, _Acc) ->
-    throw({fts_error, {invalid_fts_payload, entry_stream, byte_size(Bad)}}).
-
-%% Delta payload: per-column entry streams.
-%%   <<NCols:8, [ColId:8, StreamLen:32, EntryStream]...>>
-encode_delta(ColStreams) ->
-    iolist_to_binary([
-        <<(length(ColStreams)):8/unsigned-big>>,
-        [
-            [<<ColId:8/unsigned-big, (iolist_size(Stream)):32/unsigned-big>>, Stream]
-         || {ColId, Stream} <- ColStreams
-        ]
-    ]).
-
-decode_delta(<<NCols:8/unsigned-big, Rest/binary>>) ->
-    decode_delta_cols(NCols, Rest, []);
-decode_delta(Bad) ->
-    throw({fts_error, {invalid_fts_payload, delta_header, byte_size(Bad)}}).
-
-decode_delta_cols(0, <<>>, Acc) ->
-    lists:reverse(Acc);
-decode_delta_cols(
-    N,
-    <<ColId:8/unsigned-big, Len:32/unsigned-big, Stream:Len/binary, Rest/binary>>,
-    Acc
-) when N > 0 ->
-    decode_delta_cols(N - 1, Rest, [{ColId, Stream} | Acc]);
-decode_delta_cols(N, Bad, Acc) ->
-    throw(
-        {fts_error,
-            {invalid_fts_payload, delta_cols, N, byte_size(Bad),
-                [{C, byte_size(St)} || {C, St} <- Acc]}}
-    ).
-
-%% Base binary: per column, a fixed-width probe (token binary search)
-%% over an entry stream.
-%%   <<NCols:8, [ColId:8, ProbeLen:32, Probe, StreamLen:32, Stream]...>>
-%% Probe row: <<EntryOff:32, EntryLen:32, TokLen:16>> (token bytes at
-%% EntryOff+2 within the stream).
-encode_base(ColSections) ->
-    iolist_to_binary([
-        <<(length(ColSections)):8/unsigned-big>>,
-        [
-            begin
-                {Probe, StreamSize} = base_probe(Stream),
-                [
-                    <<ColId:8/unsigned-big, (byte_size(Probe)):32/unsigned-big>>,
-                    Probe,
-                    <<StreamSize:32/unsigned-big>>,
-                    Stream
-                ]
-            end
-         || {ColId, Stream} <- ColSections
-        ]
-    ]).
-
-base_probe(Stream) when is_binary(Stream) ->
-    base_probe(Stream, 0, byte_size(Stream), <<>>).
-
-base_probe(_Stream, Off, Size, Acc) when Off >= Size ->
-    {Acc, Size};
-base_probe(Stream, Off, Size, Acc) ->
-    <<_:Off/binary, TokLen:16/unsigned-big, _Tok:TokLen/binary, _ND:32/unsigned-big,
-        FLen:32/unsigned-big, _/binary>> = Stream,
-    EntryLen = 2 + TokLen + 4 + 4 + FLen,
-    base_probe(
-        Stream,
-        Off + EntryLen,
-        Size,
-        <<Acc/binary, Off:32/unsigned-big, EntryLen:32/unsigned-big,
-            TokLen:16/unsigned-big>>
-    ).
-
-decode_base(<<NCols:8/unsigned-big, Rest/binary>>) ->
-    decode_base_cols(NCols, Rest, #{});
-decode_base(Bad) ->
-    throw({fts_error, {invalid_fts_payload, base_header, byte_size(Bad)}}).
-
-decode_base_cols(0, <<>>, Acc) ->
-    Acc;
-decode_base_cols(
-    N,
-    <<ColId:8/unsigned-big, PLen:32/unsigned-big, Probe:PLen/binary,
-        SLen:32/unsigned-big, Stream:SLen/binary, Rest/binary>>,
-    Acc
-) when N > 0 ->
-    decode_base_cols(N - 1, Rest, Acc#{ColId => {Probe, Stream}});
-decode_base_cols(N, Bad, _Acc) ->
-    throw({fts_error, {invalid_fts_payload, base_cols, N, byte_size(Bad)}}).
-
-base_probe_row({Probe, Stream}, Idx) ->
-    <<EntryOff:32/unsigned-big, EntryLen:32/unsigned-big, TokLen:16/unsigned-big>> =
-        binary:part(Probe, (Idx - 1) * ?FTS_BASE_PROBE_BYTES, ?FTS_BASE_PROBE_BYTES),
-    Token = binary:part(Stream, EntryOff + 2, TokLen),
-    {Token, EntryOff, EntryLen}.
-
-base_probe_size({Probe, _Stream}) ->
-    byte_size(Probe) div ?FTS_BASE_PROBE_BYTES.
-
-%% Entries whose token is exactly Token, or in [Lo, Hi) for prefixes:
-%% binary search over the probe, then contiguous slices of the stream.
-base_entries_range(Section, Lo, Hi) ->
-    Size = base_probe_size(Section),
-    From = base_leftmost_geq(Section, Lo, 1, Size, none),
-    case From of
-        none ->
-            [];
-        _ ->
-            base_collect(Section, From, Size, Hi, [])
-    end.
-
-base_leftmost_geq(_Section, _Tok, LoI, HiI, Best) when LoI > HiI ->
-    Best;
-base_leftmost_geq(Section, Tok, LoI, HiI, Best) ->
-    Mid = (LoI + HiI) div 2,
-    {MTok, _Off, _Len} = base_probe_row(Section, Mid),
-    case MTok >= Tok of
-        true -> base_leftmost_geq(Section, Tok, LoI, Mid - 1, Mid);
-        false -> base_leftmost_geq(Section, Tok, Mid + 1, HiI, Best)
-    end.
-
-base_collect(_Section, Idx, Size, _Hi, Acc) when Idx > Size ->
-    lists:reverse(Acc);
-base_collect({_Probe, Stream} = Section, Idx, Size, Hi, Acc) ->
-    {Tok, Off, Len} = base_probe_row(Section, Idx),
-    Within =
-        case Hi of
-            none -> true;
-            _ -> Tok < Hi
-        end,
-    case Within of
-        false ->
-            lists:reverse(Acc);
-        true ->
-            <<_:Off/binary, Entry:Len/binary, _/binary>> = Stream,
-            TokLen = byte_size(Tok),
-            <<_:16/unsigned-big, _:TokLen/binary, _ND:32/unsigned-big,
-                FLen:32/unsigned-big, Frames:FLen/binary>> = Entry,
-            base_collect(Section, Idx + 1, Size, Hi, [{Tok, Frames} | Acc])
-    end.
-
-%% Summary payload: <<ConsSeq:64, BloomLen:32, Bloom>>.
-encode_summary(ConsSeq, Bloom) ->
-    <<ConsSeq:64/unsigned-big, (byte_size(Bloom)):32/unsigned-big, Bloom/binary>>.
-
-decode_summary(<<ConsSeq:64/unsigned-big, BLen:32/unsigned-big, Bloom:BLen/binary>>) ->
-    {ConsSeq, Bloom};
-decode_summary(Bad) ->
-    throw({fts_error, {invalid_fts_payload, summary, byte_size(Bad)}}).
-
-%% Heap-merge sorted entry streams into ONE stream (token-sorted,
-%% same-token frames concatenated in run order).
-merge_streams_to_stream(Runs) ->
-    {Heap, Tails} = merge_streams_init(Runs),
-    iolist_to_binary(merge_streams_loop(Heap, Tails, [])).
-
-merge_streams_init(Runs) ->
-    lists:foldl(
-        fun(Run, {H, T}) ->
-            case Run of
-                <<>> ->
-                    {H, T};
-                _ ->
-                    Idx = maps:size(T) + 1,
-                    {Tok, ND, Frames, Tail} = stream_head(Run),
-                    {gb_sets:add({Tok, Idx}, H), T#{Idx => {ND, Frames, Tail}}}
-            end
-        end,
-        {gb_sets:empty(), #{}},
-        Runs
-    ).
-
-stream_head(<<TokLen:16/unsigned-big, Token:TokLen/binary, ND:32/unsigned-big,
-        FLen:32/unsigned-big, Frames:FLen/binary, Tail/binary>>) ->
-    {Token, ND, Frames, Tail};
-stream_head(Bad) ->
-    throw({fts_error, {invalid_fts_payload, stream_head, byte_size(Bad)}}).
-
-merge_streams_loop(Heap, Tails, Acc) ->
-    case gb_sets:is_empty(Heap) of
-        true ->
-            lists:reverse(Acc);
-        false ->
-            {{MinTok, _Idx}, _} = gb_sets:take_smallest(Heap),
-            {ND, FramesIo, Heap1, Tails1} =
-                stream_take_token(Heap, Tails, MinTok, 0, []),
-            Entry =
-                [
-                    <<(byte_size(MinTok)):16/unsigned-big>>,
-                    MinTok,
-                    <<ND:32/unsigned-big, (iolist_size(FramesIo)):32/unsigned-big>>,
-                    FramesIo
-                ],
-            merge_streams_loop(Heap1, Tails1, [Entry | Acc])
-    end.
-
-stream_take_token(Heap0, Tails0, MinTok, NDSum, FramesAcc) ->
-    case gb_sets:is_empty(Heap0) of
-        true ->
-            {NDSum, lists:reverse(FramesAcc), Heap0, Tails0};
-        false ->
-            case gb_sets:smallest(Heap0) of
-                {MinTok, Idx} ->
-                    Heap1 = gb_sets:del_element({MinTok, Idx}, Heap0),
-                    {ND, Frames, Tail} = maps:get(Idx, Tails0),
-                    {Heap2, Tails1} =
-                        case Tail of
-                            <<>> ->
-                                {Heap1, maps:remove(Idx, Tails0)};
-                            _ ->
-                                {Tok2, ND2, F2, T2} = stream_head(Tail),
-                                {gb_sets:add({Tok2, Idx}, Heap1),
-                                    Tails0#{Idx => {ND2, F2, T2}}}
-                        end,
-                    stream_take_token(
-                        Heap2, Tails1, MinTok, NDSum + ND, [Frames | FramesAcc]
-                    );
-                _Other ->
-                    {NDSum, lists:reverse(FramesAcc), Heap0, Tails0}
-            end
-    end.
-
-%% Distinct tokens of an entry stream (for shard blooms).
-stream_tokens(Stream) ->
-    lists:reverse(
-        fold_entries(Stream, fun(Tok, _ND, _F, Acc) -> [Tok | Acc] end, [])
-    ).
-
-%% ============================================================================
-%% Grid read path: shard state (summary + pending deltas) through a
-%% write-through ETS cache under the marker-cache stamp discipline, and
-%% decoded bases through a ConsSeq-validated cache with journal fetches.
-
-query_ctx(FoldSource, Bucket, Schema, Cache, ReturnPositions) ->
-    {_Index, Tag} = Ref = index_ref(Schema),
-    %% reserved base objects live under the STANDARD tag regardless of
-    %% the index tag (per-tag head codecs must never see them).
-    Fetch =
-        case FoldSource of
-            #{fetch := F} ->
-                fun(Key) -> F(Bucket, Key, ?STD_TAG) end;
-            Pid when is_pid(Pid) ->
-                fun(Key) ->
-                    case leveled_bookie:book_get(Pid, Bucket, Key, ?STD_TAG) of
-                        {ok, Value} -> {ok, Value};
-                        not_found -> not_found;
-                        {error, _} -> not_found
-                    end
-                end;
-            _FunOnly ->
-                undefined
-        end,
-    _ = Tag,
-    #{
-        fold => FoldSource,
-        bucket => Bucket,
-        ref => Ref,
-        columns => maps:get(columns, Schema),
-        cache => Cache,
-        return_positions_opt => ReturnPositions,
-        shards => #{},
-        bases => #{},
-        fetch => Fetch
-    }.
-
-shard_state(#{shards := Memo} = Ctx, Shard) when is_map_key(Shard, Memo) ->
-    {Ctx, maps:get(Shard, Memo)};
-shard_state(#{cache := Cache} = Ctx, Shard) ->
-    State =
-        case Cache of
-            {Ets, Seq} ->
-                CKey = {shard, maps:get(bucket, Ctx), maps:get(ref, Ctx), Shard},
-                case ets:lookup(Ets, CKey) of
-                    [{_K, {Stamp, ConsSeq, Bloom, Deltas}}] when Stamp =< Seq ->
-                        #{cons_seq => ConsSeq, bloom => Bloom, deltas => Deltas};
-                    _MissOrNewer ->
-                        Loaded = load_shard_state(Ctx, Shard),
-                        case ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS of
-                            true ->
-                                ets:insert_new(
-                                    Ets,
-                                    {CKey,
-                                        {Seq, maps:get(cons_seq, Loaded),
-                                            maps:get(bloom, Loaded),
-                                            maps:get(deltas, Loaded)}}
-                                );
-                            false ->
-                                ok
-                        end,
-                        Loaded
-                end;
-            undefined ->
-                load_shard_state(Ctx, Shard)
-        end,
-    Memo = maps:get(shards, Ctx),
-    {Ctx#{shards := Memo#{Shard => State}}, State}.
-
-%% One contiguous fold covers the shard's summary and every delta.
-load_shard_state(#{fold := FoldSource, bucket := Bucket, ref := Ref}, Shard) ->
-    {StartTerm, EndTerm} = shard_term_range(Shard),
-    Fold =
-        fun(_B, {Term, _Key, Payload}, {ConsSeq, Bloom, Deltas}) ->
-            case Term of
-                <<_S:16/unsigned-big, 0:8>> ->
-                    {CS, B} = decode_summary(Payload),
-                    {CS, B, Deltas};
-                <<_S:16/unsigned-big, 1:8, Seq:64/unsigned-big>> ->
-                    {ConsSeq, Bloom, [{Seq, Payload} | Deltas]}
-            end
-        end,
-    {ConsSeq, Bloom, DeltasRev} =
-        index_fold(
-            FoldSource,
-            {Bucket, null},
-            {Fold, {0, <<>>, []}},
-            {seg_field(Ref), StartTerm, EndTerm},
-            {payload, undefined}
-        ),
-    Pending = [D || {Seq, _P} = D <- lists:reverse(DeltasRev), Seq > ConsSeq],
-    #{cons_seq => ConsSeq, bloom => Bloom, deltas => Pending}.
-
-%% Decoded base sections, validated against the shard's consolidated
-%% sequence (a stale cached base refetches after consolidation).
-shard_base(#{bases := Memo} = Ctx, Shard, _ConsSeq) when is_map_key(Shard, Memo) ->
-    {Ctx, maps:get(Shard, Memo)};
-shard_base(Ctx, _Shard, 0) ->
-    {Ctx, none};
-shard_base(#{cache := Cache} = Ctx, Shard, ConsSeq) ->
-    Sections =
-        case Cache of
-            {Ets, _Seq} ->
-                CKey = {base, maps:get(bucket, Ctx), maps:get(ref, Ctx), Shard},
-                case ets:lookup(Ets, CKey) of
-                    [{_K, {ConsSeq, Cached}}] ->
-                        Cached;
-                    _MissOrStale ->
-                        Fetched = fetch_shard_base(Ctx, Shard),
-                        case ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS of
-                            true -> ets:insert(Ets, {CKey, {ConsSeq, Fetched}});
-                            false -> ok
-                        end,
-                        Fetched
-                end;
-            undefined ->
-                fetch_shard_base(Ctx, Shard)
-        end,
-    Memo = maps:get(bases, Ctx),
-    {Ctx#{bases := Memo#{Shard => Sections}}, Sections}.
-
-fetch_shard_base(#{fetch := undefined}, _Shard) ->
-    none;
-fetch_shard_base(#{fetch := Fetch, ref := {Index, _Tag}}, Shard) ->
-    case Fetch(base_object_key(Index, Shard)) of
-        not_found -> none;
-        {ok, BaseBin} -> decode_base(BaseBin)
-    end.
-
-%% All postings for a term (or prefix) in one shard neighbourhood:
-%% bloom-gated base entry plus the pending delta streams.
-shard_token_entries(Ctx0, Shard, ColId, Token, Prefix) ->
-    {Ctx1, State} = shard_state(Ctx0, Shard),
-    #{cons_seq := ConsSeq, bloom := Bloom, deltas := Deltas} = State,
-    BaseWanted =
-        case {Prefix, Bloom} of
-            {true, _} -> ConsSeq > 0;
-            {false, <<>>} -> ConsSeq > 0;
-            {false, _} -> bloom_member_at(Bloom, 0, byte_size(Bloom), Token)
-        end,
-    {Ctx2, BaseEntries} =
-        case BaseWanted of
-            false ->
-                {Ctx1, []};
-            true ->
-                {CtxB, Sections} = shard_base(Ctx1, Shard, ConsSeq),
-                case Sections of
-                    none ->
-                        {CtxB, []};
-                    _ ->
-                        case maps:get(ColId, Sections, undefined) of
-                            undefined ->
-                                {CtxB, []};
-                            Section ->
-                                Hi =
-                                    case Prefix of
-                                        false -> <<Token/binary, 0>>;
-                                        true -> prefix_upper(Token)
-                                    end,
-                                {CtxB, base_entries_range(Section, Token, Hi)}
-                        end
-                end
-        end,
-    DeltaEntries =
-        lists:append([
-            delta_token_entries(DeltaBin, ColId, Token, Prefix)
-         || {_Seq, DeltaBin} <- Deltas
-        ]),
-    {Ctx2, BaseEntries ++ DeltaEntries}.
-
-prefix_upper(Prefix) ->
-    case next_prefix(Prefix) of
-        {ok, Next} -> Next;
-        none -> none
-    end.
-
-delta_token_entries(DeltaBin, ColId, Token, Prefix) ->
-    case lists:keyfind(ColId, 1, decode_delta(DeltaBin)) of
-        false ->
-            [];
-        {ColId, Stream} ->
-            fold_entries(
-                Stream,
-                fun(Tok, _ND, Frames, Acc) ->
-                    Match =
-                        case Prefix of
-                            false -> Tok =:= Token;
-                            true -> binary_prefix(Tok, Token)
-                        end,
-                    case Match of
-                        true -> [{Tok, Frames} | Acc];
-                        false -> Acc
-                    end
-                end,
-                []
-            )
-    end.
-
-%% ============================================================================
-%% Consolidation (docs/FTS.md "Consolidation"): fold a shard's pending
-%% deltas into its base. Everything superseded is collected by native
-%% machinery — the journal compactor reclaims the old base value, the
-%% LSM merge collects the replaced summary and the removed delta rows.
-
-%% Shards with pending deltas, from one fold over the whole field range.
-consolidate_plan(FoldSource, Bucket, Ref) ->
-    Fold =
-        fun(_B, {Term, _Key}, Acc) ->
-            case Term of
-                <<_Shard:16/unsigned-big, 0:8>> ->
-                    Acc;
-                <<Shard:16/unsigned-big, 1:8, _Seq:64/unsigned-big>> ->
-                    sets:add_element(Shard, Acc)
-            end
-        end,
-    Shards =
-        index_fold(
-            FoldSource,
-            {Bucket, null},
-            {Fold, sets:new()},
-            {seg_field(Ref), summary_term(0),
-                <<(?FTS_SHARDS - 1):16/unsigned-big, 1:8,
-                    16#FFFFFFFFFFFFFFFF:64/unsigned-big>>},
-            {true, undefined}
-        ),
-    lists:sort(sets:to_list(Shards)).
-
-%% Derive one shard's consolidated state: merge base and pending delta
-%% streams, drop dead frames against the markers (the liveness join),
-%% and return the new base, summary, and consumed delta sequences.
-consolidate_shard(FoldSource, Bucket, Schema, Cache, Shard) ->
-    Ctx0 = query_ctx(FoldSource, Bucket, Schema, Cache, false),
-    State = load_shard_state(Ctx0, Shard),
-    #{deltas := Deltas} = State,
-    case Deltas of
-        [] ->
-            noop;
-        _ ->
-            {Ctx1, Sections0} =
-                shard_base(
-                    Ctx0#{shards := #{Shard => State}},
-                    Shard,
-                    maps:get(cons_seq, State)
-                ),
-            BaseCols =
-                case Sections0 of
-                    none ->
-                        #{};
-                    _ ->
-                        maps:map(fun(_C, {_Probe, Stream}) -> Stream end, Sections0)
-                end,
-            DeltaCols =
-                lists:foldl(
-                    fun({_Seq, DeltaBin}, Acc) ->
-                        lists:foldl(
-                            fun({ColId, Stream}, A) ->
-                                maps:update_with(
-                                    ColId, fun(L) -> [Stream | L] end, [Stream], A
-                                )
-                            end,
-                            Acc,
-                            decode_delta(DeltaBin)
-                        )
-                    end,
-                    #{},
-                    Deltas
-                ),
-            ColIds = lists:usort(maps:keys(BaseCols) ++ maps:keys(DeltaCols)),
-            Merged =
-                [
-                    {ColId,
-                        merge_streams_to_stream(
-                            case maps:get(ColId, BaseCols, undefined) of
-                                undefined -> [];
-                                B -> [B]
-                            end ++ lists:reverse(maps:get(ColId, DeltaCols, []))
-                        )}
-                 || ColId <- ColIds
-                ],
-            Keys = lists:usort(stream_keys([St || {_C, St} <- Merged])),
-            {_Ctx2, Markers} = load_markers(Ctx1, Keys),
-            Filtered =
-                [
-                    {ColId, filter_stream_frames(Stream, Markers)}
-                 || {ColId, Stream} <- Merged
-                ],
-            Live = [CS || {_C, St} = CS <- Filtered, St =/= <<>>],
-            Tokens =
-                lists:usort(lists:append([stream_tokens(St) || {_C, St} <- Live])),
-            NewConsSeq = lists:max([Seq || {Seq, _P} <- Deltas]),
-            {ok, #{
-                shard => Shard,
-                base => encode_base(Live),
-                summary => encode_summary(NewConsSeq, page_bloom(Tokens)),
-                cons_seq => NewConsSeq,
-                consumed => [Seq || {Seq, _P} <- Deltas]
-            }}
-    end.
-
-stream_keys(Streams) ->
-    lists:append([
-        fold_entries(
-            Stream,
-            fun(_Tok, _ND, Frames, Acc) -> frame_keys(Frames, Acc) end,
-            []
-        )
-     || Stream <- Streams
-    ]).
-
-frame_keys(<<>>, Acc) ->
-    Acc;
-frame_keys(
-    <<_Seq:64/unsigned-big, KeyLen:16/unsigned-big, Key:KeyLen/binary,
-        PosLen:16/unsigned-big, _P:PosLen/binary, Rest/binary>>,
-    Acc
-) ->
-    frame_keys(Rest, [Key | Acc]);
-frame_keys(Bad, Acc) ->
-    throw({fts_error, {invalid_fts_payload, frame_keys, length(Acc), byte_size(Bad)}}).
-
-%% Rewrite a stream keeping only frames whose stamp matches the doc's
-%% marker; entries left empty disappear.
-filter_stream_frames(Stream, Markers) ->
-    iolist_to_binary(
-        lists:reverse(
-            fold_entries(
-                Stream,
-                fun(Tok, _ND, Frames, Acc) ->
-                    {Kept, KeptBin} = live_frames(Frames, Markers, 0, <<>>),
-                    case Kept of
-                        0 -> Acc;
-                        _ -> [encode_entry(Tok, Kept, KeptBin) | Acc]
-                    end
-                end,
-                []
-            )
-        )
-    ).
-
-live_frames(<<>>, _Markers, Kept, Acc) ->
-    {Kept, Acc};
-live_frames(
-    <<Seq:64/unsigned-big, KeyLen:16/unsigned-big, Key:KeyLen/binary,
-        PosLen:16/unsigned-big, _PosBin:PosLen/binary, _/binary>> = Bin,
-    Markers,
-    Kept,
-    Acc
-) ->
-    FrameLen = 8 + 2 + KeyLen + 2 + PosLen,
-    <<Frame:FrameLen/binary, Rest/binary>> = Bin,
-    Live =
-        case maps:get(Key, Markers, undefined) of
-            {Seq, _DocLength} -> true;
-            _DeadOrMissing -> false
-        end,
-    case Live of
-        true ->
-            live_frames(Rest, Markers, Kept + 1, <<Acc/binary, Frame/binary>>);
-        false ->
-            live_frames(Rest, Markers, Kept, Acc)
-    end;
-live_frames(Bad, _Markers, Kept, _Acc) ->
-    throw({fts_error, {invalid_fts_payload, live_frames, Kept, byte_size(Bad)}}).
-
-%% ===================== restored evaluation engine =====================
-
-%% Marker liveness loads go through a write-through ETS cache: the
-%% bookie replaces entries authoritatively on every FTS write (stamped
-%% with the write sequence), queries fill cold entries with insert_new
-%% stamped at their own sequence, and a query only trusts an entry whose
-%% stamp is at or before its snapshot sequence — anything newer falls
-%% back to the fold for that key. Without the cache every candidate list
-%% larger than the seek cap degenerated into a marker range scan of the
-%% whole corpus (51ms for a 686-hit term at the 1GB gate rung).
-load_markers(#{cache := {Ets, Seq}} = Ctx, Keys) ->
-    {Cached, Missing} =
-        lists:foldl(
-            fun(Key, {CachedAcc, MissingAcc}) ->
-                case ets:lookup(Ets, marker_key(Ctx, Key)) of
-                    [{_K, {Stamp, Value}}] when Stamp =< Seq ->
-                        case Value of
-                            not_found -> {CachedAcc, MissingAcc};
-                            Marker -> {CachedAcc#{Key => Marker}, MissingAcc}
-                        end;
-                    _MissingOrNewer ->
-                        {CachedAcc, [Key | MissingAcc]}
-                end
-            end,
-            {#{}, []},
-            Keys
-        ),
-    case Missing of
-        [] ->
-            {Ctx, Cached};
-        _ ->
-            {Ctx1, Loaded} = load_markers_uncached(Ctx, Missing),
-            Cacheable = ets:info(Ets, memory) < ?FTS_CACHE_MAX_WORDS,
-            case Cacheable of
-                true ->
-                    lists:foreach(
-                        fun(Key) ->
-                            Value = maps:get(Key, Loaded, not_found),
-                            ets:insert_new(
-                                Ets, {marker_key(Ctx, Key), {Seq, Value}}
-                            )
-                        end,
-                        Missing
-                    );
-                false ->
-                    ok
-            end,
-            {Ctx1, maps:merge(Cached, Loaded)}
-    end;
-load_markers(Ctx, Keys) ->
-    load_markers_uncached(Ctx, Keys).
-
-marker_key(#{bucket := Bucket, ref := Ref}, Key) ->
-    {marker, Bucket, Ref, Key}.
-
-load_markers_uncached(#{fold := FoldSource, bucket := Bucket, ref := Ref} = Ctx, Keys) ->
-    Field = doc_field(Ref),
-    Markers =
-        case length(Keys) =< ?FTS_MARKER_SEEK_MAX of
-            true ->
-                lists:foldl(
-                    fun(Key, Acc) ->
-                        case seek_marker(FoldSource, Bucket, Field, Key) of
-                            {ok, BatchSeq, DocLength} ->
-                                Acc#{Key => {BatchSeq, DocLength}};
-                            not_found ->
-                                Acc
-                        end
-                    end,
-                    #{},
-                    Keys
-                );
-            false ->
-                Sorted = lists:sort(Keys),
-                MinKey = hd(Sorted),
-                MaxKey = lists:last(Sorted),
-                KeySet = sets:from_list(Keys),
-                Fold =
-                    fun(_B, {_Term, Key, Payload}, Acc) ->
-                        case Key > MaxKey of
-                            true ->
-                                throw({fts_fold_stop, Acc});
-                            false ->
-                                case sets:is_element(Key, KeySet) of
-                                    true ->
-                                        case decode_marker(Payload) of
-                                            {ok, BatchSeq, DocLength} ->
-                                                Acc#{Key => {BatchSeq, DocLength}};
-                                            error ->
-                                                Acc
-                                        end;
-                                    false ->
-                                        Acc
-                                end
-                        end
-                    end,
-                try
-                    index_fold(
-                        FoldSource,
-                        {Bucket, MinKey},
-                        {Fold, #{}},
-                        {Field, doc, doc},
-                        {payload, undefined}
-                    )
-                catch
-                    throw:{fts_fold_stop, Acc} -> Acc
-                end
-        end,
-    {Ctx, Markers}.
-
-seek_marker(FoldSource, Bucket, Field, Key) ->
-    Fold =
-        fun(_B, {_Term, Key0, Payload}, _Acc) ->
-            throw({fts_fold_stop, {Key0, Payload}})
-        end,
-    Found =
-        try
-            index_fold(
-                FoldSource,
-                {Bucket, Key},
-                {Fold, not_found},
-                {Field, doc, doc},
-                {payload, undefined}
-            )
-        catch
-            throw:{fts_fold_stop, KeyPayload} -> KeyPayload
-        end,
-    case Found of
-        {Key, Payload} ->
-            case decode_marker(Payload) of
-                {ok, BatchSeq, DocLength} -> {ok, BatchSeq, DocLength};
-                error -> not_found
-            end;
-        _Other ->
-            not_found
-    end.
-
-index_fold(#{fold := FoldFun}, BucketKey, FoldAccT, Range, TermHandling) ->
-    FoldFun(BucketKey, FoldAccT, Range, TermHandling);
-index_fold(FoldFun, BucketKey, FoldAccT, Range, TermHandling) when is_function(FoldFun, 4) ->
-    FoldFun(BucketKey, FoldAccT, Range, TermHandling);
-index_fold(Pid, BucketKey, FoldAccT, Range, TermHandling) when is_pid(Pid) ->
-    {async, Runner} =
-        leveled_bookie:book_indexfold(
-            Pid, BucketKey, FoldAccT, Range, TermHandling
-        ),
-    Runner().
-
-empty_meta(Index, Key, DocLength) ->
-    #{
-        version => ?VERSION,
-        kind => fts_doc,
-        key => Key,
-        index => Index,
-        doc_length => DocLength,
-        positions => #{}
-    }.
-
-evaluate_payload_candidates(Index, AST, Opts, Metas) ->
-    try
-        Hits =
-            lists:foldl(
-                fun
-                    ({_Key, #{version := ?VERSION, index := MetaIndex} = Meta}, Acc) when
-                        MetaIndex =:= Index
-                    ->
-                        case eval(AST, Meta) of
-                            {true, Positions} ->
-                                case public_hit(Meta, Positions, Opts) of
-                                    {ok, Hit} -> [Hit | Acc];
-                                    {error, Reason} -> throw({fts_error, Reason})
-                                end;
-                            false ->
-                                Acc
-                        end;
-                    (_Other, Acc) ->
-                        Acc
-                end,
-                [],
-                maps:to_list(Metas)
-            ),
-        Sorted = lists:sort(fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end, Hits),
-        {ok, hit_list_result(Sorted, Opts)}
-    catch
-        throw:{fts_error, Reason} -> {error, Reason}
-    end.
-
-evaluate_ranked_candidates(Index, EvalAST, Leaves, Opts, Metas, Np0, {DocCount, TotalLen}) ->
-    MetaList =
-        [
-            Meta
-         || {_Key, #{version := ?VERSION, index := MetaIndex} = Meta} <-
-                maps:to_list(Metas),
-            MetaIndex =:= Index
-        ],
-    Np =
-        case Np0 of
-            positional -> np_map(Leaves, MetaList);
-            _ -> Np0
-        end,
-    AvgDl =
-        case DocCount of
-            0 -> 0.0;
-            _ -> TotalLen / DocCount
-        end,
-    try
-        Hits =
-            lists:foldl(
-                fun(Meta, Acc) ->
-                    case eval(EvalAST, Meta) of
-                        {true, Positions} ->
-                            Score = bm25_score(Meta, Leaves, Np, DocCount, AvgDl),
-                            case public_hit(Meta, Positions, Opts) of
-                                {ok, Hit} ->
-                                    [Hit#{rank => -Score, score => Score} | Acc];
-                                {error, Reason} ->
-                                    throw({fts_error, Reason})
-                            end;
-                        false ->
-                            Acc
-                    end
-                end,
-                [],
-                MetaList
-            ),
-        Sorted =
-            lists:sort(
-                fun(A, B) ->
-                    {maps:get(rank, A), maps:get(key, A)} =<
-                        {maps:get(rank, B), maps:get(key, B)}
-                end,
-                Hits
-            ),
-        {ok, hit_list_result(Sorted, Opts)}
-    catch
-        throw:{fts_error, Reason} -> {error, Reason}
-    end.
-
-%% The scoring phrases of a query: term and phrase leaves in match
-%% position — both AND/OR branches, NEAR members individually (FTS5
-%% scores each phrase of a NEAR group), and only the LEFT side of NOT.
-%% Duplicates are preserved: a term written twice in the query scores
-%% twice, as in FTS5. NEAR members keep their group context: FTS5 trims
-%% each member's position list to the instances that participate in a
-%% NEAR-satisfying configuration before counting tf (while df stays the
-%% member's standalone document frequency) — see the NEAR scoring
-%% dissection in docs/fts_sqlite_gate.md.
 scoring_phrases({term, _Token, _Prefix, _Cols} = Leaf) -> [Leaf];
 scoring_phrases({phrase, _Specs, _Cols} = Leaf) -> [Leaf];
 scoring_phrases({near, Items, Distance, Cols}) ->
@@ -3679,11 +2066,27 @@ scoring_phrases({'not', A, _B}) -> scoring_phrases(A);
 scoring_phrases(_Other) -> [].
 
 leaf_tf(Meta, {term, Token, Prefix, Cols}) ->
-    length(term_positions(Meta, Token, Prefix, Cols));
+    client_term_frequency(Meta, Token, Prefix, Cols);
 leaf_tf(Meta, {phrase, Specs, Cols}) ->
     length(phrase_match_positions(Meta, Specs, Cols));
 leaf_tf(Meta, {near_member, Index, Items, Distance, Cols}) ->
     near_member_tf(Meta, Items, Index, Distance, Cols, filtered).
+
+%% New client postings persist uncapped occurrence counts separately from the
+%% capped positional payload.  Old in-memory metas (used only by legacy private
+%% helpers retained below) have no counts and retain their former behaviour.
+client_term_frequency(#{counts := Counts}, Token, Prefix, Cols) ->
+    lists:sum([
+        lists:sum([
+            Count
+         || {StoredToken, Count} <- maps:to_list(maps:get(Column, Counts, #{})),
+            (Prefix andalso binary_prefix(StoredToken, Token)) orelse
+                (not Prefix andalso StoredToken =:= Token)
+        ])
+     || Column <- concrete_columns(Cols)
+    ]);
+client_term_frequency(Meta, Token, Prefix, Cols) ->
+    length(term_positions(Meta, Token, Prefix, Cols)).
 
 %% Document frequency counts for a leaf use the member's STANDALONE
 %% matches (FTS5's xQueryPhrase runs each phrase alone for nHit), while
@@ -3720,83 +2123,6 @@ near_member_column_spans(Meta, Items, Index, _Member, Distance, Column, filtered
                     ]
             end
     end.
-
-%% A scoring leaf has a keys-only exact document frequency when it is a
-%% plain term (or a NEAR member that is a plain term): df is then the
-%% count of live documents carrying the token, which needs page keys and
-%% cached markers but no positions. Phrase leaves need positional df
-%% (FTS5's xQueryPhrase counts docs matching the phrase).
-ranked_fast_df(Leaves) ->
-    lists:all(
-        fun
-            ({term, _T, _P, _C}) -> true;
-            ({near_member, Index, Items, _D, _C}) ->
-                case lists:nth(Index, Items) of
-                    {term, _T2, _P2, _C2} -> true;
-                    _Positional -> false
-                end;
-            (_Positional) -> false
-        end,
-        Leaves
-    ).
-
-%% Exact per-leaf document frequencies without positions: one keys-only
-%% load per unique scoring term, liveness through the marker cache, and
-%% the result cached per write sequence alongside stats (df is immutable
-%% per sequence).
-fast_np_map(FoldSource, Bucket, Schema, Cache, Leaves) ->
-    Ctx = query_ctx(FoldSource, Bucket, Schema, Cache, false),
-    {_Ctx1, Np} =
-        lists:foldl(
-            fun(Leaf, {CtxA, Acc}) ->
-                case maps:is_key(Leaf, Acc) of
-                    true ->
-                        {CtxA, Acc};
-                    false ->
-                        {CtxB, N} = leaf_df(CtxA, df_leaf_term(Leaf)),
-                        {CtxB, Acc#{Leaf => N}}
-                end
-            end,
-            {Ctx, #{}},
-            Leaves
-        ),
-    Np.
-
-df_leaf_term({term, _T, _P, _C} = Leaf) ->
-    Leaf;
-df_leaf_term({near_member, Index, Items, _D, GroupCols}) ->
-    %% restrict_ast_columns passes `all` through and intersects lists;
-    %% {empty} cannot arise here (parse rejects empty column sets).
-    restrict_ast_columns(lists:nth(Index, Items), GroupCols).
-
-leaf_df(#{bucket := Bucket, ref := Ref, cache := Cache} = Ctx, {term, Token, Prefix, Cols}) ->
-    DfKey = {df, Bucket, Ref, {Token, Prefix, Cols}},
-    case Cache of
-        {Ets, Seq} ->
-            case ets:lookup(Ets, DfKey) of
-                [{_K, {Seq, N}}] ->
-                    {Ctx, N};
-                _MissOrStale ->
-                    {Ctx1, N} = compute_leaf_df(Ctx, Token, Prefix, Cols),
-                    ets:insert(Ets, {DfKey, {Seq, N}}),
-                    {Ctx1, N}
-            end;
-        undefined ->
-            compute_leaf_df(Ctx, Token, Prefix, Cols)
-    end.
-
-compute_leaf_df(#{ref := Ref} = Ctx, Token, Prefix, Cols) ->
-    {Ctx1, Raw} =
-        lists:foldl(
-            fun(Col, {CtxA, RawA}) ->
-                load_term(CtxA, Col, Token, Prefix, all, false, RawA)
-            end,
-            {Ctx, #{}},
-            concrete_columns(Cols)
-        ),
-    {Ctx2, Markers} = load_markers(Ctx1, maps:keys(Raw)),
-    Live = build_metas(Raw, Markers, Ref),
-    {Ctx2, maps:size(Live)}.
 
 np_map(Leaves, MetaList) ->
     lists:foldl(
@@ -3845,112 +2171,7 @@ bm25_score(Meta, Leaves, Np, DocCount, AvgDl) ->
         Leaves
     ).
 
-%% Live corpus stats (document count and total token count) from the doc
-%% markers. Exact incremental maintenance is impossible under blind
-%% writes (an update or delete cannot adjust N/TotalLen without the
-%% superseded marker, which only an LSM fold resolves), so the fold is
-%% the exact mechanism. The entry lives under a stable key stamped with
-%% the write sequence it was computed at; a ranked query may accept a
-%% stamp up to stats_staleness sequences behind its own (default 0 =
-%% exact per sequence). With a window, ranked queries on write-heavy
-%% stores skip the O(N) refold between nearby writes at a bounded,
-%% documented score staleness — BM25 corpus stats move slowly, exact
-%% scores return as soon as the window is exceeded or writes pause.
-corpus_stats(FoldSource, Bucket, Schema, Cache, Staleness) ->
-    Ref = index_ref(Schema),
-    case Cache of
-        {Ets, Seq} ->
-            StatsKey = {stats, Bucket, Ref},
-            case ets:lookup(Ets, StatsKey) of
-                [{_K, {Stamp, Stats}}] when Stamp =< Seq, Seq - Stamp =< Staleness ->
-                    Stats;
-                _MissingOrOutsideWindow ->
-                    Stats = compute_corpus_stats(FoldSource, Bucket, Ref),
-                    ets:insert(Ets, {StatsKey, {Seq, Stats}}),
-                    Stats
-            end;
-        undefined ->
-            compute_corpus_stats(FoldSource, Bucket, Ref)
-    end.
-
-compute_corpus_stats(FoldSource, Bucket, Ref) ->
-    Fold =
-        fun(_B, {_Term, _Key, Payload}, {N, L} = Acc) ->
-            case decode_marker(Payload) of
-                {ok, _BatchSeq, DocLength} -> {N + 1, L + DocLength};
-                error -> Acc
-            end
-        end,
-    index_fold(
-        FoldSource,
-        {Bucket, null},
-        {Fold, {0, 0}},
-        {doc_field(Ref), doc, doc},
-        {payload, undefined}
-    ).
-
-query_terms({empty}, _Columns) ->
-    [];
-query_terms({all_docs}, _Columns) ->
-    [];
-query_terms({term, Token, Prefix, Columns}, _SearchColumns) ->
-    [{Column, Token, Prefix} || Column <- concrete_columns(Columns)];
-query_terms({phrase, Specs, Columns}, _SearchColumns) ->
-    lists:usort([
-        {Column, Token, Prefix}
-     || Column <- concrete_columns(Columns),
-        {Token, Prefix, _Offset} <- Specs
-    ]);
-query_terms({near, Items, _Distance, Columns}, SearchColumns) ->
-    lists:usort(lists:append([query_terms(restrict_ast_columns(Item, Columns), SearchColumns)
-        || Item <- Items]));
-query_terms({anchor, AST}, Columns) ->
-    query_terms(AST, Columns);
-query_terms({'and', A, B}, Columns) ->
-    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns));
-query_terms({'or', A, B}, Columns) ->
-    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns));
-query_terms({'not', A, B}, Columns) ->
-    lists:usort(query_terms(A, Columns) ++ query_terms(B, Columns)).
-
-%% Marker, directory, and page codecs for the packed posting representation.
-encode_marker(BatchSeq, DocLength) ->
-    <<BatchSeq:64/unsigned-big, DocLength:32/unsigned-big>>.
-
-decode_marker(<<BatchSeq:64/unsigned-big, DocLength:32/unsigned-big>>) ->
-    {ok, BatchSeq, DocLength};
-decode_marker(_Payload) ->
-    error.
-
-%% Positions are supplied already ascending (see group_positions/1), so no
-%% sort; deltas are appended directly onto the accumulator binary.
-%%
-%% Frames carry the positions binary behind a 16-bit length
-%% (encode_frame), so a document's per-token positions are capped at the
-%% largest varint-delta prefix that fits ?MAX_POSITIONS_BYTES. Without
-%% the cap, byte_size(PosBin):16 wrapped modulo 2^16 for tokens with
-%% tens of thousands of occurrences in one document (dense deltas are 1
-%% byte each), silently desynchronising the frame walk at rest: queries
-%% for THAT token and any full-stream walk (consolidation, count_frames)
-%% then failed with invalid_fts_payload while other tokens kept working.
-%% Dropping trailing occurrences loses nothing for term matching, doc
-%% counts, or ranking (tf saturates); phrase/NEAR matching ignores
-%% occurrences beyond the cap. The guard stops BEFORE an append, so the
-%% final binary is bounded by the cap plus one worst-case varint
-%% (10 bytes for a 64-bit delta): 65525 + 10 = 65535, the 16-bit max.
 -define(MAX_POSITIONS_BYTES, 65525).
-
-encode_positions(Positions) ->
-    encode_positions(Positions, 0, <<>>).
-
-encode_positions([], _Last, Acc) ->
-    Acc;
-encode_positions(_Rest, _Last, Acc) when
-    byte_size(Acc) >= ?MAX_POSITIONS_BYTES
-->
-    Acc;
-encode_positions([Pos | Rest], Last, Acc) ->
-    encode_positions(Rest, Pos, varint_append(Pos - Last, Acc)).
 
 decode_positions(<<>>, _Last, Acc) ->
     {ok, lists:reverse(Acc)};
@@ -3979,23 +2200,6 @@ decode_varint(<<Byte:8, Rest/binary>>, Shift, Acc) when Shift =< 63 ->
     end;
 decode_varint(_Bin, _Shift, _Acc) ->
     error.
-
-public_hit(Meta, Positions, Opts) ->
-    Base = #{
-        key => maps:get(key, Meta),
-        rank => 0.0,
-        score => 0.0,
-        doc_length => maps:get(doc_length, Meta, 0)
-    },
-    case maps:get(return_positions, Opts, false) of
-        true ->
-            case position_count(Positions) =< ?MAX_RETURN_POSITIONS of
-                true -> {ok, Base#{positions => Positions}};
-                false -> {error, fts_query_positions_limit_exceeded}
-            end;
-        false ->
-            {ok, Base}
-    end.
 
 position_count(Value) when is_map(Value) ->
     lists:sum([position_count(V) || {_K, V} <- maps:to_list(Value)]);
@@ -4187,3 +2391,91 @@ phrase_column_match_spans(Meta, [{FirstToken, FirstPrefix, FirstOffset} | Rest] 
 phrase_last_offset(Specs) ->
     lists:max([Offset || {_Token, _Prefix, Offset} <- Specs]).
 
+-ifdef(TEST).
+
+client_codec_and_capacity_test() ->
+    Posting = #{0 => #{<<"alpha">> => #{count => 70000,
+        positions => lists:seq(0, 69999)}}},
+    Encoded = client_encode_posting(Posting),
+    Decoded = client_decode_posting(Encoded),
+    #{0 := #{<<"alpha">> := #{count := 70000, positions := Capped}}} = Decoded,
+    ?assert(length(Capped) < 70000),
+    ?assertEqual(70000, maps:get(count, maps:get(<<"alpha">>, maps:get(0, Decoded)))),
+    Columns255 = [integer_to_binary(I) || I <- lists:seq(1, 255)],
+    ?assertMatch({ok, _}, schema(#{index => <<"cap255">>, columns => Columns255})),
+    Columns256 = [integer_to_binary(I) || I <- lists:seq(1, 256)],
+    ?assertMatch({error, {fts_capacity_exceeded, columns, 256, 255}},
+        schema(#{index => <<"cap256">>, columns => Columns256})),
+    ?assertError({fts_capacity_exceeded, column_id, 255, 254},
+        client_encode_posting(#{255 => #{<<"x">> => #{count => 1, positions => [0]}}})).
+
+derive_remove_update_shape_test() ->
+    {ok, Schema} = schema(#{index => <<"shape-unit">>, columns => [body]}),
+    {ok, Specs} = derive(Schema, <<"doc">>, #{body => <<"alpha beta">>}),
+    ?assert(lists:any(fun
+        ({add, <<"shape-unit">>, <<_Shard:16>>, <<"d:doc">>, _}) -> true;
+        (_) -> false
+    end, Specs)),
+    {add, <<"shape-unit">>, <<"doc">>, <<"doc">>, Manifest} =
+        lists:keyfind(<<"doc">>, 3, Specs),
+    Removes = remove(Schema, <<"doc">>, Manifest),
+    ?assert(lists:member({remove, <<"shape-unit">>, <<"doc">>, <<"doc">>, <<>>},
+        Removes)),
+    {ok, Updated} = update(Schema, <<"doc">>, #{body => <<"gamma">>}, Manifest),
+    Ids = [{B, K, SK} || {_, B, K, SK, _} <- Updated],
+    ?assertEqual(length(Ids), length(lists:usort(Ids))).
+
+cache_admission_test_() ->
+    {timeout, 60, fun cache_admission_tester/0}.
+
+cache_admission_tester() ->
+    client_with_test_bookie(fun(Bookie) ->
+        {ok, Schema} = schema(#{index => <<"cache-unit">>, columns => [body]}),
+        ok = client_test_put(Bookie, Schema, <<"seed">>, <<"common">>),
+        Gate = atomics:new(1, []),
+        Hook = fun(_) ->
+            case atomics:exchange(Gate, 1, 1) of
+                0 -> client_test_put(Bookie, Schema, <<"racer">>, <<"common">>);
+                1 -> ok
+            end
+        end,
+        {ok, Hits} = search(Bookie, Schema, <<"common">>, #{cache_fill_hook => Hook}),
+        ?assertEqual([<<"racer">>, <<"seed">>], [maps:get(key, H) || H <- Hits]),
+        Table = cache_table(Bookie, Schema),
+        ?assertEqual(1, ets:info(Table, size))
+    end).
+
+bm25_true_count_at_cap_test_() ->
+    {timeout, 60, fun bm25_true_count_at_cap_tester/0}.
+
+bm25_true_count_at_cap_tester() ->
+    client_with_test_bookie(fun(Bookie) ->
+        {ok, Schema} = schema(#{index => <<"bm25-cap">>, columns => [body]}),
+        ok = client_test_put(Bookie, Schema, <<"65000">>,
+            binary:copy(<<"hot ">>, 65000)),
+        ok = client_test_put(Bookie, Schema, <<"70000">>,
+            binary:copy(<<"hot ">>, 70000)),
+        {ok, [High, Low]} = search(Bookie, Schema, <<"hot">>, #{rank => bm25}),
+        ?assertEqual(<<"70000">>, maps:get(key, High)),
+        ?assertEqual(<<"65000">>, maps:get(key, Low)),
+        ?assert(maps:get(score, High) > maps:get(score, Low))
+    end).
+
+client_test_put(Bookie, Schema, Key, Text) ->
+    {ok, Specs} = derive(Schema, Key, #{body => Text}),
+    leveled_bookie:book_mput(Bookie, Specs).
+
+client_with_test_bookie(Fun) ->
+    Root = filename:join("/tmp", "leveled_fts_" ++
+        integer_to_list(erlang:unique_integer([positive]))),
+    _ = os:cmd("rm -rf " ++ Root),
+    {ok, Bookie} = leveled_bookie:book_start([{root_path, Root},
+        {compression_method, none}, {ledger_compression, none}]),
+    try Fun(Bookie)
+    after
+        try leveled_bookie:book_destroy(Bookie)
+        catch _:_ -> ok
+        end
+    end.
+
+-endif.
