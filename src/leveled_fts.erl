@@ -41,9 +41,9 @@
 %% Client-library wire format capacities.  These are deliberately exported by
 %% capacities/0 and consumed by schema/1.  Every fixed-width writer below also
 %% checks the same bound immediately before constructing a bit syntax.
--define(POSTING_VERSION, 1).
+-define(POSTING_VERSION, 2).
 -define(BASE_VERSION, 1).
--define(MANIFEST_VERSION, 1).
+-define(MANIFEST_VERSION, 2).
 -define(STATS_VERSION, 1).
 -define(MAX_COLUMNS, 255).
 -define(MAX_COLUMN_ID, 254).
@@ -143,12 +143,19 @@ when is_binary(DocKey), is_binary(Fingerprint) ->
     {ByShard, DocLength} = client_group_postings(ColTerms, Schema),
     Touched = lists:sort(maps:keys(ByShard)),
     Bucket = maps:get(index, Schema),
+    %% content-derived version stamp: pure, idempotent (an identical
+    %% reindex is version-stable), shared by every row of this batch
+    DocVersion =
+        binary:part(
+            erlang:md5(term_to_binary({ByShard, DocLength})), 0, 8
+        ),
     PostingSpecs = [
         {add, Bucket, client_shard_key(Shard), client_doc_subkey(DocKey),
-            client_encode_posting(maps:get(Shard, ByShard))}
+            client_encode_posting({DocVersion, maps:get(Shard, ByShard)})}
      || Shard <- Touched
     ],
-    Manifest = client_encode_manifest(Touched, DocLength, Fingerprint),
+    Manifest =
+        client_encode_manifest(DocVersion, Touched, DocLength, Fingerprint),
     EpochSpecs = [client_epoch_spec(Bucket, Shard) || Shard <- Touched],
     {ok,
         PostingSpecs ++
@@ -241,11 +248,17 @@ client_guard(_What, Value, Max) when is_integer(Value), Value >= 0, Value =< Max
 client_guard(What, Value, Max) ->
     erlang:error({fts_capacity_exceeded, What, Value, Max}).
 
-client_encode_posting(ByColumn) ->
+%% Posting rows carry the DOC VERSION STAMP (docs/FTS.md §2): an 8-byte
+%% content hash shared by every row of one derive batch. The search
+%% merge admits a shard's contribution for a doc ONLY when its stamp
+%% equals the current manifest's stamp, so a multi-shard query can
+%% never assemble postings from two different document versions
+%% (cross-shard read skew) into a false match.
+client_encode_posting({DocVersion, ByColumn}) when byte_size(DocVersion) == 8 ->
     Columns = lists:sort(maps:to_list(ByColumn)),
     client_guard(columns, length(Columns), ?MAX_COLUMNS),
     Body = iolist_to_binary([client_encode_column(C, T) || {C, T} <- Columns]),
-    <<?POSTING_VERSION:8, (length(Columns)):8, Body/binary>>.
+    <<?POSTING_VERSION:8, DocVersion:8/binary, (length(Columns)):8, Body/binary>>.
 
 client_encode_column(ColumnId, ByToken) ->
     client_guard(column_id, ColumnId, ?MAX_COLUMN_ID),
@@ -280,8 +293,10 @@ when is_integer(Position), Position >= Last ->
 client_encode_positions(Bad, _Last, _Acc) ->
     erlang:error({invalid_fts_positions, Bad}).
 
-client_decode_posting(<<?POSTING_VERSION:8, NCols:8, Rest/binary>>) ->
-    client_decode_columns(NCols, Rest, #{});
+client_decode_posting(
+    <<?POSTING_VERSION:8, DocVersion:8/binary, NCols:8, Rest/binary>>
+) ->
+    {DocVersion, client_decode_columns(NCols, Rest, #{})};
 client_decode_posting(Bad) ->
     erlang:error({invalid_fts_posting, Bad}).
 
@@ -307,21 +322,28 @@ client_decode_tokens(N,
 client_decode_tokens(_N, Bad, _Acc) ->
     erlang:error({invalid_fts_posting_tokens, Bad}).
 
-client_encode_manifest(Shards, DocLength, Fingerprint) ->
+client_encode_manifest(DocVersion, Shards, DocLength, Fingerprint) when
+    byte_size(DocVersion) == 8
+->
     client_guard(manifest_shards, length(Shards), ?MAX_U16),
     client_guard(doc_length, DocLength, ?MAX_U64),
     32 = byte_size(Fingerprint),
     ShardBin = iolist_to_binary([client_encode_shard_id(S) || S <- Shards]),
-    <<?MANIFEST_VERSION:8, (length(Shards)):16/unsigned-big,
-        ShardBin/binary, DocLength:64/unsigned-big, Fingerprint/binary>>.
+    <<?MANIFEST_VERSION:8, DocVersion:8/binary,
+        (length(Shards)):16/unsigned-big, ShardBin/binary,
+        DocLength:64/unsigned-big, Fingerprint/binary>>.
 
 client_decode_manifest_value(#{shards := _, doc_length := _, fingerprint := _} = M) -> M;
-client_decode_manifest_value(<<?MANIFEST_VERSION:8, N:16/unsigned-big, Rest/binary>>) ->
+client_decode_manifest_value(
+    <<?MANIFEST_VERSION:8, DocVersion:8/binary, N:16/unsigned-big,
+        Rest/binary>>
+) ->
     ShardBytes = N * 2,
     case Rest of
         <<ShardBin:ShardBytes/binary, DocLength:64/unsigned-big,
             Fingerprint:32/binary>> ->
-            #{shards => [S || <<S:16/unsigned-big>> <= ShardBin],
+            #{version => DocVersion,
+                shards => [S || <<S:16/unsigned-big>> <= ShardBin],
                 doc_length => DocLength, fingerprint => Fingerprint};
         _ -> erlang:error({invalid_fts_manifest, Rest})
     end;
@@ -421,15 +443,33 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
         || Shard <- Shards],
     Raw = lists:foldl(fun client_merge_shard_docs/2, #{}, States),
     Metas = maps:fold(
-        fun(DocKey, Posting, Acc) ->
+        fun(DocKey, ByVersion, Acc) ->
             case leveled_bookie:book_headonly(
                 Bookie, maps:get(index, Schema), <<"doc">>, DocKey
             ) of
                 {ok, ManifestBin} ->
                     Manifest = client_decode_manifest_value(ManifestBin),
-                    case maps:get(fingerprint, Manifest) =:= maps:get(fingerprint, Schema) of
-                        true -> Acc#{DocKey => client_meta(DocKey, Manifest, Posting, Schema)};
-                        false -> Acc
+                    %% admit only the contribution whose version stamp
+                    %% matches the CURRENT manifest: shard states read
+                    %% at different instants can never assemble two
+                    %% document versions into one match
+                    Posting =
+                        maps:get(
+                            maps:get(version, Manifest), ByVersion, none
+                        ),
+                    FpOk =
+                        maps:get(fingerprint, Manifest) =:=
+                            maps:get(fingerprint, Schema),
+                    case FpOk andalso Posting =/= none of
+                        true ->
+                            Acc#{
+                                DocKey =>
+                                    client_meta(
+                                        DocKey, Manifest, Posting, Schema
+                                    )
+                            };
+                        false ->
+                            Acc
                     end;
                 not_found -> Acc
             end
@@ -500,8 +540,13 @@ client_fold_shard_rows(Bookie, Schema, Shard) ->
     {maps:merge(Base, Docs), Keys}.
 
 client_merge_shard_docs(State, Acc) ->
-    maps:fold(fun(Key, Posting, A) ->
-        A#{Key => client_merge_posting(maps:get(Key, A, #{}), Posting)}
+    maps:fold(fun(Key, {DocVersion, Posting}, A) ->
+        ByVersion = maps:get(Key, A, #{}),
+        Merged =
+            client_merge_posting(
+                maps:get(DocVersion, ByVersion, #{}), Posting
+            ),
+        A#{Key => ByVersion#{DocVersion => Merged}}
     end, Acc, State).
 
 client_merge_posting(A, B) ->
@@ -2396,8 +2441,9 @@ phrase_last_offset(Specs) ->
 client_codec_and_capacity_test() ->
     Posting = #{0 => #{<<"alpha">> => #{count => 70000,
         positions => lists:seq(0, 69999)}}},
-    Encoded = client_encode_posting(Posting),
-    Decoded = client_decode_posting(Encoded),
+    V = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    Encoded = client_encode_posting({V, Posting}),
+    {V, Decoded} = client_decode_posting(Encoded),
     #{0 := #{<<"alpha">> := #{count := 70000, positions := Capped}}} = Decoded,
     ?assert(length(Capped) < 70000),
     ?assertEqual(70000, maps:get(count, maps:get(<<"alpha">>, maps:get(0, Decoded)))),
@@ -2407,7 +2453,9 @@ client_codec_and_capacity_test() ->
     ?assertMatch({error, {fts_capacity_exceeded, columns, 256, 255}},
         schema(#{index => <<"cap256">>, columns => Columns256})),
     ?assertError({fts_capacity_exceeded, column_id, 255, 254},
-        client_encode_posting(#{255 => #{<<"x">> => #{count => 1, positions => [0]}}})).
+        client_encode_posting(
+            {<<0:64>>, #{255 => #{<<"x">> => #{count => 1, positions => [0]}}}}
+        )).
 
 derive_remove_update_shape_test() ->
     {ok, Schema} = schema(#{index => <<"shape-unit">>, columns => [body]}),
