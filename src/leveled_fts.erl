@@ -41,7 +41,7 @@
 %% checks the same bound immediately before constructing a bit syntax.
 -define(POSTING_VERSION, 2).
 -define(TAIL_VERSION, 2).
--define(PAGE_VERSION, 4).
+-define(PAGE_VERSION, 5).
 -define(BOOLEAN_PLANE, 0).
 -define(POSITION_PLANE, 1).
 -define(PAGE_DIR_STRIDE, 8).
@@ -614,13 +614,13 @@ client_search_direct_not_store(Bookie, Schema,
                 Bookie, Schema, Negative, Column
             ),
             Source = client_read_boolean_probe_source(
-                Bookie, Schema, Negative, Column, Head
+                Bookie, Schema, Negative, Column, Head, Candidates
             ),
-            maps:filter(
-                fun(DocKey, _VersionLength) ->
-                    not client_probe_boolean_source_member(Source, DocKey)
-                end,
-                Candidates
+            Excluded = client_intersect_boolean_docids(
+                Source, member
+            ),
+            maps:without(
+                maps:keys(Excluded), Candidates
             )
         end,
         PositiveDocs,
@@ -853,36 +853,39 @@ client_direct_binary_near_candidates(Bookie, Schema, Items, Column) ->
     ),
     Candidates = case Ordered of
         [{_Token, not_found} | _] -> #{};
-        [{TokenA, HeadA}, {TokenB, HeadB}] ->
-            {ValuesA, ValuesB} = client_read_two_boolean_values(
-                Bookie, Schema, TokenA, HeadA, TokenB, HeadB, Column
+        [{AnchorToken, AnchorHead} | _] ->
+            %% The rare boolean stream drives NEAR.  Common-token membership
+            %% is checked by the versioned position lookups below, avoiding a
+            %% duplicate pass over the common boolean plane.
+            AnchorPages = client_read_boolean_values_from_head(
+                Bookie, Schema, AnchorToken, Column, all, AnchorHead
             ),
-            client_intersect_boolean_values(ValuesA, ValuesB)
+            client_decode_boolean_compact_filtered(AnchorPages, [])
     end,
     {Candidates, ColumnNHits}.
 
-client_read_two_boolean_values(
-        Bookie, Schema, TokenA, HeadA, TokenB, HeadB, Column) ->
-    Parent = self(),
-    RefA = make_ref(),
-    RefB = make_ref(),
-    spawn(fun() -> Parent ! {RefA, try
-        {ok, client_read_boolean_values_from_head(
-            Bookie, Schema, TokenA, Column, all, HeadA
-        )}
-    catch ClassA:ReasonA:StackA ->
-        {error, ClassA, ReasonA, StackA}
-    end} end),
-    spawn(fun() -> Parent ! {RefB, try
-        {ok, client_read_boolean_values_from_head(
-            Bookie, Schema, TokenB, Column, all, HeadB
-        )}
-    catch ClassB:ReasonB:StackB ->
-        {error, ClassB, ReasonB, StackB}
-    end} end),
-    ValuesA = client_receive_parallel_value(RefA),
-    ValuesB = client_receive_parallel_value(RefB),
-    {ValuesA, ValuesB}.
+client_direct_boolean_candidates(_Bookie, _Schema, _Column, []) -> #{};
+client_direct_boolean_candidates(_Bookie, _Schema, _Column,
+        [{_Token, not_found} | _]) -> #{};
+client_direct_boolean_candidates(Bookie, Schema, Column,
+        [{AnchorToken, AnchorHead} | Rest]) ->
+    AnchorPages = client_read_boolean_values_from_head(
+        Bookie, Schema, AnchorToken, Column, all, AnchorHead
+    ),
+    Candidates = client_decode_boolean_compact_filtered(AnchorPages, []),
+    lists:foldl(
+        fun
+            ({_Token, not_found}, _Acc) -> #{};
+            ({Token, Head}, Acc) when map_size(Acc) > 0 ->
+                Source = client_read_boolean_probe_source(
+                    Bookie, Schema, Token, Column, Head, Acc
+                ),
+                client_intersect_boolean_docids(Source, exact);
+            ({_Token, _Head}, Acc) -> Acc
+        end,
+        Candidates,
+        Rest
+    ).
 
 client_receive_parallel_value(Ref) ->
     receive
@@ -918,24 +921,9 @@ client_search_direct_position_store(Bookie, Schema,
             Candidates = case Ordered of
                 [] -> #{};
                 [{_AnchorToken, not_found} | _] -> #{};
-                [{TokenA, HeadA}, {TokenB, HeadB}] ->
-                    ValuesA = client_read_boolean_values_from_head(
-                        Bookie, Schema, TokenA, Column, all, HeadA
-                    ),
-                    ValuesB = client_read_boolean_values_from_head(
-                        Bookie, Schema, TokenB, Column, all, HeadB
-                    ),
-                    client_intersect_boolean_values(ValuesA, ValuesB);
-                [{AnchorToken, AnchorHead} | RestHeads] ->
-                    AnchorPages = client_read_boolean_values_from_head(
-                        Bookie, Schema, AnchorToken, Column, all, AnchorHead
-                    ),
-                    ProbeSources = [client_read_boolean_probe_source(
-                        Bookie, Schema, Token, Column, Head
-                    ) || {Token, Head} <- RestHeads],
-                    client_decode_boolean_compact_filtered(
-                        AnchorPages, ProbeSources
-                    )
+                _ -> client_direct_boolean_candidates(
+                    Bookie, Schema, Column, Ordered
+                )
             end,
             PositionRows = case map_size(Candidates) of
                 0 -> [];
@@ -1040,66 +1028,6 @@ client_token_global_docs(Bookie, Schema, Token, [Column | Rest]) ->
         );
         {ok, Value} -> client_page_global_docs(Value)
     end.
-
-client_intersect_boolean_values(ValuesA, ValuesB) ->
-    RowsA = lists:merge([client_boolean_directory_rows(Value)
-        || Value <- ValuesA]),
-    RowsB = lists:merge([client_boolean_directory_rows(Value)
-        || Value <- ValuesB]),
-    client_intersect_boolean_rows(RowsA, RowsB, #{}).
-
-client_boolean_directory_rows(
-        <<?PAGE_VERSION:8, ?BOOLEAN_PLANE:8, _PageCount:16/unsigned-big,
-            _TotalDocs:32/unsigned-big, N:32/unsigned-big,
-            DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
-            Directory:DirBytes/binary, _PageDirectory:PageDirBytes/binary,
-            Payload/binary>>) ->
-    [begin
-        <<Hash:32/unsigned-big, Offset:32/unsigned-big>> =
-            binary:part(
-                Directory, Index * ?PAGE_DIR_STRIDE, ?PAGE_DIR_STRIDE
-            ),
-        {Hash, Payload, Offset}
-     end || Index <- lists:seq(0, N - 1)].
-
-client_intersect_boolean_rows([], _RowsB, Acc) -> Acc;
-client_intersect_boolean_rows(_RowsA, [], Acc) -> Acc;
-client_intersect_boolean_rows(
-        [{HashA, _PayloadA, _OffsetA} | RestA] = RowsA,
-        [{HashB, _PayloadB, _OffsetB} | RestB] = RowsB, Acc) ->
-    if
-        HashA < HashB -> client_intersect_boolean_rows(RestA, RowsB, Acc);
-        HashA > HashB -> client_intersect_boolean_rows(RowsA, RestB, Acc);
-        true ->
-            {GroupA, AfterA} = client_take_boolean_hash(HashA, RowsA, []),
-            {GroupB, AfterB} = client_take_boolean_hash(HashB, RowsB, []),
-            Acc1 = lists:foldl(
-                fun({_Hash, PayloadA, OffsetA}, A0) ->
-                    {DocKey, VersionLength} =
-                        client_decode_boolean_compact_entry(PayloadA, OffsetA),
-                    case lists:any(
-                            fun({_OtherHash, PayloadB, OffsetB}) ->
-                                client_decode_boolean_compact_entry(
-                                    PayloadB, OffsetB
-                                ) =:= {DocKey, VersionLength}
-                            end,
-                            GroupB
-                        ) of
-                        true -> A0#{DocKey => VersionLength};
-                        false -> A0
-                    end
-                end,
-                Acc,
-                GroupA
-            ),
-            client_intersect_boolean_rows(AfterA, AfterB, Acc1)
-    end.
-
-client_take_boolean_hash(Hash,
-        [{Hash, _Payload, _Offset} = Row | Rest], Acc) ->
-    client_take_boolean_hash(Hash, Rest, [Row | Acc]);
-client_take_boolean_hash(_Hash, Rest, Acc) ->
-    {Acc, Rest}.
 
 client_direct_position_match(SpanLists, {near, Distance}) ->
     client_direct_near_positions(SpanLists, Distance);
@@ -1229,18 +1157,19 @@ client_read_boolean_values_from_head(Bookie, Schema, Token, Column,
         );
         false -> none
     end,
+    Parallel = case Folded =:= none of
+        true -> client_read_selected_plane_pages(
+            Bookie, Bucket, Key, ?BOOLEAN_PLANE, Column,
+            [PageNo || PageNo <- PageNumbers, PageNo > 0]
+        );
+        false -> #{}
+    end,
     [case PageNo of
         0 -> Value0;
         _ ->
             case Folded of
                 none ->
-                    {ok, Value} = leveled_bookie:book_headonly(
-                        Bookie, Bucket, Key,
-                        client_page_subkey(
-                            ?BOOLEAN_PLANE, Column, PageNo
-                        )
-                    ),
-                    Value;
+                    maps:get(PageNo, Parallel);
                 PageValues -> maps:get(PageNo, PageValues)
             end
      end || PageNo <- PageNumbers].
@@ -1273,19 +1202,29 @@ client_fold_exact_plane_pages(Bookie, Bucket, Key, Plane, Column,
     Runner().
 
 client_read_boolean_probe_source(_Bookie, _Schema, _Token, _Column,
-        not_found) ->
+        not_found, _Candidates) ->
     missing;
 client_read_boolean_probe_source(Bookie, Schema, Token, Column,
-        {ok, Value0} = Head) ->
-    Values = client_read_boolean_values_from_head(
-        Bookie, Schema, Token, Column, all, Head
+        {ok, Value0}, Candidates) ->
+    Bucket = maps:get(index, Schema),
+    Key = client_token_key(Token),
+    {PageNumbers, CandidateGroups} = client_candidate_page_groups(
+        Value0, Candidates
     ),
-    {client_page_boundaries(Value0), list_to_tuple(Values)}.
+    OverflowValues = client_read_selected_plane_pages(
+        Bookie, Bucket, Key, ?BOOLEAN_PLANE, Column,
+        [PageNo || PageNo <- PageNumbers, PageNo > 0]
+    ),
+    Pages = case lists:member(0, PageNumbers) of
+        true -> OverflowValues#{0 => Value0};
+        false -> OverflowValues
+    end,
+    {boolean_pages, CandidateGroups, Pages}.
 
-client_decode_boolean_compact_filtered(Values, ProbeSources) ->
+client_decode_boolean_compact_filtered(Values, _ProbeSources) ->
     lists:foldl(
         fun(Value, Acc) -> client_decode_boolean_filtered_page(
-            Value, ProbeSources, Acc
+            Value, Acc
         ) end,
         #{},
         Values
@@ -1296,85 +1235,138 @@ client_decode_boolean_filtered_page(
             _TotalDocs:32/unsigned-big, N:32/unsigned-big,
             DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
             Directory:DirBytes/binary, _PageDirectory:PageDirBytes/binary,
-            Payload/binary>>, ProbeSources, Acc) ->
+            Payload/binary>>, Acc) ->
     client_decode_boolean_filtered_rows(
-        N, Directory, Payload, ProbeSources, Acc
+        N, Directory, Payload, Acc
     ).
 
-client_decode_boolean_filtered_rows(0, _Directory, _Payload,
-        _ProbeSources, Acc) ->
+client_decode_boolean_filtered_rows(0, _Directory, _Payload, Acc) ->
     Acc;
-client_decode_boolean_filtered_rows(N, Directory, Payload,
-        ProbeSources, Acc) ->
+client_decode_boolean_filtered_rows(N, Directory, Payload, Acc) ->
     Index = N - 1,
     <<_Hash:32/unsigned-big, Offset:32/unsigned-big>> =
         binary:part(Directory, Index * ?PAGE_DIR_STRIDE, ?PAGE_DIR_STRIDE),
     {DocKey, VersionLength} = client_decode_boolean_compact_entry(
         Payload, Offset
     ),
-    Acc1 = case lists:all(
-            fun(Source) -> client_probe_boolean_source(
-                Source, DocKey, VersionLength
-            ) end,
-            ProbeSources
-        ) of
-        true -> Acc#{DocKey => VersionLength};
-        false -> Acc
-    end,
+    Acc1 = Acc#{DocKey => VersionLength},
     client_decode_boolean_filtered_rows(
-        Index, Directory, Payload, ProbeSources, Acc1
+        Index, Directory, Payload, Acc1
     ).
 
-client_probe_boolean_source(missing, _DocKey, _VersionLength) -> false;
-client_probe_boolean_source({Boundaries, Values}, DocKey, VersionLength) ->
-    PageNo = client_page_for_doc(DocKey, Boundaries),
-    client_lookup_boolean_page(
-        element(PageNo + 1, Values), DocKey
-    ) =:= VersionLength.
-
-client_probe_boolean_source_member(missing, _DocKey) -> false;
-client_probe_boolean_source_member({Boundaries, Values}, DocKey) ->
-    PageNo = client_page_for_doc(DocKey, Boundaries),
-    client_lookup_boolean_page(
-        element(PageNo + 1, Values), DocKey
-    ) =/= none.
-
-client_lookup_boolean_page(
-        <<?PAGE_VERSION:8, ?BOOLEAN_PLANE:8, _PageCount:16/unsigned-big,
-            _TotalDocs:32/unsigned-big, N:32/unsigned-big,
-            DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
-            Directory:DirBytes/binary, _PageDirectory:PageDirBytes/binary,
-            Payload/binary>>, DocKey) ->
-    Hash = client_docid_hash(DocKey),
-    Index = client_directory_lower_bound(Directory, Hash, 0, N),
-    client_lookup_boolean_hash(
-        DocKey, Hash, Index, N, Directory, Payload
+client_intersect_boolean_docids(missing, _Mode) -> #{};
+client_intersect_boolean_docids(
+        {boolean_pages, CandidateGroups, Pages}, Mode) ->
+    maps:fold(
+        fun(PageNo, Candidates, Acc) ->
+            <<?PAGE_VERSION:8, ?BOOLEAN_PLANE:8,
+                _PageCount:16/unsigned-big, _TotalDocs:32/unsigned-big,
+                N:32/unsigned-big, DirBytes:32/unsigned-big,
+                PageDirBytes:32/unsigned-big, Directory:DirBytes/binary,
+                _PageDirectory:PageDirBytes/binary, Payload/binary>> =
+                    maps:get(PageNo, Pages),
+            client_intersect_boolean_docids(
+                lists:sort(Candidates), 0, N,
+                Directory, Payload, Mode, Acc
+            )
+        end,
+        #{},
+        CandidateGroups
     ).
 
-client_lookup_boolean_hash(_DocKey, _Hash, Index, N, _Directory, _Payload)
-when Index >= N -> none;
-client_lookup_boolean_hash(DocKey, Hash, Index, N, Directory, Payload) ->
-    <<RowHash:32/unsigned-big, Offset:32/unsigned-big>> =
-        binary:part(Directory, Index * ?PAGE_DIR_STRIDE, ?PAGE_DIR_STRIDE),
-    case RowHash =:= Hash of
-        false -> none;
+client_intersect_boolean_docids([], _Index, _N, _Directory, _Payload,
+        _Mode, Acc) -> Acc;
+client_intersect_boolean_docids(
+        [{DocKey, CandidateVersionLength} | Rest], Index0, N,
+        Directory, Payload, Mode, Acc) ->
+    Index = client_boolean_directory_skip_to(
+        Directory, Payload, DocKey, Index0, N
+    ),
+    {NextIndex, Acc1} = case Index < N of
+        false -> {N, Acc};
         true ->
-            {StoredKey, VersionLength} = client_decode_boolean_compact_entry(
-                Payload, Offset
+            {StoredKey, VersionLength} = client_boolean_directory_doc(
+                Directory, Payload, Index
             ),
-            case StoredKey =:= DocKey of
-                true -> VersionLength;
-                false -> client_lookup_boolean_hash(
-                    DocKey, Hash, Index + 1, N, Directory, Payload
-                )
+            case StoredKey =:= DocKey andalso
+                    (Mode =:= member orelse
+                        VersionLength =:= CandidateVersionLength) of
+                true -> {Index + 1,
+                    Acc#{DocKey => CandidateVersionLength}};
+                false -> {Index, Acc}
             end
+    end,
+    client_intersect_boolean_docids(
+        Rest, NextIndex, N, Directory, Payload, Mode, Acc1
+    ).
+
+client_boolean_directory_skip_to(
+        _Directory, _Payload, _DocKey, Index, N) when Index >= N -> N;
+client_boolean_directory_skip_to(
+        Directory, Payload, DocKey, Index, N) ->
+    StoredKey = client_boolean_directory_key(
+        Directory, Payload, Index
+    ),
+    case StoredKey >= DocKey of
+        true -> Index;
+        false -> client_boolean_directory_skip_expand(
+            Directory, Payload, DocKey, Index + 1, 1, N
+        )
     end.
 
+client_boolean_directory_skip_expand(
+        _Directory, _Payload, _DocKey, Low, _Step, N) when Low >= N -> N;
+client_boolean_directory_skip_expand(
+        Directory, Payload, DocKey, Low, Step, N) ->
+    Probe = erlang:min(Low + Step - 1, N - 1),
+    ProbeKey = client_boolean_directory_key(
+        Directory, Payload, Probe
+    ),
+    case ProbeKey < DocKey of
+        true -> client_boolean_directory_skip_expand(
+            Directory, Payload, DocKey, Probe + 1, Step * 2, N
+        );
+        false -> client_boolean_directory_doc_lower_bound(
+            Directory, Payload, DocKey, Low, Probe + 1
+        )
+    end.
+
+client_boolean_directory_doc_lower_bound(
+        _Directory, _Payload, _DocKey, Lo, Lo) -> Lo;
+client_boolean_directory_doc_lower_bound(
+        Directory, Payload, DocKey, Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    MidKey = client_boolean_directory_key(
+        Directory, Payload, Mid
+    ),
+    case MidKey < DocKey of
+        true -> client_boolean_directory_doc_lower_bound(
+            Directory, Payload, DocKey, Mid + 1, Hi
+        );
+        false -> client_boolean_directory_doc_lower_bound(
+            Directory, Payload, DocKey, Lo, Mid
+        )
+    end.
+
+client_boolean_directory_doc(Directory, Payload, Index) ->
+    DirectoryOffset = Index * ?PAGE_DIR_STRIDE,
+    <<_:DirectoryOffset/binary, _Hash:32/unsigned-big,
+        Offset:32/unsigned-big, _/binary>> = Directory,
+    client_decode_boolean_compact_entry(Payload, Offset).
+
+client_boolean_directory_key(Directory, Payload, Index) ->
+    DirectoryOffset = Index * ?PAGE_DIR_STRIDE,
+    <<_:DirectoryOffset/binary, _Hash:32/unsigned-big,
+        Offset:32/unsigned-big, _/binary>> = Directory,
+    <<_:Offset/binary, _EntryBytes:32/unsigned-big,
+        KeyBytes:16/unsigned-big, DocKey:KeyBytes/binary, _/binary>> = Payload,
+    DocKey.
+
 client_decode_boolean_compact_entry(Payload, Offset) ->
-    <<EntryBytes:32/unsigned-big>> = binary:part(Payload, Offset, 4),
-    <<KeyBytes:16/unsigned-big, DocKey:KeyBytes/binary, Version:8/binary,
-        DocLength:64/unsigned-big, _Count:64/unsigned-big>> =
-        binary:part(Payload, Offset + 4, EntryBytes),
+    <<_:Offset/binary, _EntryBytes:32/unsigned-big,
+        KeyBytes:16/unsigned-big, DocKey:KeyBytes/binary,
+        Version:8/binary, DocLength:64/unsigned-big,
+        _Count:64/unsigned-big, _/binary>> = Payload,
     {DocKey, {Version, DocLength}}.
 
 client_read_direct_position_source(Bookie, Schema, Token, Column, Candidates) ->
@@ -1407,12 +1399,13 @@ client_read_direct_position_binary_source(
         ) of
         not_found -> missing;
         {ok, Value0} ->
-            PageNumbers = client_candidate_page_numbers(
+            {PageNumbers, CandidatePages} = client_candidate_page_map(
                 Value0, Candidates
             ),
             OverflowPages = [PageNo || PageNo <- PageNumbers, PageNo > 0],
-            OverflowValues = client_read_parallel_position_pages(
-                Bookie, Bucket, Key, Column, OverflowPages
+            OverflowValues = client_read_parallel_plane_pages(
+                Bookie, Bucket, Key, ?POSITION_PLANE, Column,
+                OverflowPages
             ),
             Pages = maps:from_list([
                 {PageNo, client_prepare_position_binary_page(case PageNo of
@@ -1421,13 +1414,30 @@ client_read_direct_position_binary_source(
                 end)}
              || PageNo <- PageNumbers
             ]),
-            {binary_positions, client_page_boundaries(Value0), Pages}
+            {binary_positions, CandidatePages, Pages}
     end.
 
-client_read_parallel_position_pages(
-        _Bookie, _Bucket, _Key, _Column, []) -> #{};
-client_read_parallel_position_pages(
-        Bookie, Bucket, Key, Column, PageNumbers) ->
+client_read_selected_plane_pages(
+        _Bookie, _Bucket, _Key, _Plane, _Column, []) -> #{};
+client_read_selected_plane_pages(
+        Bookie, Bucket, Key, Plane, Column, PageNumbers) ->
+    Ordered = lists:sort(PageNumbers),
+    First = hd(Ordered),
+    Last = lists:last(Ordered),
+    case length(Ordered) > 1 andalso
+            Ordered =:= lists:seq(First, Last) of
+        true -> client_fold_exact_plane_pages(
+            Bookie, Bucket, Key, Plane, Column, Ordered
+        );
+        false -> client_read_parallel_plane_pages(
+            Bookie, Bucket, Key, Plane, Column, Ordered
+        )
+    end.
+
+client_read_parallel_plane_pages(
+        _Bookie, _Bucket, _Key, _Plane, _Column, []) -> #{};
+client_read_parallel_plane_pages(
+        Bookie, Bucket, Key, Plane, Column, PageNumbers) ->
     Parent = self(),
     PageRefs = [
         begin
@@ -1436,13 +1446,13 @@ client_read_parallel_position_pages(
                 leveled_bookie:book_headonly(
                     Bookie, Bucket, Key,
                     client_page_subkey(
-                        ?POSITION_PLANE, Column, PageNo
+                        Plane, Column, PageNo
                     )
                 )
             of
                 {ok, Value} -> {ok, Value};
                 not_found -> {error, error,
-                    {missing_fts_position_page, PageNo}, []}
+                    {missing_fts_page, Plane, PageNo}, []}
             catch Class:Reason:Stack ->
                 {error, Class, Reason, Stack}
             end} end),
@@ -1466,13 +1476,15 @@ client_prepare_position_binary_page(
 client_direct_position_binary_lookup(
         missing, _DocKey, _Hash, _Version) -> none;
 client_direct_position_binary_lookup(
-        {binary_positions, Boundaries, Pages}, DocKey, Hash, Version) ->
-    PageNo = client_page_for_doc(DocKey, Boundaries),
-    case maps:find(PageNo, Pages) of
+        {binary_positions, CandidatePages, Pages}, DocKey, Hash, Version) ->
+    case maps:find(DocKey, CandidatePages) of
         error -> none;
-        {ok, Page} -> client_lookup_position_binary_page(
-            Page, DocKey, Hash, Version
-        )
+        {ok, PageNo} -> case maps:find(PageNo, Pages) of
+            error -> none;
+            {ok, Page} -> client_lookup_position_binary_page(
+                Page, DocKey, Hash, Version
+            )
+        end
     end.
 
 client_lookup_position_binary_page(
@@ -1729,10 +1741,50 @@ when map_size(Candidates) =:= 0 ->
     [];
 client_candidate_page_numbers(Value0, Candidates) ->
     Boundaries = client_page_boundaries(Value0),
-    lists:usort([
-        client_page_for_doc(DocKey, Boundaries)
-     || DocKey <- maps:keys(Candidates)
-    ]).
+    lists:usort(lists:filtermap(
+        fun(DocKey) -> case client_page_for_doc(DocKey, Boundaries) of
+            none -> false;
+            PageNo -> {true, PageNo}
+        end end,
+        maps:keys(Candidates)
+    )).
+
+client_candidate_page_map(Value0, Candidates) ->
+    Boundaries = client_page_boundaries(Value0),
+    {Pages, CandidatePages} = maps:fold(
+        fun(DocKey, _CandidateValue, {PageAcc, CandidateAcc}) ->
+            case client_page_for_doc(DocKey, Boundaries) of
+                none -> {PageAcc, CandidateAcc};
+                PageNo -> {
+                    PageAcc#{PageNo => true},
+                    CandidateAcc#{DocKey => PageNo}
+                }
+            end
+        end,
+        {#{}, #{}},
+        Candidates
+    ),
+    {maps:keys(Pages), CandidatePages}.
+
+client_candidate_page_groups(Value0, Candidates) ->
+    Boundaries = client_page_boundaries(Value0),
+    {Pages, CandidateGroups} = maps:fold(
+        fun(DocKey, CandidateValue, {PageAcc, GroupAcc}) ->
+            case client_page_for_doc(DocKey, Boundaries) of
+                none -> {PageAcc, GroupAcc};
+                PageNo -> {
+                    PageAcc#{PageNo => true},
+                    GroupAcc#{PageNo => [
+                        {DocKey, CandidateValue}
+                        | maps:get(PageNo, GroupAcc, [])
+                    ]}
+                }
+            end
+        end,
+        {#{}, #{}},
+        Candidates
+    ),
+    {maps:keys(Pages), CandidateGroups}.
 
 client_page_candidate_groups(Value0, all) ->
     [{PageNo, all}
@@ -1751,9 +1803,13 @@ client_partition_page_candidates(Value0, Candidates) ->
     Boundaries = client_page_boundaries(Value0),
     maps:to_list(maps:fold(
         fun(DocKey, CandidateValue, Acc) ->
-            PageNo = client_page_for_doc(DocKey, Boundaries),
-            PageCandidates = maps:get(PageNo, Acc, #{}),
-            Acc#{PageNo => PageCandidates#{DocKey => CandidateValue}}
+            case client_page_for_doc(DocKey, Boundaries) of
+                none -> Acc;
+                PageNo ->
+                    PageCandidates = maps:get(PageNo, Acc, #{}),
+                    Acc#{PageNo =>
+                        PageCandidates#{DocKey => CandidateValue}}
+            end
         end,
         #{},
         Candidates
@@ -1778,20 +1834,30 @@ client_page_global_docs(
     GlobalDocs.
 
 client_decode_page_boundaries(<<>>, Acc) ->
-    lists:reverse(Acc);
+    list_to_tuple(lists:reverse(Acc));
 client_decode_page_boundaries(
-        <<PageNo:16/unsigned-big, KeyBytes:16/unsigned-big,
-            DocKey:KeyBytes/binary, Rest/binary>>, Acc) ->
-    client_decode_page_boundaries(Rest, [{PageNo, DocKey} | Acc]).
+        <<PageNo:16/unsigned-big, MinBytes:16/unsigned-big,
+            MinDocKey:MinBytes/binary, MaxBytes:16/unsigned-big,
+            MaxDocKey:MaxBytes/binary, Rest/binary>>, Acc) ->
+    client_decode_page_boundaries(
+        Rest, [{PageNo, MinDocKey, MaxDocKey} | Acc]
+    ).
 
 client_page_for_doc(DocKey, Boundaries) ->
-    client_page_for_doc(DocKey, Boundaries, 0).
+    client_page_for_doc(DocKey, Boundaries, 1, tuple_size(Boundaries) + 1).
 
-client_page_for_doc(_DocKey, [], Current) -> Current;
-client_page_for_doc(DocKey, [{PageNo, FirstDocKey} | Rest], Current) ->
-    case FirstDocKey =< DocKey of
-        true -> client_page_for_doc(DocKey, Rest, PageNo);
-        false -> Current
+client_page_for_doc(_DocKey, _Boundaries, Lo, Lo) -> none;
+client_page_for_doc(DocKey, Boundaries, Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    {PageNo, MinDocKey, MaxDocKey} = element(Mid, Boundaries),
+    if
+        DocKey < MinDocKey -> client_page_for_doc(
+            DocKey, Boundaries, Lo, Mid
+        );
+        DocKey > MaxDocKey -> client_page_for_doc(
+            DocKey, Boundaries, Mid + 1, Hi
+        );
+        true -> PageNo
     end.
 
 client_finish_search(Bookie, Schema, AST, Opts, Hook, TokenSpecs, Shards,
@@ -1876,12 +1942,11 @@ client_read_planned_pages(Bookie, Schema, AST, TokenSpecs) ->
     case client_choose_anchor(Bookie, Schema, Required) of
         none ->
             client_read_query_pages(Bookie, Schema, TokenSpecs, all, #{});
-        {Anchor, Heads} ->
+        {Anchor, RequiredRest, Heads} ->
             AnchorStates = client_read_query_pages(
                 Bookie, Schema, [Anchor], all, Heads
             ),
             Candidates0 = client_state_doc_keys(AnchorStates),
-            RequiredRest = lists:delete(Anchor, Required),
             {RequiredStates, Candidates} = client_read_required_pages(
                 Bookie, Schema, RequiredRest, Candidates0, Heads,
                 AnchorStates
@@ -1979,12 +2044,12 @@ client_choose_anchor(Bookie, Schema, Specs) ->
         end
      || {Token, Prefix, Columns} = Spec <- Specs
     ],
-    {_Estimate, Anchor, _HeadRows} = lists:min(Estimated),
+    [{_Estimate, Anchor, _} | OrderedRest] = lists:sort(Estimated),
     Heads = maps:from_list([
         {Spec, HeadRows}
      || {_N, Spec, HeadRows} <- Estimated, HeadRows =/= prefix
     ]),
-    {Anchor, Heads}.
+    {Anchor, [Spec || {_N, Spec, _Rows} <- OrderedRest], Heads}.
 
 client_state_doc_keys(States) ->
     maps:fold(
@@ -2951,28 +3016,28 @@ client_encode_column_pages(Column, Docs) ->
     PositionCount = length(PositionChunks),
     client_guard(page_count, BooleanCount, ?MAX_U16),
     client_guard(page_count, PositionCount, ?MAX_U16),
+    BooleanBoundaries = client_encode_page_boundaries(
+        GlobalDocs, BooleanChunks
+    ),
+    PositionBoundaries = client_encode_page_boundaries(
+        GlobalDocs, PositionChunks
+    ),
     [
         {?BOOLEAN_PLANE, Column, PageNo,
             client_encode_plane_page(
                 ?BOOLEAN_PLANE, PageNo, BooleanCount,
-                length(Entries),
-                client_encode_page_boundaries(
-                    GlobalDocs, BooleanChunks
-                ), Chunk
+                length(Entries), BooleanBoundaries, Chunk
             )}
-     || {PageNo, Chunk} <- lists:zip(
+     || {PageNo, {_MinDocKey, _MaxDocKey, Chunk}} <- lists:zip(
             lists:seq(0, BooleanCount - 1), BooleanChunks
         )
     ] ++ [
         {?POSITION_PLANE, Column, PageNo,
             client_encode_plane_page(
                 ?POSITION_PLANE, PageNo, PositionCount,
-                length(Entries),
-                client_encode_page_boundaries(
-                    GlobalDocs, PositionChunks
-                ), Chunk
+                length(Entries), PositionBoundaries, Chunk
             )}
-     || {PageNo, Chunk} <- lists:zip(
+     || {PageNo, {_MinDocKey, _MaxDocKey, Chunk}} <- lists:zip(
             lists:seq(0, PositionCount - 1), PositionChunks
         )
     ].
@@ -2980,7 +3045,10 @@ client_encode_column_pages(Column, Docs) ->
 client_plane_chunks([], _Plane, [], Acc, _Bytes) ->
     lists:reverse(Acc);
 client_plane_chunks([], _Plane, Current, Acc, _Bytes) ->
-    lists:reverse([lists:reverse(Current) | Acc]);
+    [{MaxDocKey, _MaxBoolean, _MaxPosition} | _] = Current,
+    Chunk = lists:reverse(Current),
+    [{MinDocKey, _MinBoolean, _MinPosition} | _] = Chunk,
+    lists:reverse([{MinDocKey, MaxDocKey, Chunk} | Acc]);
 client_plane_chunks([{DocKey, Boolean, Position} = Item | Rest], Plane,
         Current, Acc, Bytes) ->
     Entry = case Plane of
@@ -2994,8 +3062,11 @@ client_plane_chunks([{DocKey, Boolean, Position} = Item | Rest], Plane,
     Next = Bytes + byte_size(Entry) + ?PAGE_DIR_STRIDE + FramingBytes,
     case Current =/= [] andalso Next > ?PAGE_TARGET_BYTES of
         true ->
+            [{MaxDocKey, _MaxBoolean, _MaxPosition} | _] = Current,
+            Chunk = lists:reverse(Current),
+            [{MinDocKey, _MinBoolean, _MinPosition} | _] = Chunk,
             client_plane_chunks([Item | Rest], Plane, [],
-                [lists:reverse(Current) | Acc], 0);
+                [{MinDocKey, MaxDocKey, Chunk} | Acc], 0);
         false ->
             case Next =< ?PAGE_TARGET_BYTES of
                 true -> client_plane_chunks(Rest, Plane,
@@ -3006,11 +3077,12 @@ client_plane_chunks([{DocKey, Boolean, Position} = Item | Rest], Plane,
 
 client_encode_page_boundaries(GlobalDocs, Chunks) ->
     <<GlobalDocs:32/unsigned-big, (iolist_to_binary([
-        <<PageNo:16/unsigned-big, (byte_size(DocKey)):16/unsigned-big,
-            DocKey/binary>>
-     || {PageNo, [{DocKey, _Boolean, _Position} | _]} <- lists:zip(
-            lists:seq(0, length(Chunks) - 1), Chunks
-        )
+        <<PageNo:16/unsigned-big,
+            (byte_size(MinDocKey)):16/unsigned-big, MinDocKey/binary,
+            (byte_size(MaxDocKey)):16/unsigned-big, MaxDocKey/binary>>
+     || {PageNo, {MinDocKey, MaxDocKey, _Chunk}} <- lists:zip(
+        lists:seq(0, length(Chunks) - 1), Chunks
+    )
     ]))/binary>>.
 
 client_encode_plane_page(Plane, PageNo, Count, TotalDocs,
@@ -3050,9 +3122,15 @@ client_page_directory(Plane, Chunk) ->
         {0, [], []},
         Chunk
     ),
+    DirectoryRows = case Plane of
+        %% Boolean payloads contain their docids, so directory offsets stay in
+        %% docid order and support monotonic skip_to intersection.
+        ?BOOLEAN_PLANE -> lists:reverse(Rows);
+        ?POSITION_PLANE -> lists:sort(Rows)
+    end,
     Directory = iolist_to_binary([
         <<Hash:32/unsigned-big, Offset:32/unsigned-big>>
-     || {Hash, Offset} <- lists:sort(Rows)
+     || {Hash, Offset} <- DirectoryRows
     ]),
     {Directory, iolist_to_binary(lists:reverse(PayloadRows))}.
 
@@ -3096,11 +3174,22 @@ client_decode_plane_page(Token, Column, Plane,
         Directory:DirBytes/binary, _PageDirectory:PageDirBytes/binary,
         Payload/binary>>, Candidates
 ) when DirBytes =:= N * ?PAGE_DIR_STRIDE ->
-    Docs = case Candidates of
-        all -> client_decode_directory_all(
+    Docs = case {Plane, Candidates} of
+        {_AnyPlane, all} -> client_decode_directory_all(
             N, Directory, Payload, Token, Column, Plane, #{}
         );
-        _ when map_size(Candidates) >= 8,
+        {?BOOLEAN_PLANE, _}
+        when map_size(Candidates) * 4 >= N ->
+            client_decode_boolean_directory_merge(
+                lists:sort(maps:keys(Candidates)), 0, N,
+                Directory, Payload, Token, Column, #{}
+            );
+        {?BOOLEAN_PLANE, _} ->
+            client_decode_boolean_directory_candidates(
+                lists:sort(maps:keys(Candidates)), 0, N,
+                Directory, Payload, Token, Column, #{}
+            );
+        {_AnyPlane, _} when map_size(Candidates) >= 8,
                 map_size(Candidates) * 4 >= N ->
             HashCandidates = maps:fold(
                 fun(DocKey, _True, Acc) ->
@@ -3115,7 +3204,7 @@ client_decode_plane_page(Token, Column, Plane,
                 0, N, Directory, Payload, Token, Column, Plane,
                 lists:sort(maps:keys(HashCandidates)), HashCandidates, #{}
             );
-        _ ->
+        {_AnyPlane, _} ->
             maps:fold(
                 fun(DocKey, _True, Acc) ->
                     client_decode_directory_candidate(
@@ -3153,6 +3242,70 @@ client_decode_directory_candidate(DocKey, Directory, N, Payload,
     client_decode_hash_matches(
         DocKey, Hash, Index, N, Directory, Payload, Token, Column, Plane, Acc
     ).
+
+client_decode_boolean_directory_candidates(
+        [], _Index, _N, _Directory, _Payload, _Token, _Column, Acc) -> Acc;
+client_decode_boolean_directory_candidates(
+        [DocKey | Rest], Index0, N, Directory, Payload,
+        Token, Column, Acc) ->
+    Index = client_boolean_directory_skip_to(
+        Directory, Payload, DocKey, Index0, N
+    ),
+    {NextIndex, Acc1} = case Index < N of
+        false -> {N, Acc};
+        true ->
+            DirectoryOffset = Index * ?PAGE_DIR_STRIDE,
+            <<_:DirectoryOffset/binary, _Hash:32/unsigned-big,
+                Offset:32/unsigned-big, _/binary>> = Directory,
+            case client_decode_page_entry(
+                    Payload, Offset, Token, Column, ?BOOLEAN_PLANE
+                ) of
+                {DocKey, Entry} -> {
+                    Index + 1,
+                    client_store_page_entry(
+                        ?BOOLEAN_PLANE, DocKey, Entry, Acc
+                    )
+                };
+                {_OtherKey, _Entry} -> {Index, Acc}
+            end
+    end,
+    client_decode_boolean_directory_candidates(
+        Rest, NextIndex, N, Directory, Payload, Token, Column, Acc1
+    ).
+
+client_decode_boolean_directory_merge(
+        [], _Index, _N, _Directory, _Payload, _Token, _Column, Acc) -> Acc;
+client_decode_boolean_directory_merge(
+        _Candidates, Index, N, _Directory, _Payload, _Token, _Column, Acc)
+when Index >= N -> Acc;
+client_decode_boolean_directory_merge(
+        [DocKey | Rest] = Candidates, Index, N, Directory, Payload,
+        Token, Column, Acc) ->
+    StoredKey = client_boolean_directory_key(
+        Directory, Payload, Index
+    ),
+    if
+        StoredKey < DocKey -> client_decode_boolean_directory_merge(
+            Candidates, Index + 1, N, Directory, Payload,
+            Token, Column, Acc
+        );
+        StoredKey > DocKey -> client_decode_boolean_directory_merge(
+            Rest, Index, N, Directory, Payload, Token, Column, Acc
+        );
+        true ->
+            DirectoryOffset = Index * ?PAGE_DIR_STRIDE,
+            <<_:DirectoryOffset/binary, _Hash:32/unsigned-big,
+                Offset:32/unsigned-big, _/binary>> = Directory,
+            {DocKey, Entry} = client_decode_page_entry(
+                Payload, Offset, Token, Column, ?BOOLEAN_PLANE
+            ),
+            client_decode_boolean_directory_merge(
+                Rest, Index + 1, N, Directory, Payload, Token, Column,
+                client_store_page_entry(
+                    ?BOOLEAN_PLANE, DocKey, Entry, Acc
+                )
+            )
+    end.
 
 client_decode_directory_merge(_Index, _N, _Directory, _Payload, _Token,
         _Column, _Plane, [], _HashCandidates, Acc) ->
@@ -3197,8 +3350,9 @@ client_decode_directory_merge(Index, N, Directory, Payload, Token, Column,
 client_directory_lower_bound(_Directory, _Hash, Lo, Lo) -> Lo;
 client_directory_lower_bound(Directory, Hash, Lo, Hi) ->
     Mid = (Lo + Hi) div 2,
-    <<MidHash:32/unsigned-big, _Offset:32/unsigned-big>> =
-        binary:part(Directory, Mid * ?PAGE_DIR_STRIDE, ?PAGE_DIR_STRIDE),
+    DirectoryOffset = Mid * ?PAGE_DIR_STRIDE,
+    <<_:DirectoryOffset/binary, MidHash:32/unsigned-big,
+        _Offset:32/unsigned-big, _/binary>> = Directory,
     case MidHash < Hash of
         true -> client_directory_lower_bound(Directory, Hash, Mid + 1, Hi);
         false -> client_directory_lower_bound(Directory, Hash, Lo, Mid)
