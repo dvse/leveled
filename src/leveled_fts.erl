@@ -41,6 +41,7 @@
 %% checks the same bound immediately before constructing a bit syntax.
 -define(POSTING_VERSION, 2).
 -define(TAIL_VERSION, 2).
+-define(PAGE_MAGIC, 16#4C4654). % "LFT"
 -define(PAGE_VERSION, 5).
 -define(BOOLEAN_PLANE, 0).
 -define(POSITION_PLANE, 1).
@@ -266,6 +267,37 @@ client_page_subkey(Plane, Column, PageNo) ->
     client_guard(page_column, Column, ?MAX_COLUMN_ID),
     client_guard(page_number, PageNo, ?MAX_U16),
     <<Plane:8, Column:8, PageNo:16/unsigned-big>>.
+
+%% Every page row, including page zero's cross-page directory, carries an
+%% unambiguous magic + format stamp in its value.  Page formats are
+%% intentionally not migrated in place; an older index must be reindexed.
+
+client_read_page(Bookie, Bucket, Key, Plane, Column, PageNo) ->
+    case leveled_bookie:book_headonly(
+            Bookie, Bucket, Key, client_page_subkey(Plane, Column, PageNo)
+        ) of
+        {ok, Value} = Found ->
+            client_require_page_value(Value),
+            Found;
+        not_found -> not_found
+    end.
+
+client_require_page_value(
+        <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8, _/binary>>) -> ok;
+client_require_page_value(<<?PAGE_VERSION:8, _/binary>>) ->
+    erlang:error({fts_page_format, unstamped, ?PAGE_VERSION});
+client_require_page_value(<<Found:8, _/binary>>) ->
+    erlang:error({fts_page_format, Found, ?PAGE_VERSION});
+client_require_page_value(_Bad) ->
+    erlang:error({fts_page_format, unstamped, ?PAGE_VERSION}).
+
+client_decode_page_row(
+        <<Plane:8, Column:8, PageNo:16/unsigned-big>>, Value)
+        when Plane =< ?POSITION_PLANE, Column =< ?MAX_COLUMN_ID ->
+    client_require_page_value(Value),
+    {page, Plane, Column, PageNo};
+client_decode_page_row(_SubKey, _Value) ->
+    not_page.
 
 client_shard_key(Shard) ->
     client_guard(shard_id, Shard, ?MAX_U16),
@@ -508,21 +540,25 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
     Shards = client_ast_shards(AST, Schema),
     TailSummaries = client_read_tail_summaries(Bookie, Schema, Shards),
     HasDirtyTail = client_has_dirty_tail(TailSummaries),
-    case client_can_direct_near(AST, Opts, HasDirtyTail) of
-        true -> client_search_direct_near_store(
-            Bookie, Schema, AST, Opts
+    case client_can_direct_term(AST, Opts, HasDirtyTail) of
+        true -> client_search_direct_term_store(
+            Bookie, Schema, AST, Opts, Hook, Shards, TailSummaries
         );
-        false -> case client_can_direct_not(AST, Opts, HasDirtyTail) of
-            true -> client_search_direct_not_store(
+        false -> case client_can_direct_near(AST, Opts, HasDirtyTail) of
+            true -> client_search_direct_near_store(
                 Bookie, Schema, AST, Opts
             );
-            false -> case client_can_direct_phrase(
-                    AST, Opts, HasDirtyTail
-                ) of
-                true -> client_search_direct_phrase_store(
+            false -> case client_can_direct_not(AST, Opts, HasDirtyTail) of
+                true -> client_search_direct_not_store(
                     Bookie, Schema, AST, Opts
                 );
-                false ->
+                false -> case client_can_direct_phrase(
+                        AST, Opts, HasDirtyTail
+                    ) of
+                    true -> client_search_direct_phrase_store(
+                        Bookie, Schema, AST, Opts
+                    );
+                    false ->
             BooleanStates = case HasDirtyTail of
                 true -> client_read_query_pages(
                     Bookie, Schema, TokenSpecs, all, #{}
@@ -536,6 +572,7 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
                 Bookie, Schema, AST, Opts, Hook, TokenSpecs, Shards,
                 TailSummaries, BooleanStates, PositionSpecs, HasDirtyTail
             )
+                end
             end
         end
     end.
@@ -564,6 +601,13 @@ client_search_with_positions(Bookie, Schema, AST, Opts, Hook, TokenSpecs,
             )
     end.
 
+client_can_direct_term({term, _Token, false, _Columns}, Opts, _HasDirtyTail) ->
+    (maps:get(rank, Opts, none) =:= none orelse
+        maps:get(rank, Opts, none) =:= bm25) andalso
+        not maps:get(return_positions, Opts, false);
+client_can_direct_term(_AST, _Opts, _HasDirtyTail) ->
+    false.
+
 client_can_direct_near({near, Items, _Distance, _Columns}, Opts, false) ->
     (maps:get(rank, Opts, none) =:= none orelse
         maps:get(rank, Opts, none) =:= bm25) andalso lists:all(fun
@@ -589,6 +633,144 @@ client_can_direct_phrase({phrase, Specs, _Columns}, Opts, false) ->
     );
 client_can_direct_phrase(_AST, _Opts, _HasDirtyTail) ->
     false.
+
+client_search_direct_term_store(Bookie, Schema,
+        {term, Token, false, Columns}, Opts, Hook, Shards,
+        TailSummaries) ->
+    ColumnIds = client_selector_column_ids(Columns, Schema),
+    PageDocs = lists:foldl(
+        fun(Column, Acc) ->
+            Head = client_read_boolean_head(
+                Bookie, Schema, Token, Column
+            ),
+            Values = client_read_boolean_values_from_head(
+                Bookie, Schema, Token, Column, all, Head
+            ),
+            lists:foldl(
+                fun client_decode_direct_term_page/2, Acc, Values
+            )
+        end,
+        #{},
+        ColumnIds
+    ),
+    Docs = lists:foldl(
+        fun(Shard, Acc) ->
+            client_apply_direct_term_tail(
+                Bookie, Schema, Shard, Token, ColumnIds, Acc, Hook,
+                maps:get(Shard, TailSummaries)
+            )
+        end,
+        PageDocs,
+        Shards
+    ),
+    Ranked = maps:get(rank, Opts, none) =:= bm25,
+    {DocCount, TotalLength} = case Ranked of
+        true -> client_corpus_stats(Bookie, Schema);
+        false -> {0, 0}
+    end,
+    AvgLength = case DocCount of
+        0 -> 0.0;
+        _ -> TotalLength / DocCount
+    end,
+    NHit = map_size(Docs),
+    Hits = [
+        #{key => DocKey,
+            score => case Ranked of
+                true -> client_direct_bm25_score(
+                    [Tf], [NHit], DocCount, AvgLength, Length
+                );
+                false -> 0.0
+            end,
+            doc_length => Length,
+            match_count => 0}
+     || {DocKey, {_Version, Length, Tf}} <- maps:to_list(Docs)
+    ],
+    Sorted = case Ranked of
+        true -> lists:sort(fun(A, B) ->
+            {-maps:get(score, A), maps:get(key, A)} =<
+                {-maps:get(score, B), maps:get(key, B)}
+        end, Hits);
+        false -> lists:sort(
+            fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end,
+            Hits
+        )
+    end,
+    {ok, page_hits(Sorted, Opts)}.
+
+client_apply_direct_term_tail(_Bookie, _Schema, _Shard, _Token,
+        _ColumnIds, PageDocs, _Hook, not_found) ->
+    PageDocs;
+client_apply_direct_term_tail(Bookie, Schema, Shard, Token, ColumnIds,
+        PageDocs, Hook, {ok, Summary}) ->
+    case client_tailsum_nonempty(Summary) of
+        false -> PageDocs;
+        true ->
+            {Tail, _Rows} = client_fold_shard_tail(
+                Bookie, Schema, Shard
+            ),
+            client_call_hook(Hook, {Shard, Tail}),
+            maps:fold(
+                fun
+                    (_DocKey,
+                            {_Version, _Length, _Base, remove, _Posting},
+                            Acc) -> Acc;
+                    (DocKey, {Version, Length, _Base, live, Posting}, Acc) ->
+                        Tf = client_direct_term_tail_tf(
+                            Posting, Token, ColumnIds
+                        ),
+                        case Tf > 0 of
+                            true -> Acc#{DocKey => {Version, Length, Tf}};
+                            false -> Acc
+                        end
+                end,
+                maps:without(maps:keys(Tail), PageDocs),
+                Tail
+            )
+    end.
+
+client_direct_term_tail_tf(Posting, Token, ColumnIds) ->
+    lists:sum([
+        case maps:find(Token, maps:get(Column, Posting, #{})) of
+            {ok, Entry} -> maps:get(count, Entry);
+            error -> 0
+        end
+     || Column <- ColumnIds
+    ]).
+
+client_decode_direct_term_page(
+        <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+            ?BOOLEAN_PLANE:8,
+            _PageCount:16/unsigned-big, _TotalDocs:32/unsigned-big,
+            N:32/unsigned-big, DirBytes:32/unsigned-big,
+            PageDirBytes:32/unsigned-big, Directory:DirBytes/binary,
+            _PageDirectory:PageDirBytes/binary, Payload/binary>>, Acc) ->
+    client_decode_direct_term_rows(N, Directory, Payload, Acc).
+
+client_decode_direct_term_rows(0, _Directory, _Payload, Acc) ->
+    Acc;
+client_decode_direct_term_rows(N, Directory, Payload, Acc) ->
+    Index = N - 1,
+    <<_Hash:32/unsigned-big, Offset:32/unsigned-big>> =
+        binary:part(
+            Directory, Index * ?PAGE_DIR_STRIDE, ?PAGE_DIR_STRIDE
+        ),
+    {DocKey, Version, Length, Tf} =
+        client_decode_direct_term_entry(Payload, Offset),
+    Acc1 = case maps:get(DocKey, Acc, none) of
+        {Version, ExistingLength, ExistingTf} ->
+            Acc#{DocKey => {Version, ExistingLength, ExistingTf + Tf}};
+        _ -> Acc#{DocKey => {Version, Length, Tf}}
+    end,
+    client_decode_direct_term_rows(
+        Index, Directory, Payload, Acc1
+    ).
+
+client_decode_direct_term_entry(Payload, Offset) ->
+    <<_:Offset/binary, _EntryBytes:32/unsigned-big,
+        KeyBytes:16/unsigned-big, DocKey:KeyBytes/binary,
+        Version:8/binary, Length:64/unsigned-big,
+        Tf:64/unsigned-big, _/binary>> = Payload,
+    {DocKey, Version, Length, Tf}.
 
 client_search_direct_not_store(Bookie, Schema,
         {'not', {term, Positive, false, PositiveColumns},
@@ -1133,9 +1315,9 @@ client_direct_bm25_score(Tfs, NHits, DocCount, AvgLength, DocLength) ->
 
 client_read_boolean_head(Bookie, Schema, Token, Column) ->
     Bucket = maps:get(index, Schema),
-    leveled_bookie:book_headonly(
+    client_read_page(
         Bookie, Bucket, client_token_key(Token),
-        client_page_subkey(?BOOLEAN_PLANE, Column, 0)
+        ?BOOLEAN_PLANE, Column, 0
     ).
 
 client_boolean_head_total(not_found) -> 0;
@@ -1183,15 +1365,17 @@ client_fold_exact_plane_pages(Bookie, Bucket, Key, Plane, Column,
     Wanted = maps:from_list([{PageNo, true} || PageNo <- PageNumbers]),
     Start = client_page_subkey(Plane, Column, FirstPage),
     Finish = client_page_subkey(Plane, Column, LastPage),
-    Fold = fun
-        (B, {K, <<RowPlane:8, RowColumn:8,
-                PageNo:16/unsigned-big>>}, Value, Acc)
-        when B =:= Bucket, K =:= Key,
-                RowPlane =:= Plane, RowColumn =:= Column ->
-            case maps:is_key(PageNo, Wanted) of
-                true -> Acc#{PageNo => Value};
-                false -> Acc
-            end;
+    Fold = fun(B, {K, SubKey}, Value, Acc)
+            when B =:= Bucket, K =:= Key ->
+        case client_decode_page_row(SubKey, Value) of
+            {page, Plane, Column, PageNo} ->
+                case maps:is_key(PageNo, Wanted) of
+                    true -> Acc#{PageNo => Value};
+                    false -> Acc
+                end;
+            {page, _OtherPlane, _OtherColumn, _PageNo} -> Acc;
+            not_page -> Acc
+        end;
         (_B, _K, _Value, Acc) -> Acc
     end,
     {async, Runner} = leveled_bookie:book_headfold(
@@ -1199,7 +1383,25 @@ client_fold_exact_plane_pages(Bookie, Bucket, Key, Plane, Column,
         {range, Bucket, {{Key, Start}, {Key, Finish}}},
         {Fold, #{}}, false, true, false
     ),
-    Runner().
+    Folded = Runner(),
+    lists:foldl(
+        fun(PageNo, Acc) ->
+            case maps:is_key(PageNo, Acc) of
+                true -> Acc;
+                false ->
+                    case client_read_page(
+                            Bookie, Bucket, Key, Plane, Column, PageNo
+                        ) of
+                        {ok, Value} -> Acc#{PageNo => Value};
+                        not_found -> erlang:error(
+                            {missing_fts_page, Plane, PageNo}
+                        )
+                    end
+            end
+        end,
+        Folded,
+        PageNumbers
+    ).
 
 client_read_boolean_probe_source(_Bookie, _Schema, _Token, _Column,
         not_found, _Candidates) ->
@@ -1231,7 +1433,8 @@ client_decode_boolean_compact_filtered(Values, _ProbeSources) ->
     ).
 
 client_decode_boolean_filtered_page(
-        <<?PAGE_VERSION:8, ?BOOLEAN_PLANE:8, _PageCount:16/unsigned-big,
+        <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+            ?BOOLEAN_PLANE:8, _PageCount:16/unsigned-big,
             _TotalDocs:32/unsigned-big, N:32/unsigned-big,
             DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
             Directory:DirBytes/binary, _PageDirectory:PageDirBytes/binary,
@@ -1259,7 +1462,8 @@ client_intersect_boolean_docids(
         {boolean_pages, CandidateGroups, Pages}, Mode) ->
     maps:fold(
         fun(PageNo, Candidates, Acc) ->
-            <<?PAGE_VERSION:8, ?BOOLEAN_PLANE:8,
+            <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+                ?BOOLEAN_PLANE:8,
                 _PageCount:16/unsigned-big, _TotalDocs:32/unsigned-big,
                 N:32/unsigned-big, DirBytes:32/unsigned-big,
                 PageDirBytes:32/unsigned-big, Directory:DirBytes/binary,
@@ -1371,9 +1575,9 @@ client_decode_boolean_compact_entry(Payload, Offset) ->
 
 client_read_direct_position_source(Bookie, Schema, Token, Column, Candidates) ->
     Bucket = maps:get(index, Schema),
-    Head = leveled_bookie:book_headonly(
+    Head = client_read_page(
         Bookie, Bucket, client_token_key(Token),
-        client_page_subkey(?POSITION_PLANE, Column, 0)
+        ?POSITION_PLANE, Column, 0
     ),
     case Head of
         not_found -> missing;
@@ -1393,9 +1597,8 @@ client_read_direct_position_binary_source(
         Bookie, Schema, Token, Column, Candidates) ->
     Bucket = maps:get(index, Schema),
     Key = client_token_key(Token),
-    case leveled_bookie:book_headonly(
-            Bookie, Bucket, Key,
-            client_page_subkey(?POSITION_PLANE, Column, 0)
+    case client_read_page(
+            Bookie, Bucket, Key, ?POSITION_PLANE, Column, 0
         ) of
         not_found -> missing;
         {ok, Value0} ->
@@ -1443,11 +1646,8 @@ client_read_parallel_plane_pages(
         begin
             Ref = make_ref(),
             spawn(fun() -> Parent ! {Ref, try
-                leveled_bookie:book_headonly(
-                    Bookie, Bucket, Key,
-                    client_page_subkey(
-                        Plane, Column, PageNo
-                    )
+                client_read_page(
+                    Bookie, Bucket, Key, Plane, Column, PageNo
                 )
             of
                 {ok, Value} -> {ok, Value};
@@ -1466,7 +1666,8 @@ client_read_parallel_plane_pages(
     ]).
 
 client_prepare_position_binary_page(
-        <<?PAGE_VERSION:8, ?POSITION_PLANE:8,
+        <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+            ?POSITION_PLANE:8,
             _PageCount:16/unsigned-big, _TotalDocs:32/unsigned-big,
             N:32/unsigned-big, DirBytes:32/unsigned-big,
             PageDirBytes:32/unsigned-big, Directory:DirBytes/binary,
@@ -1731,7 +1932,8 @@ client_materialize_binary_near(
     end.
 
 client_page_count(
-    <<?PAGE_VERSION:8, _Plane:8, PageCount:16/unsigned-big, _/binary>>
+    <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+        _Plane:8, PageCount:16/unsigned-big, _/binary>>
 ) -> PageCount.
 
 client_candidate_page_numbers(Value0, all) ->
@@ -1816,7 +2018,8 @@ client_partition_page_candidates(Value0, Candidates) ->
     )).
 
 client_page_boundaries(
-        <<?PAGE_VERSION:8, _Plane:8, _PageCount:16/unsigned-big,
+        <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+            _Plane:8, _PageCount:16/unsigned-big,
             _TotalDocs:32/unsigned-big, _N:32/unsigned-big,
             DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
             _Directory:DirBytes/binary, PageDirectory:PageDirBytes/binary,
@@ -1825,7 +2028,8 @@ client_page_boundaries(
     client_decode_page_boundaries(Boundaries, []).
 
 client_page_global_docs(
-        <<?PAGE_VERSION:8, _Plane:8, PageCount:16/unsigned-big,
+        <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+            _Plane:8, PageCount:16/unsigned-big,
             _TotalDocs:32/unsigned-big, _N:32/unsigned-big,
             DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
             _Directory:DirBytes/binary, PageDirectory:PageDirBytes/binary,
@@ -2263,9 +2467,8 @@ client_position_spec_spans(TokenRows, DocKey, Version) ->
 client_read_token_positions(Bookie, Schema, Token, Column, Candidates) ->
     Bucket = maps:get(index, Schema),
     Key = client_token_key(Token),
-    Head = leveled_bookie:book_headonly(
-        Bookie, Bucket, Key,
-        client_page_subkey(?POSITION_PLANE, Column, 0)
+    Head = client_read_page(
+        Bookie, Bucket, Key, ?POSITION_PLANE, Column, 0
     ),
     client_read_position_column_pages(
         Bookie, Schema, Token, Column, Candidates, Head
@@ -2293,11 +2496,9 @@ client_read_position_column_pages(Bookie, Schema, Token, Column,
                 _ ->
                     case Folded of
                         none ->
-                            {ok, PageValue} = leveled_bookie:book_headonly(
+                            {ok, PageValue} = client_read_page(
                                 Bookie, Bucket, Key,
-                                client_page_subkey(
-                                    ?POSITION_PLANE, Column, PageNo
-                                )
+                                ?POSITION_PLANE, Column, PageNo
                             ),
                             PageValue;
                         PageValues -> maps:get(PageNo, PageValues)
@@ -2317,18 +2518,23 @@ client_fold_prefix_positions(Bookie, Schema, Prefix, Column, Candidates) ->
     Start = client_token_key(Prefix),
     Finish = <<Start/binary, 255>>,
     Fold = fun
-        (B, {<<"t:", Token/binary>>,
-                <<?POSITION_PLANE:8, RowColumn:8, _PageNo:16>>}, Value, Acc)
-        when B =:= Bucket, RowColumn =:= Column ->
-            case binary_prefix(Token, Prefix) of
-                true ->
-                    {_PageCount, Positions} = client_decode_plane_page(
-                        Token, Column, ?POSITION_PLANE, Value, Candidates
-                    ),
-                    Acc#{Token => maps:merge(
-                        maps:get(Token, Acc, #{}), Positions
-                    )};
-                false -> Acc
+        (B, {<<"t:", Token/binary>>, SubKey}, Value, Acc)
+        when B =:= Bucket ->
+            case client_decode_page_row(SubKey, Value) of
+                {page, ?POSITION_PLANE, Column, _PageNo} ->
+                    case binary_prefix(Token, Prefix) of
+                        true ->
+                            {_PageCount, Positions} = client_decode_plane_page(
+                                Token, Column, ?POSITION_PLANE,
+                                Value, Candidates
+                            ),
+                            Acc#{Token => maps:merge(
+                                maps:get(Token, Acc, #{}), Positions
+                            )};
+                        false -> Acc
+                    end;
+                {page, _Plane, _Column, _PageNo} -> Acc;
+                not_page -> Acc
             end;
         (_B, _K, _V, Acc) -> Acc
     end,
@@ -2409,8 +2615,8 @@ client_read_plane_heads(Bookie, Schema, Token, Plane, ColumnIds) ->
     Bucket = maps:get(index, Schema),
     Key = client_token_key(Token),
     [
-        {Column, leveled_bookie:book_headonly(
-            Bookie, Bucket, Key, client_page_subkey(Plane, Column, 0)
+        {Column, client_read_page(
+            Bookie, Bucket, Key, Plane, Column, 0
         )}
      || Column <- ColumnIds
     ].
@@ -2424,9 +2630,9 @@ client_read_token_plane(Bookie, Schema, Token, Plane, ColumnIds,
                 {ok, Result} -> Result;
                 error ->
                     Bucket = maps:get(index, Schema),
-                    leveled_bookie:book_headonly(
+                    client_read_page(
                         Bookie, Bucket, client_token_key(Token),
-                        client_page_subkey(Plane, Column, 0)
+                        Plane, Column, 0
                     )
             end,
             Docs = client_read_column_pages(
@@ -2450,9 +2656,8 @@ client_read_column_pages(Bookie, Schema, Token, Plane, Column,
             Value = case PageNo of
                 0 -> Value0;
                 _ ->
-                    {ok, PageValue} = leveled_bookie:book_headonly(
-                        Bookie, Bucket, Key,
-                        client_page_subkey(Plane, Column, PageNo)
+                    {ok, PageValue} = client_read_page(
+                        Bookie, Bucket, Key, Plane, Column, PageNo
                     ),
                     PageValue
             end,
@@ -2470,20 +2675,23 @@ client_fold_prefix_plane(Bookie, Schema, Prefix, Plane, ColumnIds, Candidates) -
     Start = client_token_key(Prefix),
     Finish = <<Start/binary, 255>>,
     Fold = fun
-        (B, {<<"t:", Token/binary>>,
-                <<RowPlane:8, Column:8, _PageNo:16>>}, Value, Acc)
+        (B, {<<"t:", Token/binary>>, SubKey}, Value, Acc)
         when B =:= Bucket ->
-            case RowPlane =:= Plane andalso
-                    lists:member(Column, ColumnIds) andalso
-                    binary_prefix(Token, Prefix) of
-                true ->
-                    {_PageCount, Docs} = client_decode_plane_page(
-                        Token, Column, Plane, Value, Candidates
-                    ),
-                    Acc#{Token => client_merge_state(
-                        maps:get(Token, Acc, #{}), Docs
-                    )};
-                false -> Acc
+            case client_decode_page_row(SubKey, Value) of
+                {page, Plane, Column, _PageNo} ->
+                    case lists:member(Column, ColumnIds) andalso
+                            binary_prefix(Token, Prefix) of
+                        true ->
+                            {_PageCount, Docs} = client_decode_plane_page(
+                                Token, Column, Plane, Value, Candidates
+                            ),
+                            Acc#{Token => client_merge_state(
+                                maps:get(Token, Acc, #{}), Docs
+                            )};
+                        false -> Acc
+                    end;
+                {page, _OtherPlane, _Column, _PageNo} -> Acc;
+                not_page -> Acc
             end;
         (_B, _K, _V, Acc) -> Acc
     end,
@@ -3091,7 +3299,8 @@ client_encode_plane_page(Plane, PageNo, Count, TotalDocs,
     PageCount = case PageNo of 0 -> Count; _ -> 0 end,
     PageTotal = case PageNo of 0 -> TotalDocs; _ -> 0 end,
     PageBoundaries = case PageNo of 0 -> PageBoundaries0; _ -> <<>> end,
-    Value = <<?PAGE_VERSION:8, Plane:8, PageCount:16/unsigned-big,
+    Value = <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+        Plane:8, PageCount:16/unsigned-big,
         PageTotal:32/unsigned-big, (length(Chunk)):32/unsigned-big,
         (byte_size(Directory)):32/unsigned-big,
         (byte_size(PageBoundaries)):32/unsigned-big,
@@ -3160,7 +3369,8 @@ client_docid_hash(DocKey) ->
     erlang:phash2(DocKey, 16#100000000).
 
 client_page_total_docs(
-    <<?PAGE_VERSION:8, _Plane:8, PageCount:16/unsigned-big,
+    <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+        _Plane:8, PageCount:16/unsigned-big,
         TotalDocs:32/unsigned-big, _Rest/binary>>
 ) when PageCount > 0 ->
     TotalDocs;
@@ -3168,7 +3378,8 @@ client_page_total_docs(Bad) ->
     erlang:error({invalid_fts_page_header, Bad}).
 
 client_decode_plane_page(Token, Column, Plane,
-    <<?PAGE_VERSION:8, Plane:8, PageCount:16/unsigned-big,
+    <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+        Plane:8, PageCount:16/unsigned-big,
         _TotalDocs:32/unsigned-big, N:32/unsigned-big,
         DirBytes:32/unsigned-big, PageDirBytes:32/unsigned-big,
         Directory:DirBytes/binary, _PageDirectory:PageDirBytes/binary,
@@ -3494,21 +3705,27 @@ client_fold_shard_pages(Bookie, Schema, Shard) ->
     Start = client_token_key(LoToken),
     Finish = client_token_key(HiToken),
     Fold = fun
-        (B, {<<"t:", Token/binary>>,
-                <<Plane:8, Column:8, _PageNo:16>> = SubKey}, Value, Acc)
+        (B, {<<"t:", Token/binary>>, SubKey}, Value, Acc)
         when B =:= Bucket ->
-            {OldDocs, OldKeys} = maps:get(Token, Acc, {#{}, []}),
-            {_Count, Decoded} = client_decode_plane_page(
-                Token, Column, Plane, Value, all
-            ),
-            Docs = case Plane of
-                ?BOOLEAN_PLANE -> client_merge_state(OldDocs, Decoded);
-                ?POSITION_PLANE -> client_hydrate_state_positions(
-                    OldDocs, Token, Column, Decoded
-                )
-            end,
-            Acc#{Token =>
-                {Docs, [SubKey | OldKeys]}};
+            case client_decode_page_row(SubKey, Value) of
+                {page, Plane, Column, _PageNo} ->
+                    {OldDocs, OldKeys} = maps:get(
+                        Token, Acc, {#{}, []}
+                    ),
+                    {_Count, Decoded} = client_decode_plane_page(
+                        Token, Column, Plane, Value, all
+                    ),
+                    Docs = case Plane of
+                        ?BOOLEAN_PLANE -> client_merge_state(
+                            OldDocs, Decoded
+                        );
+                        ?POSITION_PLANE -> client_hydrate_state_positions(
+                            OldDocs, Token, Column, Decoded
+                        )
+                    end,
+                    Acc#{Token => {Docs, [SubKey | OldKeys]}};
+                not_page -> Acc
+            end;
         (_B, _K, _V, Acc) -> Acc
     end,
     {async, Runner} = leveled_bookie:book_headfold(
@@ -5382,6 +5599,61 @@ derive_remove_update_shape_test() ->
     Ids = [{B, K, SK} || {_, B, K, SK, _} <- Updated],
     ?assertEqual(length(Ids), length(lists:usort(Ids))).
 
+page_format_stamp_and_v4_rejection_test_() ->
+    {timeout, 60, fun page_format_stamp_and_v4_rejection_tester/0}.
+
+page_format_stamp_and_v4_rejection_tester() ->
+    client_with_test_bookie(fun(Bookie) ->
+        Bucket = <<"page-format-unit">>,
+        {ok, Schema} = schema(#{index => Bucket, columns => [body]}),
+        ok = client_test_put(Bookie, Schema, <<"one">>, <<"alpha">>),
+        ok = client_test_put(Bookie, Schema, <<"two">>, <<"beta">>),
+        {ok, #{skipped := []}} = consolidate(Bookie, Schema, #{}),
+
+        %% Current pages round-trip and every row value carries the explicit
+        %% format magic and version before its page header.
+        {ok, [AlphaHit]} = search(Bookie, Schema, <<"alpha">>, #{}),
+        ?assertEqual(<<"one">>, maps:get(key, AlphaHit)),
+        AlphaKey = client_token_key(<<"alpha">>),
+        AlphaPageKey = client_page_subkey(?BOOLEAN_PLANE, 0, 0),
+        {ok, <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+                AlphaPageRest/binary>> = AlphaPage} =
+            leveled_bookie:book_headonly(
+                Bookie, Bucket, AlphaKey, AlphaPageKey
+            ),
+
+        %% A v4-shaped payload is a migration error, not
+        %% an absent token and not a function-clause crash.
+        ok = leveled_bookie:book_mput(Bookie, [
+            {add, Bucket, AlphaKey, AlphaPageKey,
+                <<4:8, AlphaPageRest/binary>>}
+        ]),
+        ?assertEqual(
+            {error, {fts_page_format, 4, ?PAGE_VERSION}},
+            search(Bookie, Schema, <<"alpha">>, #{})
+        ),
+
+        %% A pre-envelope v5 payload is also rejected as unstamped.
+        BetaKey = client_token_key(<<"beta">>),
+        BetaPageKey = client_page_subkey(?BOOLEAN_PLANE, 0, 0),
+        {ok, <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
+                BetaPageRest/binary>>} = leveled_bookie:book_headonly(
+            Bookie, Bucket, BetaKey, BetaPageKey
+        ),
+        ok = leveled_bookie:book_mput(Bookie, [
+            {add, Bucket, BetaKey, BetaPageKey,
+                <<?PAGE_VERSION:8, BetaPageRest/binary>>}
+        ]),
+        ?assertEqual(
+            {error, {fts_page_format, unstamped, ?PAGE_VERSION}},
+            search(Bookie, Schema, <<"beta">>, #{})
+        ),
+        ?assertMatch(
+            <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8, _/binary>>,
+            AlphaPage
+        )
+    end).
+
 tail_fold_interleaving_test_() ->
     {timeout, 60, fun tail_fold_interleaving_tester/0}.
 
@@ -5472,6 +5744,7 @@ client_layout_counts(Bookie, Bucket) ->
         (B, {<<"t:", _Token/binary>>,
                 <<_Plane:8, _Column:8, _Page:16>>}, Value,
                 {P, Bases, Tails, Big}) when B =:= Bucket ->
+            ok = client_require_page_value(Value),
             {P + 1, Bases, Tails,
                 Big + case byte_size(Value) > ?PAGE_MAX_BYTES of
                     true -> 1;
