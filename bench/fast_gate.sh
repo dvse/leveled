@@ -4,11 +4,13 @@
 set -e
 export PATH="$HOME/.local/share/mise/shims:$PATH"
 RANK=${1:-none}
+METHOD=${FTS_COMPRESSION_METHOD:-native}
+LEDGER=${FTS_LEDGER_COMPRESSION:-as_store}
 W=/tmp/leveled_fts_bench
 FAST=${FTS_FAST_DIR:-$W/fast}
 Q=bench/fts_gate_queries.txt
 SQL_R=$W/results/fast/sqlite-s10m-$RANK.tsv   # shared baseline (read-only reuse)
-LEV_R=$FAST/leveled-s10m-$RANK.tsv
+LEV_R=$FAST/leveled-s10m-$RANK-$METHOD-$LEDGER.tsv
 mkdir -p $W/results/fast $FAST $FAST/ebin
 # SQLite side: run once, cache (delete the TSV to re-measure)
 if [ ! -f "$SQL_R" ]; then
@@ -18,10 +20,11 @@ fi
 # Leveled side: recompile bench + library, fresh store, no settle sleep
 ./rebar3 compile >/dev/null
 erlc -o $FAST/ebin -I include -pa _build/default/lib/leveled/ebin bench/leveled_fts_bench.erl 2>/dev/null
-rm -rf $FAST/fast-store
+rm -rf $FAST/fast-store-$METHOD-$LEDGER
 erl -noshell -pa $FAST/ebin -pa _build/default/lib/leveled/ebin -pa _build/default/lib/lz4/ebin -pa _build/default/lib/zstd/ebin -eval "
-Args = [\"--tsv\",\"$W/docs-s10m.tsv\",\"--root\",\"$FAST/fast-store\",
+Args = [\"--tsv\",\"$W/docs-s10m.tsv\",\"--root\",\"$FAST/fast-store-$METHOD-$LEDGER\",
         \"--queries\",\"$Q\",\"--result\",\"$LEV_R\",
+        \"--compression-method\",\"$METHOD\",\"--ledger-compression\",\"$LEDGER\",
         \"--rank\",\"$RANK\",\"--runs\",\"9\",\"--warmup\",\"3\",
         \"--amortized\",\"--compact\",\"--settle-ms\",\"0\"],
 R = leveled_fts_bench:main(Args), io:format(\"leveled=~p~n\",[R]), init:stop()." 
