@@ -42,7 +42,7 @@
 -define(POSTING_VERSION, 2).
 -define(TAIL_VERSION, 2).
 -define(PAGE_MAGIC, 16#4C4654). % "LFT"
--define(PAGE_VERSION, 5).
+-define(PAGE_VERSION, 6).
 -define(BOOLEAN_PLANE, 0).
 -define(POSITION_PLANE, 1).
 -define(PAGE_DIR_STRIDE, 8).
@@ -50,7 +50,16 @@
 -define(MANIFEST_VERSION, 3).
 -define(STATS_VERSION, 2).
 -define(PAGE_MAX_BYTES, 32768).
--define(PAGE_TARGET_BYTES, 30000).
+%% Page 0 of a consolidated token carries the all-pages boundary index ON TOP
+%% of a full chunk payload. The index is prefix-delta compressed (~tens of
+%% bytes per page rather than two full doc keys), so at 24000 the ordinary
+%% headroom under PAGE_MAX_BYTES absorbs it. PAGE_ZERO_MAX_BYTES is the
+%% backstop for pathological hot terms: a token's page count is O(postings),
+%% so page 0 may legitimately outgrow PAGE_MAX_BYTES rather than abort the
+%% whole shard's consolidation. Both are build-time only: not stored, the
+%% reader reads sizes from the page header.
+-define(PAGE_TARGET_BYTES, 24000).
+-define(PAGE_ZERO_MAX_BYTES, 131072).
 -define(PAGE_POSITION_BYTES, 24000).
 -define(TAIL_BLOOM_BYTES, 32).
 -define(MAX_COLUMNS, 255).
@@ -2025,7 +2034,7 @@ client_page_boundaries(
             _Directory:DirBytes/binary, PageDirectory:PageDirBytes/binary,
             _Payload/binary>>) ->
     <<_GlobalDocs:32/unsigned-big, Boundaries/binary>> = PageDirectory,
-    client_decode_page_boundaries(Boundaries, []).
+    client_decode_page_boundaries(Boundaries, <<>>, 0, []).
 
 client_page_global_docs(
         <<?PAGE_MAGIC:24/unsigned-big, ?PAGE_VERSION:8,
@@ -2037,15 +2046,21 @@ client_page_global_docs(
     <<GlobalDocs:32/unsigned-big, _/binary>> = PageDirectory,
     GlobalDocs.
 
-client_decode_page_boundaries(<<>>, Acc) ->
+client_decode_page_boundaries(<<>>, _Prev, _PageNo, Acc) ->
     list_to_tuple(lists:reverse(Acc));
-client_decode_page_boundaries(
-        <<PageNo:16/unsigned-big, MinBytes:16/unsigned-big,
-            MinDocKey:MinBytes/binary, MaxBytes:16/unsigned-big,
-            MaxDocKey:MaxBytes/binary, Rest/binary>>, Acc) ->
+client_decode_page_boundaries(Bin, Prev, PageNo, Acc) ->
+    {MinDocKey, Rest0} = client_decode_boundary_key(Prev, Bin),
+    {MaxDocKey, Rest} = client_decode_boundary_key(MinDocKey, Rest0),
     client_decode_page_boundaries(
-        Rest, [{PageNo, MinDocKey, MaxDocKey} | Acc]
+        Rest, MaxDocKey, PageNo + 1,
+        [{PageNo, MinDocKey, MaxDocKey} | Acc]
     ).
+
+client_decode_boundary_key(Base,
+        <<Shared:16/unsigned-big, SuffixBytes:16/unsigned-big,
+            Suffix:SuffixBytes/binary, Rest/binary>>) ->
+    <<Prefix:Shared/binary, _/binary>> = Base,
+    {<<Prefix/binary, Suffix/binary>>, Rest}.
 
 client_page_for_doc(DocKey, Boundaries) ->
     client_page_for_doc(DocKey, Boundaries, 1, tuple_size(Boundaries) + 1).
@@ -3283,15 +3298,32 @@ client_plane_chunks([{DocKey, Boolean, Position} = Item | Rest], Plane,
             end
     end.
 
+%% Boundary entries are prefix-delta compressed and the page number is
+%% implicit in entry order: Min is delta-encoded against the previous
+%% entry's Max (the first against <<>>), Max against its own Min.  Doc keys
+%% in one corpus share long path prefixes, so this shrinks the index from
+%% two full keys per page to a few dozen bytes.  Compression never affects
+%% correctness — order only affects the ratio.
 client_encode_page_boundaries(GlobalDocs, Chunks) ->
-    <<GlobalDocs:32/unsigned-big, (iolist_to_binary([
-        <<PageNo:16/unsigned-big,
-            (byte_size(MinDocKey)):16/unsigned-big, MinDocKey/binary,
-            (byte_size(MaxDocKey)):16/unsigned-big, MaxDocKey/binary>>
-     || {PageNo, {MinDocKey, MaxDocKey, _Chunk}} <- lists:zip(
-        lists:seq(0, length(Chunks) - 1), Chunks
-    )
-    ]))/binary>>.
+    {_Prev, Parts} = lists:foldl(
+        fun({MinDocKey, MaxDocKey, _Chunk}, {Prev, Acc}) ->
+            {MaxDocKey, [
+                [client_encode_boundary_key(Prev, MinDocKey),
+                    client_encode_boundary_key(MinDocKey, MaxDocKey)]
+                | Acc
+            ]}
+        end,
+        {<<>>, []},
+        Chunks
+    ),
+    <<GlobalDocs:32/unsigned-big,
+        (iolist_to_binary(lists:reverse(Parts)))/binary>>.
+
+client_encode_boundary_key(Base, Key) ->
+    Shared = binary:longest_common_prefix([Base, Key]),
+    Suffix = binary:part(Key, Shared, byte_size(Key) - Shared),
+    <<Shared:16/unsigned-big, (byte_size(Suffix)):16/unsigned-big,
+        Suffix/binary>>.
 
 client_encode_plane_page(Plane, PageNo, Count, TotalDocs,
         PageBoundaries0, Chunk) ->
@@ -3305,7 +3337,11 @@ client_encode_plane_page(Plane, PageNo, Count, TotalDocs,
         (byte_size(Directory)):32/unsigned-big,
         (byte_size(PageBoundaries)):32/unsigned-big,
         Directory/binary, PageBoundaries/binary, Payload/binary>>,
-    case byte_size(Value) =< ?PAGE_MAX_BYTES of
+    MaxBytes = case PageNo of
+        0 -> ?PAGE_ZERO_MAX_BYTES;
+        _ -> ?PAGE_MAX_BYTES
+    end,
+    case byte_size(Value) =< MaxBytes of
         true -> Value;
         false -> erlang:error({fts_page_too_large, PageNo, byte_size(Value)})
     end.
