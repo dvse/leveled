@@ -18,6 +18,7 @@
 -export([
     schema/1,
     capacities/0,
+    tokenize_with_offsets/2,
     derive/3,
     remove/3,
     update/4,
@@ -4512,6 +4513,47 @@ first_unknown([Item | Rest], Known) ->
         false -> {unknown, Item}
     end.
 
+%% Return the index tokenizer's normalized token stream together with source
+%% coordinates.  Coordinates address Text0 itself, before the SQLite UTF-8
+%% compatibility rewrite and before token normalization.  In particular, the
+%% F0 9F 92 truncation quirk maps the synthesized two-byte U+07D2 character
+%% back to all three original input bytes.
+-spec tokenize_with_offsets(binary(), map()) ->
+    [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}].
+tokenize_with_offsets(Text, Opts) when is_binary(Text), is_map(Opts) ->
+    Stopwords = maps:get(stopwords, Opts, []),
+    Tokens = case maps:get(tokenchars, Opts, []) =:= [] andalso
+            maps:get(separators, Opts, []) =:= [] of
+        true ->
+            fast_tokens_with_offsets(
+                Text, 0, Opts, Stopwords, <<>>, false, undefined, 0, []
+            );
+        false ->
+            unicode_tokens_with_offsets(
+                Text, 0, Opts, Stopwords, <<>>, undefined, 0, []
+            )
+    end,
+    [compat_source_range(Text, Token) || Token <- Tokens].
+
+%% sqlite_utf8_compat/1 recognizes the malformed three-byte prefix only by
+%% looking at the following non-continuation byte.  If a token ends at that
+%% synthesized character, include the one-byte lookahead in its source range
+%% so tokenizing binary:part(Input, Offset, Length) reproduces the same token.
+%% When the token continues past the quirk its ordinary range already includes
+%% the lookahead and no extension is needed.
+compat_source_range(
+    Text, {Token, Pos, Offset, Length} = WithOffset
+) when Offset + Length < byte_size(Text), Length >= 3 ->
+    End = Offset + Length,
+    case binary:part(Text, End - 3, 3) of
+        <<16#F0, 16#9F, 16#92>> ->
+            {Token, Pos, Offset, Length + 1};
+        _Other ->
+            WithOffset
+    end;
+compat_source_range(_Text, WithOffset) ->
+    WithOffset.
+
 tokenize(Text0, Opts) ->
     Text = sqlite_utf8_compat(normalise_text(Text0)),
     case maps:get(tokenchars, Opts, []) =:= [] andalso maps:get(separators, Opts, []) =:= [] of
@@ -4536,6 +4578,171 @@ sqlite_utf8_compat(<<Byte, Rest/binary>>, Acc) ->
     sqlite_utf8_compat(Rest, <<Acc/binary, Byte>>);
 sqlite_utf8_compat(<<>>, Acc) ->
     Acc.
+
+%% Offset-aware common path.  Token bytes follow sqlite_utf8_compat/1 while
+%% Start/Offset remain coordinates in the original input binary.
+fast_tokens_with_offsets(
+    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
+) when C >= $a, C =< $z ->
+    fast_tokens_with_offsets(
+        Rest, Offset + 1, Opts, SW, <<Tok/binary, C>>, NA,
+        token_start(Start, Offset), Pos, Acc
+    );
+fast_tokens_with_offsets(
+    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
+) when C >= $0, C =< $9 ->
+    fast_tokens_with_offsets(
+        Rest, Offset + 1, Opts, SW, <<Tok/binary, C>>, NA,
+        token_start(Start, Offset), Pos, Acc
+    );
+fast_tokens_with_offsets(
+    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
+) when C >= $A, C =< $Z ->
+    fast_tokens_with_offsets(
+        Rest, Offset + 1, Opts, SW, <<Tok/binary, (C bor 16#20)>>, NA,
+        token_start(Start, Offset), Pos, Acc
+    );
+fast_tokens_with_offsets(
+    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
+) when C < 128 ->
+    {Pos1, Acc1} = fast_offset_flush(
+        Tok, NA, Start, Offset, Opts, SW, Pos, Acc
+    ),
+    fast_tokens_with_offsets(
+        Rest, Offset + 1, Opts, SW, <<>>, false, undefined, Pos1, Acc1
+    );
+fast_tokens_with_offsets(
+    <<16#F0, 16#9F, 16#92, Next, Rest/binary>>, Offset,
+    Opts, SW, Tok, _NA, Start, Pos, Acc
+) when Next band 16#C0 =/= 16#80 ->
+    fast_tokens_with_offsets(
+        <<Next, Rest/binary>>, Offset + 3, Opts, SW,
+        <<Tok/binary, 16#DF, 16#92>>, true, token_start(Start, Offset), Pos, Acc
+    );
+fast_tokens_with_offsets(
+    <<CP/utf8, Rest/binary>> = Bin, Offset,
+    Opts, SW, Tok, NA, Start, Pos, Acc
+) ->
+    CharLen = byte_size(Bin) - byte_size(Rest),
+    case unicode_token_char(CP, Opts) of
+        true ->
+            <<Char:CharLen/binary, _/binary>> = Bin,
+            fast_tokens_with_offsets(
+                Rest, Offset + CharLen, Opts, SW,
+                <<Tok/binary, Char/binary>>, true,
+                token_start(Start, Offset), Pos, Acc
+            );
+        false ->
+            {Pos1, Acc1} = fast_offset_flush(
+                Tok, NA, Start, Offset, Opts, SW, Pos, Acc
+            ),
+            fast_tokens_with_offsets(
+                Rest, Offset + CharLen, Opts, SW, <<>>, false,
+                undefined, Pos1, Acc1
+            )
+    end;
+fast_tokens_with_offsets(
+    <<_Bad, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
+) ->
+    {Pos1, Acc1} = fast_offset_flush(
+        Tok, NA, Start, Offset, Opts, SW, Pos, Acc
+    ),
+    fast_tokens_with_offsets(
+        Rest, Offset + 1, Opts, SW, <<>>, false, undefined, Pos1, Acc1
+    );
+fast_tokens_with_offsets(
+    <<>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
+) ->
+    {_Pos1, Acc1} = fast_offset_flush(
+        Tok, NA, Start, Offset, Opts, SW, Pos, Acc
+    ),
+    lists:reverse(Acc1).
+
+fast_offset_flush(<<>>, _NA, _Start, _End, _Opts, _SW, Pos, Acc) ->
+    {Pos, Acc};
+fast_offset_flush(Tok, false, Start, End, _Opts, SW, Pos, Acc) ->
+    case lists:member(Tok, SW) of
+        true -> {Pos + 1, Acc};
+        false -> {Pos + 1, [{Tok, Pos, Start, End - Start} | Acc]}
+    end;
+fast_offset_flush(Tok, true, Start, End, Opts, SW, Pos, Acc) ->
+    Norm = normalise_token(Tok, Opts),
+    case {Norm =:= <<>>, lists:member(Norm, SW)} of
+        {true, _} -> {Pos, Acc};
+        {false, true} -> {Pos + 1, Acc};
+        {false, false} ->
+            {Pos + 1, [{Norm, Pos, Start, End - Start} | Acc]}
+    end.
+
+%% Custom tokenchars/separators use the same classifier and normalization as
+%% tokenize_unicode/2, with the original byte range carried beside each token.
+unicode_tokens_with_offsets(
+    <<16#F0, 16#9F, 16#92, Next, Rest/binary>>, Offset,
+    Opts, SW, Tok, Start, Pos, Acc
+) when Next band 16#C0 =/= 16#80 ->
+    unicode_offset_char(
+        16#7D2, <<16#DF, 16#92>>, <<Next, Rest/binary>>, Offset, Offset + 3,
+        Opts, SW, Tok, Start, Pos, Acc
+    );
+unicode_tokens_with_offsets(
+    <<CP/utf8, Rest/binary>> = Bin, Offset,
+    Opts, SW, Tok, Start, Pos, Acc
+) ->
+    CharLen = byte_size(Bin) - byte_size(Rest),
+    <<Char:CharLen/binary, _/binary>> = Bin,
+    unicode_offset_char(
+        CP, Char, Rest, Offset, Offset + CharLen,
+        Opts, SW, Tok, Start, Pos, Acc
+    );
+unicode_tokens_with_offsets(
+    <<_Bad, Rest/binary>>, Offset, Opts, SW, Tok, Start, Pos, Acc
+) ->
+    {Pos1, Acc1} = unicode_offset_flush(
+        Tok, Start, Offset, Opts, SW, Pos, Acc
+    ),
+    unicode_tokens_with_offsets(
+        Rest, Offset + 1, Opts, SW, <<>>, undefined, Pos1, Acc1
+    );
+unicode_tokens_with_offsets(
+    <<>>, Offset, Opts, SW, Tok, Start, Pos, Acc
+) ->
+    {_Pos1, Acc1} = unicode_offset_flush(
+        Tok, Start, Offset, Opts, SW, Pos, Acc
+    ),
+    lists:reverse(Acc1).
+
+unicode_offset_char(
+    CP, Char, Rest, Offset, NextOffset,
+    Opts, SW, Tok, Start, Pos, Acc
+) ->
+    case token_char(CP, Opts) of
+        true ->
+            unicode_tokens_with_offsets(
+                Rest, NextOffset, Opts, SW, <<Tok/binary, Char/binary>>,
+                token_start(Start, Offset), Pos, Acc
+            );
+        false ->
+            {Pos1, Acc1} = unicode_offset_flush(
+                Tok, Start, Offset, Opts, SW, Pos, Acc
+            ),
+            unicode_tokens_with_offsets(
+                Rest, NextOffset, Opts, SW, <<>>, undefined, Pos1, Acc1
+            )
+    end.
+
+unicode_offset_flush(<<>>, _Start, _End, _Opts, _SW, Pos, Acc) ->
+    {Pos, Acc};
+unicode_offset_flush(Tok, Start, End, Opts, SW, Pos, Acc) ->
+    Norm = normalise_token(Tok, Opts),
+    case {Norm =:= <<>>, lists:member(Norm, SW)} of
+        {true, _} -> {Pos, Acc};
+        {false, true} -> {Pos + 1, Acc};
+        {false, false} ->
+            {Pos + 1, [{Norm, Pos, Start, End - Start} | Acc]}
+    end.
+
+token_start(undefined, Offset) -> Offset;
+token_start(Start, _Offset) -> Start.
 
 tokenize_unicode(Text0, Opts) ->
     %% Keep malformed input explicit.  Dropping a bad byte before this fold
@@ -5903,6 +6110,69 @@ bm25_true_count_at_cap_tester() ->
         ?assertEqual(<<"65000">>, maps:get(key, Low)),
         ?assert(maps:get(score, High) > maps:get(score, Low))
     end).
+
+tokenize_with_offsets_sqlite_oracle_corpus_test() ->
+    Oracle = tokenizer_oracle_path(),
+    {ok, [Cases]} = file:consult(Oracle),
+    lists:foreach(
+        fun(#{id := Id, tokenizer_opts := DefinitionOpts, doc := Text}) ->
+            {ok, Schema} = schema(DefinitionOpts#{
+                index => atom_to_binary(Id, utf8),
+                columns => [body]
+            }),
+            Opts = schema_tokenizer_options(Schema),
+            Expected = tokenize(Text, Opts),
+            WithOffsets = tokenize_with_offsets(Text, Opts),
+            ?assertEqual(
+                Expected,
+                [{Token, Pos} || {Token, Pos, _Offset, _Length} <- WithOffsets]
+            ),
+            lists:foreach(
+                fun({Token, _Pos, Offset, Length}) ->
+                    SourceToken = binary:part(Text, Offset, Length),
+                    ?assertEqual(
+                        [{Token, 0}],
+                        tokenize(SourceToken, Opts#{stopwords => []})
+                    )
+                end,
+                WithOffsets
+            )
+        end,
+        Cases
+    ).
+
+tokenize_with_offsets_stopword_ordinals_test() ->
+    {ok, Schema} = schema(#{
+        index => <<"offset-stopwords">>,
+        columns => [body],
+        remove_diacritics => true,
+        stopwords => [<<"skip">>]
+    }),
+    Opts = schema_tokenizer_options(Schema),
+    ?assertEqual(
+        [
+            {<<"alpha">>, 0, 0, 5},
+            {<<"cafe">>, 2, 11, 5},
+            {<<"omega">>, 3, 17, 5}
+        ],
+        tokenize_with_offsets(<<"Alpha skip caf\xC3\xA9 omega">>, Opts)
+    ),
+    ?assertEqual(
+        [{<<"ab\xDF\x92cd">>, 0, 0, 7}],
+        tokenize_with_offsets(<<"ab", 16#F0, 16#9F, 16#92, "cd">>, Opts)
+    ).
+
+tokenizer_oracle_path() ->
+    Name = "fts_sqlite_oracle_corpus.eterm",
+    Candidates = [
+        filename:absname(filename:join([
+            code:lib_dir(leveled), "..", "..", "..", "..", "test", Name
+        ])),
+        filename:absname(filename:join([
+            filename:dirname(?FILE), "..", "test", Name
+        ]))
+    ],
+    hd([Path || Path <- Candidates, filelib:is_file(Path)]).
 
 exact_positions_pathological_scale_test_() ->
     {timeout, 60, fun exact_positions_pathological_scale_tester/0}.
