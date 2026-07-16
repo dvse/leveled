@@ -45,8 +45,8 @@ index's bucket. For index `I`:
 - **Doc-id rows** — one row per live doc version:
   `{I, <<"id">>, <<DocId:64>>}` → `{DocKey, Version}`. This is the
   lookup direction used at serve; a missing row means the id is retired.
-  `{I, <<"id">>, <<"counter">>}` is the single compact-id allocator.
-  IDs are representation state, not a domain version clock.
+  IDs are content-derived representation state, not a domain version
+  clock.
 - **Epoch rows** — one row per shard: `{I, ShardId, <<"epoch">>}` →
   small counter value. Rewritten in EVERY batch that touches the shard;
   its SQN is the condition consolidation's casmput commits against (§5).
@@ -79,8 +79,7 @@ index's bucket. For index `I`:
 Liveness needs no queue or version-clock machinery: reindexing a doc overwrites its posting
 rows and manifest in one batch; deleting removes them. There is no
 domain sequence to allocate, stamp, or reseed — the audit's L2-F3 class
-cannot be expressed. The doc-id counter is only an at-rest representation
-allocator and advances atomically with a page rewrite.
+cannot be expressed.
 
 **Doc-version stamp.** Every posting row and the manifest of one derive
 batch share an 8-byte content-derived stamp (pure, idempotent). A doc id
@@ -104,12 +103,13 @@ journal-bodied bulk objects, ordered AFTER the bulk write so the
 manifest row is the authoritative "indexed" fact (NATIVE_CAS.md §2).
 An update uses the manifest to compute removed shards and retirement ids.
 
-Pure derivation gives a new version a collision-resistant transient id so
-it is immediately searchable before maintenance. The first consolidation
-that sees the version CAS-allocates its never-reused compact id, rewrites
-the manifest/id row, and uses the compact id in pages. Other dirty shards
-point-read that doc's manifest and converge on the same id; there is never
-a corpus manifest fold or an in-memory reverse dictionary.
+Pure derivation gives each version a collision-resistant id that is
+immediately searchable and remains its page id after maintenance. A shard
+consolidation uses the ids already carried by its authoritative tail; the
+epoch CAS rejects a rebuild if any document touching the shard raced the
+fold. Consolidation therefore performs no per-document manifest reads, id
+assignment, or id-row retirement, and there is never a corpus manifest fold
+or an in-memory reverse dictionary.
 
 Derivation is embarrassingly parallel across docs/workers; the store
 sees only ordinary mput batches.
@@ -143,11 +143,9 @@ Correctness without cache admission:
 ## 5. Consolidation
 
 A maintenance fold (caller-scheduled, per shard): read the shard's
-doc-major tail from a snapshot, point-read only those touched docs' manifests,
-merge into token pages (the inverter), allocate compact ids for new live
-versions, then commit `pages' + touched-manifest/id updates + counter advance
-+ tail removals + tailsum'` via `book_casmput` conditioned on the epoch,
-changed manifests, and counter SQNs. A write that raced
+doc-major tail from a snapshot, merge it into token pages (the inverter),
+then commit `pages + tail removals + tailsum` via `book_casmput` conditioned
+only on the shard epoch. A write that raced
 the fold fails the condition and the shard is retried later —
 linearizable consolidation from the public CAS. Queries see either the
 pre- or post-consolidation row set, both complete. Because reads are

@@ -60,7 +60,6 @@
 -define(TAILSUM_VERSION, 1).
 -define(MANIFEST_VERSION, 4).
 -define(DOCID_ROW_VERSION, 1).
--define(DOCID_COUNTER_VERSION, 1).
 -define(TRANSIENT_DOC_ID_BIT, 16#8000000000000000).
 -define(STATS_VERSION, 2).
 -define(PAGE_MAX_BYTES, 32768).
@@ -3381,18 +3380,36 @@ client_encode_boolean_entry(DocId, DocLength, Count) ->
     client_guard(doc_id, DocId, ?MAX_DOC_ID),
     client_guard(doc_length, DocLength, ?MAX_U64),
     client_guard(true_occurrences, Count, ?MAX_U64),
-    <<(varint_append(DocId, <<>>))/binary,
+    <<(client_encode_doc_id(DocId))/binary,
         (varint_append(DocLength, <<>>))/binary,
         (varint_append(Count, <<>>))/binary>>.
 
 client_encode_position_entries(DocId, Positions) ->
     client_guard(doc_id, DocId, ?MAX_DOC_ID),
-    DocIdBin = varint_append(DocId, <<>>),
+    DocIdBin = client_encode_doc_id(DocId),
     [<<DocIdBin/binary,
         (varint_append(byte_size(PosBin), <<>>))/binary,
         PosBin/binary>>
      || {_Count, PosBin} <-
         client_encode_position_chunks(Positions, ?PAGE_POSITION_BYTES)].
+
+%% Derived ids always carry the high-bit version namespace and therefore
+%% occupy exactly ten bytes in the existing unsigned-varint page format.
+%% Constructing that fixed shape once avoids ten growing-binary copies for
+%% every boolean and position entry during a page rebuild.
+client_encode_doc_id(DocId) when DocId >= ?TRANSIENT_DOC_ID_BIT ->
+    <<((DocId band 16#7F) bor 16#80):8,
+        (((DocId bsr 7) band 16#7F) bor 16#80):8,
+        (((DocId bsr 14) band 16#7F) bor 16#80):8,
+        (((DocId bsr 21) band 16#7F) bor 16#80):8,
+        (((DocId bsr 28) band 16#7F) bor 16#80):8,
+        (((DocId bsr 35) band 16#7F) bor 16#80):8,
+        (((DocId bsr 42) band 16#7F) bor 16#80):8,
+        (((DocId bsr 49) band 16#7F) bor 16#80):8,
+        (((DocId bsr 56) band 16#7F) bor 16#80):8,
+        (DocId bsr 63):8>>;
+client_encode_doc_id(DocId) ->
+    varint_append(DocId, <<>>).
 
 client_encode_token_pages(Docs) ->
     Columns = lists:usort(lists:append([
@@ -3839,31 +3856,34 @@ client_consolidate_shard(Bookie, Schema, Shard, Hook, Acc) ->
             case DocRows of
                 [] -> Acc;
                 _ ->
-                    {Tail, IdSpecs, IdConditions} =
-                        client_allocate_tail_doc_ids(
-                            Bookie, Schema, Tail0
-                        ),
+                    %% The shard tail is the authoritative latest row for
+                    %% every document that touched this shard. Any concurrent
+                    %% update also advances this shard's epoch, so the CAS
+                    %% below rejects a page rebuild from a stale tail without
+                    %% per-document manifest reads or id reassignment.
                     Existing = client_fold_shard_pages(
                         Bookie, Schema, Shard
                     ),
-                    Inverted = client_invert_tail(Tail),
+                    Inverted = client_invert_tail(Tail0),
                     client_call_hook(Hook, {Shard, ObservedSQN}),
                     Bucket = maps:get(index, Schema),
                     ShardKey = client_shard_key(Shard),
                     PageSpecs = client_merge_page_specs(
                         Bucket, Existing, Inverted,
-                        client_tail_doc_ids(Tail)
+                        client_tail_doc_ids(Tail0)
                     ),
-                    Specs = PageSpecs ++ IdSpecs ++
+                    Specs = PageSpecs ++
                         [{remove, Bucket, ShardKey, SubKey, <<>>}
                             || SubKey <- DocRows] ++
                         [{add, Bucket, ShardKey, <<"tailsum">>,
                             client_encode_tailsum(empty)},
                             client_epoch_spec(Bucket, Shard)],
-                    Condition = [
-                        {Bucket, ShardKey, <<"epoch">>, {sqn, ObservedSQN}}
-                    ] ++ IdConditions,
-                    case leveled_bookie:book_casmput(Bookie, Specs, Condition) of
+                    Condition = {
+                        Bucket, ShardKey, <<"epoch">>, {sqn, ObservedSQN}
+                    },
+                    case leveled_bookie:book_casmput(
+                            Bookie, Specs, [Condition]
+                        ) of
                         ok -> Acc#{consolidated := [Shard |
                             maps:get(consolidated, Acc)]};
                         pause -> Acc#{consolidated := [Shard |
@@ -3875,123 +3895,6 @@ client_consolidate_shard(Bookie, Schema, Shard, Hook, Acc) ->
                     end
             end
     end.
-
-client_allocate_tail_doc_ids(Bookie, #{index := Bucket}, Tail) ->
-    {Next0, CounterCondition} = client_read_doc_id_counter(Bookie, Bucket),
-    {CanonicalTail, Next, Specs0, Conditions0} = lists:foldl(
-        fun
-            ({DocKey, {_Version, _DocId, _RetiredIds,
-                    _Length, _Base, remove, _Posting} = Row},
-                    {TailAcc, NextAcc, SpecsAcc, ConditionsAcc}) ->
-                {TailAcc#{DocKey => Row}, NextAcc,
-                    SpecsAcc, ConditionsAcc};
-            ({DocKey, {Version, StoredDocId, RetiredIds,
-                    Length, Base, live, Posting}},
-                    {TailAcc, NextAcc, SpecsAcc, ConditionsAcc}) ->
-                case client_read_manifest_for_allocation(
-                        Bookie, Bucket, DocKey
-                    ) of
-                    {ok, #{version := Version, doc_id := CurrentDocId} =
-                            Manifest, ManifestCondition} ->
-                        case client_transient_doc_id(CurrentDocId) of
-                            false ->
-                                Row = {Version, CurrentDocId,
-                                    lists:usort([StoredDocId | RetiredIds]),
-                                    Length, Base, live, Posting},
-                                {TailAcc#{DocKey => Row}, NextAcc,
-                                    SpecsAcc, ConditionsAcc};
-                            true ->
-                                client_guard(
-                                    compact_doc_id, NextAcc,
-                                    ?TRANSIENT_DOC_ID_BIT - 1
-                                ),
-                                Updated = Manifest#{doc_id => NextAcc},
-                                ManifestSpec = {
-                                    add, Bucket, <<"doc">>, DocKey,
-                                    client_encode_manifest(
-                                        maps:get(version, Updated),
-                                        maps:get(doc_id, Updated),
-                                        maps:get(shards, Updated),
-                                        maps:get(doc_length, Updated),
-                                        maps:get(base_length, Updated, none),
-                                        maps:get(fingerprint, Updated)
-                                    )
-                                },
-                                Row = {Version, NextAcc,
-                                    lists:usort([
-                                        StoredDocId, CurrentDocId
-                                        | RetiredIds
-                                    ]), Length, Base, live, Posting},
-                                IdSpecs = [
-                                    ManifestSpec,
-                                    client_doc_id_spec(
-                                        Bucket, NextAcc, DocKey, Version
-                                    ),
-                                    client_remove_doc_id_spec(
-                                        Bucket, CurrentDocId
-                                    )
-                                ],
-                                {TailAcc#{DocKey => Row}, NextAcc + 1,
-                                    lists:reverse(IdSpecs, SpecsAcc),
-                                    [ManifestCondition | ConditionsAcc]}
-                        end;
-                    _ ->
-                        Row = {Version, StoredDocId, RetiredIds,
-                            Length, Base, remove, #{}},
-                        {TailAcc#{DocKey => Row}, NextAcc,
-                            SpecsAcc, ConditionsAcc}
-                end
-        end,
-        {#{}, Next0, [], []},
-        lists:sort(maps:to_list(Tail))
-    ),
-    {CounterSpecs, CounterConditions} = case Next =:= Next0 of
-        true -> {[], []};
-        false ->
-            {[{add, Bucket, <<"id">>, <<"counter">>,
-                client_encode_doc_id_counter(Next)}],
-                [CounterCondition]}
-    end,
-    {CanonicalTail, lists:reverse(Specs0) ++ CounterSpecs,
-        lists:reverse(Conditions0) ++ CounterConditions}.
-
-client_read_manifest_for_allocation(Bookie, Bucket, DocKey) ->
-    case leveled_bookie:book_sqn(
-            Bookie, Bucket, {<<"doc">>, DocKey}, ?HEAD_TAG
-        ) of
-        not_found -> not_found;
-        {ok, SQN} ->
-            case leveled_bookie:book_headonly(
-                    Bookie, Bucket, <<"doc">>, DocKey
-                ) of
-                {ok, Value} ->
-                    {ok, client_decode_manifest_value(Value),
-                        {Bucket, <<"doc">>, DocKey, {sqn, SQN}}};
-                not_found -> not_found
-            end
-    end.
-
-client_read_doc_id_counter(Bookie, Bucket) ->
-    case leveled_bookie:book_sqn(
-            Bookie, Bucket, {<<"id">>, <<"counter">>}, ?HEAD_TAG
-        ) of
-        not_found -> {1, {Bucket, <<"id">>, <<"counter">>, absent}};
-        {ok, SQN} ->
-            {ok, Value} = leveled_bookie:book_headonly(
-                Bookie, Bucket, <<"id">>, <<"counter">>
-            ),
-            {client_decode_doc_id_counter(Value),
-                {Bucket, <<"id">>, <<"counter">>, {sqn, SQN}}}
-    end.
-
-client_encode_doc_id_counter(Next) ->
-    <<?DOCID_COUNTER_VERSION:8, Next:64/unsigned-big>>.
-
-client_decode_doc_id_counter(
-        <<?DOCID_COUNTER_VERSION:8, Next:64/unsigned-big>>
-    ) when Next > 0 -> Next;
-client_decode_doc_id_counter(Bad) ->
-    erlang:error({invalid_fts_doc_id_counter, Bad}).
 
 client_fold_shard_pages(Bookie, Schema, Shard) ->
     Bucket = maps:get(index, Schema),
@@ -6107,6 +6010,15 @@ client_codec_and_capacity_test() ->
         )).
 
 v7_page_entry_roundtrip_test() ->
+    DerivedDocId = ?TRANSIENT_DOC_ID_BIT + 16#123456789ABC,
+    ?assertEqual(
+        varint_append(DerivedDocId, <<>>),
+        client_encode_doc_id(DerivedDocId)
+    ),
+    ?assertEqual(
+        {ok, DerivedDocId, <<>>},
+        decode_varint(client_encode_doc_id(DerivedDocId))
+    ),
     Boolean = client_encode_boolean_entry(300, 9876, 70000),
     ?assertEqual(
         {300, {300, 9876,
@@ -6223,21 +6135,21 @@ doc_id_row_lookup_direction_tester() ->
         ?assertEqual({<<"doc">>, Version}, client_decode_doc_id_row(IdRow)),
         ?assertMatch({ok, [_]}, search(Bookie, Schema, <<"alpha">>, #{})),
         {ok, #{skipped := []}} = consolidate(Bookie, Schema, #{}),
-        {ok, CompactManifestBin} = leveled_bookie:book_headonly(
+        {ok, ConsolidatedManifestBin} = leveled_bookie:book_headonly(
             Bookie, Bucket, <<"doc">>, <<"doc">>
         ),
-        #{doc_id := CompactDocId} =
-            client_decode_manifest_value(CompactManifestBin),
-        ?assertNot(client_transient_doc_id(CompactDocId)),
-        ?assertEqual(not_found, leveled_bookie:book_headonly(
+        #{doc_id := DocId} =
+            client_decode_manifest_value(ConsolidatedManifestBin),
+        {ok, ConsolidatedIdRow} = leveled_bookie:book_headonly(
             Bookie, Bucket, <<"id">>, client_doc_id_subkey(DocId)
-        )),
-        {ok, CompactIdRow} = leveled_bookie:book_headonly(
-            Bookie, Bucket, <<"id">>, client_doc_id_subkey(CompactDocId)
         ),
         ?assertEqual(
-            {<<"doc">>, Version}, client_decode_doc_id_row(CompactIdRow)
-        )
+            {<<"doc">>, Version},
+            client_decode_doc_id_row(ConsolidatedIdRow)
+        ),
+        ?assertEqual(not_found, leveled_bookie:book_headonly(
+            Bookie, Bucket, <<"id">>, <<"counter">>
+        ))
     end).
 
 search_skips_manifest_fold_test_() ->
