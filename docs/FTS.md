@@ -116,6 +116,21 @@ sees only ordinary mput batches.
 
 ## 4. Reading: store-direct, no library caches
 
+### Query syntax
+
+The canonical proximity spelling is `left NEAR,n right`, where `n` is
+the maximum distance from 0 through 64. For example,
+`"point duty" NEAR,20 "cross claim"` keeps each quoted phrase as one
+operand. `left NEAR right` uses the documented default distance of 10.
+
+Common unambiguous variants are accepted and normalized by the query
+lexer: `NEAR(left right, n)`, `NEAR(left, right, n)`, and
+`left NEAR/n right`. An explicit comma-distance also makes case
+variants such as `Near,3` and `near,3` unambiguous; bare lowercase
+`near` stays a prose term. `AND`, `OR`, and `NOT` remain uppercase-only
+operators; their lowercase spellings are ordinary search terms so prose
+queries keep their meaning.
+
 The library maintains NO caches (settled 2026-07-12): every query reads the
 store directly, and the only warmth is leveled's own ledger/page caches.
 Query flow per token: point-read the token's pages
