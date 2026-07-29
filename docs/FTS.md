@@ -57,14 +57,22 @@ index's bucket. For index `I`:
   tokens; a selective or missing term never folds anything.
 - **Token pages (consolidated)** — the at-rest read format, chosen for
   stock leveled's strengths (bloom-guarded point reads; ordered-key
-  range folds; journal for big values): one row per (token, page),
-  `{I, <<"t:", Token>>, PageNo}` → merged postings for that token slice
-  (docs, true counts, exact positions), pages bounded (~8–64KB) so SST
-  merges stay cheap; oversized hot tokens overflow to journal-bodied
-  pages behind ledger stubs. Boolean entries are `varint DocId, varint
-  DocLength, varint Count`. Position entries are `varint DocId, varint
-  PosBytes, PosBin`; the position codec itself is unchanged. A term query is one
-  or two point reads; a
+  range folds; journal for big values). Format v8 page subkeys include
+  the page's first and last docids. Posting payloads are docid-ordered
+  ~2KB chunks: each header carries first/last docid and a conservative
+  one-byte BM25 bound; the first docid is absolute at the chunk boundary
+  and later docids are delta varints. The page-0 header carries document
+  frequency, collection frequency, and the term bound. Exact positions
+  use distinct position-plane subkey rows and are read only for
+  positional evaluation or final winners; they never occupy scan-hot
+  boolean rows. Position lists larger than one page entry are split into
+  independently decodable bounded chunks, preserving the position-length
+  safety contract without truncating true counts. Pages stay below the
+  ordinary 32KB value limit. If a hot term's cross-page boundary index no
+  longer fits in page 0, it spills into bounded, separately addressed rows
+  committed in the same batch; the page reader reassembles those rows only
+  when it sees the overflow marker. A term query is one or two point/range
+  reads; a
   missing term is a bloom miss; prefix expansion is a bounded ordered
   range fold. Consolidation (§5) is the INVERTER: it folds the
   doc-major tail into token pages. Doc-major posting rows exist only in
@@ -72,7 +80,8 @@ index's bucket. For index `I`:
   and overwrite-live — and the tail masks consolidated pages for
   updated/removed docs (segment semantics). Version-stamp admission
   applies to the tail; consolidation bakes only live versions into
-  pages. Page format v7 requires reindexing from v6.
+  pages. Readers negotiate v7 and v8; new consolidation writes v8 and a
+  v7 index remains readable without in-place migration.
 - **Stats row** — `{I, <<"stats">>}` → doc count and total length for
   BM25, updated in the same batches.
 
