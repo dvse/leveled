@@ -62,14 +62,9 @@
     book_get/4,
     book_head/3,
     book_head/4,
-    book_mhead_sqn/3,
-    book_mvaluecache_get/3,
-    book_journalsqn/1,
     book_sqn/3,
     book_sqn/4,
     book_headonly/4,
-    book_valuecache_get/3,
-    book_valuecache_put/4,
     book_snapshot/4,
     book_compactjournal/2,
     book_islastcompactionpending/1,
@@ -150,8 +145,7 @@
     {snapshot_timeout_long, ?SNAPTIMEOUT_LONG},
     {stats_percentage, ?DEFAULT_STATS_PERC},
     {stats_logfrequency, element(1, leveled_monitor:get_defaults())},
-    {monitor_loglist, element(2, leveled_monitor:get_defaults())},
-    {value_cache_size, 0}
+    {monitor_loglist, element(2, leveled_monitor:get_defaults())}
 ]).
 
 -record(ledger_cache, {
@@ -257,9 +251,6 @@
         % - no_lookup prevents individual objects from being fetched, so
         % that the store can only be used for folds (without segment list
         % acceleration)
-        | {value_cache_size, non_neg_integer()}
-        % Byte budget for the caller-side SQN-keyed value cache. Zero
-        % disables it.
         | {waste_retention_period, undefined | pos_integer()}
         % If a value is not required in the journal (i.e. it has been
         % replaced and is now to be removed for compaction) for how long
@@ -735,71 +726,12 @@ book_get(Pid, Bucket, Key) ->
 book_head(Pid, Bucket, Key) ->
     book_head(Pid, Bucket, Key, ?STD_TAG).
 
-%% @doc Resolve the current SQN for several HEAD_TAG rows in one in-memory
-%% Bookie call. A row may be identified by Key (the null subkey) or
-%% {Key, SubKey}. Input order and duplicates are preserved. This is the head
-%% phase used by callers that hydrate only cache misses.
-book_mhead_sqn(Pid, Bucket, Keys) when is_list(Keys) ->
-    gen_server:call(Pid, {mhead_sqn, Bucket, Keys}, infinity).
-
-%% @doc Resolve already-cached current values in one caller-side pass.  A
-%% cache miss at either the head or value layer is explicit, so callers retain
-%% their ordinary Bookie fallback without a staleness window.
-book_mvaluecache_get(Pid, Bucket, Rows) when is_list(Rows) ->
-    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
-        undefined ->
-            [{Row, miss} || {Row, _CacheKey} <- Rows];
-        {Tid, _Size} ->
-            try
-                [
-                    {
-                        Row,
-                        book_current_cached_value(
-                            Tid, Bucket, Row, CacheKey
-                        )
-                    }
-                 || {Row, CacheKey} <- Rows
-                ]
-            catch
-                error:badarg ->
-                    [{Row, miss} || {Row, _CacheKey} <- Rows]
-            end
-    end.
-
-book_current_cached_value(Tid, Bucket, Row, CacheKey) ->
-    case ets:lookup(Tid, {head_sqn, Bucket, Row}) of
-        [{_HeadCacheKey, {ok, SQN}}] ->
-            case ets:lookup(Tid, {CacheKey, SQN}) of
-                [{_ValueCacheKey, Value}] -> {ok, Value};
-                [] -> miss
-            end;
-        [{_HeadCacheKey, not_found}] ->
-            not_found;
-        [] ->
-            miss
-    end.
-
 book_headonly(Pid, Bucket, Key, SubKey) ->
     gen_server:call(
         Pid,
         {head, Bucket, {Key, SubKey}, ?HEAD_TAG, false},
         infinity
     ).
-
-%% @doc Look up and populate caller-owned decoded values in the Bookie's
-%% SQN-keyed cache. The SQN is part of the cache key, so overwrites cannot
-%% return a stale entry.
-book_valuecache_get(Pid, Key, SQN) ->
-    valuecache_lookup(Pid, Key, SQN).
-
-book_valuecache_put(Pid, Key, SQN, Value) ->
-    valuecache_insert(Pid, Key, SQN, Value).
-
--spec book_journalsqn(pid()) -> {ok, non_neg_integer()}.
-%% @doc Return the current store-wide journal sequence. Every committed write,
-%% including a raw batched write, advances this value.
-book_journalsqn(Pid) ->
-    gen_server:call(Pid, journal_sqn, infinity).
 
 book_sqn(Pid, Bucket, Key) ->
     book_sqn(Pid, Bucket, Key, ?STD_TAG).
@@ -1544,7 +1476,6 @@ init([Opts]) ->
             {Inker, Penciller} = startup(InkerOpts, PencillerOpts0),
 
             NewETS = ets:new(mem, [ordered_set]),
-            ok = valuecache_init(proplists:get_value(value_cache_size, Opts)),
             ?STD_LOG(b0001, [Inker, Penciller]),
             {ok, #state{
                 cache_size = CacheSize,
@@ -1643,68 +1574,6 @@ handle_call({casmput, ObjectSpecs, Conditions, TTL}, From, State) when
         Failures ->
             {reply, {error, {precondition_failed, Failures}}, State}
     end;
-handle_call({mhead_sqn, Bucket, Keys}, _From, State) when
-    State#state.head_lookup == true
-->
-    Results =
-        lists:map(
-            fun(Row) ->
-                {Key, SubKey} =
-                    case Row of
-                        {AddressKey, AddressSubKey} ->
-                            {AddressKey, AddressSubKey};
-                        AddressKey ->
-                            {AddressKey, null}
-                    end,
-                Result =
-                    case headcache_lookup(self(), Bucket, Row) of
-                        {ok, Cached} ->
-                            Cached;
-                        miss ->
-                            LedgerKey =
-                                leveled_codec:to_objectkey(
-                                    Bucket, {Key, SubKey}, ?HEAD_TAG
-                                ),
-                            {Head, _CacheHit} =
-                                fetch_head(
-                                    LedgerKey,
-                                    State#state.penciller,
-                                    State#state.ledger_cache,
-                                    true
-                                ),
-                            Resolved =
-                                case Head of
-                                    not_present ->
-                                        not_found;
-                                    Head ->
-                                        case
-                                            leveled_codec:striphead_to_v1details(
-                                                Head
-                                            )
-                                        of
-                                            {_SeqN, tomb, _MH, _MD} ->
-                                                not_found;
-                                            {SeqN, {active, TS}, _MH, _MD} ->
-                                                case
-                                                    TS >=
-                                                        leveled_util:integer_now()
-                                                of
-                                                    true -> {ok, SeqN};
-                                                    false -> not_found
-                                                end
-                                        end
-                                end,
-                            ok =
-                                headcache_insert(
-                                    self(), Bucket, Row, Resolved
-                                ),
-                            Resolved
-                    end,
-                {Row, Result}
-            end,
-            Keys
-        ),
-    {reply, Results, State};
 handle_call({get, Bucket, Key, Tag}, _From, State) when
     State#state.head_only == false
 ->
@@ -1936,8 +1805,6 @@ handle_call(return_actors, _From, State) ->
     {reply, {ok, State#state.inker, State#state.penciller}, State};
 handle_call(head_status, _From, State) ->
     {reply, {State#state.head_only, State#state.head_lookup}, State};
-handle_call(journal_sqn, _From, State) ->
-    {reply, leveled_inker:ink_getjournalsqn(State#state.inker), State};
 handle_call(status, _From, State) ->
     {reply, status(State), State};
 handle_call(Msg, _From, State) ->
@@ -2000,7 +1867,6 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(Reason, _State) ->
-    _ = persistent_term:erase({?MODULE, valuecache, self()}),
     ?STD_LOG(b0003, [Reason]).
 
 code_change(_OldVsn, State, _Extra) ->
@@ -2009,131 +1875,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%%============================================================================
 %%% External functions
 %%%============================================================================
-
-%% Caller-side value cache. Entries are keyed by a caller namespace plus the
-%% current ledger SQN. A write allocates a new SQN, so cache hits are current
-%% without invalidation or a staleness window.
-valuecache_init(Size) when is_integer(Size), Size > 0 ->
-    Tid =
-        ets:new(leveled_bookie_valuecache, [
-            set,
-            public,
-            {read_concurrency, true},
-            {write_concurrency, true}
-        ]),
-    persistent_term:put({?MODULE, valuecache, self()}, {Tid, Size}),
-    ok;
-valuecache_init(_Disabled) ->
-    ok.
-
-valuecache_lookup(Pid, Key, SQN) ->
-    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
-        undefined ->
-            miss;
-        {Tid, _Size} ->
-            try ets:lookup(Tid, {Key, SQN}) of
-                [{_CacheKey, Value}] -> {ok, Value};
-                [] -> miss
-            catch
-                error:badarg -> miss
-            end
-    end.
-
-valuecache_insert(Pid, Key, SQN, Value) ->
-    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
-        undefined ->
-            ok;
-        {Tid, Size} ->
-            try
-                ets:insert(Tid, {{Key, SQN}, Value}),
-                valuecache_bound(Tid, Size)
-            catch
-                error:badarg -> ok
-            end
-    end.
-
-valuecache_bound(Tid, Size) ->
-    Words = ets:info(Tid, memory),
-    case
-        is_integer(Words) andalso
-            Words * erlang:system_info(wordsize) > Size
-    of
-        true ->
-            case ets:first(Tid) of
-                '$end_of_table' ->
-                    ok;
-                First ->
-                    ets:delete(Tid, First),
-                    valuecache_bound(Tid, Size)
-            end;
-        false ->
-            ok
-    end.
-
-headcache_lookup(Pid, Bucket, Key) ->
-    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
-        undefined ->
-            miss;
-        {Tid, _Size} ->
-            try ets:lookup(Tid, {head_sqn, Bucket, Key}) of
-                [{_CacheKey, Result}] -> {ok, Result};
-                [] -> miss
-            catch
-                error:badarg -> miss
-            end
-    end.
-
-headcache_insert(Pid, Bucket, Key, Result) ->
-    case persistent_term:get({?MODULE, valuecache, Pid}, undefined) of
-        undefined ->
-            ok;
-        {Tid, Size} ->
-            try
-                ets:insert(Tid, {{head_sqn, Bucket, Key}, Result}),
-                valuecache_bound(Tid, Size)
-            catch
-                error:badarg -> ok
-            end
-    end.
-
-headcache_publish(ObjectSpecs, SQN, TTL) ->
-    case persistent_term:get({?MODULE, valuecache, self()}, undefined) of
-        undefined ->
-            ok;
-        {_Tid, _Size} ->
-            headcache_publish_enabled(ObjectSpecs, SQN, TTL)
-    end.
-
-headcache_publish_enabled(ObjectSpecs, SQN, TTL) ->
-    lists:foreach(
-        fun
-            ({add, Bucket, Key, SubKey, _Value}) ->
-                Row =
-                    case SubKey of
-                        null -> Key;
-                        _ -> {Key, SubKey}
-                    end,
-                Result =
-                    case
-                        TTL == infinity orelse
-                            TTL >= leveled_util:integer_now()
-                    of
-                        true -> {ok, SQN};
-                        false -> not_found
-                    end,
-                ok = headcache_insert(self(), Bucket, Row, Result);
-            ({remove, Bucket, Key, SubKey, _Value}) ->
-                Row =
-                    case SubKey of
-                        null -> Key;
-                        _ -> {Key, SubKey}
-                    end,
-                ok = headcache_insert(self(), Bucket, Row, not_found);
-            (_) ->
-                ok
-        end,
-        ObjectSpecs
-    ).
 
 -spec empty_ledgercache() -> ledger_cache().
 %% @doc
@@ -2995,7 +2736,6 @@ do_mput(ObjectSpecs, TTL, From, State) ->
             {ObjectSpecs, TTL}
         ),
     Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
-    ok = headcache_publish(ObjectSpecs, SQN, TTL),
     case State#state.slow_offer of
         true ->
             gen_server:reply(From, pause);
@@ -4663,74 +4403,5 @@ check_notfound_test() ->
     ),
 
     ?assertMatch({false, 0}, check_notfound(0, MissingFun)).
-
-head_sqn_valuecache_test_() ->
-    {timeout, 60, fun head_sqn_valuecache_tester/0}.
-
-head_sqn_valuecache_tester() ->
-    RootPath = reset_filestructure(),
-    {ok, Bookie} =
-        book_start([
-            {root_path, RootPath},
-            {value_cache_size, 1024 * 1024}
-        ]),
-    {ok, InitialJournalSQN} = book_journalsqn(Bookie),
-    B = <<"cache">>,
-    K1 = <<"one">>,
-    K2 = <<"two">>,
-    SubKey = <<"addressed">>,
-    ok = book_mput(
-        Bookie,
-        [
-            {add, B, K1, null, first},
-            {add, B, K2, null, second},
-            {add, B, K1, SubKey, addressed_first}
-        ]
-    ),
-    {ok, FirstJournalSQN} = book_journalsqn(Bookie),
-    true = FirstJournalSQN > InitialJournalSQN,
-    [{K1, {ok, SQN1}}, {K2, {ok, SQN2}}, {<<"missing">>, not_found}] =
-        book_mhead_sqn(Bookie, B, [K1, K2, <<"missing">>]),
-    miss = book_valuecache_get(Bookie, {decoded, K1}, SQN1),
-    ok = book_valuecache_put(Bookie, {decoded, K1}, SQN1, cached_first),
-    {ok, cached_first} =
-        book_valuecache_get(Bookie, {decoded, K1}, SQN1),
-    [
-        {K1, {ok, cached_first}},
-        {K2, miss},
-        {<<"missing">>, not_found}
-    ] =
-        book_mvaluecache_get(
-            Bookie,
-            B,
-            [
-                {K1, {decoded, K1}},
-                {K2, {decoded, K2}},
-                {<<"missing">>, {decoded, <<"missing">>}}
-            ]
-        ),
-    miss = book_valuecache_get(Bookie, {decoded, K1}, SQN1 + 1),
-    [{{K1, SubKey}, {ok, AddressedSQN}}] =
-        book_mhead_sqn(Bookie, B, [{K1, SubKey}]),
-    ok = book_mput(Bookie, [{add, B, K1, null, updated}]),
-    {ok, UpdatedJournalSQN} = book_journalsqn(Bookie),
-    true = UpdatedJournalSQN > FirstJournalSQN,
-    [{K1, {ok, NewSQN}}, {K2, {ok, SQN2}}] =
-        book_mhead_sqn(Bookie, B, [K1, K2]),
-    true = NewSQN > SQN1,
-    miss = book_valuecache_get(Bookie, {decoded, K1}, NewSQN),
-    [{K1, miss}] =
-        book_mvaluecache_get(
-            Bookie, B, [{K1, {decoded, K1}}]
-        ),
-    ok = book_mput(
-        Bookie, [{add, B, K1, SubKey, addressed_updated}]
-    ),
-    [{{K1, SubKey}, {ok, NewAddressedSQN}}] =
-        book_mhead_sqn(Bookie, B, [{K1, SubKey}]),
-    true = NewAddressedSQN > AddressedSQN,
-    ok = book_close(Bookie),
-    miss = book_valuecache_get(Bookie, {decoded, K1}, SQN1),
-    reset_filestructure().
 
 -endif.

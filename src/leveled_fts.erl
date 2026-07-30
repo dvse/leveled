@@ -665,73 +665,36 @@ client_read_v8_selected_pages_from_head(
 client_read_cached_direct_term_pages(
     Bookie, #{index := Bucket}, Token, Column
 ) ->
-    CacheKey = {fts_term_docs, Bucket, Token, Column},
-    case client_clean_stats_epoch(Bookie, Bucket) of
-        {ok, Epoch} ->
-            case
-                leveled_bookie:book_valuecache_get(
-                    Bookie, CacheKey, Epoch
-                )
-            of
-                {ok, {Docs, Validators}} ->
-                    case client_term_cache_current(
-                        Bookie, Bucket, Validators
-                    ) of
-                        true ->
-                            Docs;
-                        false ->
-                            client_refresh_direct_term_cache(
-                                Bookie,
-                                Bucket,
-                                Token,
-                                Column,
-                                CacheKey,
-                                Epoch
-                            )
-                    end;
-                miss ->
-                    client_refresh_direct_term_cache(
-                        Bookie,
-                        Bucket,
-                        Token,
-                        Column,
-                        CacheKey,
-                        Epoch
-                    )
-            end;
-        dirty ->
-            {Docs, _Validators} = client_read_direct_term_pages(
-                Bookie, Bucket, Token, Column
-            ),
-            Docs
-    end.
-
-client_refresh_direct_term_cache(
-    Bookie, Bucket, Token, Column, CacheKey, Epoch
-) ->
-    {Docs, Validators} = client_read_direct_term_pages(
+    {Docs, _Validators} = client_read_direct_term_pages(
         Bookie, Bucket, Token, Column
     ),
-    case Validators of
-        no_cache ->
-            ok;
-        _ ->
-            ok = leveled_bookie:book_valuecache_put(
-                Bookie, CacheKey, Epoch, {Docs, Validators}
-            )
-    end,
     Docs.
 
-client_term_cache_current(_Bookie, _Bucket, no_cache) ->
-    false;
-client_term_cache_current(Bookie, Bucket, Validators) ->
-    Rows = [Row || {Row, _SQN} <- Validators],
-    leveled_bookie:book_mhead_sqn(Bookie, Bucket, Rows) =:=
-        Validators.
+%% Per-key head SQN reads over the standard bookie API. The batched
+%% book_mhead_sqn bookie extension was reverted with the campaign API
+%% changes; sequence reads now go one head request per row.
+client_head_sqns(Bookie, Bucket, Rows) ->
+    [
+        {Row,
+            case Row of
+                {Key, SubKey} ->
+                    case
+                        leveled_bookie:book_headonly(
+                            Bookie, Bucket, Key, SubKey
+                        )
+                    of
+                        {ok, _Value} -> {ok, 0};
+                        not_found -> not_found
+                    end;
+                _ ->
+                    not_found
+            end}
+     || Row <- Rows
+    ].
 
 client_clean_stats_epoch(Bookie, Bucket) ->
     case
-        leveled_bookie:book_mhead_sqn(
+        client_head_sqns(
             Bookie,
             Bucket,
             [
@@ -764,7 +727,7 @@ client_read_direct_term_pages(
              || {_PageNo, {SubKey, _Value}} <- maps:to_list(V8Pages)
             ],
             SQNs = maps:from_list(
-                leveled_bookie:book_mhead_sqn(Bookie, Bucket, Rows)
+                client_head_sqns(Bookie, Bucket, Rows)
             ),
             Docs =
                 maps:fold(
@@ -832,7 +795,7 @@ client_read_cached_direct_term_overflow(
         {Key, client_page_subkey(?BOOLEAN_PLANE, Column, PageNo)}
      || PageNo <- PageNumbers
     ],
-    SQNs = leveled_bookie:book_mhead_sqn(Bookie, Bucket, Rows),
+    SQNs = client_head_sqns(Bookie, Bucket, Rows),
     [
         begin
             {ok, Page} = client_read_cached_direct_term_page(
@@ -848,7 +811,7 @@ client_read_cached_direct_term_page(
     Bookie, Bucket, Key, Column, PageNo
 ) ->
     Row = {Key, client_page_subkey(?BOOLEAN_PLANE, Column, PageNo)},
-    case leveled_bookie:book_mhead_sqn(Bookie, Bucket, [Row]) of
+    case client_head_sqns(Bookie, Bucket, [Row]) of
         [{Row, {ok, SQN}}] ->
             client_read_cached_direct_term_page(
                 Bookie, Bucket, Key, Column, PageNo, SQN
@@ -865,7 +828,7 @@ client_read_cached_direct_term_page(
                 )
             of
                 #{PageNo := {SubKey, Value}} ->
-                    [{_Row, {ok, SQN}}] = leveled_bookie:book_mhead_sqn(
+                    [{_Row, {ok, SQN}}] = client_head_sqns(
                         Bookie,
                         Bucket,
                         [{Key, SubKey}]
@@ -879,28 +842,19 @@ client_read_cached_direct_term_page(
     end.
 
 client_read_cached_v8_direct_term_page(
-    Bookie, Bucket, Key, SubKey, SQN, Value
+    _Bookie, _Bucket, _Key, SubKey, _SQN, Value
 ) ->
-    CacheKey = {fts_decoded_page, direct_boolean_v2, Bucket, Key, SubKey},
-    case leveled_bookie:book_valuecache_get(Bookie, CacheKey, SQN) of
-        {ok, Page} ->
-            {ok, Page};
-        miss ->
-            PageNo = client_v8_subkey_page_number(SubKey),
-            Page = #{
-                page_count => client_page_count(Value),
-                total_docs =>
-                    case PageNo of
-                        0 -> client_page_total_docs(Value);
-                        _ -> 0
-                    end,
-                docs => client_decode_direct_term_page(Value, #{})
-            },
-            ok = leveled_bookie:book_valuecache_put(
-                Bookie, CacheKey, SQN, Page
-            ),
-            {ok, Page}
-    end.
+    PageNo = client_v8_subkey_page_number(SubKey),
+    Page = #{
+        page_count => client_page_count(Value),
+        total_docs =>
+            case PageNo of
+                0 -> client_page_total_docs(Value);
+                _ -> 0
+            end,
+        docs => client_decode_direct_term_page(Value, #{})
+    },
+    {ok, Page}.
 
 client_v8_subkey_page_number(
     <<_Plane:8, _Column:8, _Last:64/unsigned-big, _First:64/unsigned-big,
@@ -916,45 +870,36 @@ client_read_cached_direct_term_page(
     ).
 
 client_read_cached_direct_term_page(
-    Bookie, Bucket, Key, Column, PageNo, SQN, RawValue
+    Bookie, Bucket, Key, Column, PageNo, _SQN, RawValue
 ) ->
     SubKey = client_page_subkey(?BOOLEAN_PLANE, Column, PageNo),
-    CacheKey = {fts_decoded_page, direct_boolean_v1, Bucket, Key, SubKey},
-    case leveled_bookie:book_valuecache_get(Bookie, CacheKey, SQN) of
-        {ok, Page} ->
+    ReadResult =
+        case RawValue of
+            undefined ->
+                leveled_bookie:book_headonly(
+                    Bookie, Bucket, Key, SubKey
+                );
+            ProvidedValue when is_binary(ProvidedValue) ->
+                {ok, ProvidedValue}
+        end,
+    case ReadResult of
+        {ok, PageValue} ->
+            client_require_page_value(PageValue),
+            Page = #{
+                page_count => client_page_count(PageValue),
+                total_docs =>
+                    case PageNo of
+                        0 -> client_page_total_docs(PageValue);
+                        _ -> 0
+                    end,
+                docs =>
+                    client_decode_direct_term_page(
+                        PageValue, #{}
+                    )
+            },
             {ok, Page};
-        miss ->
-            ReadResult =
-                case RawValue of
-                    undefined ->
-                        leveled_bookie:book_headonly(
-                            Bookie, Bucket, Key, SubKey
-                        );
-                    ProvidedValue when is_binary(ProvidedValue) ->
-                        {ok, ProvidedValue}
-                end,
-            case ReadResult of
-                {ok, PageValue} ->
-                    client_require_page_value(PageValue),
-                    Page = #{
-                        page_count => client_page_count(PageValue),
-                        total_docs =>
-                            case PageNo of
-                                0 -> client_page_total_docs(PageValue);
-                                _ -> 0
-                            end,
-                        docs =>
-                            client_decode_direct_term_page(
-                                PageValue, #{}
-                            )
-                    },
-                    ok = leveled_bookie:book_valuecache_put(
-                        Bookie, CacheKey, SQN, Page
-                    ),
-                    {ok, Page};
-                not_found ->
-                    not_found
-            end
+        not_found ->
+            not_found
     end.
 
 client_merge_direct_term_docs(Docs, Acc) ->
@@ -3115,7 +3060,7 @@ client_ranked_boolean_probe_source(
      || PageNo <- PageNumbers
     ],
     SQNs = maps:from_list(
-        leveled_bookie:book_mhead_sqn(Bookie, Bucket, Rows)
+        client_head_sqns(Bookie, Bucket, Rows)
     ),
     maps:fold(
         fun(PageNo, Candidates, Acc) ->
@@ -4941,7 +4886,7 @@ client_intersect_boolean_docids(
      || PageNo <- PageNumbers
     ],
     SQNs = maps:from_list(
-        leveled_bookie:book_mhead_sqn(Bookie, Bucket, Rows)
+        client_head_sqns(Bookie, Bucket, Rows)
     ),
     maps:fold(
         fun(PageNo, Candidates, Acc) ->
@@ -5038,60 +4983,33 @@ client_read_direct_position_source(Bookie, Schema, Token, Column, Candidates) ->
 client_read_cached_position_pages(
     Bookie, Bucket, Token, Column
 ) ->
-    CacheKey = {fts_position_pages, Bucket, Token, Column},
-    case client_clean_stats_epoch(Bookie, Bucket) of
-        {ok, Epoch} ->
+    Key = client_token_key(Token),
+    Pages0 = client_read_v8_plane_pages(
+        Bookie,
+        Bucket,
+        Key,
+        ?POSITION_PLANE,
+        Column,
+        all
+    ),
+    case maps:find(0, Pages0) of
+        {ok, {_SubKey, Head}} ->
             case
-                leveled_bookie:book_valuecache_get(
-                    Bookie, CacheKey, Epoch
-                )
+                client_page_version(Head) =:=
+                    ?PAGE_VERSION andalso
+                    map_size(Pages0) =:=
+                        client_page_count(Head)
             of
-                {ok, Pages} ->
-                    {ok, Pages};
-                miss ->
-                    Key = client_token_key(Token),
-                    Pages0 = client_read_v8_plane_pages(
-                        Bookie,
-                        Bucket,
-                        Key,
-                        ?POSITION_PLANE,
-                        Column,
-                        all
+                true ->
+                    Pages = maps:map(
+                        fun(_PageNo, {_PageSubKey, Value}) -> Value end,
+                        Pages0
                     ),
-                    case maps:find(0, Pages0) of
-                        {ok, {_SubKey, Head}} ->
-                            case
-                                client_page_version(Head) =:=
-                                    ?PAGE_VERSION andalso
-                                    map_size(Pages0) =:=
-                                        client_page_count(Head)
-                            of
-                                true ->
-                                    Pages = maps:map(
-                                        fun(
-                                            _PageNo,
-                                            {_PageSubKey, Value}
-                                        ) ->
-                                            Value
-                                        end,
-                                        Pages0
-                                    ),
-                                    ok =
-                                        leveled_bookie:book_valuecache_put(
-                                            Bookie,
-                                            CacheKey,
-                                            Epoch,
-                                            Pages
-                                        ),
-                                    {ok, Pages};
-                                false ->
-                                    fallback
-                            end;
-                        _ ->
-                            fallback
-                    end
+                    {ok, Pages};
+                false ->
+                    fallback
             end;
-        dirty ->
+        _ ->
             fallback
     end.
 
@@ -7615,7 +7533,7 @@ client_resolve_doc_id_mappings(Bookie, Bucket, DocIds) ->
         {<<"id">>, client_doc_id_subkey(DocId)}
      || DocId <- DocIds
     ],
-    Heads = leveled_bookie:book_mhead_sqn(Bookie, Bucket, Rows),
+    Heads = client_head_sqns(Bookie, Bucket, Rows),
     lists:foldl(
         fun
             ({DocId, {_Row, not_found}}, Acc) ->
@@ -7630,21 +7548,11 @@ client_resolve_doc_id_mappings(Bookie, Bucket, DocIds) ->
         lists:zip(DocIds, Heads)
     ).
 
-client_read_cached_doc_id_mapping(Bookie, Bucket, SubKey, SQN) ->
-    CacheKey = {fts_decoded_id_row, direct_v1, Bucket, <<"id">>, SubKey},
-    case leveled_bookie:book_valuecache_get(Bookie, CacheKey, SQN) of
-        {ok, Mapping} ->
-            Mapping;
-        miss ->
-            {ok, Value} = leveled_bookie:book_headonly(
-                Bookie, Bucket, <<"id">>, SubKey
-            ),
-            Mapping = client_decode_doc_id_row(Value),
-            ok = leveled_bookie:book_valuecache_put(
-                Bookie, CacheKey, SQN, Mapping
-            ),
-            Mapping
-    end.
+client_read_cached_doc_id_mapping(Bookie, Bucket, SubKey, _SQN) ->
+    {ok, Value} = leveled_bookie:book_headonly(
+        Bookie, Bucket, <<"id">>, SubKey
+    ),
+    client_decode_doc_id_row(Value).
 
 client_validate_doc_id_mapping(DocId, DocKey, DocVersion) ->
     case client_transient_doc_id(DocId) of
@@ -13893,10 +13801,13 @@ bounded_top_k_stability_tester() ->
         )
     end).
 
-decoded_page_value_cache_test_() ->
-    {timeout, 60, fun decoded_page_value_cache_tester/0}.
+decoded_page_recompute_test_() ->
+    {timeout, 60, fun decoded_page_recompute_tester/0}.
 
-decoded_page_value_cache_tester() ->
+%% The SQN value cache was removed (campaign cache cleanout): repeated
+%% searches must RE-DECODE pages every time, and results stay correct
+%% across writes with no cache layer.
+decoded_page_recompute_tester() ->
     client_with_test_bookie(fun(Bookie) ->
         {ok, Schema} = schema(#{
             index => <<"decoded-page-value-cache">>, columns => [body]
@@ -13920,8 +13831,8 @@ decoded_page_value_cache_tester() ->
         {ok, _} = search(
             Bookie, Schema, <<"common">>, #{rank => none, limit => 10}
         ),
-        ?assertEqual(
-            FirstCount, erlang:get({?MODULE, direct_page_decodes})
+        ?assert(
+            erlang:get({?MODULE, direct_page_decodes}) > FirstCount
         ),
         ok = client_test_put(
             Bookie, Schema, <<"1">>, <<"different term">>
@@ -13932,9 +13843,6 @@ decoded_page_value_cache_tester() ->
             Schema,
             <<"common">>,
             #{rank => none, limit => 10, return_count => true}
-        ),
-        ?assert(
-            erlang:get({?MODULE, direct_page_decodes}) > FirstCount
         ),
         erlang:erase({?MODULE, direct_page_decodes})
     end).
