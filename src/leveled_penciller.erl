@@ -848,17 +848,12 @@ handle_call(
             true -> State#state.levelzero_index;
             false -> none
         end,
-    R = [
-        timed_fetch_mem(
-            Key,
-            Hash,
-            M,
-            State#state.levelzero_cache,
-            L0Idx,
-            State#state.monitor
-        )
-     || {Key, Hash} <- Keys
-    ],
+    R = fetch_many_mem(
+        Keys,
+        M,
+        State#state.levelzero_cache,
+        L0Idx
+    ),
     {reply, R, State};
 handle_call(
     {check_sqn, Key, Hash, SQN},
@@ -1785,6 +1780,105 @@ roll_memory(
 %% the cost of requests dropping levels can be monitored.
 %%
 %% the result tuple includes the level at which the result was found.
+fetch_many_mem(Keys, Manifest, L0Cache, L0Index) ->
+    {Found, Pending} = lists:foldl(
+        fun({{Key, Hash}, Index}, {FoundAcc, PendingAcc}) ->
+            PosList =
+                case L0Index of
+                    none -> lists:seq(1, length(L0Cache));
+                    _ -> leveled_pmem:check_index(Hash, L0Index)
+                end,
+            case
+                leveled_pmem:check_levelzero(
+                    Key, Hash, PosList, L0Cache
+                )
+            of
+                {true, KV} ->
+                    {FoundAcc#{Index => KV}, PendingAcc};
+                {false, not_found} ->
+                    {FoundAcc, [{Index, Key, Hash} | PendingAcc]}
+            end
+        end,
+        {#{}, []},
+        lists:zip(Keys, lists:seq(1, length(Keys)))
+    ),
+    Resolved = fetch_many_levels(
+        lists:reverse(Pending), Manifest, 0, Found
+    ),
+    [maps:get(Index, Resolved) || Index <- lists:seq(1, length(Keys))].
+
+fetch_many_levels([], _Manifest, _Level, Found) ->
+    Found;
+fetch_many_levels(Pending, _Manifest, ?MAX_LEVELS + 1, Found) ->
+    lists:foldl(
+        fun({Index, _Key, _Hash}, Acc) -> Acc#{Index => not_present} end,
+        Found,
+        Pending
+    );
+fetch_many_levels(Pending, Manifest, Level, Found) ->
+    {Groups, NextLevel} = lists:foldl(
+        fun({Index, Key, Hash} = Item, {GroupsAcc, NextAcc}) ->
+            case leveled_pmanifest:key_lookup(Manifest, Level, Key) of
+                false ->
+                    {GroupsAcc, [Item | NextAcc]};
+                FilePid ->
+                    case
+                        leveled_pmanifest:check_bloom(
+                            Manifest, FilePid, Hash
+                        )
+                    of
+                        true ->
+                            {
+                                GroupsAcc#{
+                                    FilePid => [
+                                        {Index, Key, Hash}
+                                        | maps:get(FilePid, GroupsAcc, [])
+                                    ]
+                                },
+                                NextAcc
+                            };
+                        false ->
+                            {GroupsAcc, [Item | NextAcc]}
+                    end
+            end
+        end,
+        {#{}, []},
+        Pending
+    ),
+    {FoundAtLevel, MissingAtLevel} = maps:fold(
+        fun(FilePid, ReversedItems, {FoundAcc, MissingAcc}) ->
+            Items = lists:reverse(ReversedItems),
+            Results = leveled_sst:sst_getmany(
+                FilePid,
+                [{Key, Hash} || {_Index, Key, Hash} <- Items]
+            ),
+            lists:foldl(
+                fun
+                    (
+                        {{_Index, _Key, _Hash} = Item, not_present},
+                        {InnerFound, InnerMissing}
+                    ) ->
+                        {InnerFound, [Item | InnerMissing]};
+                    (
+                        {{Index, _Key, _Hash}, Result},
+                        {InnerFound, InnerMissing}
+                    ) ->
+                        {InnerFound#{Index => Result}, InnerMissing}
+                end,
+                {FoundAcc, MissingAcc},
+                lists:zip(Items, Results)
+            )
+        end,
+        {Found, []},
+        Groups
+    ),
+    fetch_many_levels(
+        lists:reverse(NextLevel) ++ lists:reverse(MissingAtLevel),
+        Manifest,
+        Level + 1,
+        FoundAtLevel
+    ).
+
 timed_fetch_mem(Key, Hash, Manifest, L0Cache, L0Index, Monitor) ->
     SW0 = leveled_monitor:maybe_time(Monitor),
     {R, Level} =

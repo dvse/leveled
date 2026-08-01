@@ -90,21 +90,30 @@
 % "CRP"
 -define(CANDIDATE_PAGE_MAGIC, 16#435250).
 -define(PREVIOUS_CANDIDATE_PAGE_VERSION, 1).
--define(CANDIDATE_PAGE_VERSION, 2).
--define(CANDIDATE_PAGE_SHIFT, 60).
+-define(CANDIDATE_PAGE_VERSION, 4).
+-define(CANDIDATE_PAGE_TARGET_BYTES, 24000).
+-define(CANDIDATE_PAGE_HEAD, 16#FFFF).
+-define(LEGACY_CANDIDATE_PAGE_SHIFT, 60).
 -define(CANDIDATE_PAGE_DIR_STRIDE, 14).
 -define(CANDIDATE_PAGE_FOLD_THRESHOLD, 64).
 -define(CANDIDATE_PAGE_WRITE_SLICE, 64).
--define(PREVIOUS_TEXT_BLOCK_VERSION, 2).
--define(TEXT_BLOCK_VERSION, 3).
--define(TEXT_PACK_MAGIC, 16#544250). % "TBP"
--define(TEXT_PACK_VERSION, 1).
+-define(LEGACY_TEXT_BLOCK_VERSION, 2).
+-define(PREVIOUS_TEXT_BLOCK_VERSION, 3).
+-define(VARINT_TEXT_BLOCK_VERSION, 4).
+-define(TEXT_BLOCK_VERSION, 5).
+-define(TEXT_BLOCK_OFFSET_CHUNK, 32).
+-define(TEXT_BLOCK_OFFSET_DIR_STRIDE, 8).
+% "TBP"
+-define(TEXT_PACK_MAGIC, 16#544250).
+-define(PREVIOUS_TEXT_PACK_VERSION, 1).
+-define(TEXT_PACK_VERSION, 2).
 -define(TEXT_PACK_DIR_STRIDE, 16).
 -define(TEXT_BLOCK_BYTES, 4096).
--define(IMPACT_MAGIC, 16#4C4649). % "LFI"
+% "LFI"
+-define(IMPACT_MAGIC, 16#4C4649).
 -define(IMPACT_VERSION, 1).
 -define(IMPACT_PLANE, 3).
--define(IMPACT_MIN_DOCS, 64).
+-define(IMPACT_MIN_DOCS, 1).
 -define(IMPACT_PAGE_TARGET_BYTES, 2048).
 -define(IMPACT_BOUND_SCALE, 1000000).
 -define(IMPACT_ENTRY_BYTES, 32).
@@ -354,7 +363,10 @@ client_derive(
                     DocId,
                     DocKey,
                     DocVersion,
-                    CandidateRecord
+                    CandidateRecord#{
+                        '$fts_text_blocks' => BlockDirectory,
+                        '$fts_text_bytes' => byte_size(Text)
+                    }
                 ),
                 client_record_tail_dirty_spec(Bucket),
                 client_stats_dirty_spec(Bucket),
@@ -523,10 +535,13 @@ client_text_block_key(DocId) ->
 client_text_block_specs(Bucket, DocId, Blocks, Tokens) ->
     Key = client_text_block_key(DocId),
     case Blocks of
-        [] -> [];
+        [] ->
+            [];
         _ ->
-            [{add, Bucket, Key, <<0:32/unsigned-big>>,
-                client_encode_text_pack(Blocks, Tokens)}]
+            [
+                {add, Bucket, Key, <<0:32/unsigned-big>>,
+                    client_encode_text_pack(Blocks, Tokens)}
+            ]
     end.
 
 client_text_block_token_offsets(BlockNo, Tokens) ->
@@ -549,15 +564,22 @@ client_remove_text_block_specs(Bucket, DocId, BlockCount) ->
 client_encode_text_pack(Blocks, Tokens) ->
     {Directory0, Payload0, _Offset} = lists:foldl(
         fun({BlockNo, Block}, {Directory, Payload, Offset}) ->
-            EncodedOffsets = client_encode_text_block_offsets(
-                client_text_block_token_offsets(BlockNo, Tokens)
-            ),
-            Raw = <<(byte_size(Block)):32/unsigned-big, Block/binary,
-                EncodedOffsets/binary>>,
+            {OffsetDirectory, EncodedOffsets} =
+                client_encode_seekable_text_block_offsets(
+                    client_text_block_token_offsets(BlockNo, Tokens)
+                ),
+            Raw = <<
+                (byte_size(Block)):32/unsigned-big,
+                Block/binary,
+                (byte_size(OffsetDirectory)):32/unsigned-big,
+                OffsetDirectory/binary,
+                EncodedOffsets/binary
+            >>,
             Compressed = leveled_zstd:compress(Raw),
-            Row = <<BlockNo:32/unsigned-big, Offset:32/unsigned-big,
-                (byte_size(Compressed)):32/unsigned-big,
-                (byte_size(Raw)):32/unsigned-big>>,
+            Row =
+                <<BlockNo:32/unsigned-big, Offset:32/unsigned-big,
+                    (byte_size(Compressed)):32/unsigned-big,
+                    (byte_size(Raw)):32/unsigned-big>>,
             {
                 [Row | Directory],
                 [Compressed | Payload],
@@ -571,27 +593,60 @@ client_encode_text_pack(Blocks, Tokens) ->
     Payload = iolist_to_binary(lists:reverse(Payload0)),
     <<?TEXT_PACK_MAGIC:24/unsigned-big, ?TEXT_PACK_VERSION:8,
         (length(Blocks)):32/unsigned-big,
-        (byte_size(Directory)):32/unsigned-big,
-        Directory/binary, Payload/binary>>.
+        (byte_size(Directory)):32/unsigned-big, Directory/binary,
+        Payload/binary>>.
 
-client_encode_text_block(Block, Offsets) when is_binary(Block), is_list(Offsets) ->
-    EncodedOffsets = client_encode_text_block_offsets(Offsets),
-    Compressed = leveled_zstd:compress(
-        <<(byte_size(Block)):32/unsigned-big, Block/binary,
-            EncodedOffsets/binary>>
-    ),
-    <<?TEXT_BLOCK_VERSION:8, Compressed/binary>>.
+client_encode_text_block(Block, Offsets) when
+    is_binary(Block), is_list(Offsets)
+->
+    {OffsetDirectory, EncodedOffsets} =
+        client_encode_seekable_text_block_offsets(Offsets),
+    Raw = <<
+        (byte_size(Block)):32/unsigned-big,
+        Block/binary,
+        (byte_size(OffsetDirectory)):32/unsigned-big,
+        OffsetDirectory/binary,
+        EncodedOffsets/binary
+    >>,
+    Compressed = leveled_zstd:compress(Raw),
+    <<?TEXT_BLOCK_VERSION:8, (byte_size(Raw)):32/unsigned-big,
+        Compressed/binary>>.
 
-client_decode_text_block(<<?TEXT_BLOCK_VERSION:8, Compressed/binary>>) ->
+client_decode_text_block(
+    <<?TEXT_BLOCK_VERSION:8, _RawBytes:32/unsigned-big, Compressed/binary>>
+) ->
+    case leveled_zstd:decompress(Compressed) of
+        <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary,
+            _OffsetDirectoryBytes:32/unsigned-big, _/binary>> ->
+            Block;
+        Encoded when is_binary(Encoded) ->
+            client_decode_term_text_block(Encoded, text);
+        error ->
+            erlang:error({invalid_fts_text_block, compressed})
+    end;
+client_decode_text_block(
+    <<?VARINT_TEXT_BLOCK_VERSION:8, _RawBytes:32/unsigned-big,
+        Compressed/binary>>
+) ->
+    case leveled_zstd:decompress(Compressed) of
+        <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary, _/binary>> ->
+            Block;
+        error ->
+            erlang:error({invalid_fts_text_block, compressed})
+    end;
+client_decode_text_block(
+    <<?PREVIOUS_TEXT_BLOCK_VERSION:8, Compressed/binary>>
+) ->
     case leveled_zstd:decompress(Compressed) of
         <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary, _/binary>> ->
             Block;
         Encoded when is_binary(Encoded) ->
             client_decode_term_text_block(Encoded, text);
-        error -> erlang:error({invalid_fts_text_block, compressed})
+        error ->
+            erlang:error({invalid_fts_text_block, compressed})
     end;
 client_decode_text_block(
-    <<?PREVIOUS_TEXT_BLOCK_VERSION:8, Compressed/binary>>
+    <<?LEGACY_TEXT_BLOCK_VERSION:8, Compressed/binary>>
 ) ->
     case leveled_zstd:decompress(Compressed) of
         Block when is_binary(Block) -> Block;
@@ -601,7 +656,37 @@ client_decode_text_block(Bad) ->
     erlang:error({invalid_fts_text_block, Bad}).
 
 client_decode_text_block_with_offsets(
-    <<?TEXT_BLOCK_VERSION:8, Compressed/binary>>
+    <<?TEXT_BLOCK_VERSION:8, _RawBytes:32/unsigned-big, Compressed/binary>>
+) ->
+    case leveled_zstd:decompress(Compressed) of
+        <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary,
+            OffsetDirectoryBytes:32/unsigned-big,
+            OffsetDirectory:OffsetDirectoryBytes/binary,
+            EncodedOffsets/binary>> when
+            OffsetDirectoryBytes rem ?TEXT_BLOCK_OFFSET_DIR_STRIDE =:= 0
+        ->
+            {Block,
+                client_decode_seekable_text_block_offsets(
+                    OffsetDirectory, EncodedOffsets, all
+                )};
+        Encoded when is_binary(Encoded) ->
+            client_decode_term_text_block(Encoded, offsets);
+        error ->
+            erlang:error({invalid_fts_text_block, compressed})
+    end;
+client_decode_text_block_with_offsets(
+    <<?VARINT_TEXT_BLOCK_VERSION:8, _RawBytes:32/unsigned-big,
+        Compressed/binary>>
+) ->
+    case leveled_zstd:decompress(Compressed) of
+        <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary,
+            EncodedOffsets/binary>> ->
+            {Block, client_decode_text_block_offsets(EncodedOffsets)};
+        error ->
+            erlang:error({invalid_fts_text_block, compressed})
+    end;
+client_decode_text_block_with_offsets(
+    <<?PREVIOUS_TEXT_BLOCK_VERSION:8, Compressed/binary>>
 ) ->
     case leveled_zstd:decompress(Compressed) of
         <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary,
@@ -609,10 +694,11 @@ client_decode_text_block_with_offsets(
             {Block, client_decode_text_block_offsets(EncodedOffsets)};
         Encoded when is_binary(Encoded) ->
             client_decode_term_text_block(Encoded, offsets);
-        error -> erlang:error({invalid_fts_text_block, compressed})
+        error ->
+            erlang:error({invalid_fts_text_block, compressed})
     end;
 client_decode_text_block_with_offsets(
-    <<?PREVIOUS_TEXT_BLOCK_VERSION:8, Compressed/binary>>
+    <<?LEGACY_TEXT_BLOCK_VERSION:8, Compressed/binary>>
 ) ->
     case leveled_zstd:decompress(Compressed) of
         Block when is_binary(Block) -> {Block, unavailable};
@@ -653,12 +739,128 @@ client_encode_text_block_offsets(Offsets) ->
     ),
     iolist_to_binary(Encoded).
 
+client_encode_seekable_text_block_offsets(Offsets) ->
+    Chunks = client_offset_chunks(Offsets, ?TEXT_BLOCK_OFFSET_CHUNK, []),
+    {Directory0, Payload0, _PayloadBytes} = lists:foldl(
+        fun(Chunk, {Directory, Payload, PayloadBytes}) ->
+            [{FirstOrdinal, _FirstOffset, _FirstLength} | _] = Chunk,
+            Encoded = client_encode_text_block_offsets(Chunk),
+            {
+                [
+                    <<FirstOrdinal:32/unsigned-big,
+                        PayloadBytes:32/unsigned-big>>
+                    | Directory
+                ],
+                [Encoded | Payload],
+                PayloadBytes + byte_size(Encoded)
+            }
+        end,
+        {[], [], 0},
+        Chunks
+    ),
+    {
+        iolist_to_binary(lists:reverse(Directory0)),
+        iolist_to_binary(lists:reverse(Payload0))
+    }.
+
+client_offset_chunks([], _Limit, Acc) ->
+    lists:reverse(Acc);
+client_offset_chunks(Offsets, Limit, Acc) ->
+    {Chunk, Rest} = lists:split(erlang:min(Limit, length(Offsets)), Offsets),
+    client_offset_chunks(Rest, Limit, [Chunk | Acc]).
+
+client_decode_seekable_text_block_offsets(Directory, Encoded, all) ->
+    lists:append([
+        client_decode_text_block_offsets(Chunk)
+     || Chunk <- client_seekable_offset_chunks(Directory, Encoded)
+    ]);
+client_decode_seekable_text_block_offsets(
+    Directory, Encoded, WantedOrdinals
+) when is_list(WantedOrdinals) ->
+    lists:usort(
+        lists:filtermap(
+            fun(Ordinal) ->
+                case
+                    client_seekable_offset_chunk(Directory, Encoded, Ordinal)
+                of
+                    not_found ->
+                        false;
+                    Chunk ->
+                        case
+                            lists:keyfind(
+                                Ordinal,
+                                1,
+                                client_decode_text_block_offsets(Chunk)
+                            )
+                        of
+                            false -> false;
+                            Offset -> {true, Offset}
+                        end
+                end
+            end,
+            WantedOrdinals
+        )
+    ).
+
+client_seekable_offset_chunks(<<>>, _Encoded) ->
+    [];
+client_seekable_offset_chunks(Directory, Encoded) ->
+    Entries = [
+        {FirstOrdinal, Offset}
+     || <<FirstOrdinal:32/unsigned-big, Offset:32/unsigned-big>> <= Directory
+    ],
+    client_seekable_offset_chunks(Entries, Encoded, []).
+
+client_seekable_offset_chunks([], _Encoded, Acc) ->
+    lists:reverse(Acc);
+client_seekable_offset_chunks([{_Ordinal, Start}], Encoded, Acc) ->
+    lists:reverse([
+        binary:part(Encoded, Start, byte_size(Encoded) - Start) | Acc
+    ]);
+client_seekable_offset_chunks(
+    [{_Ordinal, Start}, {_NextOrdinal, Finish} = Next | Rest], Encoded, Acc
+) ->
+    client_seekable_offset_chunks(
+        [Next | Rest],
+        Encoded,
+        [binary:part(Encoded, Start, Finish - Start) | Acc]
+    ).
+
+client_seekable_offset_chunk(Directory, Encoded, Ordinal) ->
+    Entries = [
+        {FirstOrdinal, Offset}
+     || <<FirstOrdinal:32/unsigned-big, Offset:32/unsigned-big>> <= Directory,
+        FirstOrdinal =< Ordinal
+    ],
+    case lists:reverse(Entries) of
+        [] ->
+            not_found;
+        [{_FirstOrdinal, Start} | _] ->
+            Finish = client_next_offset_chunk_start(Directory, Start, Encoded),
+            binary:part(Encoded, Start, Finish - Start)
+    end.
+
+client_next_offset_chunk_start(Directory, Start, Encoded) ->
+    case
+        [
+            Offset
+         || <<_FirstOrdinal:32/unsigned-big, Offset:32/unsigned-big>> <=
+                Directory,
+            Offset > Start
+        ]
+    of
+        [Finish | _] -> Finish;
+        [] -> byte_size(Encoded)
+    end.
+
 client_decode_text_block_offsets(Encoded) ->
     client_decode_text_block_offsets(Encoded, 0, 0, []).
 
 client_decode_text_block_offsets(<<>>, _Ordinal, _Offset, Acc) ->
     lists:reverse(Acc);
-client_decode_text_block_offsets(Encoded0, PreviousOrdinal, PreviousOffset, Acc) ->
+client_decode_text_block_offsets(
+    Encoded0, PreviousOrdinal, PreviousOffset, Acc
+) ->
     {OrdinalDelta, Encoded1} = client_decode_uvarint(Encoded0),
     {OffsetDelta, Encoded2} = client_decode_uvarint(Encoded1),
     {Length, Rest} = client_decode_uvarint(Encoded2),
@@ -674,8 +876,10 @@ client_decode_text_block_offsets(Encoded0, PreviousOrdinal, PreviousOffset, Acc)
 client_encode_uvarint(Value) when is_integer(Value), Value >= 0, Value < 128 ->
     <<Value>>;
 client_encode_uvarint(Value) when is_integer(Value), Value >= 128 ->
-    <<((Value band 16#7F) bor 16#80),
-        (client_encode_uvarint(Value bsr 7))/binary>>.
+    <<
+        ((Value band 16#7F) bor 16#80),
+        (client_encode_uvarint(Value bsr 7))/binary
+    >>.
 
 client_decode_uvarint(Encoded) ->
     client_decode_uvarint(Encoded, 0, 0).
@@ -1679,15 +1883,18 @@ text_blocks(
     LastBlock >= FirstBlock
 ->
     try
-        case text_blocks_batch(
-            Bookie, Schema, [{DocId, FirstBlock, LastBlock}]
-        ) of
+        case
+            text_blocks_batch(
+                Bookie, Schema, [{DocId, FirstBlock, LastBlock}]
+            )
+        of
             {ok, Blocks} ->
-                {ok, lists:sort([
-                    {BlockNo, Text}
-                 || {{DocId0, BlockNo}, Text} <- maps:to_list(Blocks),
-                    DocId0 =:= DocId
-                ])};
+                {ok,
+                    lists:sort([
+                        {BlockNo, Text}
+                     || {{DocId0, BlockNo}, Text} <- maps:to_list(Blocks),
+                        DocId0 =:= DocId
+                    ])};
             Error ->
                 Error
         end
@@ -1701,7 +1908,9 @@ text_blocks(_Bookie, _Schema, _DocId, _FirstBlock, _LastBlock) ->
     pid(),
     map(),
     [{non_neg_integer(), non_neg_integer(), non_neg_integer()}]
-) -> {ok, #{{non_neg_integer(), non_neg_integer()} => binary()}} | {error, term()}.
+) ->
+    {ok, #{{non_neg_integer(), non_neg_integer()} => binary()}}
+    | {error, term()}.
 text_blocks_batch(Bookie, #{index := _Bucket} = Schema, Requests) when
     is_pid(Bookie), is_list(Requests)
 ->
@@ -1719,9 +1928,14 @@ text_blocks_batch(_Bookie, _Schema, _Requests) ->
     map(),
     [{non_neg_integer(), non_neg_integer(), non_neg_integer()}]
 ) ->
-    {ok,
-        #{{non_neg_integer(), non_neg_integer()} =>
-            {binary(), unavailable | [{non_neg_integer(), non_neg_integer(), non_neg_integer()}]}}}
+    {ok, #{
+        {non_neg_integer(), non_neg_integer()} =>
+            {
+                binary(),
+                unavailable
+                | [{non_neg_integer(), non_neg_integer(), non_neg_integer()}]
+            }
+    }}
     | {error, term()}.
 text_blocks_with_offsets_batch(Bookie, #{index := Bucket}, Requests) when
     is_pid(Bookie), is_list(Requests)
@@ -1729,7 +1943,9 @@ text_blocks_with_offsets_batch(Bookie, #{index := Bucket}, Requests) when
     try
         Keys = lists:usort([
             {DocId, BlockNo}
-         || {DocId, FirstBlock, LastBlock} <- Requests,
+         || Request <- Requests,
+            {DocId, FirstBlock, LastBlock} <-
+                [client_text_block_request_range(Request)],
             is_integer(DocId),
             is_integer(FirstBlock),
             is_integer(LastBlock),
@@ -1737,95 +1953,226 @@ text_blocks_with_offsets_batch(Bookie, #{index := Bucket}, Requests) when
             LastBlock >= FirstBlock,
             BlockNo <- lists:seq(FirstBlock, LastBlock)
         ]),
-        DocIds = lists:usort([DocId || {DocId, _BlockNo} <- Keys]),
-        PackKeys = [
-            {client_text_block_key(DocId), <<0:32/unsigned-big>>}
-         || DocId <- DocIds
-        ],
-        PackValues = leveled_bookie:book_headonly_many(
-            Bookie, Bucket, PackKeys
-        ),
+        WantedOffsets = client_text_block_wanted_offsets(Requests),
         Wanted = maps:from_list([{Key, true} || Key <- Keys]),
-        {PackFrames, LegacyDocIds} = lists:foldl(
-            fun
-                ({DocId, {ok, Value}}, {Frames, Legacy}) ->
-                    case client_text_pack_frames(Value, DocId, Wanted) of
-                        not_pack -> {Frames, [DocId | Legacy]};
-                        Selected -> {Selected ++ Frames, Legacy}
-                    end;
-                ({DocId, not_found}, {Frames, Legacy}) ->
-                    {Frames, [DocId | Legacy]}
+        DocIds = lists:usort([DocId || {DocId, _BlockNo} <- Keys]),
+        PackValues = leveled_bookie:book_headonly_many(
+            Bookie,
+            Bucket,
+            [
+                {client_text_block_key(DocId), <<0:32/unsigned-big>>}
+             || DocId <- DocIds
+            ]
+        ),
+        {PackFrames, PackedDocIds} = lists:foldl(
+            fun({DocId, Result}, {Frames, Packed}) ->
+                case Result of
+                    {ok, Value} ->
+                        case client_text_pack_frames(Value, DocId, Wanted) of
+                            not_pack ->
+                                {Frames, Packed};
+                            Selected ->
+                                {Selected ++ Frames, Packed#{DocId => true}}
+                        end;
+                    not_found ->
+                        {Frames, Packed}
+                end
             end,
-            {[], []},
+            {[], #{}},
             lists:zip(DocIds, PackValues)
         ),
-        PackDecoded = client_decode_text_pack_frames(PackFrames),
-        LegacyKeys = [
+        DirectKeys = [
             {DocId, BlockNo}
          || {DocId, BlockNo} <- Keys,
-            lists:member(DocId, LegacyDocIds)
+            not maps:is_key(DocId, PackedDocIds)
         ],
-        LegacyLookupKeys = [
-            {client_text_block_key(DocId), <<BlockNo:32/unsigned-big>>}
-         || {DocId, BlockNo} <- LegacyKeys
-        ],
-        LegacyValues = leveled_bookie:book_headonly_many(
-            Bookie, Bucket, LegacyLookupKeys
+        DirectValues =
+            case DirectKeys of
+                [] ->
+                    [];
+                _ ->
+                    leveled_bookie:book_headonly_many(
+                        Bookie,
+                        Bucket,
+                        [
+                            {client_text_block_key(DocId), <<
+                                BlockNo:32/unsigned-big
+                            >>}
+                         || {DocId, BlockNo} <- DirectKeys
+                        ]
+                    )
+            end,
+        {DirectFrames, DirectDecoded} = lists:foldl(
+            fun
+                (
+                    {
+                        {DocId, BlockNo},
+                        {ok,
+                            <<?TEXT_BLOCK_VERSION:8, RawBytes:32/unsigned-big,
+                                Frame/binary>>}
+                    },
+                    {Frames, Decoded}
+                ) ->
+                    {
+                        [
+                            {{DocId, BlockNo}, Frame, RawBytes, seekable}
+                            | Frames
+                        ],
+                        Decoded
+                    };
+                (
+                    {
+                        {DocId, BlockNo},
+                        {ok,
+                            <<?VARINT_TEXT_BLOCK_VERSION:8,
+                                RawBytes:32/unsigned-big, Frame/binary>>}
+                    },
+                    {Frames, Decoded}
+                ) ->
+                    {
+                        [{{DocId, BlockNo}, Frame, RawBytes, varint} | Frames],
+                        Decoded
+                    };
+                ({{DocId, BlockNo}, {ok, Value}}, {Frames, Decoded}) ->
+                    {
+                        Frames,
+                        Decoded#{
+                            {DocId, BlockNo} =>
+                                client_decode_text_block_with_offsets(Value)
+                        }
+                    };
+                ({{_DocId, _BlockNo}, not_found}, Acc) ->
+                    Acc
+            end,
+            {[], #{}},
+            lists:zip(DirectKeys, DirectValues)
         ),
-        LegacyDecoded = maps:from_list([
-            {{DocId, BlockNo}, client_decode_text_block_with_offsets(Value)}
-         || {{DocId, BlockNo}, {ok, Value}} <-
-                lists:zip(LegacyKeys, LegacyValues)
-        ]),
-        {ok, maps:merge(LegacyDecoded, PackDecoded)}
+        FrameDecoded = client_decode_text_pack_frames(
+            PackFrames ++ DirectFrames, WantedOffsets
+        ),
+        {ok, maps:merge(DirectDecoded, FrameDecoded)}
     catch
         error:CaughtReason -> {error, CaughtReason}
     end;
 text_blocks_with_offsets_batch(_Bookie, _Schema, _Requests) ->
     {error, invalid_fts_text_block_batch}.
 
+client_text_block_request_range({DocId, FirstBlock, LastBlock}) ->
+    {DocId, FirstBlock, LastBlock};
+client_text_block_request_range(
+    {DocId, FirstBlock, LastBlock, _WantedOrdinals}
+) ->
+    {DocId, FirstBlock, LastBlock}.
+
+client_text_block_wanted_offsets(Requests) ->
+    lists:foldl(
+        fun
+            ({DocId, FirstBlock, LastBlock}, Acc) ->
+                lists:foldl(
+                    fun(BlockNo, InnerAcc) ->
+                        InnerAcc#{{DocId, BlockNo} => all}
+                    end,
+                    Acc,
+                    lists:seq(FirstBlock, LastBlock)
+                );
+            ({DocId, FirstBlock, LastBlock, WantedOrdinals}, Acc) when
+                is_list(WantedOrdinals)
+            ->
+                Selected = lists:usort([
+                    Ordinal
+                 || Ordinal <- WantedOrdinals,
+                    is_integer(Ordinal),
+                    Ordinal >= 0,
+                    Ordinal =< ?MAX_U32
+                ]),
+                lists:foldl(
+                    fun(BlockNo, InnerAcc) ->
+                        Key = {DocId, BlockNo},
+                        case maps:get(Key, InnerAcc, []) of
+                            all ->
+                                InnerAcc;
+                            Existing ->
+                                InnerAcc#{
+                                    Key => lists:umerge(Existing, Selected)
+                                }
+                        end
+                    end,
+                    Acc,
+                    lists:seq(FirstBlock, LastBlock)
+                )
+        end,
+        #{},
+        Requests
+    ).
+
 client_text_pack_frames(
-    <<?TEXT_PACK_MAGIC:24/unsigned-big, ?TEXT_PACK_VERSION:8,
-        Count:32/unsigned-big, DirectoryBytes:32/unsigned-big,
-        Directory:DirectoryBytes/binary, Payload/binary>>,
+    <<?TEXT_PACK_MAGIC:24/unsigned-big, Version:8, Count:32/unsigned-big,
+        DirectoryBytes:32/unsigned-big, Directory:DirectoryBytes/binary,
+        Payload/binary>>,
     DocId,
     Wanted
-) when DirectoryBytes =:= Count * ?TEXT_PACK_DIR_STRIDE ->
-    client_text_pack_frames(Directory, Payload, DocId, Wanted, []);
+) when
+    (Version =:= ?TEXT_PACK_VERSION orelse
+        Version =:= ?PREVIOUS_TEXT_PACK_VERSION) andalso
+        DirectoryBytes =:= Count * ?TEXT_PACK_DIR_STRIDE
+->
+    Format =
+        case Version of
+            ?TEXT_PACK_VERSION -> seekable;
+            ?PREVIOUS_TEXT_PACK_VERSION -> varint
+        end,
+    client_text_pack_frames(
+        Directory, Payload, DocId, Wanted, Format, []
+    );
 client_text_pack_frames(_Value, _DocId, _Wanted) ->
     not_pack.
 
-client_text_pack_frames(<<>>, _Payload, _DocId, _Wanted, Acc) ->
+client_text_pack_frames(
+    <<>>, _Payload, _DocId, _Wanted, _Format, Acc
+) ->
     lists:reverse(Acc);
 client_text_pack_frames(
-    <<BlockNo:32/unsigned-big, Offset:32/unsigned-big,
-        Bytes:32/unsigned-big, RawBytes:32/unsigned-big, Rest/binary>>,
+    <<BlockNo:32/unsigned-big, Offset:32/unsigned-big, Bytes:32/unsigned-big,
+        RawBytes:32/unsigned-big, Rest/binary>>,
     Payload,
     DocId,
     Wanted,
+    Format,
     Acc
 ) ->
     Acc1 =
         case maps:is_key({DocId, BlockNo}, Wanted) of
             true ->
                 Frame = binary:part(Payload, Offset, Bytes),
-                [{{DocId, BlockNo}, Frame, RawBytes} | Acc];
+                [{{DocId, BlockNo}, Frame, RawBytes, Format} | Acc];
             false ->
                 Acc
         end,
-    client_text_pack_frames(Rest, Payload, DocId, Wanted, Acc1).
+    client_text_pack_frames(
+        Rest, Payload, DocId, Wanted, Format, Acc1
+    ).
 
 client_decode_text_pack_frames([]) ->
     #{};
 client_decode_text_pack_frames(Frames) ->
-    Inputs = [{Frame, RawBytes} || {_Key, Frame, RawBytes} <- Frames],
+    client_decode_text_pack_frames(Frames, #{}).
+
+client_decode_text_pack_frames([], _WantedOffsets) ->
+    #{};
+client_decode_text_pack_frames(Frames, WantedOffsets) ->
+    Inputs = [{Frame, RawBytes} || {_Key, Frame, RawBytes, _Format} <- Frames],
     case leveled_zstd:decompress_many(Inputs) of
         error ->
             erlang:error({invalid_fts_text_pack, compressed});
         Decoded ->
             maps:from_list([
-                {Key, client_decode_text_pack_payload(Payload)}
-             || {{Key, _Frame, _RawBytes}, Payload} <- lists:zip(Frames, Decoded)
+                {Key,
+                    client_decode_text_pack_payload(
+                        Payload, Format, maps:get(Key, WantedOffsets, all)
+                    )}
+             || {{Key, _Frame, _RawBytes, Format}, Payload} <- lists:zip(
+                    Frames, Decoded
+                )
             ])
     end.
 
@@ -1835,6 +2182,34 @@ client_decode_text_pack_payload(
 ) ->
     {Block, client_decode_text_block_offsets(EncodedOffsets)};
 client_decode_text_pack_payload(Bad) ->
+    erlang:error({invalid_fts_text_pack_payload, Bad}).
+
+client_decode_text_pack_payload(
+    <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary,
+        OffsetDirectoryBytes:32/unsigned-big,
+        OffsetDirectory:OffsetDirectoryBytes/binary, EncodedOffsets/binary>>,
+    seekable,
+    WantedOrdinals
+) when
+    OffsetDirectoryBytes rem ?TEXT_BLOCK_OFFSET_DIR_STRIDE =:= 0
+->
+    {Block,
+        client_decode_seekable_text_block_offsets(
+            OffsetDirectory, EncodedOffsets, WantedOrdinals
+        )};
+client_decode_text_pack_payload(
+    <<BlockBytes:32/unsigned-big, Block:BlockBytes/binary,
+        EncodedOffsets/binary>>,
+    varint,
+    all
+) ->
+    {Block, client_decode_text_block_offsets(EncodedOffsets)};
+client_decode_text_pack_payload(Payload, varint, _WantedOrdinals) ->
+    %% Version 4 and packed compatibility rows have a delta stream without a
+    %% seek directory. Decode it completely; fresh version 5 rows use the
+    %% seek directory above.
+    client_decode_text_pack_payload(Payload);
+client_decode_text_pack_payload(Bad, _Format, _WantedOrdinals) ->
     erlang:error({invalid_fts_text_pack_payload, Bad}).
 
 -spec document_text(pid(), map(), binary()) ->
@@ -2082,9 +2457,11 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
     TokenSpecs = lists:usort(client_ast_token_specs(AST)),
     Shards = client_ast_shards(AST, Schema),
     TailSummaries = client_read_tail_summaries(Bookie, Schema, Shards),
-    case client_try_impact_search(
-        Bookie, Schema, AST, Opts, TokenSpecs, TailSummaries
-    ) of
+    case
+        client_try_impact_search(
+            Bookie, Schema, AST, Opts, TokenSpecs, TailSummaries
+        )
+    of
         {ok, _Result} = ImpactResult ->
             ImpactResult;
         fallback ->
@@ -2119,15 +2496,17 @@ client_try_impact_search(
     ColumnIds = client_selector_column_ids(Columns, Schema),
     Facet = maps:get(impact_facet, Opts, nil),
     FilterFields = maps:get(candidate_filter_fields, Schema, []),
-    case {
-        maps:get(impact, Opts, false),
-        maps:get(rank, Opts, none),
-        maps:get(return_positions, Opts, false),
-        maps:get(resolve_hits, Opts, true),
-        ColumnIds,
-        Facet,
-        client_has_dirty_tail(TailSummaries, TokenSpecs, Schema)
-    } of
+    case
+        {
+            maps:get(impact, Opts, false),
+            maps:get(rank, Opts, none),
+            maps:get(return_positions, Opts, false),
+            maps:get(resolve_hits, Opts, true),
+            ColumnIds,
+            Facet,
+            client_has_dirty_tail(TailSummaries, TokenSpecs, Schema)
+        }
+    of
         {true, bm25, false, false, [Column], FacetValues, false} when
             is_list(FacetValues), length(FacetValues) =:= length(FilterFields)
         ->
@@ -2147,17 +2526,23 @@ client_try_impact_search(
 ) ->
     fallback.
 
-client_search_impact(Bookie, #{index := Bucket} = Schema, Token, Column, Facet, Opts) ->
+client_search_impact(
+    Bookie, #{index := Bucket} = Schema, Token, Column, Facet, Opts
+) ->
     FacetBin = term_to_binary(Facet, [deterministic]),
     <<FacetHash:64/unsigned-big, _/binary>> = crypto:hash(sha256, FacetBin),
     Key = client_token_key(Token),
-    case leveled_bookie:book_headonly(
-        Bookie, Bucket, Key, client_impact_subkey(Column, FacetHash, 0)
-    ) of
+    case
+        leveled_bookie:book_headonly(
+            Bookie, Bucket, Key, client_impact_subkey(Column, FacetHash, 0)
+        )
+    of
         {ok, Head} ->
             case client_decode_impact_page(Head, Column, FacetBin) of
                 {ok, PageCount, GroupCount, NHit, RemainingBound, Entries} ->
-                    {DocCount, TotalLength} = client_corpus_stats(Bookie, Schema),
+                    {DocCount, TotalLength} = client_corpus_stats(
+                        Bookie, Schema
+                    ),
                     AvgLength =
                         case DocCount of
                             0 -> 0.0;
@@ -2240,16 +2625,18 @@ client_scan_impact_pages(
         true ->
             Hits;
         false ->
-            case leveled_bookie:book_headonly(
-                Bookie,
-                Bucket,
-                Key,
-                client_impact_subkey(Column, FacetHash, PageNo)
-            ) of
+            case
+                leveled_bookie:book_headonly(
+                    Bookie,
+                    Bucket,
+                    Key,
+                    client_impact_subkey(Column, FacetHash, PageNo)
+                )
+            of
                 {ok, Value} ->
                     case client_decode_impact_page(Value, Column, FacetBin) of
-                        {ok, _IgnoredPageCount, _IgnoredGroupCount, _IgnoredNHit,
-                            NextRemainingBound, Entries} ->
+                        {ok, _IgnoredPageCount, _IgnoredGroupCount,
+                            _IgnoredNHit, NextRemainingBound, Entries} ->
                             PageHits = client_impact_hits(
                                 Entries, Idf, AvgLength
                             ),
@@ -2277,20 +2664,15 @@ client_scan_impact_pages(
     end.
 
 client_decode_impact_page(
-    <<?IMPACT_MAGIC:24/unsigned-big, ?IMPACT_VERSION:8,
-        ?IMPACT_PLANE:8, Column:8, PageCount:16/unsigned-big,
-        GroupCount:32/unsigned-big, NHit:32/unsigned-big,
-        _PageMaxBound:32/unsigned-big, RemainingBound:32/unsigned-big,
-        FacetBytes:16/unsigned-big, EntryCount:16/unsigned-big,
-        Facet:FacetBytes/binary, Payload/binary>>,
+    <<?IMPACT_MAGIC:24/unsigned-big, ?IMPACT_VERSION:8, ?IMPACT_PLANE:8,
+        Column:8, PageCount:16/unsigned-big, GroupCount:32/unsigned-big,
+        NHit:32/unsigned-big, _PageMaxBound:32/unsigned-big,
+        RemainingBound:32/unsigned-big, FacetBytes:16/unsigned-big,
+        EntryCount:16/unsigned-big, Facet:FacetBytes/binary, Payload/binary>>,
     Column,
     Facet
 ) when byte_size(Payload) =:= EntryCount * ?IMPACT_ENTRY_BYTES ->
-    {ok,
-        PageCount,
-        GroupCount,
-        NHit,
-        RemainingBound,
+    {ok, PageCount, GroupCount, NHit, RemainingBound,
         client_decode_impact_entries(Payload, [])};
 client_decode_impact_page(_Value, _Column, _Facet) ->
     invalid.
@@ -2298,9 +2680,8 @@ client_decode_impact_page(_Value, _Column, _Facet) ->
 client_decode_impact_entries(<<>>, Acc) ->
     lists:reverse(Acc);
 client_decode_impact_entries(
-    <<_Bound:32/unsigned-big, DocId:64/unsigned-big,
-        Length:64/unsigned-big, Tf:32/unsigned-big,
-        MatchCount:64/unsigned-big, Rest/binary>>,
+    <<_Bound:32/unsigned-big, DocId:64/unsigned-big, Length:64/unsigned-big,
+        Tf:32/unsigned-big, MatchCount:64/unsigned-big, Rest/binary>>,
     Acc
 ) ->
     client_decode_impact_entries(
@@ -7794,11 +8175,24 @@ client_bounded_ranked_hits(Hits, Limit) ->
      || {_RankKey, Hit} <- gb_trees:to_list(Tree)
     ].
 
+client_bounded_ranked_hits(_Bookie, _Schema, [], _Limit, _Opts) ->
+    [];
+client_bounded_ranked_hits(_Bookie, _Schema, _Hits, Limit, _Opts) when
+    Limit =< 0
+->
+    [];
 client_bounded_ranked_hits(Bookie, Schema, Hits, Limit, Opts) ->
     Materialized = [client_materialize_ranked_candidate(Hit) || Hit <- Hits],
+    ScoreWindow = client_bounded_ranked_hits(Materialized, Limit),
+    CutoffScore = client_ranked_candidate_score(lists:last(ScoreWindow)),
+    CandidateWindow = [
+        Hit
+     || Hit <- Materialized,
+        client_ranked_candidate_score(Hit) >= CutoffScore
+    ],
     DocIds = [
         DocId
-     || Hit <- Materialized,
+     || Hit <- CandidateWindow,
         DocId <- [maps:get(key, Hit)],
         is_integer(DocId)
     ],
@@ -7834,16 +8228,31 @@ client_bounded_ranked_hits(Bookie, Schema, Hits, Limit, Opts) ->
                                 DocKey
                             }
                     end,
-                Hit#{
+                KeyedHit = Hit#{
                     rank_key => RankKey,
                     candidate_key => DocKey,
                     candidate_version => DocVersion,
                     candidate_record => Candidate
-                };
+                },
+                case
+                    {
+                        maps:find('$fts_text_blocks', Candidate),
+                        maps:find('$fts_text_bytes', Candidate)
+                    }
+                of
+                    {{ok, TextBlocks}, {ok, TextBytes}} ->
+                        KeyedHit#{
+                            text_blocks => TextBlocks,
+                            text_bytes => TextBytes,
+                            index_resident_complete => true
+                        };
+                    _Unavailable ->
+                        KeyedHit
+                end;
             not_found ->
                 Hit
         end
-     || Hit <- Materialized
+     || Hit <- CandidateWindow
     ],
     client_bounded_ranked_hits(Keyed, Limit).
 
@@ -8124,35 +8533,85 @@ client_overlay_hit_record_tail(Base, Tail) ->
 client_fold_candidate_records(_Bookie, _Schema, []) ->
     #{};
 client_fold_candidate_records(Bookie, Schema, DocIds) ->
-    Base = client_fold_candidate_pages(Bookie, Schema, DocIds),
-    TailIds = case client_record_tail_present(Bookie, Schema) of
-        true -> DocIds;
-        false -> DocIds -- maps:keys(Base)
-    end,
-    Tail = case TailIds of
-        [] -> #{};
-        _ -> client_point_candidate_record_tail(Bookie, Schema, TailIds)
-    end,
+    Base = client_candidate_page_compatibility_fallback(
+        Bookie,
+        Schema,
+        DocIds,
+        fold,
+        client_fold_candidate_pages(Bookie, Schema, DocIds)
+    ),
+    TailIds =
+        case client_record_tail_present(Bookie, Schema) of
+            true -> DocIds;
+            false -> DocIds -- maps:keys(Base)
+        end,
+    Tail =
+        case TailIds of
+            [] -> #{};
+            _ -> client_point_candidate_record_tail(Bookie, Schema, TailIds)
+        end,
     client_overlay_candidate_record_tail(Base, Tail).
 
 client_point_candidate_records(_Bookie, _Schema, []) ->
     #{};
 client_point_candidate_records(Bookie, Schema, DocIds) ->
-    Base = client_point_candidate_pages(Bookie, Schema, DocIds),
-    TailIds = case client_record_tail_present(Bookie, Schema) of
-        true -> DocIds;
-        false -> DocIds -- maps:keys(Base)
-    end,
-    Tail = case TailIds of
-        [] -> #{};
-        _ -> client_point_candidate_record_tail(Bookie, Schema, TailIds)
-    end,
+    Base = client_candidate_page_compatibility_fallback(
+        Bookie,
+        Schema,
+        DocIds,
+        points,
+        client_point_candidate_pages(Bookie, Schema, DocIds)
+    ),
+    TailIds =
+        case client_record_tail_present(Bookie, Schema) of
+            true -> DocIds;
+            false -> DocIds -- maps:keys(Base)
+        end,
+    Tail =
+        case TailIds of
+            [] -> #{};
+            _ -> client_point_candidate_record_tail(Bookie, Schema, TailIds)
+        end,
     client_overlay_candidate_record_tail(Base, Tail).
 
+client_candidate_page_compatibility_fallback(
+    Bookie, Schema, DocIds, Strategy, Base
+) ->
+    case maps:take('$legacy_candidate_pages', Base) of
+        {true, _WithoutMarker} ->
+            HitRecords =
+                case Strategy of
+                    fold -> client_fold_hit_records(Bookie, Schema, DocIds);
+                    points -> client_point_hit_records(Bookie, Schema, DocIds)
+                end,
+            maps:map(
+                fun(
+                    _DocId,
+                    {DocKey, DocVersion, HitRecord}
+                ) ->
+                    Record = maps:get(record, HitRecord, #{}),
+                    Candidate0 = maps:with(
+                        client_candidate_field_names(Schema), Record
+                    ),
+                    Candidate = Candidate0#{
+                        '$fts_text_blocks' =>
+                            maps:get(text_blocks, HitRecord, []),
+                        '$fts_text_bytes' => maps:get(text_bytes, HitRecord, 0)
+                    },
+                    {DocKey, DocVersion, Candidate}
+                end,
+                HitRecords
+            );
+        error ->
+            Base
+    end.
+
 client_record_tail_present(Bookie, #{index := Bucket}) ->
-    case leveled_bookie:book_headonly(
-        Bookie, Bucket, <<"record-tail">>, <<"dirty">>
-    ) of
+    case
+        leveled_bookie:book_headonly(
+            Bookie, Bucket, <<"record-tail">>, <<"dirty">>
+        )
+    of
         {ok, <<1>>} -> true;
         not_found -> false
     end.
@@ -8229,93 +8688,227 @@ client_point_candidate_record_tail(Bookie, #{index := Bucket}, DocIds) ->
 
 client_fold_candidate_pages(_Bookie, _Schema, []) ->
     #{};
-client_fold_candidate_pages(Bookie, #{index := Bucket} = Schema, DocIds) ->
-    Wanted = maps:from_list([{DocId, true} || DocId <- DocIds]),
-    PageNumbers = lists:usort([
-        client_candidate_page_number(DocId)
-     || DocId <- DocIds
-    ]),
-    First = hd(PageNumbers),
-    Last = lists:last(PageNumbers),
-    WantedPages = maps:from_list([{PageNo, true} || PageNo <- PageNumbers]),
-    Fold = fun
-        (
-            B,
-            {<<"cp">>, <<PageNo:16/unsigned-big>>},
-            Value,
-            Acc
-        ) when B =:= Bucket ->
-            case maps:is_key(PageNo, WantedPages) of
-                true ->
-                    client_decode_candidate_page(Value, Wanted, Schema, Acc);
-                false ->
-                    Acc
+client_fold_candidate_pages(
+    Bookie, #{index := Bucket} = Schema, DocIds
+) ->
+    %% A large winner window usually spans most bounded pages.  Stream that
+    %% contiguous page range once instead of turning the fold path back into
+    %% dozens of independent SST probes.  Sparse windows continue to use the
+    %% exact batched point path below.
+    case
+        leveled_bookie:book_headonly(
+            Bookie,
+            Bucket,
+            <<"cp">>,
+            client_candidate_page_subkey(?CANDIDATE_PAGE_HEAD)
+        )
+    of
+        {ok, Head} ->
+            Wanted = maps:from_list([{DocId, true} || DocId <- DocIds]),
+            case client_candidate_head_pages(Head, DocIds) of
+                [] ->
+                    #{};
+                PageNumbers ->
+                    WantedPages = maps:from_list([
+                        {PageNo, true}
+                     || PageNo <- PageNumbers
+                    ]),
+                    First = hd(PageNumbers),
+                    Last = lists:last(PageNumbers),
+                    Fold = fun
+                        (
+                            B,
+                            {<<"cp">>, <<PageNo:16/unsigned-big>>},
+                            Value,
+                            Acc
+                        ) when B =:= Bucket ->
+                            case maps:is_key(PageNo, WantedPages) of
+                                true ->
+                                    client_decode_candidate_page(
+                                        Value, Wanted, Schema, Acc
+                                    );
+                                false ->
+                                    Acc
+                            end;
+                        (_B, _K, _Value, Acc) ->
+                            Acc
+                    end,
+                    {async, Runner} = leveled_bookie:book_headfold(
+                        Bookie,
+                        ?HEAD_TAG,
+                        {range, Bucket, {
+                            {<<"cp">>, client_candidate_page_subkey(First)},
+                            {<<"cp">>, client_candidate_page_subkey(Last)}
+                        }},
+                        {client_cancellable_fold(Fold), #{}},
+                        false,
+                        true,
+                        false
+                    ),
+                    client_run_fold(Runner)
             end;
-        (_B, _K, _Value, Acc) ->
-            Acc
-    end,
-    {async, Runner} = leveled_bookie:book_headfold(
-        Bookie,
-        ?HEAD_TAG,
-        {range, Bucket, {
-            {<<"cp">>, client_candidate_page_subkey(First)},
-            {<<"cp">>, client_candidate_page_subkey(Last)}
-        }},
-        {client_cancellable_fold(Fold), #{}},
-        false,
-        true,
-        false
-    ),
-    client_run_fold(Runner).
+        not_found ->
+            client_point_candidate_pages(Bookie, Schema, DocIds)
+    end.
 
 client_point_candidate_pages(_Bookie, _Schema, []) ->
     #{};
 client_point_candidate_pages(Bookie, #{index := Bucket} = Schema, DocIds) ->
     Wanted = maps:from_list([{DocId, true} || DocId <- DocIds]),
-    PageNumbers = lists:usort([
-        client_candidate_page_number(DocId)
-     || DocId <- DocIds
-    ]),
+    Current =
+        case
+            leveled_bookie:book_headonly(
+                Bookie,
+                Bucket,
+                <<"cp">>,
+                client_candidate_page_subkey(?CANDIDATE_PAGE_HEAD)
+            )
+        of
+            {ok, Head} ->
+                PageNumbers = client_candidate_head_pages(Head, DocIds),
+                client_read_candidate_pages(
+                    Bookie, Bucket, Schema, Wanted, PageNumbers, #{}
+                );
+            not_found ->
+                %% Experimental page-v4 stores predating the bounded-page
+                %% directory used the top sixteen DocID bits.  Keep their
+                %% read path narrow while the stable v1-v3 compatibility
+                %% probe below retains the established coarse bucket math.
+                FinePageNumbers = lists:usort([
+                    DocId bsr 48
+                 || DocId <- DocIds
+                ]),
+                client_read_candidate_pages(
+                    Bookie, Bucket, Schema, Wanted, FinePageNumbers, #{}
+                )
+        end,
+    Missing = [
+        DocId
+     || DocId <- DocIds,
+        not maps:is_key(DocId, Current)
+    ],
+    case Missing of
+        [] ->
+            Current;
+        _ ->
+            %% Page v3 and earlier used only the top four DocID bits. Readers
+            %% probe those coarse buckets only for unresolved candidates, so
+            %% current stores pay no legacy I/O while Run 86/87 stores remain
+            %% directly searchable.
+            LegacyPageNumbers = lists:usort([
+                client_legacy_candidate_page_number(DocId)
+             || DocId <- Missing
+            ]),
+            client_read_candidate_pages(
+                Bookie,
+                Bucket,
+                Schema,
+                Wanted,
+                LegacyPageNumbers,
+                Current
+            )
+    end.
+
+client_read_candidate_pages(
+    Bookie, Bucket, Schema, Wanted, PageNumbers, Acc0
+) ->
     Keys = [
         {<<"cp">>, client_candidate_page_subkey(PageNo)}
      || PageNo <- PageNumbers
     ],
     Values = leveled_bookie:book_headonly_many(Bookie, Bucket, Keys),
     lists:foldl(
-        fun({_PageNo, Result}, Acc) ->
+        fun({_PageNo, Result}, PageAcc) ->
             case Result of
                 {ok, Value} ->
-                    client_decode_candidate_page(Value, Wanted, Schema, Acc);
+                    client_decode_candidate_page(
+                        Value, Wanted, Schema, PageAcc
+                    );
                 not_found ->
-                    Acc
+                    PageAcc
             end
         end,
-        #{},
+        Acc0,
         lists:zip(PageNumbers, Values)
     ).
 
-client_candidate_page_number(DocId) ->
-    DocId bsr ?CANDIDATE_PAGE_SHIFT.
+client_legacy_candidate_page_number(DocId) ->
+    DocId bsr ?LEGACY_CANDIDATE_PAGE_SHIFT.
 
 client_candidate_page_subkey(PageNo) ->
     <<PageNo:16/unsigned-big>>.
 
+client_candidate_head_pages(
+    <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, ?CANDIDATE_PAGE_VERSION:8,
+        ?CANDIDATE_PAGE_HEAD:16/unsigned-big, Count:16/unsigned-big,
+        Directory/binary>>,
+    DocIds
+) when byte_size(Directory) =:= Count * 18 ->
+    Boundaries = list_to_tuple(client_decode_candidate_head(Directory, [])),
+    lists:usort(
+        lists:filtermap(
+            fun(DocId) ->
+                client_candidate_boundary_page(
+                    DocId, Boundaries, 1, tuple_size(Boundaries)
+                )
+            end,
+            DocIds
+        )
+    );
+client_candidate_head_pages(Bad, _DocIds) ->
+    erlang:error({invalid_fts_candidate_page_head, Bad}).
+
+client_decode_candidate_head(<<>>, Acc) ->
+    lists:reverse(Acc);
+client_decode_candidate_head(
+    <<PageNo:16/unsigned-big, First:64/unsigned-big, Last:64/unsigned-big,
+        Rest/binary>>,
+    Acc
+) when First =< Last ->
+    client_decode_candidate_head(Rest, [{PageNo, First, Last} | Acc]).
+
+client_candidate_boundary_page(_DocId, _Boundaries, Lo, Hi) when Lo > Hi ->
+    false;
+client_candidate_boundary_page(DocId, Boundaries, Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    {PageNo, First, Last} = element(Mid, Boundaries),
+    case true of
+        _ when DocId < First ->
+            client_candidate_boundary_page(DocId, Boundaries, Lo, Mid - 1);
+        _ when DocId > Last ->
+            client_candidate_boundary_page(DocId, Boundaries, Mid + 1, Hi);
+        true ->
+            {true, PageNo}
+    end.
+
 client_decode_candidate_page(
-    <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, Version:8,
-        Count:16/unsigned-big, DirectoryBytes:32/unsigned-big,
-        PayloadBytes:32/unsigned-big, Directory:DirectoryBytes/binary,
-        Payload:PayloadBytes/binary>>,
+    <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, Version:8, Count:16/unsigned-big,
+        DirectoryBytes:32/unsigned-big, PayloadBytes:32/unsigned-big,
+        Directory:DirectoryBytes/binary, Payload:PayloadBytes/binary>>,
     Wanted,
     Schema,
     Acc
 ) when
-    (Version =:= ?CANDIDATE_PAGE_VERSION orelse
-        Version =:= ?PREVIOUS_CANDIDATE_PAGE_VERSION),
+    Version >= 3,
+    Version =< ?CANDIDATE_PAGE_VERSION,
     DirectoryBytes =:= Count * ?CANDIDATE_PAGE_DIR_STRIDE
 ->
     client_decode_candidate_page_directory(
         Directory, Payload, Wanted, Schema, Acc
     );
+client_decode_candidate_page(
+    <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, Version:8, Count:16/unsigned-big,
+        DirectoryBytes:32/unsigned-big, PayloadBytes:32/unsigned-big,
+        _Directory:DirectoryBytes/binary, _Payload:PayloadBytes/binary>>,
+    _Wanted,
+    _Schema,
+    Acc
+) when
+    Version >= ?PREVIOUS_CANDIDATE_PAGE_VERSION,
+    Version < ?CANDIDATE_PAGE_VERSION,
+    DirectoryBytes =:= Count * ?CANDIDATE_PAGE_DIR_STRIDE
+->
+    Acc#{'$legacy_candidate_pages' => true};
 client_decode_candidate_page(Bad, _Wanted, _Schema, _Acc) ->
     erlang:error({invalid_fts_candidate_page, Bad}).
 
@@ -8365,6 +8958,15 @@ client_decode_page_candidate_record(CandidateBin, Schema) ->
             Names = client_candidate_field_names(Schema),
             true = length(Names) =:= length(Values),
             maps:from_list(lists:zip(Names, Values));
+        {Values, TextBlocks, TextBytes} when
+            is_list(Values), is_list(TextBlocks), is_integer(TextBytes)
+        ->
+            Names = client_candidate_field_names(Schema),
+            true = length(Names) =:= length(Values),
+            (maps:from_list(lists:zip(Names, Values)))#{
+                '$fts_text_blocks' => TextBlocks,
+                '$fts_text_bytes' => TextBytes
+            };
         Bad ->
             erlang:error({invalid_fts_page_candidate_record, Bad})
     end.
@@ -8865,11 +9467,13 @@ client_encode_impact_pages(
 ) ->
     ColumnModes = maps:get(column_modes, Schema, #{}),
     GroupFields = maps:get(candidate_group_fields, Schema, []),
-    case {
-        maps:get(Column, ColumnModes, text),
-        GroupFields,
-        maps:get(candidate_filter_fields, Schema, [])
-    } of
+    case
+        {
+            maps:get(Column, ColumnModes, text),
+            GroupFields,
+            maps:get(candidate_filter_fields, Schema, [])
+        }
+    of
         {text, [_ | _], FilterFields} ->
             ExpectedDocs = length([
                 ok
@@ -8878,10 +9482,12 @@ client_encode_impact_pages(
             ]),
             Rows = lists:filtermap(
                 fun({DocId, {_Version, DocLength, Posting}}) ->
-                    case {
-                        maps:find(Column, Posting),
-                        maps:find(DocId, CandidateRecords)
-                    } of
+                    case
+                        {
+                            maps:find(Column, Posting),
+                            maps:find(DocId, CandidateRecords)
+                        }
+                    of
                         {{ok, Tokens}, {ok, {DocKey, _DocVersion, Candidate}}} ->
                             [{_Token, #{count := Tf}}] = maps:to_list(Tokens),
                             Facet = [
@@ -8889,7 +9495,8 @@ client_encode_impact_pages(
                              || {_FilterColumn, Field} <- FilterFields
                             ],
                             {true,
-                                {Facet, DocId, DocKey, DocLength, Tf, Candidate}};
+                                {Facet, DocId, DocKey, DocLength, Tf,
+                                    Candidate}};
                         _ ->
                             false
                     end
@@ -8934,7 +9541,10 @@ client_encode_impact_facet_pages(
     VersionField = maps:get(candidate_version_field, Schema, undefined),
     Groups = lists:foldl(
         fun({_Facet, DocId, DocKey, Length, Tf, Candidate}, Acc) ->
-            GroupKey = [maps:get(Field, Candidate, undefined) || Field <- GroupFields],
+            GroupKey = [
+                maps:get(Field, Candidate, undefined)
+             || Field <- GroupFields
+            ],
             Version =
                 case VersionField of
                     undefined -> 0;
@@ -8958,8 +9568,13 @@ client_encode_impact_facet_pages(
     Entries0 = maps:fold(
         fun(_GroupKey, {_Version, VersionRows}, Acc) ->
             Scored = [
-                {client_impact_score(Tf, AvgLength, Length), DocId, DocKey,
-                    Length, Tf}
+                {
+                    client_impact_score(Tf, AvgLength, Length),
+                    DocId,
+                    DocKey,
+                    Length,
+                    Tf
+                }
              || {DocId, DocKey, Length, Tf} <- VersionRows
             ],
             [{Score, DocId, _DocKey, Length, Tf} | _] = lists:sort(
@@ -8985,8 +9600,10 @@ client_encode_impact_facet_pages(
         Groups
     ),
     Entries = lists:sort(
-        fun({ScoreA, _BoundA, DocA, _, _, _},
-            {ScoreB, _BoundB, DocB, _, _, _}) ->
+        fun(
+            {ScoreA, _BoundA, DocA, _, _, _},
+            {ScoreB, _BoundB, DocB, _, _, _}
+        ) ->
             {-ScoreA, DocA} =< {-ScoreB, DocB}
         end,
         Entries0
@@ -9010,8 +9627,10 @@ client_encode_impact_facet_pages(
                 begin
                     RemainingBound =
                         case lists:nthtail(PageNo + 1, Pages) of
-                            [[{_, NextBound, _, _, _, _} | _]
-                                | _] ->
+                            [
+                                [{_, NextBound, _, _, _, _} | _]
+                                | _
+                            ] ->
                                 NextBound;
                             [] ->
                                 0
@@ -9067,28 +9686,39 @@ client_encode_impact_page(
     FacetBin,
     Entries
 ) ->
-    PageCount = case PageNo of 0 -> PageCount0; _ -> 0 end,
-    GroupCount = case PageNo of 0 -> GroupCount0; _ -> 0 end,
-    RawCount = case PageNo of 0 -> RawCount0; _ -> 0 end,
+    PageCount =
+        case PageNo of
+            0 -> PageCount0;
+            _ -> 0
+        end,
+    GroupCount =
+        case PageNo of
+            0 -> GroupCount0;
+            _ -> 0
+        end,
+    RawCount =
+        case PageNo of
+            0 -> RawCount0;
+            _ -> 0
+        end,
     client_guard(impact_facet_bytes, byte_size(FacetBin), ?MAX_U16),
     Payload = iolist_to_binary([
-        <<Bound:32/unsigned-big, DocId:64/unsigned-big,
-            Length:64/unsigned-big, Tf:32/unsigned-big,
+        <<Bound:32/unsigned-big, DocId:64/unsigned-big, Length:64/unsigned-big,
+            Tf:32/unsigned-big,
             MatchCount:64/unsigned-big>>
      || {_Score, Bound, DocId, Length, Tf, MatchCount} <- Entries
     ]),
-    <<?IMPACT_MAGIC:24/unsigned-big, ?IMPACT_VERSION:8,
-        ?IMPACT_PLANE:8, Column:8, PageCount:16/unsigned-big,
-        GroupCount:32/unsigned-big, RawCount:32/unsigned-big,
-        PageMaxBound:32/unsigned-big, RemainingBound:32/unsigned-big,
-        (byte_size(FacetBin)):16/unsigned-big,
+    <<?IMPACT_MAGIC:24/unsigned-big, ?IMPACT_VERSION:8, ?IMPACT_PLANE:8,
+        Column:8, PageCount:16/unsigned-big, GroupCount:32/unsigned-big,
+        RawCount:32/unsigned-big, PageMaxBound:32/unsigned-big,
+        RemainingBound:32/unsigned-big, (byte_size(FacetBin)):16/unsigned-big,
         (length(Entries)):16/unsigned-big, FacetBin/binary, Payload/binary>>.
 
 client_decode_impact_row(
     <<?IMPACT_PLANE:8, _Column:8, _FacetHash:64/unsigned-big,
         _PageNo:16/unsigned-big, 0:64>>,
-    <<?IMPACT_MAGIC:24/unsigned-big, ?IMPACT_VERSION:8,
-        ?IMPACT_PLANE:8, _/binary>>
+    <<?IMPACT_MAGIC:24/unsigned-big, ?IMPACT_VERSION:8, ?IMPACT_PLANE:8,
+        _/binary>>
 ) ->
     impact;
 client_decode_impact_row(_SubKey, _Value) ->
@@ -9785,10 +10415,12 @@ client_fold_shard_pages(Bookie, Schema, Shard) ->
                             {Docs, [SubKey | OldKeys], Positions}
                     };
                 not_page ->
-                    case {
-                        client_decode_impact_row(SubKey, Value),
-                        client_decode_boundary_overflow_row(SubKey, Value)
-                    } of
+                    case
+                        {
+                            client_decode_impact_row(SubKey, Value),
+                            client_decode_boundary_overflow_row(SubKey, Value)
+                        }
+                    of
                         {impact, _} ->
                             {OldDocs, OldKeys, OldPositions} = maps:get(
                                 Token, Acc, {#{}, [], #{}}
@@ -10026,9 +10658,11 @@ client_refresh_stats(Bookie, Schema, Shards) ->
 client_refresh_record_pages(Bookie, #{index := Bucket} = Schema) ->
     client_refresh_hit_pages(Bookie, Schema),
     client_refresh_candidate_pages(Bookie, Schema),
-    case leveled_bookie:book_mput(Bookie, [
-        {remove, Bucket, <<"record-tail">>, <<"dirty">>, <<>>}
-    ]) of
+    case
+        leveled_bookie:book_mput(Bookie, [
+            {remove, Bucket, <<"record-tail">>, <<"dirty">>, <<>>}
+        ])
+    of
         ok -> ok;
         pause -> ok;
         {error, Reason} -> erlang:error({fts_record_tail_clear_failed, Reason})
@@ -10147,8 +10781,9 @@ client_fold_all_hit_record_tail(Bookie, #{index := Bucket}) ->
     {async, Runner} = leveled_bookie:book_headfold(
         Bookie,
         ?HEAD_TAG,
-        {range, Bucket,
-            {{<<"r">>, <<>>}, {<<"r">>, <<?MAX_U64:64/unsigned-big>>}}},
+        {range, Bucket, {
+            {<<"r">>, <<>>}, {<<"r">>, <<?MAX_U64:64/unsigned-big>>}
+        }},
         {client_cancellable_fold(Fold), #{}},
         false,
         true,
@@ -10176,41 +10811,92 @@ client_remove_hit_record_tail(Bookie, Bucket, DocIds) ->
 
 client_refresh_candidate_pages(Bookie, #{index := Bucket} = Schema) ->
     Dirty = client_fold_all_candidate_record_tail(Bookie, Schema),
-    case client_candidate_page_inventory(Bookie, Schema) of
-        current ->
-            ByPage = client_group_candidate_pages(Dirty),
-            client_refresh_candidate_page_slices(
-                Bookie,
-                Bucket,
-                Schema,
-                ByPage,
-                lists:sort(maps:keys(ByPage))
-            );
-        {legacy, Existing, OldPageNumbers} ->
-            Updated = client_overlay_candidate_record_tail(Existing, Dirty),
-            ByPage = client_group_candidate_pages(Updated),
-            NewPageNumbers = lists:sort(maps:keys(ByPage)),
-            client_replace_candidate_page_slices(
-                Bookie, Bucket, Schema, ByPage, NewPageNumbers
-            ),
-            client_remove_candidate_pages(
-                Bookie, Bucket, OldPageNumbers -- NewPageNumbers
-            )
-    end,
+    {Existing, OldPageNumbers} = client_candidate_page_inventory(
+        Bookie, Schema
+    ),
+    Updated = client_overlay_candidate_record_tail(
+        Existing,
+        client_enrich_candidate_records(Bookie, Schema, Dirty)
+    ),
+    ByPage = client_group_candidate_pages(Updated, Schema),
+    NewPageNumbers = lists:sort(maps:keys(ByPage)),
+    client_replace_candidate_page_slices(
+        Bookie, Bucket, Schema, ByPage, NewPageNumbers
+    ),
+    client_write_candidate_page_head(Bookie, Bucket, ByPage),
+    client_remove_candidate_pages(
+        Bookie, Bucket, OldPageNumbers -- NewPageNumbers
+    ),
     client_remove_candidate_record_tail(
         Bookie, Bucket, lists:sort(maps:keys(Dirty))
     ).
 
-client_group_candidate_pages(CandidateRecords) ->
-    maps:fold(
-        fun(DocId, CandidateRecord, Acc) ->
-            PageNo = client_candidate_page_number(DocId),
-            Page = maps:get(PageNo, Acc, #{}),
-            Acc#{PageNo => Page#{DocId => CandidateRecord}}
+client_enrich_candidate_records(_Bookie, _Schema, CandidateRecords) when
+    map_size(CandidateRecords) =:= 0
+->
+    CandidateRecords;
+client_enrich_candidate_records(Bookie, Schema, CandidateRecords) ->
+    HitRecords = client_fold_hit_records(
+        Bookie, Schema, lists:sort(maps:keys(CandidateRecords))
+    ),
+    maps:map(
+        fun
+            (_DocId, deleted) ->
+                deleted;
+            (DocId, {DocKey, DocVersion, Candidate}) ->
+                case maps:find(DocId, HitRecords) of
+                    {ok,
+                        {DocKey, DocVersion, #{
+                            text_blocks := TextBlocks, text_bytes := TextBytes
+                        }}} ->
+                        {DocKey, DocVersion, Candidate#{
+                            '$fts_text_blocks' => TextBlocks,
+                            '$fts_text_bytes' => TextBytes
+                        }};
+                    _MissingOrSuperseded ->
+                        {DocKey, DocVersion, Candidate}
+                end
         end,
-        #{},
         CandidateRecords
     ).
+
+client_group_candidate_pages(CandidateRecords, Schema) ->
+    {Pages, PageNo, Current, _Bytes} = lists:foldl(
+        fun({DocId, CandidateRecord}, {Acc, No, Page, Bytes}) ->
+            EntryBytes =
+                ?CANDIDATE_PAGE_DIR_STRIDE +
+                    byte_size(
+                        client_encode_candidate_page_entry(
+                            CandidateRecord, Schema
+                        )
+                    ),
+            case
+                map_size(Page) > 0 andalso
+                    Bytes + EntryBytes > ?CANDIDATE_PAGE_TARGET_BYTES
+            of
+                true ->
+                    {
+                        Acc#{No => Page},
+                        No + 1,
+                        #{DocId => CandidateRecord},
+                        EntryBytes
+                    };
+                false ->
+                    {
+                        Acc,
+                        No,
+                        Page#{DocId => CandidateRecord},
+                        Bytes + EntryBytes
+                    }
+            end
+        end,
+        {#{}, 0, #{}, 0},
+        lists:sort(maps:to_list(CandidateRecords))
+    ),
+    case map_size(Current) of
+        0 -> Pages;
+        _ -> Pages#{PageNo => Current}
+    end.
 
 client_candidate_page_inventory(Bookie, #{index := Bucket} = Schema) ->
     Fold = fun
@@ -10219,12 +10905,9 @@ client_candidate_page_inventory(Bookie, #{index := Bucket} = Schema) ->
             {<<"cp">>, <<PageNo:16/unsigned-big>>},
             <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, Version:8, _/binary>> =
                 Value,
-            {Legacy, Pages}
-        ) when B =:= Bucket ->
-            {
-                Legacy orelse Version =/= ?CANDIDATE_PAGE_VERSION,
-                [{PageNo, Value} | Pages]
-            };
+            Pages
+        ) when B =:= Bucket, PageNo =/= ?CANDIDATE_PAGE_HEAD ->
+            [{PageNo, Version, Value} | Pages];
         (_B, _K, _Value, Acc) ->
             Acc
     end,
@@ -10232,34 +10915,33 @@ client_candidate_page_inventory(Bookie, #{index := Bucket} = Schema) ->
         Bookie,
         ?HEAD_TAG,
         {range, Bucket, {{<<"cp">>, <<>>}, {<<"cp">>, <<255, 255>>}}},
-        {client_cancellable_fold(Fold), {false, []}},
+        {client_cancellable_fold(Fold), []},
         false,
         true,
         false
     ),
-    case client_run_fold(Runner) of
-        {false, _Pages} ->
-            current;
-        {true, Pages} ->
-            Existing = lists:foldl(
-                fun({_PageNo, Value}, Acc) ->
-                    client_decode_candidate_page(Value, all, Schema, Acc)
-                end,
-                #{},
-                Pages
-            ),
-            {legacy, Existing, lists:usort([PageNo || {PageNo, _} <- Pages])}
-    end.
+    Pages = client_run_fold(Runner),
+    Existing = lists:foldl(
+        fun({_PageNo, _Version, Value}, Acc) ->
+            client_decode_candidate_page(Value, all, Schema, Acc)
+        end,
+        #{},
+        Pages
+    ),
+    {
+        maps:remove('$legacy_candidate_pages', Existing),
+        lists:usort([PageNo || {PageNo, _Version, _Value} <- Pages])
+    }.
 
 client_all_candidate_records(Bookie, #{index := Bucket} = Schema) ->
     Fold = fun
         (
             B,
-            {<<"cp">>, <<_PageNo:16/unsigned-big>>},
+            {<<"cp">>, <<PageNo:16/unsigned-big>>},
             <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, _Version:8, _/binary>> =
                 Value,
             Acc
-        ) when B =:= Bucket ->
+        ) when B =:= Bucket, PageNo =/= ?CANDIDATE_PAGE_HEAD ->
             client_decode_candidate_page(Value, all, Schema, Acc);
         (_B, _K, _Value, Acc) ->
             Acc
@@ -10304,6 +10986,39 @@ client_replace_candidate_page_slices(
             erlang:error({fts_candidate_page_replace_failed, Batch, Reason})
     end.
 
+client_write_candidate_page_head(Bookie, Bucket, ByPage) ->
+    Boundaries = [
+        begin
+            DocIds = lists:sort(maps:keys(maps:get(PageNo, ByPage))),
+            <<PageNo:16/unsigned-big, (hd(DocIds)):64/unsigned-big,
+                (lists:last(DocIds)):64/unsigned-big>>
+        end
+     || PageNo <- lists:sort(maps:keys(ByPage))
+    ],
+    client_guard(
+        candidate_page_count,
+        length(Boundaries),
+        ?CANDIDATE_PAGE_HEAD - 1
+    ),
+    Head =
+        <<?CANDIDATE_PAGE_MAGIC:24/unsigned-big, ?CANDIDATE_PAGE_VERSION:8,
+            ?CANDIDATE_PAGE_HEAD:16/unsigned-big,
+            (length(Boundaries)):16/unsigned-big,
+            (iolist_to_binary(Boundaries))/binary>>,
+    case
+        leveled_bookie:book_mput(Bookie, [
+            {add, Bucket, <<"cp">>,
+                client_candidate_page_subkey(?CANDIDATE_PAGE_HEAD), Head}
+        ])
+    of
+        ok ->
+            ok;
+        pause ->
+            client_write_candidate_page_head(Bookie, Bucket, ByPage);
+        {error, Reason} ->
+            erlang:error({fts_candidate_page_head_write_failed, Reason})
+    end.
+
 client_remove_candidate_pages(_Bookie, _Bucket, []) ->
     ok;
 client_remove_candidate_pages(Bookie, Bucket, PageNumbers) ->
@@ -10314,8 +11029,10 @@ client_remove_candidate_pages(Bookie, Bucket, PageNumbers) ->
      || PageNo <- Batch
     ],
     case leveled_bookie:book_mput(Bookie, Specs) of
-        ok -> client_remove_candidate_pages(Bookie, Bucket, Rest);
-        pause -> client_remove_candidate_pages(Bookie, Bucket, Rest);
+        ok ->
+            client_remove_candidate_pages(Bookie, Bucket, Rest);
+        pause ->
+            client_remove_candidate_pages(Bookie, Bucket, Rest);
         {error, Reason} ->
             erlang:error({fts_candidate_page_remove_failed, Batch, Reason})
     end.
@@ -10390,8 +11107,9 @@ client_fold_all_candidate_record_tail(Bookie, #{index := Bucket}) ->
     {async, Runner} = leveled_bookie:book_headfold(
         Bookie,
         ?HEAD_TAG,
-        {range, Bucket,
-            {{<<"c">>, <<>>}, {<<"c">>, <<?MAX_U64:64/unsigned-big>>}}},
+        {range, Bucket, {
+            {<<"c">>, <<>>}, {<<"c">>, <<?MAX_U64:64/unsigned-big>>}
+        }},
         {client_cancellable_fold(Fold), #{}},
         false,
         true,
@@ -10468,8 +11186,10 @@ normalise_candidate_filter_field({Column, Field}) ->
 normalise_field_names(Fields) when is_list(Fields) ->
     [Name || Name <- Fields, is_atom(Name) orelse is_binary(Name)].
 
-normalise_optional_field_name(undefined) -> undefined;
-normalise_optional_field_name(nil) -> undefined;
+normalise_optional_field_name(undefined) ->
+    undefined;
+normalise_optional_field_name(nil) ->
+    undefined;
 normalise_optional_field_name(Name) when is_atom(Name) orelse is_binary(Name) ->
     Name.
 
@@ -10612,23 +11332,8 @@ client_encode_candidate_page(CandidateRecords, Schema) ->
             {Directory, Payload, Offset}
         ) ->
             client_guard(doc_id, DocId, ?MAX_DOC_ID),
-            client_guard(
-                doc_key_bytes, byte_size(DocKey), ?MAX_DOC_KEY_BYTES
-            ),
-            CandidateBin = client_encode_page_candidate_record(
-                CandidateRecord, Schema
-            ),
-            client_guard(
-                candidate_page_record_bytes,
-                byte_size(CandidateBin),
-                ?MAX_U16
-            ),
-            Entry =
-                <<DocVersion:8/binary, (byte_size(DocKey)):16/unsigned-big,
-                    DocKey/binary, (byte_size(CandidateBin)):16/unsigned-big,
-                    CandidateBin/binary>>,
-            client_guard(
-                candidate_page_entry_bytes, byte_size(Entry), ?MAX_U16
+            Entry = client_encode_candidate_page_entry(
+                {DocKey, DocVersion, CandidateRecord}, Schema
             ),
             {
                 [
@@ -10650,12 +11355,41 @@ client_encode_candidate_page(CandidateRecords, Schema) ->
         (byte_size(Payload)):32/unsigned-big, Directory/binary,
         Payload/binary>>.
 
+client_encode_candidate_page_entry(
+    {DocKey, DocVersion, CandidateRecord}, Schema
+) ->
+    client_guard(doc_key_bytes, byte_size(DocKey), ?MAX_DOC_KEY_BYTES),
+    CandidateBin = client_encode_page_candidate_record(
+        CandidateRecord, Schema
+    ),
+    client_guard(
+        candidate_page_record_bytes, byte_size(CandidateBin), ?MAX_U16
+    ),
+    Entry =
+        <<DocVersion:8/binary, (byte_size(DocKey)):16/unsigned-big,
+            DocKey/binary, (byte_size(CandidateBin)):16/unsigned-big,
+            CandidateBin/binary>>,
+    client_guard(candidate_page_entry_bytes, byte_size(Entry), ?MAX_U16),
+    Entry.
+
 client_encode_page_candidate_record(CandidateRecord, Schema) ->
     Values = [
         maps:get(Name, CandidateRecord)
      || Name <- client_candidate_field_names(Schema)
     ],
-    term_to_binary(Values, [deterministic]).
+    case
+        {
+            maps:find('$fts_text_blocks', CandidateRecord),
+            maps:find('$fts_text_bytes', CandidateRecord)
+        }
+    of
+        {{ok, TextBlocks}, {ok, TextBytes}} ->
+            term_to_binary(
+                {Values, TextBlocks, TextBytes}, [deterministic, compressed]
+            );
+        _Unavailable ->
+            term_to_binary(Values, [deterministic])
+    end.
 
 client_candidate_field_names(Schema) ->
     [
@@ -14280,16 +15014,48 @@ v10_text_block_batch_exposes_exact_offsets_and_reads_v2_tester() ->
             <<0:32/unsigned-big>>
         ),
         FirstText = element(1, maps:get({DocId, 0}, Batch)),
-        [{{DocId, 0}, _Frame, _RawBytes}] = client_text_pack_frames(
-            FirstPack, DocId, #{{DocId, 0} => true}
+        ?assertMatch(
+            <<?TEXT_PACK_MAGIC:24/unsigned-big, ?TEXT_PACK_VERSION:8,
+                _/binary>>,
+            FirstPack
+        ),
+        ?assertEqual(
+            not_found,
+            leveled_bookie:book_headonly(
+                Bookie,
+                Bucket,
+                client_text_block_key(DocId),
+                <<1:32/unsigned-big>>
+            )
+        ),
+        {_Token, WantedOrdinal, WantedOffset, WantedLength} =
+            lists:nth(100, Tokens),
+        WantedBlock = WantedOffset div ?TEXT_BLOCK_BYTES,
+        {ok, SelectedBatch} = text_blocks_with_offsets_batch(
+            Bookie,
+            Schema,
+            [{DocId, WantedBlock, WantedBlock, [WantedOrdinal]}]
+        ),
+        {SelectedText, SelectedOffsets} = maps:get(
+            {DocId, WantedBlock}, SelectedBatch
+        ),
+        ?assertEqual(
+            element(1, maps:get({DocId, WantedBlock}, Batch)), SelectedText
+        ),
+        ?assertEqual(
+            [
+                {WantedOrdinal, WantedOffset rem ?TEXT_BLOCK_BYTES,
+                    WantedLength}
+            ],
+            SelectedOffsets
         ),
         Legacy = <<
-            ?PREVIOUS_TEXT_BLOCK_VERSION:8,
+            ?LEGACY_TEXT_BLOCK_VERSION:8,
             (leveled_zstd:compress(FirstText))/binary
         >>,
         ok = leveled_bookie:book_mput(Bookie, [
-            {add, Bucket, client_text_block_key(DocId),
-                <<0:32/unsigned-big>>, Legacy}
+            {add, Bucket, client_text_block_key(DocId), <<0:32/unsigned-big>>,
+                Legacy}
         ]),
         {ok, LegacyBatch} = text_blocks_with_offsets_batch(
             Bookie, Schema, [{DocId, 0, 0}]
@@ -14709,7 +15475,8 @@ candidate_projection_stays_index_resident_tester() ->
             index => Bucket,
             columns => [body],
             hit_fields => [title],
-            candidate_fields => [title]
+            candidate_fields => [title],
+            candidate_group_fields => [title]
         }),
         lists:foreach(
             fun(I) ->
@@ -14721,7 +15488,7 @@ candidate_projection_stays_index_resident_tester() ->
                 ),
                 ok = leveled_bookie:book_mput(Bookie, Specs)
             end,
-            [3, 1, 2]
+            [6, 3, 1, 5, 2, 4]
         ),
         {ok, RawHits} = search(
             Bookie,
@@ -14764,8 +15531,81 @@ candidate_projection_stays_index_resident_tester() ->
         ),
         {ok, #{skipped := []}} = consolidate(Bookie, Schema, #{}),
         {ok, CandidatesAfter} = candidate_fetch(Bookie, Schema, DocIds, fold),
-        ?assertEqual(Candidates, CandidatesAfter)
+        ?assertEqual(Candidates, CandidatesAfter),
+        {ok, RankedAfter} = search(
+            Bookie,
+            Schema,
+            <<"alpha">>,
+            #{
+                rank => bm25,
+                limit => 2,
+                resolve_hits => false,
+                rank_tie_fields => [title]
+            }
+        ),
+        ?assertEqual(
+            [<<"title-1">>, <<"title-2">>],
+            [
+                maps:get(title, maps:get(candidate_record, Hit))
+             || Hit <- RankedAfter
+            ]
+        )
     end).
+
+candidate_pages_use_bounded_current_ranges_and_keep_legacy_bucket_math_test() ->
+    DocIdA = 16#8001000000000001,
+    DocIdB = 16#8002000000000001,
+    ?assertEqual(
+        client_legacy_candidate_page_number(DocIdA),
+        client_legacy_candidate_page_number(DocIdB)
+    ),
+    Schema = #{candidate_fields => [{title, [title]}]},
+    Records = maps:from_list([
+        {
+            16#8000000000000000 + I,
+            {
+                <<I:16/unsigned-big>>,
+                <<I:64/unsigned-big>>,
+                #{title => binary:copy(<<"x">>, 1000)}
+            }
+        }
+     || I <- lists:seq(1, 40)
+    ]),
+    Pages = client_group_candidate_pages(Records, Schema),
+    ?assert(map_size(Pages) > 1),
+    ?assert(
+        lists:all(
+            fun({_PageNo, Page}) ->
+                byte_size(client_encode_candidate_page(Page, Schema)) =<
+                    ?CANDIDATE_PAGE_TARGET_BYTES + 1280
+            end,
+            maps:to_list(Pages)
+        )
+    ).
+
+sub_threshold_term_still_has_an_impact_page_test() ->
+    Schema = #{
+        column_modes => #{0 => text},
+        candidate_filter_fields => [],
+        candidate_group_fields => [group_id],
+        candidate_version_field => undefined
+    },
+    Docs = #{
+        16#8001000000000001 =>
+            {<<0:64>>, 4, #{0 => #{<<"rare">> => #{count => 1}}}},
+        16#8002000000000001 =>
+            {<<1:64>>, 5, #{0 => #{<<"rare">> => #{count => 2}}}}
+    },
+    Candidates = #{
+        16#8001000000000001 =>
+            {<<"a">>, <<0:64>>, #{group_id => <<"a">>}},
+        16#8002000000000001 =>
+            {<<"b">>, <<1:64>>, #{group_id => <<"b">>}}
+    },
+    ?assertMatch(
+        [{?IMPACT_PLANE, 0, 0, _SubKey, _Value}],
+        client_encode_impact_pages(0, Docs, Schema, 4.5, Candidates)
+    ).
 
 impact_pages_match_exact_grouped_ranking_and_dirty_fallback_test_() ->
     {timeout, 60,
@@ -14836,7 +15676,7 @@ impact_pages_match_exact_grouped_ranking_and_dirty_fallback_tester() ->
         ?assertEqual(
             [],
             [
-                {DocId, client_candidate_page_number(DocId)}
+                DocId
              || DocId <- maps:keys(AlphaDocs),
                 not maps:is_key(DocId, Candidates)
             ]
@@ -14877,19 +15717,31 @@ impact_pages_match_exact_grouped_ranking_and_dirty_fallback_tester() ->
                         Version = maps:get(content_version, Candidate),
                         case maps:find(Group, Acc) of
                             error ->
-                                Acc#{Group => {Version, Hit, maps:get(match_count, Hit)}};
+                                Acc#{
+                                    Group =>
+                                        {Version, Hit,
+                                            maps:get(match_count, Hit)}
+                                };
                             {ok, {Older, _OldHit, _OldCount}} when
                                 Version > Older
                             ->
-                                Acc#{Group => {Version, Hit, maps:get(match_count, Hit)}};
+                                Acc#{
+                                    Group =>
+                                        {Version, Hit,
+                                            maps:get(match_count, Hit)}
+                                };
                             {ok, {Version, Best, Count}} ->
                                 Better =
-                                    {-maps:get(score, Hit),
+                                    {
+                                        -maps:get(score, Hit),
                                         maps:get(candidate_key, Hit),
-                                        maps:get(key, Hit)} <
-                                        {-maps:get(score, Best),
+                                        maps:get(key, Hit)
+                                    } <
+                                        {
+                                            -maps:get(score, Best),
                                             maps:get(candidate_key, Best),
-                                            maps:get(key, Best)},
+                                            maps:get(key, Best)
+                                        },
                                 Acc#{
                                     Group =>
                                         {Version,
@@ -14966,8 +15818,7 @@ impact_pages_match_exact_grouped_ranking_and_dirty_fallback_tester() ->
                         group_id, maps:get(candidate_record, ExpectedHit)
                     ),
                     maps:get(group_id, maps:get(candidate_record, ImpactHit)),
-                    maps:get(score, ExpectedHit),
-                    maps:get(score, ImpactHit),
+                    maps:get(score, ExpectedHit), maps:get(score, ImpactHit),
                     maps:get(key, ExpectedHit),
                     maps:get(key, ImpactHit)}
              || {Index, {_Version, ExpectedHit, _Count}, ImpactHit} <-

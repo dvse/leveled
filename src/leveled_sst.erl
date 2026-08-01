@@ -128,6 +128,7 @@
     sst_open/4,
     sst_get/2,
     sst_get/3,
+    sst_getmany/2,
     sst_getsqn/3,
     sst_expandpointer/5,
     sst_getmaxsequencenumber/1,
@@ -492,6 +493,15 @@ sst_get(Pid, LedgerKey) ->
 sst_get(Pid, LedgerKey, Hash) ->
     gen_statem:call(Pid, {get_kv, LedgerKey, Hash, undefined}, infinity).
 
+-spec sst_getmany(
+    pid(), [{leveled_codec:object_key(), leveled_codec:segment_hash()}]
+) -> [leveled_codec:ledger_kv() | not_present].
+%% @doc Resolve exact keys in one SST state-machine call. Results preserve
+%% input order and evolve the reader's block/fetch caches between keys exactly
+%% as repeated `sst_get/3` calls do.
+sst_getmany(Pid, Keys) when is_list(Keys) ->
+    gen_statem:call(Pid, {get_many, Keys}, infinity).
+
 -spec sst_getsqn(
     pid(), leveled_codec:object_key(), leveled_codec:segment_hash()
 ) ->
@@ -815,6 +825,35 @@ starting(cast, {sst_returnslot, FetchedSlot, FetchFun, SlotCount}, State) ->
 
 reader(
     {call, From},
+    {get_many, Keys},
+    State = #state{read_state = RS}
+) when ?IS_DEF(RS), is_list(Keys) ->
+    {Results, BlockIndexCache, HighModifiedDate, FetchCache} = fetch_many_kvs(
+        Keys,
+        State#state.summary,
+        State#state.block_method,
+        State#state.high_modified_date,
+        State#state.index_moddate,
+        RS#read_state.filter_fun,
+        RS#read_state.blockindex_cache,
+        RS#read_state.fetch_cache,
+        RS#read_state.handle,
+        RS#read_state.level,
+        State#state.monitor,
+        []
+    ),
+    RS0 = RS#read_state{
+        blockindex_cache = BlockIndexCache,
+        fetch_cache = FetchCache
+    },
+    {keep_state,
+        State#state{
+            read_state = RS0,
+            high_modified_date = HighModifiedDate
+        },
+        [{reply, From, Results}]};
+reader(
+    {call, From},
     {get_kv, LedgerKey, Hash, Filter},
     State = #state{read_state = RS}
 ) when ?IS_DEF(RS) ->
@@ -967,6 +1006,35 @@ reader(
             {stop, normal}
     end.
 
+delete_pending(
+    {call, From},
+    {get_many, Keys},
+    State = #state{read_state = RS}
+) when ?IS_DEF(RS), is_list(Keys) ->
+    {Results, BlockIndexCache, HighModifiedDate, FetchCache} = fetch_many_kvs(
+        Keys,
+        State#state.summary,
+        State#state.block_method,
+        State#state.high_modified_date,
+        State#state.index_moddate,
+        RS#read_state.filter_fun,
+        RS#read_state.blockindex_cache,
+        RS#read_state.fetch_cache,
+        RS#read_state.handle,
+        RS#read_state.level,
+        {no_monitor, 0},
+        []
+    ),
+    RS0 = RS#read_state{
+        blockindex_cache = BlockIndexCache,
+        fetch_cache = FetchCache
+    },
+    {keep_state,
+        State#state{
+            read_state = RS0,
+            high_modified_date = HighModifiedDate
+        },
+        [{reply, From, Results}, ?DELETE_TIMEOUT]};
 delete_pending(
     {call, From},
     {get_kv, LedgerKey, Hash, Filter},
@@ -1532,6 +1600,109 @@ check_modified(HighLastModifiedInSST, LowModDate, true) when
     LowModDate =< HighLastModifiedInSST;
 check_modified(_, _, _) ->
     true.
+
+fetch_many_kvs(
+    Keys,
+    Summary,
+    BlockMethod,
+    HighModDate,
+    IndexModDate,
+    FilterFun,
+    BlockIndexCache,
+    FetchCache,
+    Handle,
+    Level,
+    Monitor,
+    Acc
+) ->
+    fetch_many_kvs_sequential(
+        Keys,
+        Summary,
+        BlockMethod,
+        HighModDate,
+        IndexModDate,
+        FilterFun,
+        BlockIndexCache,
+        FetchCache,
+        Handle,
+        Level,
+        Monitor,
+        Acc
+    ).
+
+fetch_many_kvs_sequential(
+    [],
+    _Summary,
+    _BlockMethod,
+    HighModDate,
+    _IndexModDate,
+    _FilterFun,
+    BlockIndexCache,
+    FetchCache,
+    _Handle,
+    _Level,
+    _Monitor,
+    Acc
+) ->
+    {lists:reverse(Acc), BlockIndexCache, HighModDate, FetchCache};
+fetch_many_kvs_sequential(
+    [{LedgerKey, Hash} | Rest],
+    Summary,
+    BlockMethod,
+    HighModDate,
+    IndexModDate,
+    FilterFun,
+    BlockIndexCache,
+    FetchCache,
+    Handle,
+    Level,
+    Monitor,
+    Acc
+) ->
+    {Result, BlockIndexUpdate, HighModDateUpdate, FetchCacheUpdate} = fetch(
+        LedgerKey,
+        Hash,
+        Summary,
+        BlockMethod,
+        HighModDate,
+        IndexModDate,
+        FilterFun,
+        BlockIndexCache,
+        FetchCache,
+        Handle,
+        Level,
+        Monitor
+    ),
+    NextBlockIndexCache =
+        case BlockIndexUpdate of
+            no_update -> BlockIndexCache;
+            UpdatedBlockIndexCache -> UpdatedBlockIndexCache
+        end,
+    NextHighModDate =
+        case HighModDateUpdate of
+            no_update -> HighModDate;
+            undefined -> HighModDate;
+            UpdatedHighModDate -> UpdatedHighModDate
+        end,
+    NextFetchCache =
+        case FetchCacheUpdate of
+            no_update -> FetchCache;
+            UpdatedFetchCache -> UpdatedFetchCache
+        end,
+    fetch_many_kvs_sequential(
+        Rest,
+        Summary,
+        BlockMethod,
+        NextHighModDate,
+        IndexModDate,
+        FilterFun,
+        NextBlockIndexCache,
+        NextFetchCache,
+        Handle,
+        Level,
+        Monitor,
+        [Result | Acc]
+    ).
 
 -spec fetch(
     leveled_codec:ledger_key(),
