@@ -1,6 +1,6 @@
 -module(leveled_zstd).
 
--export([compress/1, decompress/1]).
+-export([compress/1, decompress/1, decompress_many/1]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -27,6 +27,34 @@ decompress(Binary) when is_binary(Binary) ->
         error:{zstd_error, _Reason} ->
             error
     end.
+
+-spec decompress_many([{binary(), non_neg_integer()}]) -> [binary()] | error.
+decompress_many([]) ->
+    [];
+decompress_many(Frames) when is_list(Frames) ->
+    ensure_stdlib_zstd_loaded(),
+    Compressed = iolist_to_binary([Frame || {Frame, _Bytes} <- Frames]),
+    try zstd:decompress(Compressed) of
+        error ->
+            error;
+        Output ->
+            split_frames(
+                iolist_to_binary(Output),
+                [Bytes || {_Frame, Bytes} <- Frames],
+                []
+            )
+    catch
+        error:{zstd_error, _Reason} ->
+            error
+    end.
+
+split_frames(<<>>, [], Acc) ->
+    lists:reverse(Acc);
+split_frames(Binary, [Bytes | Rest], Acc) when byte_size(Binary) >= Bytes ->
+    <<Frame:Bytes/binary, Tail/binary>> = Binary,
+    split_frames(Tail, Rest, [Frame | Acc]);
+split_frames(_Binary, _Sizes, _Acc) ->
+    error.
 
 -spec ensure_stdlib_zstd_loaded() -> ok.
 ensure_stdlib_zstd_loaded() ->

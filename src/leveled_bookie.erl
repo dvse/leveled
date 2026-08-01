@@ -65,6 +65,7 @@
     book_sqn/3,
     book_sqn/4,
     book_headonly/4,
+    book_headonly_many/3,
     book_snapshot/4,
     book_compactjournal/2,
     book_islastcompactionpending/1,
@@ -732,6 +733,14 @@ book_headonly(Pid, Bucket, Key, SubKey) ->
         {head, Bucket, {Key, SubKey}, ?HEAD_TAG, false},
         infinity
     ).
+
+-spec book_headonly_many(
+    pid(), leveled_codec:key(), [{leveled_codec:key(), leveled_codec:key()}]
+) -> [{ok, any()} | not_found].
+%% @doc Resolve exact HEAD_TAG keys in one bounded request. Results preserve
+%% input order and have the same shape as repeated book_headonly/4 calls.
+book_headonly_many(Pid, Bucket, Keys) when is_list(Keys) ->
+    gen_server:call(Pid, {headonly_many, Bucket, Keys}, infinity).
 
 book_sqn(Pid, Bucket, Key) ->
     book_sqn(Pid, Bucket, Key, ?STD_TAG).
@@ -1696,6 +1705,67 @@ handle_call({head, Bucket, Key, Tag, SQNOnly}, _From, State) when
         UpdJrnalCheckFreq ->
             {reply, Reply, State#state{ink_checking = UpdJrnalCheckFreq}}
     end;
+handle_call(
+    {headonly_many, Bucket, Keys},
+    _From,
+    State = #state{head_lookup = true, penciller = Penciller}
+) when
+    is_list(Keys)
+->
+    LKs = [
+        leveled_codec:to_objectkey(Bucket, {Key, SubKey}, ?HEAD_TAG)
+     || {Key, SubKey} <- Keys
+    ],
+    {Cached, Missing} =
+        lists:foldl(
+            fun({LK, Index}, {CachedAcc, MissingAcc}) ->
+                case ets:lookup((State#state.ledger_cache)#ledger_cache.mem, LK) of
+                    [{LK, Head}] ->
+                        {[{Index, Head} | CachedAcc], MissingAcc};
+                    [] ->
+                        Hash = leveled_codec:segment_hash(LK),
+                        {CachedAcc, [{Index, LK, Hash} | MissingAcc]}
+                end
+            end,
+            {[], []},
+            lists:zip(LKs, lists:seq(1, length(LKs)))
+        ),
+    OrderedMissing = lists:reverse(Missing),
+    Fetched = leveled_penciller:pcl_fetchmany(
+        Penciller,
+        [{LK, Hash} || {_Index, LK, Hash} <- OrderedMissing],
+        false
+    ),
+    IndexedHeads =
+        Cached ++
+            [
+                {Index,
+                    case Result of
+                        {LK, Head} -> Head;
+                        not_present -> not_present
+                    end}
+             || {{Index, LK, _Hash}, Result} <-
+                    lists:zip(OrderedMissing, Fetched)
+            ],
+    HeadMap = maps:from_list(IndexedHeads),
+    Now = leveled_util:integer_now(),
+    Reply = [
+        case maps:get(Index, HeadMap, not_present) of
+            not_present ->
+                not_found;
+            Head ->
+                case leveled_codec:striphead_to_v1details(Head) of
+                    {_SeqN, tomb, _MH, _MD} ->
+                        not_found;
+                    {_SeqN, {active, TS}, _MH, MD} when TS >= Now ->
+                        {ok, leveled_head:build_head(?HEAD_TAG, MD)};
+                    {_SeqN, {active, _Expired}, _MH, _MD} ->
+                        not_found
+                end
+        end
+     || Index <- lists:seq(1, length(LKs))
+    ],
+    {reply, Reply, State};
 handle_call(
     {snapshot, SnapType, Query, LongRunning},
     _From,

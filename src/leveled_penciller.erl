@@ -176,6 +176,7 @@
     pcl_pushmem/2,
     pcl_fetchlevelzero/3,
     pcl_fetch/4,
+    pcl_fetchmany/3,
     pcl_fetchkeys/5,
     pcl_fetchkeys/6,
     pcl_fetchkeysbysegment/8,
@@ -412,6 +413,17 @@ pcl_fetchlevelzero(Pid, Slot, ReturnFun) ->
 %% are fetchable no index entries are created whne added to the ledger cache
 pcl_fetch(Pid, Key, Hash, UseL0Index) ->
     gen_server:call(Pid, {fetch, Key, Hash, UseL0Index}, infinity).
+
+-spec pcl_fetchmany(
+    pid(),
+    [{leveled_codec:ledger_key(), leveled_codec:segment_hash()}],
+    boolean()
+) -> [leveled_codec:ledger_kv() | not_present].
+%% @doc Fetch a bounded set of independent keys through one penciller call.
+%% This preserves point-lookup semantics while avoiding one mailbox round trip
+%% per key for callers which already have an exact key set.
+pcl_fetchmany(Pid, Keys, UseL0Index) when is_list(Keys) ->
+    gen_server:call(Pid, {fetch_many, Keys, UseL0Index}, infinity).
 
 -spec pcl_fetchkeys(
     pid(),
@@ -825,6 +837,28 @@ handle_call(
             L0Idx,
             State#state.monitor
         ),
+    {reply, R, State};
+handle_call(
+    {fetch_many, Keys, UseL0Index}, _From, State = #state{manifest = M}
+) when
+    ?IS_DEF(M), is_list(Keys)
+->
+    L0Idx =
+        case UseL0Index of
+            true -> State#state.levelzero_index;
+            false -> none
+        end,
+    R = [
+        timed_fetch_mem(
+            Key,
+            Hash,
+            M,
+            State#state.levelzero_cache,
+            L0Idx,
+            State#state.monitor
+        )
+     || {Key, Hash} <- Keys
+    ],
     {reply, R, State};
 handle_call(
     {check_sqn, Key, Hash, SQN},
