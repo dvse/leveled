@@ -692,7 +692,7 @@ serialise_object(Object, true, Method) when is_binary(Object) ->
             {ok, Bin} = lz4:pack(Object),
             Bin;
         zstd ->
-            leveled_zstd:compress(Object);
+            iolist_to_binary(zstd:compress(Object));
         native ->
             zlib:compress(Object);
         none ->
@@ -734,7 +734,12 @@ deserialise_object(Binary, true, true, lz4) ->
     {ok, Deflated} = lz4:unpack(Binary),
     Deflated;
 deserialise_object(Binary, true, true, zstd) ->
-    leveled_zstd:decompress(Binary);
+    try
+        iolist_to_binary(zstd:decompress(Binary))
+    catch
+        error:{zstd_error, Reason} ->
+            erlang:error({invalid_zstd_object, Reason})
+    end;
 deserialise_object(Binary, true, true, native) ->
     zlib:uncompress(Binary);
 deserialise_object(Binary, true, false, _) ->

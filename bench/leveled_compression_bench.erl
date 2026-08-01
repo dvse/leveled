@@ -553,11 +553,11 @@ codec_compress(lz4, Bin) ->
     {ok, Compressed} = lz4:pack(Bin),
     Compressed;
 codec_compress(native, Bin) -> zlib:compress(Bin);
-codec_compress(zstd, Bin) -> leveled_zstd:compress(Bin).
+codec_compress(zstd, Bin) -> iolist_to_binary(zstd:compress(Bin)).
 
 codec_decompress(none, Bin) -> Bin;
 codec_decompress(lz4, Bin) ->
     {ok, Decompressed} = lz4:unpack(Bin),
     Decompressed;
 codec_decompress(native, Bin) -> zlib:uncompress(Bin);
-codec_decompress(zstd, Bin) -> leveled_zstd:decompress(Bin).
+codec_decompress(zstd, Bin) -> iolist_to_binary(zstd:decompress(Bin)).

@@ -150,18 +150,17 @@ consolidation_write_race(_Config) ->
     with_bookie(fun(Bookie, _Root) ->
         Schema = schema(<<"race">>, [body], #{}),
         ok = put_doc(Bookie, Schema, <<"seed">>, #{body => <<"alpha">>}),
-        Shard = hd([S || {add, <<"race">>, <<S:16>>, <<"d:seed">>, _} <-
-            element(2, leveled_fts:derive(Schema, <<"seed">>, #{body => <<"alpha">>}))]),
         Gate = atomics:new(1, []),
-        Hook = fun({_S, _SQN}) ->
+        Hook = fun({_S, _Conditions}) ->
             case atomics:exchange(Gate, 1, 1) of
                 0 -> put_doc(Bookie, Schema, <<"late">>, #{body => <<"apple">>});
                 1 -> ok
             end
         end,
-        {ok, #{skipped := [Shard], consolidated := []}} =
+        {ok, #{skipped := Skipped, consolidated := []}} =
             leveled_fts:consolidate(Bookie, Schema,
-                #{shards => [Shard], before_consolidate_commit => Hook}),
+                #{before_consolidate_commit => Hook}),
+        true = Skipped =:= lists:seq(0, maps:get(shards, Schema) - 1),
         [<<"late">>, <<"seed">>] = keys(search(Bookie, Schema, <<"alpha OR apple">>, #{}))
     end).
 
