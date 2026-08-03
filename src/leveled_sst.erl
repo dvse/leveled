@@ -95,6 +95,7 @@
 -define(STARTUP_TIMEOUT, 10000).
 -define(MIN_HASH, 32768).
 -define(MAX_HASH, 65535).
+-define(GETMANY_CACHE, '$leveled_sst_getmany_cache').
 -define(LOG_BUILDTIMINGS_LEVELS, [3]).
 -define(NO_LOOKUP_POS, {<<127:8/integer>>, [], 0}).
 
@@ -171,7 +172,7 @@
 -type press_method() ::
     lz4 | native | zstd | none.
 -type block_version() ::
-    0 | 1.
+    0 | 1 | 2.
 -type block_method() ::
     {block_version(), press_method()}.
 -type range_endpoint() ::
@@ -560,7 +561,13 @@ sst_gettombcount(Pid) ->
 %% For this file to be closed and deleted
 sst_clear(Pid) ->
     gen_statem:call(Pid, {set_for_delete, false}, infinity),
-    gen_statem:call(Pid, close).
+    try gen_statem:call(Pid, close) of
+        ok -> ok
+    catch
+        %% The immediate reclaim timeout may win the race and complete the
+        %% same delete before this synchronous acknowledgement is delivered.
+        exit:{normal, {gen_statem, call, [Pid, close, _Timeout]}} -> ok
+    end.
 
 -spec sst_deleteconfirmed(pid()) -> ok.
 %% @doc
@@ -947,7 +954,10 @@ reader({call, From}, get_maxsequencenumber, State) ->
 reader({call, From}, {set_for_delete, Penciller}, State) ->
     ?STD_LOG(sst06, [State#state.filename]),
     {next_state, delete_pending, State#state{penciller = Penciller}, [
-        {reply, From, ok}, ?DELETE_TIMEOUT
+        %% Ask the manifest owner immediately.  Snapshot protection remains
+        %% authoritative there; only the first otherwise-unnecessary 10s
+        %% polling delay is removed.
+        {reply, From, ok}, 0
     ]};
 reader({call, From}, background_complete, State) ->
     Summary = State#state.summary,
@@ -979,6 +989,12 @@ reader(
                 }
         },
         [hibernate]};
+reader(cast, close, _State) ->
+    %% A reclaim confirmation can race the manifest owner's set_for_delete
+    %% call because they are sent by different processes.  Deletion is only
+    %% legal after the state transition above; an early confirmation is
+    %% ignored and the zero-timeout delete_pending transition asks again.
+    keep_state_and_data;
 reader(info, {update_blockindex_cache, BIC}, State) ->
     handle_update_blockindex_cache(BIC, State);
 reader(info, bic_complete, State) ->
@@ -1615,20 +1631,25 @@ fetch_many_kvs(
     Monitor,
     Acc
 ) ->
-    fetch_many_kvs_sequential(
-        Keys,
-        Summary,
-        BlockMethod,
-        HighModDate,
-        IndexModDate,
-        FilterFun,
-        BlockIndexCache,
-        FetchCache,
-        Handle,
-        Level,
-        Monitor,
-        Acc
-    ).
+    put(?GETMANY_CACHE, {#{}, #{}}),
+    try
+        fetch_many_kvs_sequential(
+            Keys,
+            Summary,
+            BlockMethod,
+            HighModDate,
+            IndexModDate,
+            FilterFun,
+            BlockIndexCache,
+            FetchCache,
+            Handle,
+            Level,
+            Monitor,
+            Acc
+        )
+    after
+        erase(?GETMANY_CACHE)
+    end.
 
 fetch_many_kvs_sequential(
     [],
@@ -1846,6 +1867,8 @@ fetch_range(StartKey, EndKey, Summary, FilterFun, true) ->
                 RTrim -> EndKey
             end}
     of
+        {[], _LastKey} ->
+            [];
         {[Slot], LastKey} ->
             [{pointer, Self, Slot, StartKey, LastKey}];
         {[Hd | Rest], all} ->
@@ -2008,7 +2031,9 @@ gen_fileversion({BlockVersion, PressMethod}, IdxModDate, CountOfTombs) ->
             0 ->
                 0;
             1 ->
-                16
+                16;
+            2 ->
+                32
         end,
     Bit1 + Bit2 + Bit3 + Bit4 + Bit5.
 
@@ -2028,11 +2053,10 @@ imp_fileversion(VersionInt, State) ->
                 zstd
         end,
     BlockVersion =
-        case VersionInt band 16 of
-            0 ->
-                0;
-            16 ->
-                1
+        case VersionInt band 48 of
+            0 -> 0;
+            16 -> 1;
+            32 -> 2
         end,
     UpdState0 = State#state{block_method = {BlockVersion, CompressionMethod}},
     UpdState1 =
@@ -2317,11 +2341,16 @@ lookup_slots(StartKey, EndKey, Tree, FilterFun) ->
             Tree,
             StartKeyFun
         ),
-    {EK, _EndSlot} = lists:last(SlotList),
-    {
-        lists:map(MapFun, SlotList),
-        leveled_codec:endkey_passed(FilteredEndKey, EK)
-    }.
+    case SlotList of
+        [] ->
+            {[], true};
+        _ ->
+            {EK, _EndSlot} = lists:last(SlotList),
+            {
+                lists:map(MapFun, SlotList),
+                leveled_codec:endkey_passed(FilteredEndKey, EK)
+            }
+    end.
 
 %%%============================================================================
 %%% Slot Implementation
@@ -2589,12 +2618,14 @@ check_blocks_allkeys(
 ) ->
     {BlockNumber, BlockPos} = revert_position(Pos),
     BlockBin =
-        read_block(
+        read_item_block(
             BlockPointer,
             BlockLengths,
             PosBinLength,
             BlockNumber,
-            additional_offset(IdxModDate)
+            BlockPos,
+            additional_offset(IdxModDate),
+            BlockMethod
         ),
     case spawn_check_block(BlockPos, BlockBin, BlockMethod) of
         {K, V} ->
@@ -2635,12 +2666,14 @@ check_blocks_matchkey(
 ) ->
     {BlockNumber, BlockPos} = revert_position(Pos),
     BlockBin =
-        read_block(
+        read_item_block(
             BlockPointer,
             BlockLengths,
             PosBinLength,
             BlockNumber,
-            additional_offset(IdxModDate)
+            BlockPos,
+            additional_offset(IdxModDate),
+            BlockMethod
         ),
     CheckResult = spawn_check_block(BlockPos, BlockBin, BlockMethod),
     case {CheckResult, LedgerKeyToCheck} of
@@ -2661,19 +2694,118 @@ check_blocks_matchkey(
 -spec spawn_check_block(non_neg_integer(), binary(), block_method()) ->
     not_present | leveled_codec:ledger_kv().
 spawn_check_block(BlockPos, BlockBin, BlockMethod) ->
-    Parent = self(),
-    Pid =
-        spawn_link(
-            fun() ->
-                check_block(Parent, BlockPos, BlockBin, BlockMethod)
-            end
-        ),
-    receive
-        {checked_block, Pid, R} -> R
+    case get(?GETMANY_CACHE) of
+        undefined ->
+            Parent = self(),
+            Pid =
+                spawn_link(
+                    fun() ->
+                        check_block(Parent, BlockPos, BlockBin, BlockMethod)
+                    end
+                ),
+            receive
+                {checked_block, Pid, R} -> R
+            end;
+        _ ->
+            getmany_nth(BlockPos, BlockBin, BlockMethod)
     end.
 
+read_item_block(
+    BlockPointer,
+    BlockLengths,
+    PosBinLength,
+    BlockID,
+    _BlockPos,
+    AO,
+    {Version, _PressMethod}
+) when Version =/= 2 ->
+    read_block(BlockPointer, BlockLengths, PosBinLength, BlockID, AO);
+read_item_block(
+    {Handle, StartPos},
+    BlockLengths,
+    PosBinLength,
+    BlockID,
+    BlockPos,
+    AO,
+    {2, _PressMethod}
+) ->
+    {Offset, BlockLength} = block_offsetandlength(BlockLengths, BlockID),
+    BlockStart = StartPos + Offset + PosBinLength + AO,
+    DirectoryReadLength = min(BlockLength, 5 + 8 * 32),
+    DirectoryPrefix = pread_block(Handle, BlockStart, DirectoryReadLength),
+    case leveled_sstblock:row_pointer(DirectoryPrefix, BlockPos) of
+        {ok, RowStart, RowLength} ->
+            pread_block(Handle, BlockStart + RowStart, RowLength);
+        error ->
+            <<>>
+    end;
+read_item_block(
+    SlotBin,
+    BlockLengths,
+    PosBinLength,
+    BlockID,
+    BlockPos,
+    AO,
+    {2, _PressMethod}
+) ->
+    Block = read_block(
+        SlotBin, BlockLengths, PosBinLength, BlockID, AO
+    ),
+    case leveled_sstblock:row_location(Block, BlockPos) of
+        {ok, RowStart, RowLength} ->
+            binary:part(Block, RowStart, RowLength);
+        error ->
+            <<>>
+    end.
+
+%% Native and uncompressed version-1 blocks are one ETF term.  `get_nth/3`
+%% therefore decodes the whole block even for one row, so retain that decoded
+%% tuple for the lifetime of this getmany call and never decode it twice.  The
+%% framed compressors keep their selective first-read path for scattered
+%% batches and promote to a call-scoped decoded tuple on the second access.
+getmany_nth(BlockPos, BlockBin, BlockMethod) ->
+    case BlockMethod of
+        {2, PressMethod} ->
+            leveled_sstblock:get_row(BlockBin, PressMethod);
+        _ ->
+            getmany_nth_block(BlockPos, BlockBin, BlockMethod)
+    end.
+
+getmany_nth_block(BlockPos, BlockBin, BlockMethod) ->
+    {ReadCache, DecodeCache} = get(?GETMANY_CACHE),
+    case maps:find(BlockBin, DecodeCache) of
+        error when BlockMethod =:= {1, native}; BlockMethod =:= {1, none} ->
+            Decoded = list_to_tuple(
+                leveled_sstblock:get_all(BlockBin, BlockMethod)
+            ),
+            put(?GETMANY_CACHE, {ReadCache, DecodeCache#{BlockBin => Decoded}}),
+            getmany_tuple_nth(BlockPos, Decoded);
+        error ->
+            put(?GETMANY_CACHE, {ReadCache, DecodeCache#{BlockBin => once}}),
+            leveled_sstblock:get_nth(BlockPos, BlockBin, BlockMethod);
+        {ok, once} ->
+            Decoded = list_to_tuple(
+                leveled_sstblock:get_all(BlockBin, BlockMethod)
+            ),
+            put(?GETMANY_CACHE, {ReadCache, DecodeCache#{BlockBin => Decoded}}),
+            getmany_tuple_nth(BlockPos, Decoded);
+        {ok, Decoded} ->
+            getmany_tuple_nth(BlockPos, Decoded)
+    end.
+
+getmany_tuple_nth(BlockPos, Decoded) when BlockPos =< tuple_size(Decoded) ->
+    element(BlockPos, Decoded);
+getmany_tuple_nth(_BlockPos, _Decoded) ->
+    not_present.
+
 check_block(From, BlockPos, BlockBin, BlockMethod) ->
-    R = leveled_sstblock:get_nth(BlockPos, BlockBin, BlockMethod),
+    R =
+        case BlockMethod of
+            {2, PressMethod} ->
+                leveled_sstblock:get_row(BlockBin, PressMethod);
+            _ ->
+                leveled_sstblock:get_nth(BlockPos, BlockBin, BlockMethod)
+        end,
     From ! {checked_block, self(), R}.
 
 -spec additional_offset(boolean()) -> pos_integer().
@@ -2687,17 +2819,35 @@ additional_offset(false) ->
 
 read_block({Handle, StartPos}, BlockLengths, PosBinLength, BlockID, AO) ->
     {Offset, Length} = block_offsetandlength(BlockLengths, BlockID),
-    {ok, BlockBin} =
-        file:pread(
-            Handle,
-            StartPos + Offset + PosBinLength + AO,
-            Length
-        ),
-    BlockBin;
+    ReadKey = {StartPos, BlockID},
+    case get(?GETMANY_CACHE) of
+        {ReadCache, _DecodeCache} = Caches ->
+            case maps:find(ReadKey, ReadCache) of
+                {ok, BlockBin} ->
+                    BlockBin;
+                error ->
+                    BlockBin = pread_block(
+                        Handle, StartPos + Offset + PosBinLength + AO, Length
+                    ),
+                    put(
+                        ?GETMANY_CACHE,
+                        setelement(1, Caches, ReadCache#{ReadKey => BlockBin})
+                    ),
+                    BlockBin
+            end;
+        undefined ->
+            pread_block(
+                Handle, StartPos + Offset + PosBinLength + AO, Length
+            )
+    end;
 read_block(SlotBin, BlockLengths, PosBinLength, BlockID, AO) ->
     {Offset, Length} = block_offsetandlength(BlockLengths, BlockID),
     StartPos = Offset + PosBinLength + AO,
     <<_Pre:StartPos/binary, BlockBin:Length/binary, _Rest/binary>> = SlotBin,
+    BlockBin.
+
+pread_block(Handle, Position, Length) ->
+    {ok, BlockBin} = file:pread(Handle, Position, Length),
     BlockBin.
 
 read_slot(Handle, Slot) ->
@@ -3382,7 +3532,22 @@ fetch_value([Pos | Rest], BlockLengths, Blocks, Key, BlockMethod) ->
     {BlockNumber, BlockPos} = revert_position(Pos),
     {Offset, Length} = block_offsetandlength(BlockLengths, BlockNumber),
     <<_Pre:Offset/binary, Block:Length/binary, _Rest/binary>> = Blocks,
-    R = leveled_sstblock:get_nth(BlockPos, Block, BlockMethod),
+    R =
+        case {get(?GETMANY_CACHE), BlockMethod} of
+            {undefined, _} ->
+                leveled_sstblock:get_nth(BlockPos, Block, BlockMethod);
+            {_, {2, PressMethod}} ->
+                case leveled_sstblock:row_location(Block, BlockPos) of
+                    {ok, RowStart, RowLength} ->
+                        leveled_sstblock:get_row(
+                            binary:part(Block, RowStart, RowLength), PressMethod
+                        );
+                    error ->
+                        not_present
+                end;
+            {_, _} ->
+                getmany_nth(BlockPos, Block, BlockMethod)
+        end,
     case R of
         {K, V} when K == Key ->
             {K, V};
@@ -3914,6 +4079,15 @@ maybelog_fetch_timing({Pid, _SlotFreq}, Level, Type, SW) when
 -include_lib("eunit/include/eunit.hrl").
 
 -define(TEST_AREA, "test/test_area/").
+
+lookup_slots_empty_range_test() ->
+    Tree = leveled_tree:from_orderedlist(
+        [{<<"b">>, first_slot}, {<<"d">>, second_slot}], tree, 16
+    ),
+    ?assertEqual(
+        {[], true},
+        lookup_slots(<<"z">>, <<"zz">>, Tree, fun(Key) -> Key end)
+    ).
 
 binaryslot_trimmed(
     FullBin, StartKey, EndKey, BlockMethod, IdxModDate, SegmentChecker
@@ -4894,6 +5068,92 @@ additional_range_test() ->
 
 simple_switchcache_test_() ->
     {timeout, 60, fun simple_switchcache_tester/0}.
+
+v1_native_getmany_decodes_block_once_test_() ->
+    {timeout, 60, fun v1_native_getmany_decodes_block_once/0}.
+
+v2_cold_getmany_reads_rows_test_() ->
+    {timeout, 60, fun v2_cold_getmany_reads_rows/0}.
+
+v2_cold_getmany_reads_rows() ->
+    {RP, Filename} = {?TEST_AREA, "v2_cold_getmany_reads_rows"},
+    KVList = lists:sublist(
+        lists:ukeysort(
+            1,
+            generate_randomkeys(1, ?LOOK_SLOTSIZE, 1, 4)
+        ),
+        ?LOOK_SLOTSIZE
+    ),
+    [{FirstKey, _}, {SecondKey, _} | _] = KVList,
+    {ok, Pid, _Range, _Bloom} = testsst_new(
+        RP, Filename, 1, KVList, length(KVList), {2, native}
+    ),
+    try
+        ?assertEqual(
+            [
+                lists:keyfind(FirstKey, 1, KVList),
+                lists:keyfind(SecondKey, 1, KVList)
+            ],
+            sst_getmany(Pid, [
+                {FirstKey, leveled_codec:segment_hash(FirstKey)},
+                {SecondKey, leveled_codec:segment_hash(SecondKey)}
+            ])
+        )
+    after
+        ok = sst_close(Pid),
+        ok = file:delete(filename:join(RP, Filename ++ ".sst"))
+    end.
+
+v1_native_getmany_decodes_block_once() ->
+    {RP, Filename} = {?TEST_AREA, "v1_native_getmany_decode_once"},
+    KVList = lists:sublist(
+        lists:ukeysort(
+            1,
+            generate_randomkeys(1, ?LOOK_SLOTSIZE, 1, 4)
+        ),
+        ?LOOK_SLOTSIZE
+    ),
+    [{FirstKey, _}, {SecondKey, _} | _] = KVList,
+    {ok, Pid, _Range, _Bloom} = testsst_new(
+        RP, Filename, 1, KVList, length(KVList), {1, native}
+    ),
+    MFAs = [
+        {leveled_sstblock, get_all, 2},
+        {leveled_sstblock, get_nth, 3}
+    ],
+    lists:foreach(
+        fun(MFA) ->
+            1 = erlang:trace_pattern(MFA, true, [local, call_count]),
+            1 = erlang:trace_pattern(MFA, restart, [local, call_count])
+        end,
+        MFAs
+    ),
+    try
+        Expected = [lists:keyfind(FirstKey, 1, KVList),
+            lists:keyfind(SecondKey, 1, KVList)],
+        ?assertEqual(
+            Expected,
+            sst_getmany(Pid, [
+                {FirstKey, leveled_codec:segment_hash(FirstKey)},
+                {SecondKey, leveled_codec:segment_hash(SecondKey)}
+            ])
+        ),
+        {call_count, GetAllCount} = erlang:trace_info(
+            {leveled_sstblock, get_all, 2}, call_count
+        ),
+        {call_count, GetNthCount} = erlang:trace_info(
+            {leveled_sstblock, get_nth, 3}, call_count
+        ),
+        ?assertEqual(1, GetAllCount),
+        ?assertEqual(0, GetNthCount)
+    after
+        lists:foreach(
+            fun(MFA) -> erlang:trace_pattern(MFA, false, [local, call_count]) end,
+            MFAs
+        ),
+        ok = sst_close(Pid),
+        ok = file:delete(filename:join(RP, Filename ++ ".sst"))
+    end.
 
 simple_switchcache_tester() ->
     {RP, Filename} = {?TEST_AREA, "simple_switchcache_test"},

@@ -207,7 +207,7 @@ clerk_compact(Pid, Checker, InitiateFun, CloseFun, FilterFun, Manifest) ->
 %% @doc
 %% Trim the Inker back to the persisted SQN
 clerk_trim(Pid, PersistedSQN, ManifestAsList) ->
-    gen_server:cast(Pid, {trim, PersistedSQN, ManifestAsList}).
+    gen_server:call(Pid, {trim, PersistedSQN, ManifestAsList}, infinity).
 
 -spec clerk_hashtablecalc(ets:tid(), integer(), pid()) -> ok.
 %% @doc
@@ -307,6 +307,14 @@ init([LogOpts, IClerkOpts]) ->
             IClerkOpts#iclerk_options.score_onein
     }}.
 
+handle_call(
+    {trim, PersistedSQN, ManifestAsList}, _From, State = #state{inker = Ink}
+) when ?IS_DEF(Ink) ->
+    FilesToDelete =
+        leveled_imanifest:find_persistedentries(PersistedSQN, ManifestAsList),
+    ?STD_LOG(ic007, []),
+    ok = leveled_inker:ink_clerkcomplete(Ink, [], FilesToDelete),
+    {reply, ok, State};
 handle_call(stop, _From, State) ->
     case State#state.scoring_state of
         undefined ->
@@ -485,16 +493,6 @@ handle_cast(
         }
     ),
     {noreply, State#state{scoring_state = undefined}, hibernate};
-handle_cast(
-    {trim, PersistedSQN, ManifestAsList}, State = #state{inker = Ink}
-) when
-    ?IS_DEF(Ink)
-->
-    FilesToDelete =
-        leveled_imanifest:find_persistedentries(PersistedSQN, ManifestAsList),
-    ?STD_LOG(ic007, []),
-    ok = leveled_inker:ink_clerkcomplete(Ink, [], FilesToDelete),
-    {noreply, State};
 handle_cast({hashtable_calc, HashTree, StartPos, CDBpid}, State) ->
     {IndexList, HashTreeBin} = leveled_cdb:hashtable_calc(HashTree, StartPos),
     ok = leveled_cdb:cdb_returnhashtable(CDBpid, IndexList, HashTreeBin),
@@ -1162,7 +1160,7 @@ file_gc_test() ->
         filename:join(State#state.waste_path, "1.cdb"),
         term_to_binary("Hello")
     ),
-    timer:sleep(1100),
+    timer:sleep(2100),
     file:write_file(
         filename:join(State#state.waste_path, "2.cdb"),
         term_to_binary("Hello")
@@ -1170,7 +1168,9 @@ file_gc_test() ->
     clear_waste(State),
     {ok, ClearedJournals} = file:list_dir(State#state.waste_path),
     ?assertMatch(["2.cdb"], ClearedJournals),
-    timer:sleep(1100),
+    %% The waste clock and this filesystem's mtime are both second-granular.
+    %% Cross two complete ticks so the retention comparison is deterministic.
+    timer:sleep(2100),
     clear_waste(State),
     {ok, ClearedJournals2} = file:list_dir(State#state.waste_path),
     ?assertMatch([], ClearedJournals2).

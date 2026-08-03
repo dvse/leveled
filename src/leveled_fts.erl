@@ -27,8 +27,25 @@
     document_text/3,
     record_fetch/4,
     candidate_fetch/4,
+    hydrate_page/3,
     consolidate/3
 ]).
+
+-ifdef(TEST).
+-export([
+    tokenize_fold_for_test/4,
+    fts2_available/2,
+    fts2_codec_term_key/3,
+    fts2_codec_identity_key/1,
+    fts2_codec_encode_plane/1,
+    fts2_codec_decode_plane/1,
+    fts2_codec_encode_positions/1,
+    fts2_codec_decode_positions/1,
+    fts2_codec_encode_identity_page/1,
+    fts2_codec_decode_identity_page/2,
+    fts2_phrase_fast/7
+]).
+-endif.
 
 -define(DEFAULT_LIMIT, 10000).
 -define(MAX_LIMIT, 20000).
@@ -39,6 +56,36 @@
 -define(MAX_NEAR_DISTANCE, 64).
 -define(MAX_PREFIX_BYTES, 64).
 -define(DEFAULT_NEAR, 10).
+-define(TERM_BLOOM_BITS, (1 bsl 20)).
+-define(TERM_BLOOM_WORDS, (?TERM_BLOOM_BITS div 64)).
+-define(TERM_BLOOM_SHARDS, 256).
+-define(TERM_BLOOM_SHARD_BITS, (1 bsl 13)).
+-define(TERM_BLOOM_SHARD_WORDS, (?TERM_BLOOM_SHARD_BITS div 64)).
+-define(BIGRAM_BLOOM_SHARDS, 256).
+-define(BIGRAM_BLOOM_SHARD_BITS, (1 bsl 16)).
+-define(BIGRAM_BLOOM_SHARD_WORDS, (?BIGRAM_BLOOM_SHARD_BITS div 64)).
+
+%% Search candidates stay in one flat tuple until the final requested page is
+%% hydrated.  The two association lists are query-sized (not candidate maps):
+%% term_stats holds {Term, Tf, Source, Df}, while columns and match_positions
+%% hold {Key, Positions} pairs.
+-record(fts2_match, {
+    chunk_id,
+    group_id = undefined,
+    source_id,
+    doc_length = 0,
+    tf = 0,
+    term_stats = [],
+    terms = [],
+    columns = [],
+    match_positions = [],
+    match_count = undefined,
+    logical_group = undefined,
+    group_version = 0,
+    group_match_count = undefined,
+    delta_document = undefined,
+    score = 0.0
+}).
 
 %% Client-library wire format capacities.  These are deliberately exported by
 %% capacities/0 and consumed by schema/1.  Every fixed-width writer below also
@@ -76,8 +123,10 @@
 %% All persisted state is made from ordinary HEAD_TAG object specs.  The store
 %% has no FTS callback, configuration, or privileged payload.  The logical
 %% Search resolves the current FTS2 root and merges its immutable planes with
-%% the exhaustive document-major delta set. The library owns no ETS or other
-%% serving cache; leveled's ledger/page caches are the sole source of warmth.
+%% the exhaustive document-major delta set. A configured store may hold one
+%% immutable generation resident through leveled_fts_residency; that state is
+%% built as a bounded unit, never populated by serving reads, and is discarded
+%% at the same FTS state/root transition that supersedes the generation.
 %% ---------------------------------------------------------------------------
 
 -spec capacities() -> map().
@@ -216,9 +265,10 @@ client_derive(
     Fields = extract_fields(Decoded, maps:get(column_specs, Schema)),
     ColTerms = build_column_terms(Fields, maps:get(options, Schema)),
     Text = client_extract_text(Decoded, Schema),
-    TextTokens = tokenize_with_offsets(Text, maps:get(options, Schema)),
     Blocks = client_text_blocks(Text),
-    BlockDirectory = client_text_block_directory(Text, TextTokens),
+    {BlockDirectory, BlockOffsets} = client_text_structure(
+        Text, maps:get(options, Schema)
+    ),
     HitRecord = client_hit_record(
         DocKey, Decoded, Schema, BlockDirectory, byte_size(Text)
     ),
@@ -266,10 +316,11 @@ client_derive(
             Fingerprint,
             length(Blocks)
         ),
-    BlockSpecs = client_text_block_specs(Bucket, DocId, Blocks, TextTokens),
+    BlockSpecs = client_text_block_specs(Bucket, DocId, Blocks, BlockOffsets),
     WriteShards = client_write_shards(Touched),
     {ok,
         BlockSpecs ++
+            client_tail_presence_specs(Bucket, ByShard, RetiredIds) ++
             [
                 {add, Bucket, <<"doc">>, DocKey, Manifest},
                 client_fts2_delta_spec(
@@ -288,6 +339,7 @@ client_derive(
                         hit_record => HitRecord
                     }
                 ),
+                client_fts2_state_dirty_spec(Bucket),
                 client_record_tail_dirty_spec(Bucket),
                 client_stats_dirty_spec(Bucket)
             ] ++
@@ -325,8 +377,10 @@ remove(#{index := Bucket, fingerprint := Fingerprint}, DocKey, Manifest0) when
                     base_length => BaseLength
                 }
             ),
+            client_fts2_state_dirty_spec(Bucket),
             client_record_tail_dirty_spec(Bucket),
-            client_stats_dirty_spec(Bucket)
+            client_stats_dirty_spec(Bucket),
+            client_tail_mutation_spec(Bucket)
         ] ++
         client_remove_text_block_specs(Bucket, DocId, BlockCount) ++
         [
@@ -427,7 +481,33 @@ client_transient_doc_id(DocId) ->
 
 client_fts2_delta_spec(Bucket, DocId, Delta) ->
     {add, Bucket, <<"f2:d">>, client_doc_id_subkey(DocId),
-        leveled_fts2_codec:encode(delta, Delta)}.
+        fts2_codec_encode(delta, Delta)}.
+
+%% A dirty tail remains document-major, but a compact union of 16-bit term
+%% hashes proves the overwhelmingly common zero-tail-match case without a
+%% fold.  Collisions only cause a conservative full scan.  Markers are never
+%% removed by document updates, so they cannot introduce false negatives.
+client_tail_presence_specs(Bucket, ByShard, RetiredIds) ->
+    Posting = client_full_posting(ByShard),
+    Hashes = lists:usort(lists:append([
+        [erlang:crc32(Token) band 16#FFFF || Token <- maps:keys(Tokens)]
+     || Tokens <- maps:values(Posting)
+    ])),
+    [{add, Bucket, <<"f2:p">>, <<"ready">>, <<1>>}] ++
+        case RetiredIds of
+            [] -> [];
+            _ -> [client_tail_mutation_spec(Bucket)]
+        end ++
+        [
+            {add, Bucket, <<"f2:p">>, <<Hash:16/unsigned-big>>, <<1>>}
+         || Hash <- Hashes
+        ].
+
+client_tail_mutation_spec(Bucket) ->
+    {add, Bucket, <<"f2:p">>, <<"mutated">>, <<1>>}.
+
+client_fts2_state_dirty_spec(Bucket) ->
+    {add, Bucket, <<"f2:state">>, <<"current">>, <<0>>}.
 
 client_record_tail_dirty_spec(Bucket) ->
     {add, Bucket, <<"record-tail">>, <<"dirty">>, <<1>>}.
@@ -436,7 +516,7 @@ client_text_block_key(DocId) ->
     client_guard(doc_id, DocId, ?MAX_DOC_ID),
     <<"b:", DocId:64/unsigned-big>>.
 
-client_text_block_specs(Bucket, DocId, Blocks, Tokens) ->
+client_text_block_specs(Bucket, DocId, Blocks, BlockOffsets) ->
     Key = client_text_block_key(DocId),
     case Blocks of
         [] ->
@@ -444,19 +524,9 @@ client_text_block_specs(Bucket, DocId, Blocks, Tokens) ->
         _ ->
             [
                 {add, Bucket, Key, <<0:32/unsigned-big>>,
-                    client_encode_text_pack(Blocks, Tokens)}
+                    client_encode_text_pack(Blocks, BlockOffsets)}
             ]
     end.
-
-client_text_block_token_offsets(BlockNo, Tokens) ->
-    Start = BlockNo * ?TEXT_BLOCK_BYTES,
-    Finish = Start + ?TEXT_BLOCK_BYTES,
-    [
-        {Ordinal, Offset - Start, Length}
-     || {_Token, Ordinal, Offset, Length} <- Tokens,
-        Offset >= Start,
-        Offset < Finish
-    ].
 
 client_remove_text_block_specs(Bucket, DocId, BlockCount) ->
     Key = client_text_block_key(DocId),
@@ -465,12 +535,12 @@ client_remove_text_block_specs(Bucket, DocId, BlockCount) ->
      || BlockNo <- lists:seq(0, erlang:max(BlockCount - 1, 0))
     ].
 
-client_encode_text_pack(Blocks, Tokens) ->
+client_encode_text_pack(Blocks, BlockOffsets) ->
     {Directory0, Payload0, _Offset} = lists:foldl(
         fun({BlockNo, Block}, {Directory, Payload, Offset}) ->
             {OffsetDirectory, EncodedOffsets} =
                 client_encode_seekable_text_block_offsets(
-                    client_text_block_token_offsets(BlockNo, Tokens)
+                    maps:get(BlockNo, BlockOffsets, [])
                 ),
             Raw = <<
                 (byte_size(Block)):32/unsigned-big,
@@ -1368,7 +1438,7 @@ record_fetch(Bookie, #{index := _} = Schema, DocIds0, Strategy) when
 ->
     try
         DocIds = lists:usort(DocIds0),
-        Documents = leveled_fts2:lookup_documents(Bookie, Schema, DocIds),
+        Documents = fts2_lookup_documents(Bookie, Schema, DocIds),
         Found = maps:map(
             fun(_DocId, Document) ->
                 {
@@ -1396,7 +1466,7 @@ candidate_fetch(Bookie, #{index := _} = Schema, DocIds0, Strategy) when
 ->
     try
         DocIds = lists:usort(DocIds0),
-        Documents = leveled_fts2:lookup_documents(Bookie, Schema, DocIds),
+        Documents = fts2_lookup_documents(Bookie, Schema, DocIds),
         Found = maps:map(
             fun(_DocId, Document) ->
                 {
@@ -1422,6 +1492,70 @@ candidate_fetch(Bookie, #{index := _} = Schema, DocIds0, Strategy) when
 candidate_fetch(_Bookie, _Schema, _DocIds, _Strategy) ->
     {error, invalid_fts_candidate_fetch}.
 
+%% Phase two of served search: hydrate only final-page identity coordinates.
+%% The page address is stable within the root used by phase one and resolves
+%% through one batched read per distinct identity page.
+-spec hydrate_page(pid(), map(), [{non_neg_integer(), non_neg_integer()}]) ->
+    {ok, map()} | {error, term()}.
+hydrate_page(_Bookie, #{fingerprint := _}, []) ->
+    {ok, #{}};
+hydrate_page(Bookie, #{fingerprint := _} = Schema, Addresses) when
+    is_pid(Bookie), is_list(Addresses)
+->
+    try
+        ok = leveled_fts_residency:prepare(Bookie, Schema),
+        case fts2_search_root(Bookie, Schema) of
+            {ok, Root} ->
+                Requests = lists:usort(Addresses),
+                Rows = fts2_search_read_identity_rows(
+                    Bookie, Schema, Root, Requests
+                ),
+                {ok, lists:foldl(
+                    fun
+                        (undefined, Acc) ->
+                            Acc;
+                        ({GroupId, _GroupKey, ChunkId, SourceId, DocKey,
+                            DocVersion, DocLength, Candidate, HitRecord}, Acc) ->
+                            Acc#{{GroupId, ChunkId} =>
+                                fts2_search_page_row(
+                                    SourceId, DocKey, DocVersion, DocLength,
+                                    Candidate, HitRecord
+                                )}
+                    end,
+                    #{},
+                    Rows
+                )};
+            not_found ->
+                {ok, #{}}
+        end
+    catch
+        error:Reason -> {error, Reason};
+        throw:{fts_error, Reason} -> {error, Reason}
+    end;
+hydrate_page(_Bookie, _Schema, _Addresses) ->
+    {error, invalid_fts_hydrate_page}.
+
+fts2_search_page_row(
+    SourceId, DocKey, DocVersion, DocLength, Candidate, HitRecord
+) ->
+    Base = #{
+        doc_id => SourceId,
+        doc_length => DocLength,
+        candidate_key => DocKey,
+        candidate_version => DocVersion,
+        candidate_record => Candidate,
+        hit_record => HitRecord
+    },
+    case {maps:find('$fts_text_blocks', Candidate),
+        maps:find('$fts_text_bytes', Candidate)}
+    of
+        {{ok, Blocks}, {ok, Bytes}} ->
+            Base#{text_blocks => Blocks, text_bytes => Bytes,
+                index_resident_complete => true};
+        _ ->
+            Base
+    end.
+
 client_query_ast(
     #{fingerprint := Fingerprint} = Schema,
     {leveled_fts_prepared_v1, Fingerprint, Columns, AST},
@@ -1441,6 +1575,14 @@ client_query_ast(Schema, Query, Opts) ->
     client_prepare_query_ast(Schema, Query, Opts).
 
 client_prepare_query_ast(Schema, Query, Opts) ->
+    case client_plain_query_ast(Schema, Query, Opts) of
+        {ok, AST} ->
+            {ok, AST};
+        parse ->
+            client_prepare_parsed_query_ast(Schema, Query, Opts)
+    end.
+
+client_prepare_parsed_query_ast(Schema, Query, Opts) ->
     case parse(Query, Opts) of
         {ok, AST0} ->
             Columns = option_columns(Opts, Schema),
@@ -1457,6 +1599,63 @@ client_prepare_query_ast(Schema, Query, Opts) ->
             Error
     end.
 
+client_plain_query_ast(Schema, Query, Opts) when
+    is_binary(Query), byte_size(Query) > 0
+->
+    case client_plain_query_bytes(Query) of
+        true ->
+            {ok, {term, Query, false,
+                canonical_selector(option_columns(Opts, Schema))}};
+        false ->
+            client_simple_phrase_query_ast(Schema, Query, Opts)
+    end;
+client_plain_query_ast(_Schema, _Query, _Opts) ->
+    parse.
+
+%% The public interactive grammar commonly emits a two-token quoted phrase.
+%% Its lowercase ASCII spelling is already in the exact token form accepted by
+%% the plain-term fast path, so avoid constructing the general lexer/parser
+%% state solely to recover the same two offsets. All other phrase spellings
+%% retain the complete grammar path.
+client_simple_phrase_query_ast(Schema, <<$", Rest/binary>>, Opts) when
+    byte_size(Rest) >= 2
+->
+    InnerBytes = byte_size(Rest) - 1,
+    case Rest of
+        <<Inner:InnerBytes/binary, $">> ->
+            case binary:split(Inner, <<" ">>, [global]) of
+                [First, Second] when byte_size(First) > 0,
+                    byte_size(Second) > 0 ->
+                    case client_plain_query_bytes(First) andalso
+                        client_plain_query_bytes(Second) of
+                        true ->
+                            {ok, {phrase,
+                                [{First, false, 0}, {Second, false, 1}],
+                                canonical_selector(
+                                    option_columns(Opts, Schema)
+                                )}};
+                        false ->
+                            parse
+                    end;
+                _ ->
+                    parse
+            end;
+        _ ->
+            parse
+    end;
+client_simple_phrase_query_ast(_Schema, _Query, _Opts) ->
+    parse.
+
+client_plain_query_bytes(<<>>) ->
+    true;
+client_plain_query_bytes(<<Byte, Rest/binary>>) when
+    (Byte >= $a andalso Byte =< $z) orelse
+        (Byte >= $0 andalso Byte =< $9)
+->
+    client_plain_query_bytes(Rest);
+client_plain_query_bytes(_Query) ->
+    false.
+
 client_posting_read(_Bookie, _Schema, _AST, [], _Opts) ->
     {ok, []};
 client_posting_read(Bookie, Schema, AST, DocKeys, Opts) ->
@@ -1465,11 +1664,11 @@ client_posting_read(Bookie, Schema, AST, DocKeys, Opts) ->
     ),
     case client_fts2_state(Bookie, Schema) of
         {clean, Root} when is_map(Root) ->
-            leveled_fts2:posting_read(
+            fts2_posting_read(
                 Bookie, Schema, Root, AST, CandidateIds, Opts
             );
         {_State, Root} ->
-            leveled_fts2:posting_read_dirty(
+            fts2_posting_read_dirty(
                 Bookie, Schema, Root, AST, CandidateIds, Opts
             )
     end.
@@ -1538,33 +1737,362 @@ client_take_option(Key, Opts) when is_list(Opts) ->
 %% clear.  Consolidation publishes the immutable FTS2 root before clearing the
 %% record marker, so there is no interval in which a stale generation can be
 %% selected after a write.
+client_fts2_state_for_ast(Bookie, Schema, AST) ->
+    TermRequirements = client_term_bloom_requirements(AST, Schema),
+    BigramRequirements = client_bigram_bloom_requirements(AST, Schema),
+    case {TermRequirements, BigramRequirements} of
+        {[], []} -> client_fts2_state(Bookie, Schema);
+        _ ->
+            client_fts2_state_with_bloom(
+                Bookie, Schema, TermRequirements, BigramRequirements
+            )
+    end.
+
+client_term_bloom_requirements({term, Token, false, Columns}, Schema) ->
+    [{Token, fts2_search_selector_ids(Columns, Schema)}];
+client_term_bloom_requirements({phrase, Specs, Columns}, Schema) ->
+    ColumnIds = fts2_search_selector_ids(Columns, Schema),
+    [
+        {Token, ColumnIds}
+     || {Token, Prefix, _Offset} <- Specs,
+        Prefix =:= false
+    ];
+client_term_bloom_requirements(_AST, _Schema) ->
+    [].
+
+client_bigram_bloom_requirements(
+    {phrase, [{First, false, Offset}, {Second, false, NextOffset}], Columns},
+    Schema
+) when NextOffset =:= Offset + 1 ->
+    [{First, Second, fts2_search_selector_ids(Columns, Schema)}];
+client_bigram_bloom_requirements(_AST, _Schema) ->
+    [].
+
+client_fts2_state_with_bloom(
+    Bookie, #{index := Bucket} = Schema, Requirements, BigramRequirements
+) ->
+    TermShards = lists:usort([
+        fts2_term_bloom_shard(Column, Token)
+     || {Token, ColumnIds} <- Requirements,
+        Column <- ColumnIds
+    ]),
+    BigramShards = lists:usort([
+        fts2_bigram_bloom_shard(Column, First, Second)
+     || {First, Second, ColumnIds} <- BigramRequirements,
+        Column <- ColumnIds
+    ]),
+    ShardKeys =
+        [{term, Shard} || Shard <- TermShards] ++
+            [{bigram, Shard} || Shard <- BigramShards],
+    case length(ShardKeys) =< 8 of
+        false ->
+            client_fts2_state_with_bloom_legacy(
+                Bookie, Schema, Requirements
+            );
+        true ->
+            [StateResult | BloomResults] = leveled_fts_residency:headonly_many(
+                Bookie,
+                Bucket,
+                [{<<"f2:state">>, <<"current">>}] ++
+                    [client_bloom_shard_key(ShardKey)
+                     || ShardKey <- ShardKeys]
+            ),
+            case StateResult of
+                {ok, <<1, RootValue/binary>>} ->
+                    Root = fts2_codec_decode_root(RootValue),
+                    case maps:get(fingerprint, Root) =:=
+                        maps:get(fingerprint, Schema) of
+                        false ->
+                            {dirty, undefined};
+                        true ->
+                            BloomByShard = maps:from_list(
+                                lists:zip(ShardKeys, BloomResults)
+                            ),
+                            TermProof = client_term_shard_bloom_proves_absent(
+                                Root, BloomByShard, Requirements
+                            ),
+                            BigramProof =
+                                client_bigram_shard_bloom_proves_absent(
+                                    Root,
+                                    BloomByShard,
+                                    BigramRequirements
+                                ),
+                            case {TermProof, BigramProof} of
+                                {true, _} -> {clean_absent, Root};
+                                {_, true} -> {clean_absent, Root};
+                                {false, false} -> {clean, Root};
+                                %% Missing optional shards select the legacy
+                                %% proof, never an empty result.
+                                _ ->
+                                    client_fts2_state_with_bloom_legacy(
+                                        Bookie, Schema, Requirements
+                                    )
+                            end
+                    end;
+                _DirtyOrLegacy ->
+                    client_fts2_state(Bookie, Schema)
+            end
+    end.
+
+client_bloom_shard_key({term, Shard}) ->
+    {<<"f2:bloom">>, <<"s", Shard:8>>};
+client_bloom_shard_key({bigram, Shard}) ->
+    {<<"f2:bloom">>, <<"g", Shard:8>>}.
+
+client_term_shard_bloom_proves_absent(
+    #{generation := Generation,
+        term_bloom_shards := ?TERM_BLOOM_SHARDS},
+    BloomByShard,
+    Requirements
+) ->
+    try
+        lists:any(
+            fun({Token, ColumnIds}) ->
+                ColumnIds =/= [] andalso
+                    not lists:any(
+                        fun(Column) ->
+                            Shard = fts2_term_bloom_shard(Column, Token),
+                            case maps:get(
+                                {term, Shard}, BloomByShard, not_found
+                            ) of
+                                {ok, <<1, Generation:64/unsigned-big,
+                                    Bloom/binary>>} when
+                                    byte_size(Bloom) >=
+                                        ?TERM_BLOOM_SHARD_WORDS * 8
+                                ->
+                                    fts2_term_bloom_might_contain(
+                                        Bloom,
+                                        ?TERM_BLOOM_SHARD_BITS,
+                                        Column,
+                                        Token,
+                                        0
+                                    );
+                                _ ->
+                                    throw(unavailable)
+                            end
+                        end,
+                        ColumnIds
+                    )
+            end,
+            Requirements
+        )
+    catch
+        throw:unavailable -> unavailable
+    end;
+client_term_shard_bloom_proves_absent(_Root, _BloomByShard, _Requirements) ->
+    unavailable.
+
+client_bigram_shard_bloom_proves_absent(_Root, _BloomByShard, []) ->
+    false;
+client_bigram_shard_bloom_proves_absent(
+    #{generation := Generation,
+        bigram_bloom_shards := ?BIGRAM_BLOOM_SHARDS},
+    BloomByShard,
+    Requirements
+) ->
+    try
+        lists:any(
+            fun({First, Second, ColumnIds}) ->
+                ColumnIds =/= [] andalso
+                    not lists:any(
+                        fun(Column) ->
+                            Shard = fts2_bigram_bloom_shard(
+                                Column, First, Second
+                            ),
+                            case maps:get(
+                                {bigram, Shard}, BloomByShard, not_found
+                            ) of
+                                {ok, <<1, Generation:64/unsigned-big,
+                                    Bloom/binary>>} when
+                                    byte_size(Bloom) >=
+                                        ?BIGRAM_BLOOM_SHARD_WORDS * 8
+                                ->
+                                    fts2_bigram_bloom_might_contain(
+                                        Bloom,
+                                        ?BIGRAM_BLOOM_SHARD_BITS,
+                                        Column,
+                                        First,
+                                        Second,
+                                        0
+                                    );
+                                _ ->
+                                    throw(unavailable)
+                            end
+                        end,
+                        ColumnIds
+                    )
+            end,
+            Requirements
+        )
+    catch
+        throw:unavailable -> unavailable
+    end;
+client_bigram_shard_bloom_proves_absent(
+    _Root, _BloomByShard, _Requirements
+) ->
+    unavailable.
+
+fts2_term_bloom_shard(Column, Token) ->
+    erlang:phash2({Column, Token}, ?TERM_BLOOM_SHARDS).
+
+fts2_bigram_bloom_shard(Column, First, Second) ->
+    erlang:phash2({Column, First, Second}, ?BIGRAM_BLOOM_SHARDS).
+
+client_fts2_state_with_bloom_legacy(
+    Bookie, #{index := Bucket} = Schema, Requirements
+) ->
+    [StateResult, BloomResult] = leveled_fts_residency:headonly_many(
+        Bookie,
+        Bucket,
+        [
+            {<<"f2:state">>, <<"current">>},
+            {<<"f2:bloom">>, <<"current">>}
+        ]
+    ),
+    case StateResult of
+        {ok, <<1, RootValue/binary>>} ->
+            client_fts2_state_with_bloom_value(
+                RootValue, BloomResult, Schema, Requirements
+            );
+        _DirtyOrLegacy ->
+            client_fts2_state(Bookie, Schema)
+    end.
+
+client_fts2_state_with_bloom_value(
+    RootValue, BloomResult, Schema, Requirements
+) ->
+    Root = fts2_codec_decode_root(RootValue),
+    case maps:get(fingerprint, Root) =:= maps:get(fingerprint, Schema) of
+        false ->
+            {dirty, undefined};
+        true ->
+            case client_term_bloom_proves_absent(
+                Root, BloomResult, Requirements
+            ) of
+                true -> {clean_absent, Root};
+                false -> {clean, Root}
+            end
+    end.
+
+client_term_bloom_proves_absent(
+    #{generation := Generation, term_bloom := 1},
+    {ok, <<1, Generation:64/unsigned-big, Bloom/binary>>},
+    Requirements
+) when byte_size(Bloom) >= ?TERM_BLOOM_WORDS * 8 ->
+    BloomBits = byte_size(Bloom) * 8,
+    lists:any(
+        fun({Token, ColumnIds}) ->
+            ColumnIds =/= [] andalso
+                not lists:any(
+                    fun(Column) ->
+                        fts2_term_bloom_might_contain(
+                            Bloom, BloomBits, Column, Token, 0
+                        )
+                    end,
+                    ColumnIds
+                )
+        end,
+        Requirements
+    );
+client_term_bloom_proves_absent(_Root, _BloomResult, _Requirements) ->
+    false.
+
+fts2_term_bloom_might_contain(_Bloom, _BloomBits, _Column, _Token, 4) ->
+    true;
+fts2_term_bloom_might_contain(Bloom, BloomBits, Column, Token, Salt) ->
+    BitIndex = erlang:phash2({Salt, Column, Token}, BloomBits),
+    Offset = (BitIndex bsr 6) * 8,
+    <<Word:64/unsigned-little>> = binary:part(Bloom, Offset, 8),
+    case Word band (1 bsl (BitIndex band 63)) of
+        0 -> false;
+        _ -> fts2_term_bloom_might_contain(
+            Bloom, BloomBits, Column, Token, Salt + 1
+        )
+    end.
+
+fts2_bigram_bloom_might_contain(
+    _Bloom, _BloomBits, _Column, _First, _Second, 4
+) ->
+    true;
+fts2_bigram_bloom_might_contain(
+    Bloom, BloomBits, Column, First, Second, Salt
+) ->
+    BitIndex = erlang:phash2(
+        {Salt, Column, First, Second}, BloomBits
+    ),
+    Offset = (BitIndex bsr 6) * 8,
+    <<Word:64/unsigned-little>> = binary:part(Bloom, Offset, 8),
+    case Word band (1 bsl (BitIndex band 63)) of
+        0 -> false;
+        _ -> fts2_bigram_bloom_might_contain(
+            Bloom, BloomBits, Column, First, Second, Salt + 1
+        )
+    end.
+
 client_fts2_state(Bookie, #{index := Bucket} = Schema) ->
-    Root = case leveled_fts2:available(Bookie, Schema) of
-        {ok, ExistingRoot} -> ExistingRoot;
-        not_found -> undefined
-    end,
-    State = case
-        leveled_bookie:book_headonly_many(
+    case leveled_fts_residency:headonly(
+        Bookie, Bucket, <<"f2:state">>, <<"current">>
+    ) of
+        {ok, <<1, RootValue/binary>>} ->
+            Root = fts2_codec_decode_root(RootValue),
+            case maps:get(fingerprint, Root) =:= maps:get(fingerprint, Schema) of
+                true -> {clean, Root};
+                false -> {dirty, undefined}
+            end;
+        {ok, <<0>>} ->
+            Root = case fts2_search_root(Bookie, Schema) of
+                {ok, ExistingRoot} -> ExistingRoot;
+                not_found -> undefined
+            end,
+            {dirty, Root};
+        not_found ->
+            client_fts2_legacy_state(Bookie, Bucket, Schema)
+    end.
+
+client_fts2_legacy_state(Bookie, Bucket, Schema) ->
+    {RootKey, RootSubKey} = fts2_codec_root_key(),
+    [RootResult, StatsResult, RecordResult] =
+        leveled_fts_residency:headonly_many(
             Bookie,
             Bucket,
             [
+                {RootKey, RootSubKey},
                 {<<"stats">>, <<"dirty">>},
                 {<<"record-tail">>, <<"dirty">>}
             ]
-        )
-    of
-        [not_found, not_found] -> clean;
-        _DirtyOrUnavailable ->
-            dirty
+        ),
+    Root = case RootResult of
+        {ok, RootValue} ->
+            ExistingRoot = fts2_codec_decode_root(RootValue),
+            case maps:get(fingerprint, ExistingRoot) =:=
+                maps:get(fingerprint, Schema) of
+                true -> ExistingRoot;
+                false -> undefined
+            end;
+        not_found ->
+            undefined
+    end,
+    State = case {StatsResult, RecordResult} of
+        {not_found, not_found} -> clean;
+        _DirtyOrUnavailable -> dirty
     end,
     {State, Root}.
 
 client_search(Bookie, Schema, AST, Opts, Hook) ->
-    case client_fts2_state(Bookie, Schema) of
+    ok = leveled_fts_residency:prepare(Bookie, Schema),
+    case client_fts2_state_for_ast(Bookie, Schema, AST) of
+        {clean_absent, _Root} ->
+            client_empty_search_result(Opts);
         {clean, Root} when is_map(Root) ->
-            leveled_fts2:search(Bookie, Schema, Root, AST, Opts);
+            fts2_search(Bookie, Schema, Root, AST, Opts);
         {_State, Root} ->
-            leveled_fts2:search_dirty(Bookie, Schema, Root, AST, Opts, Hook)
+            fts2_search_dirty(Bookie, Schema, Root, AST, Opts, Hook)
+    end.
+
+client_empty_search_result(Opts) ->
+    case maps:get(return_count, Opts, false) of
+        true -> {ok, #{hits => [], count => 0, count_kind => grouped}};
+        false -> {ok, []}
     end.
 
 client_validate_doc_id_mapping(DocId, DocKey, DocVersion) ->
@@ -1584,11 +2112,25 @@ consolidate(Bookie, #{fingerprint := _} = Schema, Opts0) when is_pid(Bookie) ->
     try
         {Hook, Opts} = client_take_option(before_consolidate_commit, Opts0),
         AllShards = lists:seq(0, maps:get(shards, Schema) - 1),
-        case client_option(shards, Opts, all) of
-            Shards when is_list(Shards) ->
+        case {client_option(shards, Opts, all), client_fts2_state(Bookie, Schema)} of
+            {_Requested, {clean, _Root}} ->
+                case client_option(reclaim, Opts, true) of
+                    true ->
+                        fts2_build_reclaim_ledgers(
+                            lists:usort([
+                                Bookie,
+                                fts2_build_identity_bookie(Bookie, Schema)
+                            ]),
+                            client_option(reclaim_timeout_ms, Opts, 300000)
+                        );
+                    false ->
+                        ok
+                end,
+                {ok, #{consolidated => [], skipped => []}};
+            {Shards, _State} when is_list(Shards) ->
                 {ok, #{consolidated => Shards, skipped => []}};
-            all ->
-                case leveled_fts2:consolidate(Bookie, Schema, Hook) of
+            {all, _State} ->
+                case fts2_consolidate(Bookie, Schema, Hook, Opts) of
                     {ok, _Root} ->
                         {ok, #{consolidated => AllShards, skipped => []}}
                 end
@@ -1736,39 +2278,89 @@ client_text_blocks(Text, BlockNo, Acc) ->
     <<Block:Bytes/binary, Rest/binary>> = Text,
     client_text_blocks(Rest, BlockNo + 1, [{BlockNo, Block} | Acc]).
 
-client_text_block_directory(<<>>, _Opts) ->
-    [];
-client_text_block_directory(Text, Tokens) ->
+client_text_structure(<<>>, _Opts) ->
+    {[], #{}};
+client_text_structure(Text, Opts) ->
     BlockCount =
         (byte_size(Text) + ?TEXT_BLOCK_BYTES - 1) div ?TEXT_BLOCK_BYTES,
-    client_text_block_directory(0, BlockCount, Tokens, []).
+    {BlockCount, NextDirectoryBlock, Directory0, CurrentBlock,
+        CurrentOffsets, OffsetBlocks0, EndOrdinal} = client_token_fold(
+        fun client_text_structure_token/5,
+        {BlockCount, 0, [], undefined, [], [], 0},
+        Text,
+        Opts
+    ),
+    Directory = client_finish_text_directory(
+        NextDirectoryBlock, BlockCount, EndOrdinal, Directory0
+    ),
+    OffsetBlocks = case CurrentBlock of
+        undefined -> OffsetBlocks0;
+        _ -> [{CurrentBlock, lists:reverse(CurrentOffsets)} | OffsetBlocks0]
+    end,
+    {lists:reverse(Directory), maps:from_list(OffsetBlocks)}.
 
-client_text_block_directory(BlockNo, BlockCount, _Tokens, Acc) when
-    BlockNo >= BlockCount
-->
-    lists:reverse(Acc);
-client_text_block_directory(BlockNo, BlockCount, Tokens, Acc) ->
+client_text_structure_token(
+    _Token,
+    Ordinal,
+    Offset,
+    Length,
+    {BlockCount, NextDirectoryBlock, Directory, CurrentBlock,
+        CurrentOffsets, OffsetBlocks, _EndOrdinal}
+) ->
+    {NextDirectoryBlock1, Directory1} = client_fill_text_directory(
+        NextDirectoryBlock,
+        BlockCount,
+        Offset + Length,
+        Ordinal,
+        Directory
+    ),
+    TokenBlock = Offset div ?TEXT_BLOCK_BYTES,
+    RelativeOffset = Offset - TokenBlock * ?TEXT_BLOCK_BYTES,
+    {CurrentBlock1, CurrentOffsets1, OffsetBlocks1} =
+        case CurrentBlock of
+            undefined ->
+                {TokenBlock, [{Ordinal, RelativeOffset, Length}], OffsetBlocks};
+            TokenBlock ->
+                {CurrentBlock,
+                    [{Ordinal, RelativeOffset, Length} | CurrentOffsets],
+                    OffsetBlocks};
+            _ ->
+                {TokenBlock,
+                    [{Ordinal, RelativeOffset, Length}],
+                    [{CurrentBlock, lists:reverse(CurrentOffsets)}
+                        | OffsetBlocks]}
+        end,
+    {BlockCount, NextDirectoryBlock1, Directory1, CurrentBlock1,
+        CurrentOffsets1, OffsetBlocks1, Ordinal + 1}.
+
+client_fill_text_directory(
+    BlockNo, BlockCount, TokenEnd, Ordinal, Directory
+) when BlockNo < BlockCount, BlockNo * ?TEXT_BLOCK_BYTES < TokenEnd ->
     Start = BlockNo * ?TEXT_BLOCK_BYTES,
-    FirstOrdinal = client_first_block_ordinal(Tokens, Start),
-    client_text_block_directory(
+    client_fill_text_directory(
         BlockNo + 1,
         BlockCount,
-        Tokens,
-        [{BlockNo, FirstOrdinal, Start} | Acc]
-    ).
-
-client_first_block_ordinal(Tokens, Start) ->
-    client_first_block_ordinal(Tokens, Start, length(Tokens)).
-
-client_first_block_ordinal([], _Start, EndOrdinal) ->
-    EndOrdinal;
-client_first_block_ordinal(
-    [{_Token, Ordinal, Offset, Length} | Rest], Start, EndOrdinal
+        TokenEnd,
+        Ordinal,
+        [{BlockNo, Ordinal, Start} | Directory]
+    );
+client_fill_text_directory(
+    BlockNo, _BlockCount, _TokenEnd, _Ordinal, Directory
 ) ->
-    case Offset + Length > Start of
-        true -> Ordinal;
-        false -> client_first_block_ordinal(Rest, Start, EndOrdinal)
-    end.
+    {BlockNo, Directory}.
+
+client_finish_text_directory(BlockNo, BlockCount, _Ordinal, Directory) when
+    BlockNo >= BlockCount
+->
+    Directory;
+client_finish_text_directory(BlockNo, BlockCount, Ordinal, Directory) ->
+    Start = BlockNo * ?TEXT_BLOCK_BYTES,
+    client_finish_text_directory(
+        BlockNo + 1,
+        BlockCount,
+        Ordinal,
+        [{BlockNo, Ordinal, Start} | Directory]
+    ).
 
 %% Stores that journal externally-encoded terms (term_to_binary bodies)
 %% declare decode => external_term so column paths address the decoded
@@ -1908,27 +2500,28 @@ column_token_positions(verbatim, Token, _Opts) when byte_size(Token) =< 65535 ->
 column_token_positions(verbatim, _Oversized, _Opts) ->
     [];
 column_token_positions(text, Text, Opts) ->
-    group_positions([
-        TP
-     || {Token, _Pos} = TP <- tokenize(Text, Opts),
-        byte_size(Token) =< 65535
-    ]).
-
-group_positions(Tokens) ->
-    group_positions(Tokens, #{}).
-
-group_positions([], Acc) ->
-    %% Positions are appended in increasing order during tokenisation and
-    %% prepended here, so each list is descending; a single reverse yields the
-    %% ascending order encode_positions/1 expects (no per-token sort needed).
+    Grouped = client_token_fold(
+        fun(Token, Position, _Offset, _Length, Acc) ->
+            case byte_size(Token) =< 65535 of
+                true ->
+                    maps:update_with(
+                        Token,
+                        fun(Positions) -> [Position | Positions] end,
+                        [Position],
+                        Acc
+                    );
+                false ->
+                    Acc
+            end
+        end,
+        #{},
+        Text,
+        Opts
+    ),
     [
         {Token, lists:reverse(Positions)}
-     || {Token, Positions} <- maps:to_list(Acc)
-    ];
-group_positions([{Token, Pos} | Rest], Acc) ->
-    group_positions(
-        Rest, maps:update_with(Token, fun(Ps) -> [Pos | Ps] end, [Pos], Acc)
-    ).
+     || {Token, Positions} <- maps:to_list(Grouped)
+    ].
 
 client_cancellable_fold(Fold) ->
     fun(Bucket, Key, Value, Acc) ->
@@ -2097,6 +2690,10 @@ validate_search_option_list([{resolve_hits, Bool} | Rest]) when
     validate_search_option_list(Rest);
 validate_search_option_list([{impact, Bool} | Rest]) when is_boolean(Bool) ->
     validate_search_option_list(Rest);
+validate_search_option_list([{count_only, Bool} | Rest]) when is_boolean(Bool) ->
+    validate_search_option_list(Rest);
+validate_search_option_list([{page_only, Bool} | Rest]) when is_boolean(Bool) ->
+    validate_search_option_list(Rest);
 validate_search_option_list([{impact_facet, Facet} | Rest]) when
     is_list(Facet) orelse Facet =:= undefined orelse Facet =:= nil
 ->
@@ -2241,22 +2838,616 @@ first_unknown([Item | Rest], Known) ->
 -spec tokenize_with_offsets(binary(), map()) ->
     [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()}].
 tokenize_with_offsets(Text, Opts) when is_binary(Text), is_map(Opts) ->
+    case maps:get(presize, Opts, false) andalso byte_size(Text) >= 262144 of
+        true ->
+            Words = (byte_size(Text) div 6) * 12 + 32768,
+            OldHeap = erlang:process_flag(min_heap_size, Words),
+            OldSweep = erlang:process_flag(fullsweep_after, 65535),
+            erlang:garbage_collect(),
+            try client_tokenize_with_offsets(Text, Opts)
+            after
+                _ = erlang:process_flag(min_heap_size, OldHeap),
+                _ = erlang:process_flag(fullsweep_after, OldSweep)
+            end;
+        false ->
+            client_tokenize_with_offsets(Text, Opts)
+    end.
+
+client_tokenize_with_offsets(Text, Opts) ->
     Stopwords = maps:get(stopwords, Opts, []),
-    Tokens =
-        case
-            maps:get(tokenchars, Opts, []) =:= [] andalso
-                maps:get(separators, Opts, []) =:= []
-        of
-            true ->
-                fast_tokens_with_offsets(
-                    Text, 0, Opts, Stopwords, <<>>, false, undefined, 0, []
-                );
-            false ->
-                unicode_tokens_with_offsets(
-                    Text, 0, Opts, Stopwords, <<>>, undefined, 0, []
-                )
-        end,
-    [compat_source_range(Text, Token) || Token <- Tokens].
+    case
+        maps:get(tokenchars, Opts, []) =:= [] andalso
+            maps:get(separators, Opts, []) =:= []
+    of
+        true ->
+            Tokens = client_ascii_tokens(Text, Text, 0, 0, Opts),
+            case Stopwords of
+                [] -> Tokens;
+                _ -> [
+                    Token
+                 || {Value, _, _, _} = Token <- Tokens,
+                    not lists:member(Value, Stopwords)
+                ]
+            end;
+        false ->
+            Tokens = unicode_tokens_with_offsets(
+                Text, 0, Opts, Stopwords, <<>>, undefined, 0, []
+            ),
+            [compat_source_range(Text, Token) || Token <- Tokens]
+    end.
+
+-ifdef(TEST).
+tokenize_fold_for_test(Fun, Acc, Text, Opts) ->
+    client_token_fold(Fun, Acc, Text, Opts).
+-endif.
+
+client_token_fold(Fun, Acc, Text, Opts) when
+    is_function(Fun, 5), is_binary(Text), is_map(Opts)
+->
+    case
+        maps:get(tokenchars, Opts, []) =:= [] andalso
+            maps:get(separators, Opts, []) =:= []
+    of
+        true ->
+            client_ascii_fold(
+                Text,
+                Text,
+                0,
+                0,
+                Opts,
+                maps:get(stopwords, Opts, []),
+                Fun,
+                Acc
+            );
+        false ->
+            Tokens = unicode_tokens_with_offsets(
+                Text,
+                0,
+                Opts,
+                maps:get(stopwords, Opts, []),
+                <<>>,
+                undefined,
+                0,
+                []
+            ),
+            lists:foldl(
+                fun(Token0, Inner) ->
+                    {Token, Ordinal, Offset, Length} =
+                        compat_source_range(Text, Token0),
+                    Fun(Token, Ordinal, Offset, Length, Inner)
+                end,
+                Acc,
+                Tokens
+            )
+    end.
+
+%% Lane-05 ASCII-run scanner. The common lane records only a start offset and
+%% extracts one sub-binary at the boundary; uppercase runs fold in one integer
+%% OR for lengths up to seven bytes. Unicode machinery is entered only at the
+%% first non-ASCII byte and hands back at the next boundary.
+client_ascii_tokens(<<C, Rest/binary>>, Text, Offset, Ordinal, Opts) when
+    C >= $a, C =< $z
+->
+    client_ascii_lower(Rest, Text, Offset + 1, Offset, Ordinal, Opts);
+client_ascii_tokens(<<C, Rest/binary>>, Text, Offset, Ordinal, Opts) when
+    C >= $0, C =< $9
+->
+    client_ascii_lower(Rest, Text, Offset + 1, Offset, Ordinal, Opts);
+client_ascii_tokens(<<C, Rest/binary>>, Text, Offset, Ordinal, Opts) when
+    C >= $A, C =< $Z
+->
+    client_ascii_upper(Rest, Text, Offset + 1, Offset, Ordinal, Opts);
+client_ascii_tokens(<<C, Rest/binary>>, Text, Offset, Ordinal, Opts) when
+    C < 128
+->
+    client_ascii_tokens(Rest, Text, Offset + 1, Ordinal, Opts);
+client_ascii_tokens(<<>>, _Text, _Offset, _Ordinal, _Opts) ->
+    [];
+client_ascii_tokens(Binary, Text, Offset, Ordinal, Opts) ->
+    client_ascii_slow(
+        Binary, Text, Offset, <<>>, false, undefined, Ordinal, Opts
+    ).
+
+client_ascii_lower(<<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts) when
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9)
+->
+    client_ascii_lower(Rest, Text, Offset + 1, Start, Ordinal, Opts);
+client_ascii_lower(<<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts) when
+    C >= $A, C =< $Z
+->
+    client_ascii_upper(Rest, Text, Offset + 1, Start, Ordinal, Opts);
+client_ascii_lower(<<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts) when
+    C < 128
+->
+    Length = Offset - Start,
+    [
+        {binary_part(Text, Start, Length), Ordinal, Start, Length}
+        | client_ascii_tokens(Rest, Text, Offset + 1, Ordinal + 1, Opts)
+    ];
+client_ascii_lower(<<>>, Text, Offset, Start, Ordinal, _Opts) ->
+    Length = Offset - Start,
+    [{binary_part(Text, Start, Length), Ordinal, Start, Length}];
+client_ascii_lower(Binary, Text, Offset, Start, Ordinal, Opts) ->
+    client_ascii_slow(
+        Binary,
+        Text,
+        Offset,
+        client_ascii_lowercase(binary_part(Text, Start, Offset - Start)),
+        false,
+        Start,
+        Ordinal,
+        Opts
+    ).
+
+client_ascii_upper(<<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts) when
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+        (C >= $A andalso C =< $Z)
+->
+    client_ascii_upper(Rest, Text, Offset + 1, Start, Ordinal, Opts);
+client_ascii_upper(<<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts) when
+    C < 128
+->
+    Length = Offset - Start,
+    [
+        {client_ascii_lowercase(binary_part(Text, Start, Length)),
+            Ordinal, Start, Length}
+        | client_ascii_tokens(Rest, Text, Offset + 1, Ordinal + 1, Opts)
+    ];
+client_ascii_upper(<<>>, Text, Offset, Start, Ordinal, _Opts) ->
+    Length = Offset - Start,
+    [{client_ascii_lowercase(binary_part(Text, Start, Length)),
+        Ordinal, Start, Length}];
+client_ascii_upper(Binary, Text, Offset, Start, Ordinal, Opts) ->
+    client_ascii_slow(
+        Binary,
+        Text,
+        Offset,
+        client_ascii_lowercase(binary_part(Text, Start, Offset - Start)),
+        false,
+        Start,
+        Ordinal,
+        Opts
+    ).
+
+client_ascii_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal, Opts
+) when C >= $a, C =< $z ->
+    client_ascii_slow(
+        Rest,
+        Text,
+        Offset + 1,
+        <<Token/binary, C>>,
+        NonAscii,
+        token_start(Start, Offset),
+        Ordinal,
+        Opts
+    );
+client_ascii_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal, Opts
+) when C >= $0, C =< $9 ->
+    client_ascii_slow(
+        Rest,
+        Text,
+        Offset + 1,
+        <<Token/binary, C>>,
+        NonAscii,
+        token_start(Start, Offset),
+        Ordinal,
+        Opts
+    );
+client_ascii_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal, Opts
+) when C >= $A, C =< $Z ->
+    client_ascii_slow(
+        Rest,
+        Text,
+        Offset + 1,
+        <<Token/binary, (C bor 16#20)>>,
+        NonAscii,
+        token_start(Start, Offset),
+        Ordinal,
+        Opts
+    );
+client_ascii_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal, Opts
+) when C < 128 ->
+    case client_ascii_slow_token(
+        Token, NonAscii, Start, Offset, Text, Ordinal, Opts
+    ) of
+        skip ->
+            client_ascii_tokens(Rest, Text, Offset + 1, Ordinal, Opts);
+        Term ->
+            [Term | client_ascii_tokens(
+                Rest, Text, Offset + 1, Ordinal + 1, Opts
+            )]
+    end;
+client_ascii_slow(
+    <<16#F0, 16#9F, 16#92, Next, _/binary>> = Binary,
+    Text,
+    Offset,
+    Token,
+    _NonAscii,
+    Start,
+    Ordinal,
+    Opts
+) when Next band 16#C0 =/= 16#80 ->
+    <<_:3/binary, Rest/binary>> = Binary,
+    client_ascii_slow(
+        Rest,
+        Text,
+        Offset + 3,
+        <<Token/binary, 16#DF, 16#92>>,
+        true,
+        token_start(Start, Offset),
+        Ordinal,
+        Opts
+    );
+client_ascii_slow(
+    <<Codepoint/utf8, Rest/binary>> = Binary,
+    Text,
+    Offset,
+    Token,
+    NonAscii,
+    Start,
+    Ordinal,
+    Opts
+) ->
+    Bytes = byte_size(Binary) - byte_size(Rest),
+    case unicode_token_char(Codepoint, Opts) of
+        true ->
+            <<Character:Bytes/binary, _/binary>> = Binary,
+            client_ascii_slow(
+                Rest,
+                Text,
+                Offset + Bytes,
+                <<Token/binary, Character/binary>>,
+                true,
+                token_start(Start, Offset),
+                Ordinal,
+                Opts
+            );
+        false ->
+            case client_ascii_slow_token(
+                Token, NonAscii, Start, Offset, Text, Ordinal, Opts
+            ) of
+                skip ->
+                    client_ascii_tokens(
+                        Rest, Text, Offset + Bytes, Ordinal, Opts
+                    );
+                Term ->
+                    [Term | client_ascii_tokens(
+                        Rest, Text, Offset + Bytes, Ordinal + 1, Opts
+                    )]
+            end
+    end;
+client_ascii_slow(
+    <<_Bad, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal, Opts
+) ->
+    case client_ascii_slow_token(
+        Token, NonAscii, Start, Offset, Text, Ordinal, Opts
+    ) of
+        skip -> client_ascii_tokens(Rest, Text, Offset + 1, Ordinal, Opts);
+        Term -> [Term | client_ascii_tokens(
+            Rest, Text, Offset + 1, Ordinal + 1, Opts
+        )]
+    end;
+client_ascii_slow(
+    <<>>, Text, Offset, Token, NonAscii, Start, Ordinal, Opts
+) ->
+    case client_ascii_slow_token(
+        Token, NonAscii, Start, Offset, Text, Ordinal, Opts
+    ) of
+        skip -> [];
+        Term -> [Term]
+    end.
+
+client_ascii_slow_token(<<>>, _NonAscii, _Start, _End, _Text, _Ordinal, _Opts) ->
+    skip;
+client_ascii_slow_token(Token, false, Start, End, Text, Ordinal, _Opts) ->
+    client_ascii_compat(Text, Token, Ordinal, Start, End - Start);
+client_ascii_slow_token(Token, true, Start, End, Text, Ordinal, Opts) ->
+    case normalise_token(Token, Opts) of
+        <<>> -> skip;
+        Normalised ->
+            client_ascii_compat(
+                Text, Normalised, Ordinal, Start, End - Start
+            )
+    end.
+
+client_ascii_compat(Text, Token, Ordinal, Offset, Length) when
+    Offset + Length < byte_size(Text), Length >= 3
+->
+    case binary_part(Text, Offset + Length - 3, 3) of
+        <<16#F0, 16#9F, 16#92>> ->
+            {Token, Ordinal, Offset, Length + 1};
+        _ ->
+            {Token, Ordinal, Offset, Length}
+    end;
+client_ascii_compat(_Text, Token, Ordinal, Offset, Length) ->
+    {Token, Ordinal, Offset, Length}.
+
+client_ascii_lowercase(<<A>>) -> <<(A bor 16#20)>>;
+client_ascii_lowercase(<<A:16>>) -> <<(A bor 16#2020):16>>;
+client_ascii_lowercase(<<A:24>>) -> <<(A bor 16#202020):24>>;
+client_ascii_lowercase(<<A:32>>) -> <<(A bor 16#20202020):32>>;
+client_ascii_lowercase(<<A:40>>) -> <<(A bor 16#2020202020):40>>;
+client_ascii_lowercase(<<A:48>>) -> <<(A bor 16#202020202020):48>>;
+client_ascii_lowercase(<<A:56>>) -> <<(A bor 16#20202020202020):56>>;
+client_ascii_lowercase(<<>>) -> <<>>;
+client_ascii_lowercase(Binary) -> client_ascii_lowercase(Binary, <<>>).
+
+client_ascii_lowercase(<<Word:32, Rest/binary>>, Acc) ->
+    client_ascii_lowercase(
+        Rest, <<Acc/binary, (Word bor 16#20202020):32>>
+    );
+client_ascii_lowercase(<<C, Rest/binary>>, Acc) ->
+    client_ascii_lowercase(Rest, <<Acc/binary, (C bor 16#20)>>);
+client_ascii_lowercase(<<>>, Acc) ->
+    Acc.
+
+client_ascii_fold(
+    <<C, Rest/binary>>, Text, Offset, Ordinal, Opts, Stopwords, Fun, Acc
+) when C >= $a, C =< $z; C >= $0, C =< $9 ->
+    client_ascii_fold_lower(
+        Rest, Text, Offset + 1, Offset, Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold(
+    <<C, Rest/binary>>, Text, Offset, Ordinal, Opts, Stopwords, Fun, Acc
+) when C >= $A, C =< $Z ->
+    client_ascii_fold_upper(
+        Rest, Text, Offset + 1, Offset, Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold(
+    <<C, Rest/binary>>, Text, Offset, Ordinal, Opts, Stopwords, Fun, Acc
+) when C < 128 ->
+    client_ascii_fold(
+        Rest, Text, Offset + 1, Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold(<<>>, _Text, _Offset, _Ordinal, _Opts, _Stopwords, _Fun, Acc) ->
+    Acc;
+client_ascii_fold(Binary, Text, Offset, Ordinal, Opts, Stopwords, Fun, Acc) ->
+    client_ascii_fold_slow(
+        Binary,
+        Text,
+        Offset,
+        <<>>,
+        false,
+        undefined,
+        Ordinal,
+        Opts,
+        Stopwords,
+        Fun,
+        Acc
+    ).
+
+client_ascii_fold_lower(
+    <<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) when (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) ->
+    client_ascii_fold_lower(
+        Rest, Text, Offset + 1, Start, Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold_lower(
+    <<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) when C >= $A, C =< $Z ->
+    client_ascii_fold_upper(
+        Rest, Text, Offset + 1, Start, Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold_lower(
+    <<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) when C < 128 ->
+    Length = Offset - Start,
+    {NextOrdinal, NextAcc} = client_ascii_fold_emit(
+        binary_part(Text, Start, Length),
+        Ordinal,
+        Start,
+        Length,
+        Stopwords,
+        Fun,
+        Acc
+    ),
+    client_ascii_fold(
+        Rest,
+        Text,
+        Offset + 1,
+        NextOrdinal,
+        Opts,
+        Stopwords,
+        Fun,
+        NextAcc
+    );
+client_ascii_fold_lower(
+    <<>>, Text, Offset, Start, Ordinal, _Opts, Stopwords, Fun, Acc
+) ->
+    Length = Offset - Start,
+    {_NextOrdinal, NextAcc} = client_ascii_fold_emit(
+        binary_part(Text, Start, Length),
+        Ordinal,
+        Start,
+        Length,
+        Stopwords,
+        Fun,
+        Acc
+    ),
+    NextAcc;
+client_ascii_fold_lower(
+    Binary, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) ->
+    client_ascii_fold_slow(
+        Binary,
+        Text,
+        Offset,
+        client_ascii_lowercase(binary_part(Text, Start, Offset - Start)),
+        false,
+        Start,
+        Ordinal,
+        Opts,
+        Stopwords,
+        Fun,
+        Acc
+    ).
+
+client_ascii_fold_upper(
+    <<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) when
+    (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse
+        (C >= $A andalso C =< $Z)
+->
+    client_ascii_fold_upper(
+        Rest, Text, Offset + 1, Start, Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold_upper(
+    <<C, Rest/binary>>, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) when C < 128 ->
+    Length = Offset - Start,
+    {NextOrdinal, NextAcc} = client_ascii_fold_emit(
+        client_ascii_lowercase(binary_part(Text, Start, Length)),
+        Ordinal,
+        Start,
+        Length,
+        Stopwords,
+        Fun,
+        Acc
+    ),
+    client_ascii_fold(
+        Rest,
+        Text,
+        Offset + 1,
+        NextOrdinal,
+        Opts,
+        Stopwords,
+        Fun,
+        NextAcc
+    );
+client_ascii_fold_upper(
+    <<>>, Text, Offset, Start, Ordinal, _Opts, Stopwords, Fun, Acc
+) ->
+    Length = Offset - Start,
+    {_NextOrdinal, NextAcc} = client_ascii_fold_emit(
+        client_ascii_lowercase(binary_part(Text, Start, Length)),
+        Ordinal,
+        Start,
+        Length,
+        Stopwords,
+        Fun,
+        Acc
+    ),
+    NextAcc;
+client_ascii_fold_upper(
+    Binary, Text, Offset, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) ->
+    client_ascii_fold_slow(
+        Binary,
+        Text,
+        Offset,
+        client_ascii_lowercase(binary_part(Text, Start, Offset - Start)),
+        false,
+        Start,
+        Ordinal,
+        Opts,
+        Stopwords,
+        Fun,
+        Acc
+    ).
+
+client_ascii_fold_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal,
+    Opts, Stopwords, Fun, Acc
+) when C >= $a, C =< $z; C >= $0, C =< $9 ->
+    client_ascii_fold_slow(
+        Rest, Text, Offset + 1, <<Token/binary, C>>, NonAscii,
+        token_start(Start, Offset), Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal,
+    Opts, Stopwords, Fun, Acc
+) when C >= $A, C =< $Z ->
+    client_ascii_fold_slow(
+        Rest, Text, Offset + 1, <<Token/binary, (C bor 16#20)>>, NonAscii,
+        token_start(Start, Offset), Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold_slow(
+    <<C, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal,
+    Opts, Stopwords, Fun, Acc
+) when C < 128 ->
+    {NextOrdinal, NextAcc} = client_ascii_fold_slow_emit(
+        Token, NonAscii, Start, Offset, Text, Ordinal, Opts, Stopwords,
+        Fun, Acc
+    ),
+    client_ascii_fold(
+        Rest, Text, Offset + 1, NextOrdinal, Opts, Stopwords, Fun, NextAcc
+    );
+client_ascii_fold_slow(
+    <<16#F0, 16#9F, 16#92, Next, _/binary>> = Binary,
+    Text, Offset, Token, _NonAscii, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) when Next band 16#C0 =/= 16#80 ->
+    <<_:3/binary, Rest/binary>> = Binary,
+    client_ascii_fold_slow(
+        Rest, Text, Offset + 3, <<Token/binary, 16#DF, 16#92>>, true,
+        token_start(Start, Offset), Ordinal, Opts, Stopwords, Fun, Acc
+    );
+client_ascii_fold_slow(
+    <<Codepoint/utf8, Rest/binary>> = Binary,
+    Text, Offset, Token, NonAscii, Start, Ordinal, Opts, Stopwords, Fun, Acc
+) ->
+    Bytes = byte_size(Binary) - byte_size(Rest),
+    case unicode_token_char(Codepoint, Opts) of
+        true ->
+            <<Character:Bytes/binary, _/binary>> = Binary,
+            client_ascii_fold_slow(
+                Rest, Text, Offset + Bytes, <<Token/binary, Character/binary>>,
+                true, token_start(Start, Offset), Ordinal, Opts, Stopwords,
+                Fun, Acc
+            );
+        false ->
+            {NextOrdinal, NextAcc} = client_ascii_fold_slow_emit(
+                Token, NonAscii, Start, Offset, Text, Ordinal, Opts,
+                Stopwords, Fun, Acc
+            ),
+            client_ascii_fold(
+                Rest, Text, Offset + Bytes, NextOrdinal, Opts, Stopwords,
+                Fun, NextAcc
+            )
+    end;
+client_ascii_fold_slow(
+    <<_Bad, Rest/binary>>, Text, Offset, Token, NonAscii, Start, Ordinal,
+    Opts, Stopwords, Fun, Acc
+) ->
+    {NextOrdinal, NextAcc} = client_ascii_fold_slow_emit(
+        Token, NonAscii, Start, Offset, Text, Ordinal, Opts, Stopwords,
+        Fun, Acc
+    ),
+    client_ascii_fold(
+        Rest, Text, Offset + 1, NextOrdinal, Opts, Stopwords, Fun, NextAcc
+    );
+client_ascii_fold_slow(
+    <<>>, Text, Offset, Token, NonAscii, Start, Ordinal,
+    Opts, Stopwords, Fun, Acc
+) ->
+    {_NextOrdinal, NextAcc} = client_ascii_fold_slow_emit(
+        Token, NonAscii, Start, Offset, Text, Ordinal, Opts, Stopwords,
+        Fun, Acc
+    ),
+    NextAcc.
+
+client_ascii_fold_slow_emit(
+    Token, NonAscii, Start, End, Text, Ordinal, Opts, Stopwords, Fun, Acc
+) ->
+    case client_ascii_slow_token(
+        Token, NonAscii, Start, End, Text, Ordinal, Opts
+    ) of
+        skip -> {Ordinal, Acc};
+        {Value, Ordinal, Offset, Length} ->
+            client_ascii_fold_emit(
+                Value, Ordinal, Offset, Length, Stopwords, Fun, Acc
+            )
+    end.
+
+client_ascii_fold_emit(Token, Ordinal, Offset, Length, Stopwords, Fun, Acc) ->
+    NextAcc = case lists:member(Token, Stopwords) of
+        true -> Acc;
+        false -> Fun(Token, Ordinal, Offset, Length, Acc)
+    end,
+    {Ordinal + 1, NextAcc}.
 
 %% sqlite_utf8_compat/1 recognizes the malformed three-byte prefix only by
 %% looking at the following non-continuation byte.  If a token ends at that
@@ -2305,155 +3496,6 @@ sqlite_utf8_compat(<<Byte, Rest/binary>>, Acc) ->
     sqlite_utf8_compat(Rest, <<Acc/binary, Byte>>);
 sqlite_utf8_compat(<<>>, Acc) ->
     Acc.
-
-%% Offset-aware common path.  Token bytes follow sqlite_utf8_compat/1 while
-%% Start/Offset remain coordinates in the original input binary.
-fast_tokens_with_offsets(
-    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
-) when C >= $a, C =< $z ->
-    fast_tokens_with_offsets(
-        Rest,
-        Offset + 1,
-        Opts,
-        SW,
-        <<Tok/binary, C>>,
-        NA,
-        token_start(Start, Offset),
-        Pos,
-        Acc
-    );
-fast_tokens_with_offsets(
-    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
-) when C >= $0, C =< $9 ->
-    fast_tokens_with_offsets(
-        Rest,
-        Offset + 1,
-        Opts,
-        SW,
-        <<Tok/binary, C>>,
-        NA,
-        token_start(Start, Offset),
-        Pos,
-        Acc
-    );
-fast_tokens_with_offsets(
-    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
-) when C >= $A, C =< $Z ->
-    fast_tokens_with_offsets(
-        Rest,
-        Offset + 1,
-        Opts,
-        SW,
-        <<Tok/binary, (C bor 16#20)>>,
-        NA,
-        token_start(Start, Offset),
-        Pos,
-        Acc
-    );
-fast_tokens_with_offsets(
-    <<C, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
-) when C < 128 ->
-    {Pos1, Acc1} = fast_offset_flush(
-        Tok, NA, Start, Offset, Opts, SW, Pos, Acc
-    ),
-    fast_tokens_with_offsets(
-        Rest, Offset + 1, Opts, SW, <<>>, false, undefined, Pos1, Acc1
-    );
-fast_tokens_with_offsets(
-    <<16#F0, 16#9F, 16#92, Next, Rest/binary>>,
-    Offset,
-    Opts,
-    SW,
-    Tok,
-    _NA,
-    Start,
-    Pos,
-    Acc
-) when Next band 16#C0 =/= 16#80 ->
-    fast_tokens_with_offsets(
-        <<Next, Rest/binary>>,
-        Offset + 3,
-        Opts,
-        SW,
-        <<Tok/binary, 16#DF, 16#92>>,
-        true,
-        token_start(Start, Offset),
-        Pos,
-        Acc
-    );
-fast_tokens_with_offsets(
-    <<CP/utf8, Rest/binary>> = Bin,
-    Offset,
-    Opts,
-    SW,
-    Tok,
-    NA,
-    Start,
-    Pos,
-    Acc
-) ->
-    CharLen = byte_size(Bin) - byte_size(Rest),
-    case unicode_token_char(CP, Opts) of
-        true ->
-            <<Char:CharLen/binary, _/binary>> = Bin,
-            fast_tokens_with_offsets(
-                Rest,
-                Offset + CharLen,
-                Opts,
-                SW,
-                <<Tok/binary, Char/binary>>,
-                true,
-                token_start(Start, Offset),
-                Pos,
-                Acc
-            );
-        false ->
-            {Pos1, Acc1} = fast_offset_flush(
-                Tok, NA, Start, Offset, Opts, SW, Pos, Acc
-            ),
-            fast_tokens_with_offsets(
-                Rest,
-                Offset + CharLen,
-                Opts,
-                SW,
-                <<>>,
-                false,
-                undefined,
-                Pos1,
-                Acc1
-            )
-    end;
-fast_tokens_with_offsets(
-    <<_Bad, Rest/binary>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
-) ->
-    {Pos1, Acc1} = fast_offset_flush(
-        Tok, NA, Start, Offset, Opts, SW, Pos, Acc
-    ),
-    fast_tokens_with_offsets(
-        Rest, Offset + 1, Opts, SW, <<>>, false, undefined, Pos1, Acc1
-    );
-fast_tokens_with_offsets(
-    <<>>, Offset, Opts, SW, Tok, NA, Start, Pos, Acc
-) ->
-    {_Pos1, Acc1} = fast_offset_flush(
-        Tok, NA, Start, Offset, Opts, SW, Pos, Acc
-    ),
-    lists:reverse(Acc1).
-
-fast_offset_flush(<<>>, _NA, _Start, _End, _Opts, _SW, Pos, Acc) ->
-    {Pos, Acc};
-fast_offset_flush(Tok, false, Start, End, _Opts, SW, Pos, Acc) ->
-    case lists:member(Tok, SW) of
-        true -> {Pos + 1, Acc};
-        false -> {Pos + 1, [{Tok, Pos, Start, End - Start} | Acc]}
-    end;
-fast_offset_flush(Tok, true, Start, End, Opts, SW, Pos, Acc) ->
-    Norm = normalise_token(Tok, Opts),
-    case {Norm =:= <<>>, lists:member(Norm, SW)} of
-        {true, _} -> {Pos, Acc};
-        {false, true} -> {Pos + 1, Acc};
-        {false, false} -> {Pos + 1, [{Norm, Pos, Start, End - Start} | Acc]}
-    end.
 
 %% Custom tokenchars/separators use the same classifier and normalization as
 %% tokenize_unicode/2, with the original byte range carried beside each token.
@@ -4418,3 +5460,6227 @@ canonical_selector({not_columns, Cols}) ->
     {not_columns, schema_columns(Cols)};
 canonical_selector(Cols) ->
     schema_columns(Cols).
+
+
+%% ===========================================================================
+%% INTERNAL FTS-2 FACADE
+%% ===========================================================================
+
+%% Internal FTS2 facade.  leveled_fts remains the only public search API.
+
+-ifdef(TEST).
+fts2_available(Bookie, Schema) ->
+    fts2_search_root(Bookie, Schema).
+-endif.
+
+fts2_lookup_documents(Bookie, Schema, SourceIds) ->
+    fts2_search_lookup_documents(Bookie, Schema, SourceIds).
+
+fts2_consolidate(Bookie, Schema, Hook, Opts) ->
+    fts2_build_consolidate(Bookie, Schema, Hook, Opts).
+
+fts2_search(Bookie, Schema, Root, AST, Opts) ->
+    fts2_search_search(Bookie, Schema, Root, AST, Opts).
+
+fts2_search_dirty(Bookie, Schema, Root, AST, Opts, Hook) ->
+    fts2_search_search_dirty(Bookie, Schema, Root, AST, Opts, Hook).
+
+fts2_posting_read(Bookie, Schema, Root, AST, SourceIds, Opts) ->
+    fts2_search_posting_read(
+        Bookie, Schema, Root, AST, SourceIds, Opts
+    ).
+
+fts2_posting_read_dirty(Bookie, Schema, Root, AST, SourceIds, Opts) ->
+    fts2_search_posting_read_dirty(
+        Bookie, Schema, Root, AST, SourceIds, Opts
+    ).
+
+
+%% ===========================================================================
+%% INTERNAL FTS-2 BUILD
+%% ===========================================================================
+
+%% FTS2 immutable generation builder.
+%%
+%% The migration input is the canonical consolidated posting state.  The
+%% builder assigns group-contiguous chunk ids, writes every generation row,
+%% and publishes the root last with compare-and-swap.
+
+-define(CHUNK_BITS, 12).
+-define(CHUNKS_PER_GROUP, 1 bsl ?CHUNK_BITS).
+-define(LEGACY_IDENTITY_PAGE_SHIFT, 10).
+-define(GENERATION_IDENTITY_PAGE_SHIFT, 2).
+-define(HEAD_WINDOW, 256).
+-define(BIGRAM_MIN_CHUNKS, 256).
+-define(WRITE_SLICE, 192).
+
+fts2_build_publish(
+    Bookie,
+    Schema,
+    TokenDocs,
+    CandidateRecords,
+    HitRecords,
+    CommitSpecs,
+    CommitConditions,
+    BuildConcurrency
+) ->
+    Bucket = maps:get(index, Schema),
+    Generation = fts2_build_generation_id(),
+    Previous = fts2_build_current_root(Bookie, Bucket),
+    SourceLengths = fts2_build_source_lengths(TokenDocs),
+    {SourceMap, Groups} = fts2_build_group_sources(
+        Schema, CandidateRecords, HitRecords, SourceLengths
+    ),
+    SelectedTotalLength = lists:sum([
+        maps:get(doc_length, Source)
+     || Source <- maps:values(SourceMap)
+    ]),
+    {TermRows, ByChunk} = fts2_build_build_term_rows(TokenDocs, SourceMap),
+    TermBloom = fts2_build_term_bloom(TermRows),
+    TermBloomShards = fts2_build_term_bloom_shards(TermRows),
+    FrequentTerms = maps:from_list([
+        {Key, true}
+     || {Key, Row} <- maps:to_list(TermRows),
+        length(maps:get(entries, Row)) >= 64
+    ]),
+    {AllBigramRows, BigramBloomShards} =
+        fts2_build_build_bigram_rows(ByChunk, FrequentTerms),
+    BigramRows = maps:filter(
+        fun(_Key, Chunks) -> map_size(Chunks) >= ?BIGRAM_MIN_CHUNKS end,
+        AllBigramRows
+    ),
+    ChunkCount = map_size(SourceMap),
+    IdentityRowCount = fts2_build_write_identities_parallel(
+        fts2_build_identity_bookie(Bookie, Schema), Bucket, Generation,
+        Groups, BuildConcurrency
+    ),
+    TermRowCount = fts2_build_write_terms_parallel(
+        Bookie, Bucket, Generation, TermRows, ChunkCount,
+        SelectedTotalLength, BuildConcurrency
+    ),
+    BigramRowCount = fts2_build_write_bigrams_parallel(
+        Bookie, Bucket, Generation, BigramRows, TermRows, ChunkCount,
+        SelectedTotalLength, BuildConcurrency
+    ),
+    Root = #{
+        version => 1,
+        generation => Generation,
+        fingerprint => maps:get(fingerprint, Schema),
+        chunk_bits => ?CHUNK_BITS,
+        group_count => length(Groups),
+        chunk_count => map_size(SourceMap),
+        term_count => map_size(TermRows),
+        bigram_count => map_size(BigramRows),
+        identity_page_count => fts2_build_identity_page_count(
+            length(Groups), ?GENERATION_IDENTITY_PAGE_SHIFT
+        ),
+        identity_page_shift => ?GENERATION_IDENTITY_PAGE_SHIFT,
+        total_length => SelectedTotalLength,
+        phrase_strategy => bigram,
+        facet_domain => fts2_build_facet_domain(Schema, Groups),
+        term_bloom => 1,
+        term_bloom_shards => ?TERM_BLOOM_SHARDS,
+        bigram_bloom_shards => ?BIGRAM_BLOOM_SHARDS,
+        position_order => chunk,
+        group_order => native,
+        group_tie_fields => maps:get(candidate_group_fields, Schema, []),
+        previous_generation => fts2_build_previous_generation(Previous)
+    },
+    try
+        fts2_build_publish_root(
+            Bookie, Bucket, Previous, Root, TermBloom, TermBloomShards,
+            BigramBloomShards,
+            CommitSpecs, CommitConditions
+        )
+    catch
+        Class:Reason:Stacktrace ->
+            fts2_build_cleanup_generation(Bookie, Schema, Generation),
+            erlang:raise(Class, Reason, Stacktrace)
+    end,
+    case fts2_build_previous_generation(Previous) of
+        undefined -> ok;
+        PreviousGeneration ->
+            fts2_build_cleanup_generation(Bookie, Schema, PreviousGeneration)
+    end,
+    {ok, Root#{row_count =>
+        IdentityRowCount + TermRowCount + BigramRowCount}}.
+
+fts2_build_publish_documents(
+    Bookie, Schema, Documents, CommitSpecs, CommitConditions, BuildConcurrency
+) when
+    is_map(Documents)
+->
+    {TokenDocs, CandidateRecords, HitRecords} = maps:fold(
+        fun(SourceId, Document, {Terms, Candidates, Hits}) ->
+            Candidate = {
+                maps:get(doc_key, Document),
+                maps:get(doc_version, Document),
+                maps:get(candidate_record, Document)
+            },
+            Hit = {
+                maps:get(doc_key, Document),
+                maps:get(doc_version, Document),
+                maps:get(hit_record, Document)
+            },
+            Posting = maps:get(posting, Document, #{}),
+            NextTerms = maps:fold(
+                fun(Column, Tokens, TermAcc) ->
+                    maps:fold(
+                        fun(Token, Entry, Inner) ->
+                            Docs = maps:get(Token, Inner, #{}),
+                            TokenPosting = #{Column => #{Token => Entry}},
+                            Inner#{Token => Docs#{SourceId => {
+                                SourceId,
+                                maps:get(doc_length, Document),
+                                TokenPosting
+                            }}}
+                        end,
+                        TermAcc,
+                        Tokens
+                    )
+                end,
+                Terms,
+                Posting
+            ),
+            {
+                NextTerms,
+                Candidates#{SourceId => Candidate},
+                Hits#{SourceId => Hit}
+            }
+        end,
+        {#{}, #{}, #{}},
+        Documents
+    ),
+    fts2_build_publish(
+        Bookie,
+        Schema,
+        TokenDocs,
+        CandidateRecords,
+        HitRecords,
+        CommitSpecs,
+        CommitConditions,
+        BuildConcurrency
+    ).
+
+fts2_build_consolidate(Bookie, Schema, Hook, Opts) ->
+    EpochConditions = fts2_build_epoch_conditions(Bookie, Schema),
+    Root = case fts2_search_root(Bookie, Schema) of
+        {ok, ExistingRoot} -> ExistingRoot;
+        not_found -> undefined
+    end,
+    Existing = case Root of
+        undefined -> #{};
+        _ -> fts2_search_export_documents(Bookie, Schema, Root)
+    end,
+    Deltas = fts2_build_read_deltas(Bookie, Schema),
+    Documents = fts2_build_apply_deltas(Existing, Deltas),
+    case Hook of
+        undefined -> ok;
+        Fun when is_function(Fun, 1) -> Fun({fts2, EpochConditions});
+        Fun when is_function(Fun, 0) -> Fun()
+    end,
+    TailPresenceCleanup = fts2_build_tail_presence_cleanup(Bookie, Schema),
+    Result = fts2_build_publish_documents(
+        Bookie,
+        Schema,
+        Documents,
+        [
+            {remove, maps:get(index, Schema), <<"stats">>, <<"dirty">>, <<>>},
+            {remove, maps:get(index, Schema), <<"record-tail">>, <<"dirty">>,
+                <<>>}
+        ] ++ TailPresenceCleanup,
+        EpochConditions,
+        client_option(concurrency, Opts, 1)
+    ),
+    %% Seal the large immutable generation at its published root.  Delta
+    %% tombstones are deliberately written to the next journal so retention
+    %% of a few non-ledger tombstones cannot pin the complete build journal.
+    fts2_build_trim_journals(Bookie, Schema),
+    fts2_build_remove_deltas(Bookie, maps:get(index, Schema), Deltas),
+    {ok, PublishedRoot} = Result,
+    case {
+        client_option(reclaim, Opts, true),
+        maps:get(previous_generation, PublishedRoot, undefined)
+    } of
+        {true, PreviousGeneration} when is_integer(PreviousGeneration) ->
+            fts2_build_reclaim_ledgers(
+                lists:usort([Bookie, fts2_build_identity_bookie(Bookie, Schema)]),
+                client_option(reclaim_timeout_ms, Opts, 300000)
+            );
+        _NoSupersededGeneration ->
+            ok
+    end,
+    fts2_build_trim_journals(Bookie, Schema),
+    Result.
+
+fts2_build_reclaim_ledgers(Bookies, Timeout) when
+    is_integer(Timeout), Timeout > 0
+->
+    Started = erlang:monotonic_time(millisecond),
+    lists:foreach(
+        fun(Bookie) ->
+            Elapsed = erlang:monotonic_time(millisecond) - Started,
+            Remaining = erlang:max(Timeout - Elapsed, 1),
+            case leveled_bookie:book_reclaimledger(Bookie, Remaining) of
+                ok -> ok;
+                {error, Reason} -> erlang:error({fts2_reclaim_failed, Reason})
+            end
+        end,
+        Bookies
+    ).
+
+fts2_build_tail_presence_cleanup(Bookie, #{index := Bucket}) ->
+    Fold = fun
+        (B, {<<"f2:p">>, SubKey}, _Value, Acc) when B =:= Bucket ->
+            [{remove, Bucket, <<"f2:p">>, SubKey, <<>>} | Acc];
+        (_B, _Key, _Value, Acc) ->
+            Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {{<<"f2:p">>, <<>>}, {<<"f2:p">>, <<255, 255, 255, 255, 255>>}}},
+        {Fold, []},
+        false,
+        true,
+        false
+    ),
+    Runner().
+
+fts2_build_generation_id() ->
+    <<Generation:64/unsigned-big, _/binary>> = crypto:hash(
+        sha256,
+        term_to_binary(
+            {erlang:system_time(nanosecond), erlang:unique_integer([positive])},
+            [deterministic]
+        )
+    ),
+    Generation.
+
+fts2_build_current_root(Bookie, Bucket) ->
+    {Key, SubKey} = fts2_codec_root_key(),
+    case leveled_bookie:book_sqn(Bookie, Bucket, {Key, SubKey}, ?HEAD_TAG) of
+        not_found ->
+            absent;
+        {ok, SQN} ->
+            case leveled_bookie:book_headonly(Bookie, Bucket, Key, SubKey) of
+                {ok, Value} -> {SQN, fts2_codec_decode_root(Value)};
+                not_found -> absent
+            end
+    end.
+
+fts2_build_previous_generation(absent) -> undefined;
+fts2_build_previous_generation({_SQN, Root}) -> maps:get(generation, Root).
+
+fts2_build_publish_root(
+    Bookie, Bucket, Previous, Root, TermBloom, TermBloomShards,
+    BigramBloomShards,
+    CommitSpecs, CommitConditions
+) ->
+    {Key, SubKey} = fts2_codec_root_key(),
+    Condition =
+        case Previous of
+            absent -> {Bucket, Key, SubKey, absent};
+            {SQN, _Root} -> {Bucket, Key, SubKey, {sqn, SQN}}
+    end,
+    RootValue = fts2_codec_encode_root(Root),
+    BloomValue = <<1, (maps:get(generation, Root)):64/unsigned-big,
+        TermBloom/binary>>,
+    Spec = {add, Bucket, Key, SubKey, RootValue},
+    StateSpec = {add, Bucket, <<"f2:state">>, <<"current">>,
+        <<1, RootValue/binary>>},
+    BloomSpec = {add, Bucket, <<"f2:bloom">>, <<"current">>,
+        BloomValue},
+    BloomShardSpecs = [
+        {add, Bucket, <<"f2:bloom">>, <<"s", Shard:8>>,
+            <<1, (maps:get(generation, Root)):64/unsigned-big,
+                Bloom/binary>>}
+     || {Shard, Bloom} <- TermBloomShards
+    ],
+    BigramBloomShardSpecs = [
+        {add, Bucket, <<"f2:bloom">>, <<"g", Shard:8>>,
+            <<1, (maps:get(generation, Root)):64/unsigned-big,
+                Bloom/binary>>}
+     || {Shard, Bloom} <- BigramBloomShards
+    ],
+    case
+        leveled_bookie:book_casmput(
+            Bookie,
+            [Spec, StateSpec, BloomSpec | BloomShardSpecs] ++
+                BigramBloomShardSpecs ++ CommitSpecs,
+            [Condition | CommitConditions]
+        )
+    of
+        ok ->
+            ok;
+        pause ->
+            ok;
+        {error, {precondition_failed, _}} ->
+            erlang:error(fts2_generation_raced);
+        {error, Reason} ->
+            erlang:error({fts2_root_publish_failed, Reason})
+    end.
+
+fts2_build_epoch_conditions(Bookie, #{index := Bucket, shards := Shards}) ->
+    [
+        begin
+            Key = <<Shard:16/unsigned-big>>,
+            case leveled_bookie:book_sqn(
+                Bookie, Bucket, {Key, <<"epoch">>}, ?HEAD_TAG
+            ) of
+                not_found -> {Bucket, Key, <<"epoch">>, absent};
+                {ok, SQN} -> {Bucket, Key, <<"epoch">>, {sqn, SQN}}
+            end
+        end
+     || Shard <- lists:seq(0, Shards - 1)
+    ].
+
+fts2_build_read_deltas(Bookie, #{index := Bucket}) ->
+    Fold = fun
+        (B, {<<"f2:d">>, <<SourceId:64/unsigned-big>>}, _Value, Acc) when
+            B =:= Bucket
+        ->
+            [SourceId | Acc];
+        (_B, _Key, _Value, Acc) ->
+            Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {
+            {<<"f2:d">>, <<>>},
+            {<<"f2:d">>, <<16#FFFFFFFFFFFFFFFF:64/unsigned-big>>}
+        }},
+        {Fold, []},
+        false,
+        true,
+        false
+    ),
+    lists:filtermap(
+        fun(SourceId) ->
+            SubKey = <<SourceId:64/unsigned-big>>,
+            case leveled_bookie:book_sqn(
+                Bookie, Bucket, {<<"f2:d">>, SubKey}, ?HEAD_TAG
+            ) of
+                {ok, SQN} ->
+                    case leveled_bookie:book_headonly(
+                        Bookie, Bucket, <<"f2:d">>, SubKey
+                    ) of
+                        {ok, Value} ->
+                            {true, {SourceId, SQN,
+                                fts2_codec_decode(delta, Value)}};
+                        not_found ->
+                            false
+                    end;
+                not_found ->
+                    false
+            end
+        end,
+        lists:usort(Runner())
+    ).
+
+fts2_build_apply_deltas(Existing, Deltas) ->
+    lists:foldl(
+        fun({_SourceId, _SQN, Delta}, Acc) ->
+            WithoutRetired = maps:without(
+                maps:get(retired_ids, Delta, []), Acc
+            ),
+            SourceId = maps:get(source_id, Delta),
+            case maps:get(status, Delta) of
+                live -> WithoutRetired#{SourceId => Delta};
+                remove -> maps:remove(SourceId, WithoutRetired)
+            end
+        end,
+        Existing,
+        Deltas
+    ).
+
+fts2_build_remove_deltas(_Bookie, _Bucket, []) ->
+    ok;
+fts2_build_remove_deltas(Bookie, Bucket, Deltas) ->
+    Count = erlang:min(128, length(Deltas)),
+    {Batch, Rest} = lists:split(Count, Deltas),
+    Specs = [
+        {remove, Bucket, <<"f2:d">>, <<SourceId:64/unsigned-big>>, <<>>}
+     || {SourceId, _SQN, _Delta} <- Batch
+    ],
+    Conditions = [
+        {Bucket, <<"f2:d">>, <<SourceId:64/unsigned-big>>, {sqn, SQN}}
+     || {SourceId, SQN, _Delta} <- Batch
+    ],
+    case leveled_bookie:book_casmput(Bookie, Specs, Conditions) of
+        ok -> fts2_build_remove_deltas(Bookie, Bucket, Rest);
+        pause -> fts2_build_remove_deltas(Bookie, Bucket, Rest);
+        {error, {precondition_failed, _}} ->
+            fts2_build_remove_deltas(Bookie, Bucket, Rest);
+        {error, Reason} ->
+            erlang:error({fts2_delta_cleanup_failed, Reason})
+    end.
+
+fts2_build_source_lengths(TokenDocs) ->
+    maps:fold(
+        fun(_Token, Docs, Acc) ->
+            maps:fold(
+                fun(SourceId, {_StoredId, Length, _Posting}, Inner) ->
+                    Inner#{SourceId => Length}
+                end,
+                Acc,
+                Docs
+            )
+        end,
+        #{},
+        TokenDocs
+    ).
+
+fts2_build_group_sources(Schema, CandidateRecords, HitRecords, SourceLengths) ->
+    GroupFields = maps:get(candidate_group_fields, Schema, []),
+    VersionField = maps:get(candidate_version_field, Schema, undefined),
+    Grouped0 = maps:fold(
+        fun
+            (_SourceId, deleted, Acc) ->
+                Acc;
+            (SourceId, {DocKey, DocVersion, Candidate}, Acc) ->
+                case maps:find(SourceId, HitRecords) of
+                    {ok, {DocKey, DocVersion, HitRecord}} ->
+                        GroupKey = fts2_build_group_key(GroupFields, SourceId, Candidate),
+                        Version = fts2_build_group_version(VersionField, Candidate),
+                        Row = #{
+                            source_id => SourceId,
+                            doc_key => DocKey,
+                            doc_version => DocVersion,
+                            candidate_record => Candidate,
+                            hit_record => HitRecord,
+                            doc_length => maps:get(SourceId, SourceLengths, 0)
+                        },
+                        fts2_build_keep_group_version(GroupKey, Version, Row, Acc);
+                    _ ->
+                        Acc
+                end
+        end,
+        #{},
+        CandidateRecords
+    ),
+    OrderedGroups = lists:sort(
+        fun({KeyA, _}, {KeyB, _}) ->
+            KeyA =< KeyB
+        end,
+        maps:to_list(Grouped0)
+    ),
+    {SourceMap, Groups, _NextGroup, _NextDenseId} = lists:foldl(
+        fun(
+            {GroupKey, {_Version, Rows0}},
+            {Sources, Acc, GroupId, NextDenseId0}
+        ) ->
+            Rows = lists:sort(
+                fun(A, B) ->
+                    {maps:get(doc_key, A), maps:get(source_id, A)} =<
+                        {maps:get(doc_key, B), maps:get(source_id, B)}
+                end,
+                Rows0
+            ),
+            true = length(Rows) =< ?CHUNKS_PER_GROUP,
+            {ChunkRows, NextSources, _Local, NextDenseId} = lists:foldl(
+                fun(Row, {ChunkAcc, SourceAcc, Local, DenseId}) ->
+                    ChunkId = (GroupId bsl ?CHUNK_BITS) bor Local,
+                    Chunk = Row#{
+                        chunk_id => ChunkId,
+                        group_id => GroupId,
+                        dense_id => DenseId
+                    },
+                    {
+                        [Chunk | ChunkAcc],
+                        SourceAcc#{maps:get(source_id, Row) => Chunk},
+                        Local + 1,
+                        DenseId + 1
+                    }
+                end,
+                {[], Sources, 0, NextDenseId0},
+                Rows
+            ),
+            Group = #{
+                group_id => GroupId,
+                group_key => GroupKey,
+                chunks => lists:reverse(ChunkRows)
+            },
+            {NextSources, [Group | Acc], GroupId + 1, NextDenseId}
+        end,
+        {#{}, [], 0, 0},
+        OrderedGroups
+    ),
+    {SourceMap, lists:reverse(Groups)}.
+
+fts2_build_group_key([], SourceId, _Candidate) ->
+    {source, SourceId};
+fts2_build_group_key(Fields, _SourceId, Candidate) ->
+    {group, [maps:get(Field, Candidate, undefined) || Field <- Fields]}.
+
+fts2_build_group_version(undefined, _Candidate) -> 0;
+fts2_build_group_version(Field, Candidate) -> maps:get(Field, Candidate, 0).
+
+fts2_build_keep_group_version(Key, Version, Row, Acc) ->
+    case maps:find(Key, Acc) of
+        error ->
+            Acc#{Key => {Version, [Row]}};
+        {ok, {Older, _Rows}} when Version > Older ->
+            Acc#{Key => {Version, [Row]}};
+        {ok, {Version, Rows}} ->
+            Acc#{Key => {Version, [Row | Rows]}};
+        {ok, {_Newer, _Rows}} ->
+            Acc
+    end.
+
+fts2_build_build_term_rows(TokenDocs, SourceMap) ->
+    maps:fold(
+        fun(Token, Docs, {TermAcc, ChunkAcc}) ->
+            maps:fold(
+                fun(SourceId, {_StoredId, _Length, Posting}, {Terms, Chunks}) ->
+                    case maps:find(SourceId, SourceMap) of
+                        error ->
+                            {Terms, Chunks};
+                        {ok, Chunk} ->
+                            maps:fold(
+                                fun(Column, Tokens, {TA, CA}) ->
+                                    case maps:find(Token, Tokens) of
+                                        error ->
+                                            {TA, CA};
+                                        {ok, Entry} ->
+                                            fts2_build_add_term_entry(
+                                                Column,
+                                                Token,
+                                                Entry,
+                                                Chunk,
+                                                TA,
+                                                CA
+                                            )
+                                    end
+                                end,
+                                {Terms, Chunks},
+                                Posting
+                            )
+                    end
+                end,
+                {TermAcc, ChunkAcc},
+                Docs
+            )
+        end,
+        {#{}, #{}},
+        TokenDocs
+    ).
+
+%% Compact immutable vocabulary proof. It is fetched in the same Bookie call
+%% as the active state row, so an impossible exact term/phrase avoids all
+%% generation-qualified header reads. False positives only select the normal
+%% path; the bitset can never create a false negative.
+fts2_build_term_bloom(TermRows) ->
+    Words = maps:fold(
+        fun({Column, Token}, _Row, Acc) ->
+            fts2_term_bloom_add(Column, Token, 0, Acc)
+        end,
+        #{},
+        TermRows
+    ),
+    iolist_to_binary([
+        <<(maps:get(Word, Words, 0)):64/unsigned-little>>
+     || Word <- lists:seq(0, ?TERM_BLOOM_WORDS - 1)
+    ]).
+
+fts2_build_term_bloom_shards(TermRows) ->
+    ShardWords = maps:fold(
+        fun({Column, Token}, _Row, Acc) ->
+            Shard = fts2_term_bloom_shard(Column, Token),
+            Words0 = maps:get(Shard, Acc, #{}),
+            Acc#{Shard => fts2_term_bloom_shard_add(
+                Column, Token, 0, Words0
+            )}
+        end,
+        #{},
+        TermRows
+    ),
+    [
+        {Shard, iolist_to_binary([
+            <<(maps:get(Word, maps:get(Shard, ShardWords, #{}), 0)):
+                64/unsigned-little>>
+         || Word <- lists:seq(0, ?TERM_BLOOM_SHARD_WORDS - 1)
+        ])}
+     || Shard <- lists:seq(0, ?TERM_BLOOM_SHARDS - 1)
+    ].
+
+fts2_term_bloom_shard_add(_Column, _Token, 4, Words) ->
+    Words;
+fts2_term_bloom_shard_add(Column, Token, Salt, Words) ->
+    BitIndex = erlang:phash2(
+        {Salt, Column, Token}, ?TERM_BLOOM_SHARD_BITS
+    ),
+    Word = BitIndex bsr 6,
+    Mask = 1 bsl (BitIndex band 63),
+    fts2_term_bloom_shard_add(
+        Column, Token, Salt + 1,
+        Words#{Word => maps:get(Word, Words, 0) bor Mask}
+    ).
+
+fts2_term_bloom_add(_Column, _Token, 4, Words) ->
+    Words;
+fts2_term_bloom_add(Column, Token, Salt, Words) ->
+    BitIndex = erlang:phash2({Salt, Column, Token}, ?TERM_BLOOM_BITS),
+    Word = BitIndex bsr 6,
+    Mask = 1 bsl (BitIndex band 63),
+    fts2_term_bloom_add(
+        Column, Token, Salt + 1,
+        Words#{Word => maps:get(Word, Words, 0) bor Mask}
+    ).
+
+fts2_build_add_term_entry(Column, Token, Entry, Chunk, Terms, Chunks) ->
+    ChunkId = maps:get(chunk_id, Chunk),
+    GroupId = maps:get(group_id, Chunk),
+    SourceId = maps:get(source_id, Chunk),
+    Length = maps:get(doc_length, Chunk),
+    Tf = maps:get(count, Entry),
+    DenseId = maps:get(dense_id, Chunk),
+    Positions = maps:get(positions, Entry),
+    PlaneEntry = {ChunkId, GroupId, SourceId, Length, Tf, DenseId},
+    Key = {Column, Token},
+    Row0 = maps:get(Key, Terms, #{entries => [], positions => []}),
+    Row = Row0#{
+        entries := [PlaneEntry | maps:get(entries, Row0)],
+        positions := [{ChunkId, Positions} | maps:get(positions, Row0)]
+    },
+    ChunkTerms = maps:get({Column, ChunkId}, Chunks, []),
+    {
+        Terms#{Key => Row},
+        Chunks#{
+            {Column, ChunkId} => [{Token, Positions, PlaneEntry} | ChunkTerms]
+        }
+    }.
+
+fts2_build_build_bigram_rows(ByChunk, FrequentTerms) ->
+    {BigramRows, BloomShardWords} = maps:fold(
+        fun({Column, _ChunkId}, Terms, {RowsAcc, BloomAcc}) ->
+            PositionTokens = lists:foldl(
+                fun({Token, Positions, PlaneEntry}, PosAcc) ->
+                    lists:foldl(
+                        fun(Pos, PA) -> PA#{Pos => {Token, PlaneEntry}} end,
+                        PosAcc,
+                        Positions
+                    )
+                end,
+                #{},
+                Terms
+            ),
+            lists:foldl(
+                fun(Pos, {BigramAcc, BigramBloomAcc}) ->
+                    case
+                        {
+                            maps:find(Pos, PositionTokens),
+                            maps:find(Pos + 1, PositionTokens)
+                        }
+                    of
+                        {{ok, {First, PlaneEntry}}, {ok, {Second, SecondEntry}}} ->
+                            NextBigramAcc = case
+                                maps:is_key({Column, First}, FrequentTerms) andalso
+                                    maps:is_key({Column, Second}, FrequentTerms)
+                            of
+                                true ->
+                                    fts2_build_add_bigram(
+                                        Column,
+                                        First,
+                                        Second,
+                                        Pos,
+                                        PlaneEntry,
+                                        SecondEntry,
+                                        BigramAcc
+                                    );
+                                false ->
+                                    BigramAcc
+                            end,
+                            {
+                                NextBigramAcc,
+                                fts2_build_bigram_bloom_add(
+                                    Column, First, Second, BigramBloomAcc
+                                )
+                            };
+                        _ ->
+                            {BigramAcc, BigramBloomAcc}
+                    end
+                end,
+                {RowsAcc, BloomAcc},
+                lists:sort(maps:keys(PositionTokens))
+            )
+        end,
+        {#{}, #{}},
+        ByChunk
+    ),
+    {
+        BigramRows,
+        fts2_build_encode_bigram_bloom_shards(BloomShardWords)
+    }.
+
+fts2_build_bigram_bloom_add(Column, First, Second, ShardWords) ->
+    Shard = fts2_bigram_bloom_shard(Column, First, Second),
+    Words0 = maps:get(Shard, ShardWords, #{}),
+    ShardWords#{Shard => fts2_bigram_bloom_shard_add(
+        Column, First, Second, 0, Words0
+    )}.
+
+fts2_bigram_bloom_shard_add(_Column, _First, _Second, 4, Words) ->
+    Words;
+fts2_bigram_bloom_shard_add(Column, First, Second, Salt, Words) ->
+    BitIndex = erlang:phash2(
+        {Salt, Column, First, Second}, ?BIGRAM_BLOOM_SHARD_BITS
+    ),
+    Word = BitIndex bsr 6,
+    Mask = 1 bsl (BitIndex band 63),
+    fts2_bigram_bloom_shard_add(
+        Column,
+        First,
+        Second,
+        Salt + 1,
+        Words#{Word => maps:get(Word, Words, 0) bor Mask}
+    ).
+
+fts2_build_encode_bigram_bloom_shards(ShardWords) ->
+    [
+        {Shard, fts2_build_encode_bigram_bloom_shard(
+            maps:get(Shard, ShardWords, #{})
+        )}
+     || Shard <- lists:seq(0, ?BIGRAM_BLOOM_SHARDS - 1)
+    ].
+
+fts2_build_encode_bigram_bloom_shard(Words) ->
+    iolist_to_binary([
+        <<(maps:get(Word, Words, 0)):64/unsigned-little>>
+     || Word <- lists:seq(0, ?BIGRAM_BLOOM_SHARD_WORDS - 1)
+    ]).
+
+fts2_build_add_bigram(
+    Column, First, Second, Position, PlaneEntry, SecondPlaneEntry, Acc
+) ->
+    Key = {Column, First, Second},
+    Row0 = maps:get(Key, Acc, #{}),
+    ChunkId = element(1, PlaneEntry),
+    case maps:find(ChunkId, Row0) of
+        error ->
+            Acc#{Key => Row0#{ChunkId => {
+                PlaneEntry, element(5, SecondPlaneEntry), [Position]
+            }}};
+        {ok, {Existing, SecondTf, Positions}} ->
+            Acc#{Key => Row0#{ChunkId => {
+                Existing, SecondTf, [Position | Positions]
+            }}}
+    end.
+
+fts2_build_write_identities_parallel(
+    Bookie, Bucket, Generation, Groups, Concurrency
+) ->
+    Pages = lists:foldl(
+        fun(Group, Acc) ->
+            PageNo = maps:get(group_id, Group) bsr
+                ?GENERATION_IDENTITY_PAGE_SHIFT,
+            Acc#{PageNo => [Group | maps:get(PageNo, Acc, [])]}
+        end,
+        #{},
+        Groups
+    ),
+    Key = fts2_codec_identity_key(Generation),
+    fts2_build_parallel(
+        fts2_build_chunks(maps:to_list(Pages), 1, []),
+        Concurrency,
+        fun(PageBatch) ->
+            Specs = [
+                {add, Bucket, Key, fts2_codec_identity_subkey(PageNo),
+                    fts2_codec_encode_identity_page(
+                        lists:reverse(PageGroups)
+                    )}
+             || {PageNo, PageGroups} <- PageBatch
+            ],
+            ok = fts2_build_write_slices(Bookie, Specs),
+            length(Specs)
+        end
+    ).
+
+fts2_build_write_terms_parallel(
+    Bookie, Bucket, Generation, TermRows, ChunkCount, TotalLength,
+    Concurrency
+) ->
+    fts2_build_parallel(
+        fts2_build_chunks(maps:to_list(TermRows), 48, []),
+        Concurrency,
+        fun(RowBatch) ->
+            Specs = lists:append([
+                fts2_build_term_row_specs(
+                    Bucket, Generation, Column, Token, Row, ChunkCount,
+                    TotalLength
+                )
+             || {{Column, Token}, Row} <- RowBatch
+            ]),
+            ok = fts2_build_write_slices(Bookie, Specs),
+            length(Specs)
+        end
+    ).
+
+fts2_build_term_row_specs(
+    Bucket, Generation, Column, Token, Row, ChunkCount, TotalLength
+) ->
+    Entries = lists:sort(maps:get(entries, Row)),
+    Positions = lists:sort(maps:get(positions, Row)),
+    PositionMap = maps:from_list(Positions),
+    Header = fts2_build_header(Entries, ChunkCount, TotalLength),
+    Anchor = [
+        Entry
+     || Entry <- Entries,
+        lists:member(0, maps:get(element(1, Entry), PositionMap, []))
+    ],
+    {Key, _} = fts2_codec_term_key(Generation, Column, Token),
+    BooleanKey = fts2_codec_term_plane_key(Key, boolean),
+    PositionKey = fts2_codec_term_plane_key(Key, positions),
+    [
+        {add, Bucket, Key, <<"h">>, fts2_codec_encode_header(Header)},
+        {add, Bucket, BooleanKey, <<"b">>, fts2_codec_encode_plane(Entries)},
+        {add, Bucket, PositionKey, <<"p">>,
+            fts2_codec_encode_positions(maps:to_list(PositionMap))}
+    ] ++ case Anchor of
+        [] -> [];
+        _ -> [{add, Bucket, Key, <<"a">>,
+            fts2_codec_encode_plane(Anchor)}]
+    end.
+
+fts2_build_write_bigrams_parallel(
+    Bookie, Bucket, Generation, BigramRows, TermRows, ChunkCount,
+    TotalLength, Concurrency
+) ->
+    Items = [
+        begin
+            FirstDf = length(maps:get(
+                entries, maps:get({Column, First}, TermRows)
+            )),
+            SecondDf = length(maps:get(
+                entries, maps:get({Column, Second}, TermRows)
+            )),
+            {{Column, First, Second}, ByChunk, FirstDf, SecondDf}
+        end
+     || {{Column, First, Second}, ByChunk} <- maps:to_list(BigramRows)
+    ],
+    fts2_build_parallel(
+        fts2_build_chunks(Items, 96, []),
+        Concurrency,
+        fun(RowBatch) ->
+            Specs = lists:append([
+                fts2_build_bigram_row_specs(
+                    Bucket, Generation, Column, First, Second, ByChunk,
+                    FirstDf, SecondDf, ChunkCount, TotalLength
+                )
+             || {{Column, First, Second}, ByChunk, FirstDf, SecondDf} <-
+                    RowBatch
+            ]),
+            ok = fts2_build_write_slices(Bookie, Specs),
+            length(Specs)
+        end
+    ).
+
+fts2_build_parallel([], _Concurrency, _Fun) ->
+    0;
+fts2_build_parallel(Items, Concurrency0, Fun) ->
+    Concurrency = case Concurrency0 of
+        N when is_integer(N), N > 0 -> erlang:min(N, length(Items));
+        _ -> 1
+    end,
+    ChunkSize = (length(Items) + Concurrency - 1) div Concurrency,
+    Chunks = fts2_build_chunks(Items, ChunkSize, []),
+    Monitors = [
+        begin
+            {_Pid, Monitor} = spawn_monitor(fun() ->
+                Result = try lists:sum([Fun(Item) || Item <- Chunk]) of
+                    Count -> {fts2_parallel_ok, Count}
+                catch
+                    Class:Reason:Stacktrace ->
+                        {fts2_parallel_error, Class, Reason, Stacktrace}
+                end,
+                exit(Result)
+            end),
+            Monitor
+        end
+     || Chunk <- Chunks
+    ],
+    fts2_build_collect_parallel(Monitors, 0).
+
+fts2_build_chunks([], _ChunkSize, Acc) ->
+    lists:reverse(Acc);
+fts2_build_chunks(Items, ChunkSize, Acc) ->
+    Count = erlang:min(ChunkSize, length(Items)),
+    {Chunk, Rest} = lists:split(Count, Items),
+    fts2_build_chunks(Rest, ChunkSize, [Chunk | Acc]).
+
+fts2_build_collect_parallel([], Count) ->
+    Count;
+fts2_build_collect_parallel(Monitors, Count) ->
+    receive
+        {'DOWN', Monitor, process, _Pid, {fts2_parallel_ok, Rows}} ->
+            fts2_build_collect_parallel(
+                lists:delete(Monitor, Monitors), Count + Rows
+            );
+        {'DOWN', Monitor, process, _Pid,
+                {fts2_parallel_error, Class, Reason, Stacktrace}} ->
+            fts2_build_drain_parallel(lists:delete(Monitor, Monitors)),
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+fts2_build_drain_parallel([]) ->
+    ok;
+fts2_build_drain_parallel(Monitors) ->
+    receive
+        {'DOWN', Monitor, process, _Pid, _Reason} ->
+            fts2_build_drain_parallel(lists:delete(Monitor, Monitors))
+    end.
+
+fts2_build_bigram_row_specs(
+    Bucket,
+    Generation,
+    Column,
+    First,
+    Second,
+    ByChunk,
+    FirstDf,
+    SecondDf,
+    ChunkCount,
+    TotalLength
+) ->
+    Entries = lists:sort([
+        {element(1, PlaneEntry), element(2, PlaneEntry),
+            element(3, PlaneEntry), element(4, PlaneEntry),
+            length(Positions), element(5, PlaneEntry), SecondTf}
+     || {_ChunkId, {PlaneEntry, SecondTf, Positions}} <- maps:to_list(ByChunk)
+    ]),
+    PositionEntries = lists:sort([
+        {ChunkId, lists:sort(Positions)}
+     || {ChunkId, {_PlaneEntry, _SecondTf, Positions}} <- maps:to_list(ByChunk)
+    ]),
+    Avg = TotalLength / erlang:max(ChunkCount, 1),
+    FirstIdf = fts2_build_bm25_idf(ChunkCount, FirstDf),
+    SecondIdf = fts2_build_bm25_idf(ChunkCount, SecondDf),
+    BestByGroup = lists:foldl(
+        fun(Entry, Acc) ->
+            GroupId = element(2, Entry),
+            case maps:find(GroupId, Acc) of
+                error -> Acc#{GroupId => Entry};
+                {ok, Existing} ->
+                    case fts2_build_bigram_score(Entry, Avg, FirstIdf, SecondIdf) >
+                        fts2_build_bigram_score(Existing, Avg, FirstIdf, SecondIdf) of
+                        true -> Acc#{GroupId => Entry};
+                        false -> Acc
+                    end
+            end
+        end,
+        #{},
+        Entries
+    ),
+    BigramScore = fun(Entry) ->
+        fts2_build_bigram_score(Entry, Avg, FirstIdf, SecondIdf)
+    end,
+    Champions = fts2_build_champion_window(
+        lists:sort(
+            fun(A, B) ->
+                {-BigramScore(A), element(3, A)} =<
+                    {-BigramScore(B), element(3, B)}
+            end,
+            maps:values(BestByGroup)
+        ),
+        BigramScore
+    ),
+    {Key, _} = fts2_codec_bigram_key(
+        Generation, Column, First, Second
+    ),
+    [
+        {add, Bucket, Key, <<"x">>, fts2_codec_encode_bigram(
+            #{
+                group_df => map_size(BestByGroup),
+                first_df => FirstDf,
+                second_df => SecondDf,
+                champions => Champions,
+                entries => Entries,
+                positions => PositionEntries
+            }
+        )}
+    ].
+
+fts2_build_bigram_score(Entry, Avg, FirstIdf, SecondIdf) ->
+    Length = element(4, Entry),
+    fts2_build_bm25_tf(element(6, Entry), Length, Avg) * FirstIdf +
+        fts2_build_bm25_tf(element(7, Entry), Length, Avg) * SecondIdf.
+
+fts2_build_bm25_idf(DocCount, Df) ->
+    erlang:max(
+        math:log((DocCount - Df + 0.5) / (Df + 0.5)), 1.0e-6
+    ).
+
+fts2_build_header(Entries, ChunkCount, TotalLength) ->
+    Avg = case ChunkCount of
+        0 -> 0.0;
+        _ -> TotalLength / ChunkCount
+    end,
+    Anchors = fts2_build_best_group_entries(Entries, Avg),
+    TermScore = fun(Entry) ->
+        fts2_build_bm25_tf(element(5, Entry), element(4, Entry), Avg)
+    end,
+    Champions = fts2_build_champion_window(
+        lists:sort(
+            fun(A, B) ->
+                {-TermScore(A), element(2, A), element(3, A)} =<
+                    {-TermScore(B), element(2, B), element(3, B)}
+            end,
+            Anchors
+        ),
+        TermScore
+    ),
+    #{
+        group_df => length(Anchors),
+        chunk_df => length(Entries),
+        collection_frequency => lists:sum([element(5, E) || E <- Entries]),
+        chunk_bitmap => case length(Entries) >= 64 of
+            true -> lists:foldl(
+                fun(Entry, Bitmap) ->
+                    Bitmap bor (1 bsl element(6, Entry))
+                end,
+                0,
+                Entries
+            );
+            false -> undefined
+        end,
+        group_bitmap => case length(Entries) >= 64 of
+            true -> lists:foldl(
+                fun(Entry, Bitmap) ->
+                    Bitmap bor (1 bsl element(2, Entry))
+                end,
+                0,
+                Entries
+            );
+            false -> undefined
+        end,
+        champions => Champions
+    }.
+
+fts2_build_champion_window(Ordered, ScoreFun) ->
+    {Head, Tail} = lists:split(erlang:min(?HEAD_WINDOW, length(Ordered)), Ordered),
+    case {Head, Tail} of
+        {[], _} -> [];
+        {_, []} -> Head;
+        _ ->
+            BoundaryScore = ScoreFun(lists:last(Head)),
+            Head ++ lists:takewhile(
+                fun(Entry) -> ScoreFun(Entry) =:= BoundaryScore end,
+                Tail
+            )
+    end.
+
+fts2_build_best_group_entries(Entries, Avg) ->
+    Best = lists:foldl(
+        fun(Entry, Acc) ->
+            GroupId = element(2, Entry),
+            case maps:find(GroupId, Acc) of
+                error ->
+                    Acc#{GroupId => Entry};
+                {ok, Existing} ->
+                    EntryScore = fts2_build_bm25_tf(element(5, Entry), element(4, Entry), Avg),
+                    ExistingScore = fts2_build_bm25_tf(
+                        element(5, Existing), element(4, Existing), Avg
+                    ),
+                    case {EntryScore, -element(3, Entry)} >
+                        {ExistingScore, -element(3, Existing)} of
+                        true -> Acc#{GroupId => Entry};
+                        false -> Acc
+                    end
+            end
+        end,
+        #{},
+        Entries
+    ),
+    lists:sort(
+        fun(A, B) -> element(2, A) =< element(2, B) end,
+        maps:values(Best)
+    ).
+
+fts2_build_bm25_tf(Tf, Length, Avg) ->
+    Ratio = case Avg > 0.0 of
+        true -> Length / Avg;
+        false -> 1.0
+    end,
+    (Tf * 2.2) / (Tf + 1.2 * (0.25 + 0.75 * Ratio)).
+
+fts2_build_identity_page_count(0, _Shift) ->
+    0;
+fts2_build_identity_page_count(GroupCount, Shift) ->
+    ((GroupCount - 1) div (1 bsl Shift)) + 1.
+
+%% A generation is immutable. Recording whether each declared filter column
+%% is uniform lets count-only serving discharge the common single-tenant facet
+%% without reading a posting plane or an identity page. Older roots decode
+%% without this key and conservatively behave as `mixed`.
+fts2_build_facet_domain(Schema, Groups) ->
+    lists:foldl(
+        fun(Group, Acc) ->
+            lists:foldl(
+                fun(Chunk, Inner) ->
+                    Candidate = maps:get(candidate_record, Chunk, #{}),
+                    lists:foldl(
+                        fun({Column, Field}, Domain) ->
+                            Value = maps:get(Field, Candidate, undefined),
+                            case maps:get(Column, Domain, unset) of
+                                unset -> Domain#{Column => {uniform, Value}};
+                                {uniform, Value} -> Domain;
+                                _Other -> Domain#{Column => mixed}
+                            end
+                        end,
+                        Inner,
+                        maps:get(candidate_filter_fields, Schema, [])
+                    )
+                end,
+                Acc,
+                maps:get(chunks, Group, [])
+            )
+        end,
+        #{},
+        Groups
+    ).
+
+fts2_build_write_slices(_Bookie, []) ->
+    ok;
+fts2_build_write_slices(Bookie, Specs) ->
+    Count = erlang:min(?WRITE_SLICE, length(Specs)),
+    {Batch, Rest} = lists:split(Count, Specs),
+    case leveled_bookie:book_mput(Bookie, Batch) of
+        ok -> fts2_build_write_slices(Bookie, Rest);
+        pause -> fts2_build_write_slices(Bookie, Rest);
+        {error, Reason} -> erlang:error({fts2_generation_write_failed, Reason})
+    end.
+
+fts2_build_identity_bookie(Bookie, Schema) ->
+    maps:get(identity_bookie, Schema, Bookie).
+
+fts2_build_cleanup_generation(Bookie, Schema, Generation) ->
+    Bucket = maps:get(index, Schema),
+    fts2_build_remove_generation_rows(Bookie, Bucket, term, Generation),
+    fts2_build_remove_generation_rows(Bookie, Bucket, bigram, Generation),
+    fts2_build_remove_generation_rows(
+        fts2_build_identity_bookie(Bookie, Schema), Bucket, identity, Generation
+    ).
+
+fts2_build_remove_generation_rows(Bookie, Bucket, Kind, Generation) ->
+    {Start, Finish} = case Kind of
+        term -> {<<"f2:b:">>, <<"f2:u">>};
+        bigram -> {<<"f2:g:">>, <<"f2:h">>};
+        identity ->
+            Key = fts2_codec_identity_key(Generation),
+            {Key, Key}
+    end,
+    Fold = fun(B, {Key, SubKey}, _Value, Acc) when B =:= Bucket ->
+        case fts2_build_generation_key(Kind, Key, Generation) of
+            true -> [{remove, Bucket, Key, SubKey, <<>>} | Acc];
+            false -> Acc
+        end;
+        (_B, _Key, _Value, Acc) -> Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {{Start, <<>>}, {Finish, <<255, 255, 255, 255>>}}},
+        {Fold, []},
+        false,
+        true,
+        false
+    ),
+    fts2_build_remove_specs(Bookie, Runner()).
+
+fts2_build_generation_key(term, <<"f2:t:", Generation:64/unsigned-big, _/binary>>,
+    Generation) -> true;
+fts2_build_generation_key(term, <<"f2:b:", Generation:64/unsigned-big, _/binary>>,
+    Generation) -> true;
+fts2_build_generation_key(term, <<"f2:p:", Generation:64/unsigned-big, _/binary>>,
+    Generation) -> true;
+fts2_build_generation_key(bigram, <<"f2:g:", Generation:64/unsigned-big, _/binary>>,
+    Generation) -> true;
+fts2_build_generation_key(identity, <<"f2:i:", Generation:64/unsigned-big>>, Generation) ->
+    true;
+fts2_build_generation_key(_Kind, _Key, _Generation) -> false.
+
+fts2_build_remove_specs(_Bookie, []) -> ok;
+fts2_build_remove_specs(Bookie, Specs) ->
+    Count = erlang:min(?WRITE_SLICE, length(Specs)),
+    {Batch, Rest} = lists:split(Count, Specs),
+    case leveled_bookie:book_mput(Bookie, Batch) of
+        ok -> fts2_build_remove_specs(Bookie, Rest);
+        pause -> fts2_build_remove_specs(Bookie, Rest);
+        {error, Reason} -> erlang:error({fts2_generation_cleanup_failed, Reason})
+    end.
+
+fts2_build_trim_journals(Bookie, Schema) ->
+    case maps:get(trim_journal, Schema, false) of
+        true ->
+            Bookies = lists:usort([
+                Bookie, fts2_build_identity_bookie(Bookie, Schema)
+            ]),
+            %% Trimming is only safe after the bookie's residual ledger cache
+            %% has crossed the persisted-SQN barrier.  In particular, parallel
+            %% generation writes commonly leave a final under-sized cache.
+            fts2_build_reclaim_ledgers(Bookies, 300000),
+            lists:foreach(
+                fun leveled_bookie:book_trimjournal/1,
+                Bookies
+            );
+        false ->
+            ok
+    end.
+
+
+%% ===========================================================================
+%% INTERNAL FTS-2 CODEC
+%% ===========================================================================
+
+%% Immutable FTS2 row formats and key construction.
+%%
+%% Every generation-qualified row is write-once.  The only mutable row is the
+%% root manifest; readers fetch it once and thereafter address one immutable
+%% generation.  Values use the upstream zstd module directly.
+
+-define(ROOT_VERSION, 1).
+-define(ROW_VERSION, 1).
+-define(HEADER_VERSION, 2).
+-define(BIGRAM_VERSION, 1).
+-define(PLANE_VERSION, 1).
+-define(POSITION_VERSION, 1).
+-define(IDENTITY_PAGE_VERSION, 4).
+
+fts2_codec_root_key() ->
+    {<<"f2:root">>, <<"manifest">>}.
+
+fts2_codec_term_key(Generation, Column, Token) ->
+    {<<"f2:t:", Generation:64/unsigned-big, Column:8, Token/binary>>, <<>>}.
+
+fts2_codec_term_plane_key(<<"f2:t:", Rest/binary>>, boolean) ->
+    <<"f2:b:", Rest/binary>>;
+fts2_codec_term_plane_key(<<"f2:t:", Rest/binary>>, positions) ->
+    <<"f2:p:", Rest/binary>>.
+
+fts2_codec_term_range(Generation, Column, Prefix) ->
+    Start = <<"f2:t:", Generation:64/unsigned-big, Column:8, Prefix/binary>>,
+    {Start, <<Start/binary, 255>>}.
+
+fts2_codec_bigram_key(Generation, Column, First, Second) ->
+    {
+        <<"f2:g:", Generation:64/unsigned-big, Column:8,
+            (byte_size(First)):16/unsigned-big, First/binary, Second/binary>>,
+        <<>>
+    }.
+
+fts2_codec_identity_key(Generation) ->
+    <<"f2:i:", Generation:64/unsigned-big>>.
+
+fts2_codec_identity_subkey(PageNo) ->
+    <<PageNo:32/unsigned-big>>.
+
+fts2_codec_encode(Type, Term) when is_atom(Type) ->
+    Raw = term_to_binary(Term, [deterministic]),
+    Compressed = iolist_to_binary(zstd:compress(Raw)),
+    <<?ROW_VERSION:8, (fts2_codec_type_id(Type)):8, (byte_size(Raw)):32/unsigned-big,
+        Compressed/binary>>.
+
+fts2_codec_decode(
+    Type,
+    <<?ROW_VERSION:8, TypeId:8, RawBytes:32/unsigned-big, Compressed/binary>>
+) ->
+    case TypeId =:= fts2_codec_type_id(Type) of
+        true ->
+            _ = fts2_codec_row_wire_atoms(),
+            try iolist_to_binary(zstd:decompress(Compressed)) of
+                Raw when byte_size(Raw) =:= RawBytes ->
+                    binary_to_term(Raw, [safe]);
+                _ ->
+                    erlang:error({invalid_fts2_row, Type})
+            catch
+                error:{zstd_error, _} ->
+                    erlang:error({invalid_fts2_row, Type})
+            end;
+        false ->
+            erlang:error({invalid_fts2_row, Type})
+    end;
+fts2_codec_decode(Type, _Bad) ->
+    erlang:error({invalid_fts2_row, Type}).
+
+%% Term headers are read on every query. Keep their fixed numeric metadata and
+%% champion tuples directly pattern-matchable. New generations always keep the
+%% complete Boolean and position planes in separate row-addressable keys; the
+%% inline tail decoder below remains solely for pre-break generations.
+fts2_codec_encode_header(Header) ->
+    Champions = maps:get(champions, Header),
+    ChampionPayload = iolist_to_binary([
+        <<ChunkId:32/unsigned-big, DocLength:32/unsigned-big,
+            Tf:32/unsigned-big>>
+     || {ChunkId, _GroupId, _SourceId, DocLength, Tf, _DenseId} <- Champions
+    ]),
+    InlineEntries = case maps:find(entries, Header) of
+        {ok, Entries} -> fts2_codec_encode_header_tail(
+            fts2_codec_encode_plane(Entries)
+        );
+        error -> <<>>
+    end,
+    InlinePositions = case maps:find(positions, Header) of
+        {ok, Positions} -> fts2_codec_encode_header_tail(
+            fts2_codec_encode_positions(maps:to_list(Positions))
+        );
+        error -> <<>>
+    end,
+    ChunkBitmap = case maps:get(chunk_bitmap, Header, undefined) of
+        undefined -> <<>>;
+        ChunkBitmapValue -> binary:encode_unsigned(ChunkBitmapValue, little)
+    end,
+    GroupBitmap = case maps:get(group_bitmap, Header, undefined) of
+        undefined -> <<>>;
+        GroupBitmapValue -> binary:encode_unsigned(GroupBitmapValue, little)
+    end,
+    GroupDf = maps:get(group_df, Header),
+    ChunkDf = maps:get(chunk_df, Header),
+    CollectionFrequency = maps:get(collection_frequency, Header),
+    true = GroupDf =< ?MAX_U32,
+    true = ChunkDf =< ?MAX_U32,
+    true = CollectionFrequency =< ?MAX_U64,
+    <<?HEADER_VERSION:8, GroupDf:32/unsigned-big, ChunkDf:32/unsigned-big,
+        CollectionFrequency:64/unsigned-big,
+        (length(Champions)):32/unsigned-big,
+        (byte_size(ChampionPayload)):32/unsigned-big,
+        (byte_size(InlineEntries)):32/unsigned-big,
+        (byte_size(InlinePositions)):32/unsigned-big,
+        (byte_size(ChunkBitmap)):32/unsigned-big,
+        (byte_size(GroupBitmap)):32/unsigned-big,
+        ChampionPayload/binary, InlineEntries/binary, InlinePositions/binary,
+        ChunkBitmap/binary, GroupBitmap/binary>>.
+
+fts2_codec_decode_header(
+    Binary
+) ->
+    Header0 = fts2_codec_decode_header_metadata(Binary),
+    ChampionCount = maps:get(champion_count, Header0),
+    ChampionPayload = maps:get(champions_packed, Header0),
+    (maps:without([champion_count, champions_packed], Header0))#{
+        champions => fts2_codec_decode_header_champions(
+            ChampionCount, ChampionPayload, []
+        )
+    }.
+
+%% Boolean, prefix, and positional paths do not consume the champion prefix.
+%% Leave it as a binary so those paths do not allocate 256 five-tuples per
+%% term merely to reach the packed posting tails.
+fts2_codec_decode_header_metadata(
+    <<?HEADER_VERSION:8, GroupDf:32/unsigned-big, ChunkDf:32/unsigned-big,
+        CollectionFrequency:64/unsigned-big, ChampionCount:32/unsigned-big,
+        ChampionBytes:32/unsigned-big,
+        EntryBytes:32/unsigned-big, PositionBytes:32/unsigned-big,
+        BitmapBytes:32/unsigned-big,
+        GroupBitmapBytes:32/unsigned-big,
+        Rest/binary>>
+) when byte_size(Rest) =:=
+    ChampionBytes + EntryBytes + PositionBytes + BitmapBytes + GroupBitmapBytes
+->
+    <<ChampionPayload:ChampionBytes/binary, EntryPayload:EntryBytes/binary,
+        PositionPayload:PositionBytes/binary,
+        BitmapPayload:BitmapBytes/binary,
+        GroupBitmapPayload:GroupBitmapBytes/binary>> = Rest,
+    Header0 = #{
+        group_df => GroupDf,
+        chunk_df => ChunkDf,
+        collection_frequency => CollectionFrequency,
+        champion_count => ChampionCount,
+        champions_packed => ChampionPayload
+    },
+    Header1 = case BitmapPayload of
+        <<>> -> Header0;
+        _ -> Header0#{
+            chunk_bitmap => binary:decode_unsigned(BitmapPayload, little)
+        }
+    end,
+    Header2 = case GroupBitmapPayload of
+        <<>> -> Header1;
+        _ -> Header1#{
+            group_bitmap => binary:decode_unsigned(GroupBitmapPayload, little)
+        }
+    end,
+    Header3 = case EntryPayload of
+        <<>> -> Header2;
+        _ -> Header2#{entries_packed => EntryPayload}
+    end,
+    case PositionPayload of
+        <<>> -> Header3;
+        _ -> Header3#{positions_packed => PositionPayload}
+    end;
+fts2_codec_decode_header_metadata(Bad) ->
+    erlang:error({invalid_fts2_header, Bad}).
+
+fts2_codec_decode_header_champions(0, <<>>, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_header_champions(
+    Count,
+    <<ChunkId:32/unsigned-big, DocLength:32/unsigned-big,
+        Tf:32/unsigned-big, Rest/binary>>,
+    Acc
+) when Count > 0 ->
+    GroupId = ChunkId bsr ?CHUNK_BITS,
+    fts2_codec_decode_header_champions(
+        Count - 1,
+        Rest,
+        [{ChunkId, GroupId, 0, DocLength, Tf} | Acc]
+    );
+fts2_codec_decode_header_champions(_Count, Bad, _Acc) ->
+    erlang:error({invalid_fts2_header_champions, Bad}).
+
+fts2_codec_encode_header_tail(Raw) ->
+    Compressed = iolist_to_binary(zstd:compress(Raw)),
+    case byte_size(Compressed) + 5 < byte_size(Raw) + 1 of
+        true -> <<1, (byte_size(Raw)):32/unsigned-big, Compressed/binary>>;
+        false -> <<0, Raw/binary>>
+    end.
+
+fts2_codec_decode_header_tail(<<0, Raw/binary>>) ->
+    Raw;
+fts2_codec_decode_header_tail(
+    <<1, RawBytes:32/unsigned-big, Compressed/binary>>
+) ->
+    Raw = iolist_to_binary(zstd:decompress(Compressed)),
+    case byte_size(Raw) of
+        RawBytes -> Raw;
+        _ -> erlang:error(invalid_fts2_header_tail)
+    end;
+fts2_codec_decode_header_tail(Bad) ->
+    erlang:error({invalid_fts2_header_tail, Bad}).
+
+
+fts2_codec_header_has_entries(Header) ->
+    maps:is_key(entries_packed, Header).
+
+fts2_codec_header_entries(Header) ->
+    fts2_codec_decode_plane(
+        fts2_codec_decode_header_tail(maps:get(entries_packed, Header))
+    ).
+
+fts2_codec_header_entry_plane(Header) ->
+    fts2_codec_plane_payload(
+        fts2_codec_decode_header_tail(maps:get(entries_packed, Header))
+    ).
+
+fts2_codec_plane_payload(<<?PLANE_VERSION:8, Count:32/unsigned-big, Payload/binary>>) when
+    byte_size(Payload) =:= Count * 28
+->
+    Payload;
+fts2_codec_plane_payload(Bad) ->
+    erlang:error({invalid_fts2_plane, Bad}).
+
+fts2_codec_header_has_positions(Header) ->
+    maps:is_key(positions_packed, Header).
+
+fts2_codec_header_positions(Header) ->
+    fts2_codec_decode_positions(
+        fts2_codec_decode_header_tail(maps:get(positions_packed, Header))
+    ).
+
+fts2_codec_header_positions(Header, WantedChunkIds) ->
+    <<?POSITION_VERSION:8, Count:32/unsigned-big, Payload/binary>> =
+        fts2_codec_decode_header_tail(maps:get(positions_packed, Header)),
+    fts2_codec_decode_selected_positions(
+        Count, Payload, maps:from_keys(WantedChunkIds, true), #{}
+    ).
+
+fts2_codec_decode_selected_positions(0, <<>>, _Wanted, Acc) ->
+    Acc;
+fts2_codec_decode_selected_positions(
+    Count,
+    <<ChunkId:32/unsigned-big, PositionCount:32/unsigned-big,
+        Bytes:32/unsigned-big, Encoded:Bytes/binary, Rest/binary>>,
+    Wanted,
+    Acc
+) when Count > 0 ->
+    NextAcc = case maps:is_key(ChunkId, Wanted) of
+        true -> Acc#{ChunkId => fts2_codec_decode_position_list(
+            PositionCount, Encoded, 0, []
+        )};
+        false -> Acc
+    end,
+    fts2_codec_decode_selected_positions(
+        Count - 1, Rest, Wanted, NextAcc
+    );
+fts2_codec_decode_selected_positions(_Count, Bad, _Wanted, _Acc) ->
+    erlang:error({invalid_fts2_positions, Bad}).
+
+fts2_codec_encode_bigram(Bundle) ->
+    Champions = maps:get(champions, Bundle),
+    ChampionPayload = iolist_to_binary([
+        <<ChunkId:32/unsigned-big, Length:32/unsigned-big,
+            PhraseTf:32/unsigned-big, FirstTf:32/unsigned-big,
+            SecondTf:32/unsigned-big>>
+     || {ChunkId, _GroupId, _SourceId, Length, PhraseTf, FirstTf, SecondTf} <-
+            Champions
+    ]),
+    EntryPayload = fts2_codec_encode_header_tail(
+        fts2_codec_encode_bigram_entries(maps:get(entries, Bundle))
+    ),
+    PositionPayload = fts2_codec_encode_header_tail(
+        fts2_codec_encode_positions(maps:get(positions, Bundle))
+    ),
+    <<?BIGRAM_VERSION:8,
+        (maps:get(group_df, Bundle)):32/unsigned-big,
+        (maps:get(first_df, Bundle)):32/unsigned-big,
+        (maps:get(second_df, Bundle)):32/unsigned-big,
+        (length(Champions)):32/unsigned-big,
+        (byte_size(ChampionPayload)):32/unsigned-big,
+        (byte_size(EntryPayload)):32/unsigned-big,
+        (byte_size(PositionPayload)):32/unsigned-big,
+        ChampionPayload/binary, EntryPayload/binary, PositionPayload/binary>>.
+
+fts2_codec_decode_bigram(
+    <<?BIGRAM_VERSION:8, GroupDf:32/unsigned-big,
+        FirstDf:32/unsigned-big, SecondDf:32/unsigned-big,
+        ChampionCount:32/unsigned-big, ChampionBytes:32/unsigned-big,
+        EntryBytes:32/unsigned-big, PositionBytes:32/unsigned-big,
+        Rest/binary>>
+) when
+    ChampionBytes =:= ChampionCount * 20,
+    byte_size(Rest) =:= ChampionBytes + EntryBytes + PositionBytes
+->
+    <<ChampionPayload:ChampionBytes/binary, EntryPayload:EntryBytes/binary,
+        PositionPayload:PositionBytes/binary>> = Rest,
+    #{
+        group_df => GroupDf,
+        first_df => FirstDf,
+        second_df => SecondDf,
+        champions => fts2_codec_decode_bigram_champions(ChampionPayload, []),
+        entries_packed => EntryPayload,
+        positions_packed => PositionPayload
+    };
+fts2_codec_decode_bigram(Bad) ->
+    erlang:error({invalid_fts2_bigram, Bad}).
+
+fts2_codec_encode_bigram_entries(Entries) ->
+    iolist_to_binary([
+        <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+            SourceId:64/unsigned-big, Length:32/unsigned-big,
+            PhraseTf:32/unsigned-big, FirstTf:32/unsigned-big,
+            SecondTf:32/unsigned-big>>
+     || {ChunkId, GroupId, SourceId, Length, PhraseTf, FirstTf, SecondTf} <-
+            Entries
+    ]).
+
+fts2_codec_decode_bigram_champions(<<>>, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_bigram_champions(
+    <<ChunkId:32/unsigned-big, Length:32/unsigned-big,
+        PhraseTf:32/unsigned-big, FirstTf:32/unsigned-big,
+        SecondTf:32/unsigned-big, Rest/binary>>,
+    Acc
+) ->
+    fts2_codec_decode_bigram_champions(
+        Rest,
+        [{ChunkId, ChunkId bsr ?CHUNK_BITS, 0, Length,
+            PhraseTf, FirstTf, SecondTf} | Acc]
+    ).
+
+fts2_codec_decode_bigram_entries(<<>>, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_bigram_entries(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        PhraseTf:32/unsigned-big, FirstTf:32/unsigned-big,
+        SecondTf:32/unsigned-big, Rest/binary>>,
+    Acc
+) ->
+    fts2_codec_decode_bigram_entries(
+        Rest,
+        [{ChunkId, GroupId, SourceId, Length, PhraseTf, FirstTf, SecondTf} | Acc]
+    ).
+
+fts2_codec_bigram_entries(Bundle) ->
+    fts2_codec_decode_bigram_entries(
+        fts2_codec_decode_header_tail(maps:get(entries_packed, Bundle)), []
+    ).
+
+fts2_codec_bigram_positions(Bundle) ->
+    fts2_codec_decode_positions(
+        fts2_codec_decode_header_tail(maps:get(positions_packed, Bundle))
+    ).
+
+fts2_codec_bigram_positions(Bundle, WantedChunkIds) ->
+    <<?POSITION_VERSION:8, Count:32/unsigned-big, Payload/binary>> =
+        fts2_codec_decode_header_tail(maps:get(positions_packed, Bundle)),
+    fts2_codec_decode_selected_positions(
+        Count, Payload, maps:from_keys(WantedChunkIds, true), #{}
+    ).
+
+fts2_codec_encode_plane_entries(Entries) ->
+    iolist_to_binary([
+        <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+            SourceId:64/unsigned-big, DocLength:32/unsigned-big,
+            Tf:32/unsigned-big, DenseId:32/unsigned-big>>
+     || {ChunkId, GroupId, SourceId, DocLength, Tf, DenseId} <- Entries
+    ]).
+
+fts2_codec_encode_root(Root) ->
+    Payload = term_to_binary(Root, [deterministic]),
+    <<?ROOT_VERSION:8, (byte_size(Payload)):32/unsigned-big, Payload/binary>>.
+
+fts2_codec_decode_root(<<?ROOT_VERSION:8, Bytes:32/unsigned-big, Payload:Bytes/binary>>) ->
+    _ = fts2_codec_root_wire_atoms(),
+    binary_to_term(Payload, [safe]);
+fts2_codec_decode_root(Bad) ->
+    erlang:error({invalid_fts2_root, Bad}).
+
+%% Boolean/anchor planes are fixed-width and deliberately uncompressed.  They
+%% are already dense integer streams and avoiding decompression keeps the full
+%% result/hash path predictable.  Header/champion and identity rows use
+%% fts2_codec_encode/2 because those payloads contain arbitrary projected Ash values.
+fts2_codec_encode_plane(Entries) ->
+    Payload = fts2_codec_encode_plane_entries(Entries),
+    <<?PLANE_VERSION:8, (length(Entries)):32/unsigned-big, Payload/binary>>.
+
+fts2_codec_decode_plane(<<?PLANE_VERSION:8, Count:32/unsigned-big, Payload/binary>>) when
+    byte_size(Payload) =:= Count * 28
+->
+    fts2_codec_decode_plane_entries(Payload, []);
+fts2_codec_decode_plane(Bad) ->
+    erlang:error({invalid_fts2_plane, Bad}).
+
+fts2_codec_decode_plane_entries(<<>>, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_plane_entries(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, DocLength:32/unsigned-big, Tf:32/unsigned-big,
+        DenseId:32/unsigned-big,
+        Rest/binary>>,
+    Acc
+) ->
+    fts2_codec_decode_plane_entries(
+        Rest, [{ChunkId, GroupId, SourceId, DocLength, Tf, DenseId} | Acc]
+    ).
+
+fts2_codec_encode_positions(Entries) ->
+    Payload = iolist_to_binary([
+        begin
+            Encoded = fts2_codec_encode_position_list(Positions),
+            <<ChunkId:32/unsigned-big, (length(Positions)):32/unsigned-big,
+                (byte_size(Encoded)):32/unsigned-big, Encoded/binary>>
+        end
+     || {ChunkId, Positions} <- lists:sort(Entries)
+    ]),
+    <<?POSITION_VERSION:8, (length(Entries)):32/unsigned-big, Payload/binary>>.
+
+fts2_codec_decode_positions(
+    <<?POSITION_VERSION:8, Count:32/unsigned-big, Payload/binary>>
+) ->
+    fts2_codec_decode_position_entries(Count, Payload, #{});
+fts2_codec_decode_positions(Bad) ->
+    erlang:error({invalid_fts2_positions, Bad}).
+
+fts2_codec_decode_positions(
+    <<?POSITION_VERSION:8, Count:32/unsigned-big, Payload/binary>>,
+    WantedChunkIds
+) ->
+    fts2_codec_decode_selected_positions(
+        Count, Payload, maps:from_keys(WantedChunkIds, true), #{}
+    );
+fts2_codec_decode_positions(Bad, _WantedChunkIds) ->
+    erlang:error({invalid_fts2_positions, Bad}).
+
+fts2_codec_decode_position_entries(0, <<>>, Acc) ->
+    Acc;
+fts2_codec_decode_position_entries(
+    Count,
+    <<ChunkId:32/unsigned-big, PositionCount:32/unsigned-big,
+        Bytes:32/unsigned-big, Encoded:Bytes/binary, Rest/binary>>,
+    Acc
+) when Count > 0 ->
+    Positions = fts2_codec_decode_position_list(PositionCount, Encoded, 0, []),
+    fts2_codec_decode_position_entries(Count - 1, Rest, Acc#{ChunkId => Positions});
+fts2_codec_decode_position_entries(_Count, Bad, _Acc) ->
+    erlang:error({invalid_fts2_positions, Bad}).
+
+fts2_codec_encode_position_list(Positions) ->
+    {_, Encoded} = lists:foldl(
+        fun(Position, {Previous, Acc}) when
+            is_integer(Position), Position >= Previous, Position =< 16#FFFFFFFF
+        ->
+            {Position, [fts2_codec_encode_varint(Position - Previous) | Acc]}
+        end,
+        {0, []},
+        Positions
+    ),
+    iolist_to_binary(lists:reverse(Encoded)).
+
+fts2_codec_decode_position_list(0, <<>>, _Previous, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_position_list(Count, Encoded, Previous, Acc) when Count > 0 ->
+    {Delta, Rest} = fts2_codec_decode_varint(Encoded, 0, 0),
+    Position = Previous + Delta,
+    fts2_codec_decode_position_list(Count - 1, Rest, Position, [Position | Acc]);
+fts2_codec_decode_position_list(_Count, Bad, _Previous, _Acc) ->
+    erlang:error({invalid_fts2_position_list, Bad}).
+
+%% Identity pages are deliberately uncompressed fixed-stride directories.
+%% Page version 4 carries one layout dictionary: candidate field names plus
+%% hit-record ordinals into that same field list. Chunks then store positional
+%% values only, so a served page decodes names once and can project individual
+%% tie/filter columns without materialising every candidate record.
+fts2_codec_encode_identity_page([]) ->
+    Dict = fts2_codec_encode_identity_dict(none),
+    <<?IDENTITY_PAGE_VERSION:8, 0:32, 0:16,
+        (byte_size(Dict)):32/unsigned-big, Dict/binary, 4:32, 0:32>>;
+fts2_codec_encode_identity_page(Groups) ->
+    Ordered = lists:sort(
+        fun(A, B) -> maps:get(group_id, A) < maps:get(group_id, B) end,
+        Groups
+    ),
+    FirstGroupId = maps:get(group_id, hd(Ordered)),
+    true = [FirstGroupId + I || I <- lists:seq(0, length(Ordered) - 1)] =:=
+        [maps:get(group_id, Group) || Group <- Ordered],
+    Layout = fts2_codec_identity_layout(Ordered),
+    Dict = fts2_codec_encode_identity_dict(Layout),
+    EncodedGroups = [
+        fts2_codec_encode_identity_group(Group, Layout)
+     || Group <- Ordered
+    ],
+    {Directory, Payload} = fts2_codec_encode_identity_offsets(EncodedGroups),
+    <<?IDENTITY_PAGE_VERSION:8, FirstGroupId:32/unsigned-big,
+        (length(Ordered)):16/unsigned-big,
+        (byte_size(Dict)):32/unsigned-big, Dict/binary,
+        (byte_size(Directory)):32/unsigned-big, Directory/binary,
+        Payload/binary>>.
+
+fts2_codec_identity_layout(Groups) ->
+    case [Chunk || Group <- Groups, Chunk <- maps:get(chunks, Group)] of
+        [] ->
+            none;
+        [Chunk | _] ->
+            case {maps:get(candidate_record, Chunk), maps:get(hit_record, Chunk)} of
+                {
+                    #{'$fts_text_blocks' := _, '$fts_text_bytes' := _} = Candidate,
+                    #{doc_key := _, record := Record, text_blocks := _,
+                        text_bytes := _} = Hit
+                } when map_size(Hit) =:= 4, is_map(Record) ->
+                    CandKeys = lists:sort(
+                        maps:keys(Candidate) --
+                            ['$fts_text_blocks', '$fts_text_bytes']
+                    ),
+                    HitKeys = lists:sort(maps:keys(Record)),
+                    case CandKeys =/= [] andalso
+                        lists:all(fun is_atom/1, CandKeys) andalso
+                        lists:all(
+                            fun(Key) -> lists:member(Key, CandKeys) end,
+                            HitKeys
+                        ) andalso length(CandKeys) =< 16#FFFF
+                    of
+                        true -> {CandKeys, HitKeys};
+                        false -> none
+                    end;
+                _ ->
+                    none
+            end
+    end.
+
+fts2_codec_encode_identity_dict(none) ->
+    <<0:16/unsigned-big, 0:16/unsigned-big>>;
+fts2_codec_encode_identity_dict({CandKeys, HitKeys}) ->
+    Names = <<
+        <<(byte_size(Name)):16/unsigned-big, Name/binary>>
+     || Name <- [atom_to_binary(Key, utf8) || Key <- CandKeys]
+    >>,
+    Ordinals = <<
+        <<(fts2_codec_identity_ordinal(Key, CandKeys)):16/unsigned-big>>
+     || Key <- HitKeys
+    >>,
+    <<(length(CandKeys)):16/unsigned-big, Names/binary,
+        (length(HitKeys)):16/unsigned-big, Ordinals/binary>>.
+
+fts2_codec_decode_identity_dict(<<0:16/unsigned-big, 0:16/unsigned-big>>) ->
+    none;
+fts2_codec_decode_identity_dict(<<Count:16/unsigned-big, Rest0/binary>>) ->
+    {CandKeys, Rest1} = fts2_codec_decode_identity_names(Count, Rest0, []),
+    <<HitCount:16/unsigned-big, Ordinals:(HitCount * 2)/binary>> = Rest1,
+    Indexed = list_to_tuple(CandKeys),
+    HitKeys = [element(Ordinal + 1, Indexed) ||
+        <<Ordinal:16/unsigned-big>> <= Ordinals],
+    {CandKeys, HitKeys}.
+
+fts2_codec_decode_identity_names(0, Rest, Acc) ->
+    {lists:reverse(Acc), Rest};
+fts2_codec_decode_identity_names(
+    Count, <<Bytes:16/unsigned-big, Name:Bytes/binary, Rest/binary>>, Acc
+) when Count > 0 ->
+    fts2_codec_decode_identity_names(
+        Count - 1, Rest, [binary_to_existing_atom(Name, utf8) | Acc]
+    ).
+
+fts2_codec_identity_ordinal(Key, Keys) ->
+    fts2_codec_identity_ordinal(Key, Keys, 0).
+
+fts2_codec_identity_ordinal(Key, [Key | _Rest], Ordinal) ->
+    Ordinal;
+fts2_codec_identity_ordinal(Key, [_Other | Rest], Ordinal) ->
+    fts2_codec_identity_ordinal(Key, Rest, Ordinal + 1).
+
+fts2_codec_encode_identity_group(Group, Layout) ->
+    GroupKey = fts2_codec_encode_identity_value(maps:get(group_key, Group)),
+    Chunks = lists:sort(
+        fun(A, B) -> maps:get(chunk_id, A) < maps:get(chunk_id, B) end,
+        maps:get(chunks, Group)
+    ),
+    FirstChunkId = maps:get(chunk_id, hd(Chunks)),
+    true = [FirstChunkId + I || I <- lists:seq(0, length(Chunks) - 1)] =:=
+        [maps:get(chunk_id, Chunk) || Chunk <- Chunks],
+    EncodedChunks = [
+        fts2_codec_encode_identity_chunk(Chunk, Layout)
+     || Chunk <- Chunks
+    ],
+    {Directory, Payload} = fts2_codec_encode_identity_offsets(EncodedChunks),
+    <<(byte_size(GroupKey)):32/unsigned-big, GroupKey/binary,
+        FirstChunkId:32/unsigned-big, (length(Chunks)):16/unsigned-big,
+        (byte_size(Directory)):32/unsigned-big, Directory/binary,
+        Payload/binary>>.
+
+fts2_codec_encode_identity_chunk(Chunk, Layout) ->
+    DocKey = maps:get(doc_key, Chunk),
+    DocVersion = maps:get(doc_version, Chunk),
+    CandidateRecord = maps:get(candidate_record, Chunk),
+    HitRecord = maps:get(hit_record, Chunk),
+    case fts2_codec_identity_public_row(
+        Layout, DocKey, CandidateRecord, HitRecord
+    ) of
+        {ok, Blocks, TextBytes, Values} ->
+            TextDirectory = fts2_codec_encode_identity_text_directory(Blocks),
+            {ValueDirectory, ValuePayload} = fts2_codec_encode_identity_offsets(
+                [fts2_codec_encode_identity_value(Value) || Value <- Values]
+            ),
+            <<2, (maps:get(source_id, Chunk)):64/unsigned-big,
+                (maps:get(doc_length, Chunk)):32/unsigned-big,
+                (byte_size(DocKey)):32/unsigned-big, DocKey/binary,
+                (byte_size(DocVersion)):16/unsigned-big, DocVersion/binary,
+                TextBytes:32/unsigned-big, (length(Blocks)):16/unsigned-big,
+                TextDirectory/binary,
+                (byte_size(ValueDirectory)):32/unsigned-big,
+                ValueDirectory/binary, ValuePayload/binary>>;
+        no ->
+            Candidate = fts2_codec_encode_identity_value(CandidateRecord),
+            Hit = fts2_codec_encode_identity_value(HitRecord),
+            <<0, (maps:get(source_id, Chunk)):64/unsigned-big,
+                (maps:get(doc_length, Chunk)):32/unsigned-big,
+                (byte_size(DocKey)):32/unsigned-big, DocKey/binary,
+                (byte_size(DocVersion)):16/unsigned-big, DocVersion/binary,
+                (byte_size(Candidate)):32/unsigned-big, Candidate/binary,
+                (byte_size(Hit)):32/unsigned-big, Hit/binary>>
+    end.
+
+fts2_codec_identity_public_row(none, _DocKey, _Candidate, _Hit) ->
+    no;
+fts2_codec_identity_public_row(
+    {CandKeys, HitKeys}, DocKey,
+    #{'$fts_text_blocks' := Blocks, '$fts_text_bytes' := TextBytes} = Candidate,
+    #{doc_key := HitDocKey, record := Record, text_blocks := HitBlocks,
+        text_bytes := HitTextBytes} = Hit
+) when
+    map_size(Hit) =:= 4,
+    map_size(Candidate) =:= length(CandKeys) + 2,
+    map_size(Record) =:= length(HitKeys),
+    DocKey =:= HitDocKey,
+    Blocks =:= HitBlocks,
+    TextBytes =:= HitTextBytes,
+    is_integer(TextBytes),
+    is_list(Blocks),
+    length(Blocks) =< 16#FFFF
+->
+    case lists:all(fun(Key) -> maps:is_key(Key, Candidate) end, CandKeys) andalso
+        lists:all(
+            fun(Key) ->
+                maps:get(Key, Record, '$fts_absent') =:= maps:get(Key, Candidate)
+            end,
+            HitKeys
+        )
+    of
+        true ->
+            {ok, Blocks, TextBytes,
+                [maps:get(Key, Candidate) || Key <- CandKeys]};
+        false ->
+            no
+    end;
+fts2_codec_identity_public_row(_Layout, _DocKey, _Candidate, _Hit) ->
+    no.
+
+fts2_codec_encode_identity_offsets(Binaries) ->
+    {Offsets, Payload, FinalOffset} = lists:foldl(
+        fun(Binary, {OffsetAcc, PayloadAcc, Offset}) ->
+            {[<<Offset:32/unsigned-big>> | OffsetAcc],
+                [Binary | PayloadAcc], Offset + byte_size(Binary)}
+        end,
+        {[], [], 0},
+        Binaries
+    ),
+    {
+        iolist_to_binary(
+            lists:reverse([<<FinalOffset:32/unsigned-big>> | Offsets])
+        ),
+        iolist_to_binary(lists:reverse(Payload))
+    }.
+
+fts2_codec_identity_page_handle(
+    <<?IDENTITY_PAGE_VERSION:8, FirstGroupId:32/unsigned-big,
+        Count:16/unsigned-big, DictBytes:32/unsigned-big,
+        Dict:DictBytes/binary, DirectoryBytes:32/unsigned-big,
+        Directory:DirectoryBytes/binary, Payload/binary>>
+) when DirectoryBytes =:= (Count + 1) * 4 ->
+    {ipage, FirstGroupId, Count, Directory, Payload,
+        fts2_codec_decode_identity_dict(Dict)};
+fts2_codec_identity_page_handle(Bad) ->
+    erlang:error({invalid_fts2_identity_page, Bad}).
+
+fts2_codec_identity_page_layout({ipage, _First, _Count, _Dir, _Payload, Layout}) ->
+    Layout.
+
+fts2_codec_identity_page_ordinals({ipage, _F, _C, _D, _P, none}, _Names) ->
+    fallback;
+fts2_codec_identity_page_ordinals(
+    {ipage, _F, _C, _D, _P, {CandKeys, _HitKeys}}, Names
+) ->
+    case lists:all(fun(Name) -> lists:member(Name, CandKeys) end, Names) of
+        true -> [fts2_codec_identity_ordinal(Name, CandKeys) || Name <- Names];
+        false -> fallback
+    end.
+
+fts2_codec_decode_identity_page(Binary, Wanted) when is_list(Wanted) ->
+    Handle = fts2_codec_identity_page_handle(Binary),
+    lists:append([
+        fts2_codec_decode_identity_request(Request, Handle)
+     || Request <- Wanted
+    ]).
+
+fts2_codec_decode_identity_request(GroupId, Handle) when is_integer(GroupId) ->
+    fts2_codec_identity_group_slice(GroupId, Handle, all);
+fts2_codec_decode_identity_request({GroupId, ChunkId}, Handle) ->
+    fts2_codec_identity_group_slice(GroupId, Handle, {chunk, ChunkId});
+fts2_codec_decode_identity_request({serve, GroupId, ChunkId}, Handle) ->
+    fts2_codec_identity_group_slice(GroupId, Handle, {serve_chunk, ChunkId}).
+
+fts2_codec_identity_group_slice(
+    GroupId, {ipage, FirstGroupId, Count, Directory, Payload, Layout}, Wanted
+) ->
+    case GroupId - FirstGroupId of
+        Ordinal when Ordinal >= 0, Ordinal < Count ->
+            Group = fts2_codec_identity_slice(Ordinal, Directory, Payload),
+            fts2_codec_decode_identity_group(GroupId, Group, Wanted, Layout);
+        _ ->
+            []
+    end.
+
+fts2_codec_identity_page_row(Handle, GroupId, ChunkId) ->
+    case fts2_codec_identity_group_slice(
+        GroupId, Handle, {serve_chunk, ChunkId}
+    ) of
+        [Row] -> Row;
+        [] -> undefined
+    end.
+
+fts2_codec_identity_page_project(Handle, GroupId, ChunkId, Ordinals) ->
+    case fts2_codec_identity_chunk_slice(Handle, GroupId, ChunkId) of
+        undefined ->
+            undefined;
+        <<2, _SourceId:64/unsigned-big, _DocLength:32/unsigned-big,
+            DocKeyBytes:32/unsigned-big, DocKey:DocKeyBytes/binary,
+            VersionBytes:16/unsigned-big, _DocVersion:VersionBytes/binary,
+            _TextBytes:32/unsigned-big, BlockCount:16/unsigned-big,
+            _TextDirectory:(BlockCount * 12)/binary,
+            ValueDirectoryBytes:32/unsigned-big,
+            ValueDirectory:ValueDirectoryBytes/binary,
+            ValuePayload/binary>> ->
+            {ok, DocKey, [
+                begin
+                    {Value, <<>>} = fts2_codec_decode_identity_value(
+                        fts2_codec_identity_slice(
+                            Ordinal, ValueDirectory, ValuePayload
+                        )
+                    ),
+                    Value
+                end
+             || Ordinal <- Ordinals
+            ]};
+        Slice ->
+            Row = fts2_codec_decode_identity_chunk(
+                GroupId, undefined, ChunkId, Slice,
+                fts2_codec_identity_page_layout(Handle)
+            ),
+            {fallback, element(5, Row), element(8, Row)}
+    end.
+
+fts2_codec_identity_chunk_slice(
+    {ipage, FirstGroupId, Count, Directory, Payload, _Layout}, GroupId, ChunkId
+) ->
+    case GroupId - FirstGroupId of
+        GroupOrdinal when GroupOrdinal >= 0, GroupOrdinal < Count ->
+            <<_GroupKeyBytes:32/unsigned-big, _GroupKey:_GroupKeyBytes/binary,
+                FirstChunkId:32/unsigned-big, ChunkCount:16/unsigned-big,
+                ChunkDirectoryBytes:32/unsigned-big,
+                ChunkDirectory:ChunkDirectoryBytes/binary,
+                ChunkPayload/binary>> =
+                fts2_codec_identity_slice(GroupOrdinal, Directory, Payload),
+            case ChunkId - FirstChunkId of
+                ChunkOrdinal when ChunkOrdinal >= 0, ChunkOrdinal < ChunkCount ->
+                    fts2_codec_identity_slice(
+                        ChunkOrdinal, ChunkDirectory, ChunkPayload
+                    );
+                _ ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+fts2_codec_decode_identity_group(
+    GroupId,
+    <<GroupKeyBytes:32/unsigned-big, GroupKeyEncoded:GroupKeyBytes/binary,
+        FirstChunkId:32/unsigned-big, Count:16/unsigned-big,
+        DirectoryBytes:32/unsigned-big, Directory:DirectoryBytes/binary,
+        Payload/binary>>,
+    Wanted,
+    Layout
+) when DirectoryBytes =:= (Count + 1) * 4 ->
+    GroupKey = case Wanted of
+        {serve_chunk, _ChunkId} -> undefined;
+        _ ->
+            {DecodedGroupKey, <<>>} = fts2_codec_decode_identity_value(
+                GroupKeyEncoded
+            ),
+            DecodedGroupKey
+    end,
+    Ordinals = case Wanted of
+        all -> lists:seq(0, Count - 1);
+        {chunk, ChunkId} -> [ChunkId - FirstChunkId];
+        {serve_chunk, ChunkId} -> [ChunkId - FirstChunkId]
+    end,
+    [
+        fts2_codec_decode_identity_chunk(
+            GroupId, GroupKey, FirstChunkId + Ordinal,
+            fts2_codec_identity_slice(Ordinal, Directory, Payload), Layout
+        )
+     || Ordinal <- Ordinals, Ordinal >= 0, Ordinal < Count
+    ];
+fts2_codec_decode_identity_group(_GroupId, Bad, _Wanted, _Layout) ->
+    erlang:error({invalid_fts2_identity_group, Bad}).
+
+fts2_codec_decode_identity_chunk(
+    GroupId, GroupKey, ChunkId,
+    <<2, SourceId:64/unsigned-big, DocLength:32/unsigned-big,
+        DocKeyBytes:32/unsigned-big, DocKey:DocKeyBytes/binary,
+        VersionBytes:16/unsigned-big, DocVersion:VersionBytes/binary,
+        TextBytes:32/unsigned-big, BlockCount:16/unsigned-big,
+        TextDirectory:(BlockCount * 12)/binary,
+        ValueDirectoryBytes:32/unsigned-big,
+        _ValueDirectory:ValueDirectoryBytes/binary, ValuePayload/binary>>,
+    {CandKeys, HitKeys}
+) ->
+    Blocks = fts2_codec_decode_identity_text_directory(TextDirectory),
+    Base = maps:from_list(lists:zip(
+        CandKeys,
+        fts2_codec_decode_identity_values(length(CandKeys), ValuePayload, [])
+    )),
+    Candidate = Base#{
+        '$fts_text_blocks' => Blocks, '$fts_text_bytes' => TextBytes
+    },
+    Record = case HitKeys =:= CandKeys of
+        true -> Base;
+        false -> maps:with(HitKeys, Base)
+    end,
+    Hit = #{
+        doc_key => DocKey, record => Record,
+        text_blocks => Blocks, text_bytes => TextBytes
+    },
+    {GroupId, GroupKey, ChunkId, SourceId, DocKey, DocVersion, DocLength,
+        Candidate, Hit};
+fts2_codec_decode_identity_chunk(
+    GroupId, GroupKey, ChunkId,
+    <<0, SourceId:64/unsigned-big, DocLength:32/unsigned-big,
+        DocKeyBytes:32/unsigned-big, DocKey:DocKeyBytes/binary,
+        VersionBytes:16/unsigned-big, DocVersion:VersionBytes/binary,
+        CandidateBytes:32/unsigned-big, CandidateEncoded:CandidateBytes/binary,
+        HitBytes:32/unsigned-big, HitEncoded:HitBytes/binary>>,
+    _Layout
+) ->
+    {Candidate, <<>>} = fts2_codec_decode_identity_value(CandidateEncoded),
+    {Hit, <<>>} = fts2_codec_decode_identity_value(HitEncoded),
+    {GroupId, GroupKey, ChunkId, SourceId, DocKey, DocVersion, DocLength,
+        Candidate, Hit};
+fts2_codec_decode_identity_chunk(_GroupId, _GroupKey, _ChunkId, Bad, _Layout) ->
+    erlang:error({invalid_fts2_identity_chunk, Bad}).
+
+fts2_codec_decode_identity_values(0, _Rest, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_identity_values(Count, Encoded, Acc) when Count > 0 ->
+    {Value, Rest} = fts2_codec_decode_identity_value(Encoded),
+    fts2_codec_decode_identity_values(Count - 1, Rest, [Value | Acc]).
+
+fts2_codec_identity_slice(Ordinal, Directory, Payload) ->
+    <<Start:32/unsigned-big, Finish:32/unsigned-big>> =
+        binary:part(Directory, Ordinal * 4, 8),
+    binary:part(Payload, Start, Finish - Start).
+
+fts2_codec_encode_identity_value(Binary) when is_binary(Binary) ->
+    <<1, (byte_size(Binary)):32/unsigned-big, Binary/binary>>;
+fts2_codec_encode_identity_value(Integer) when is_integer(Integer) ->
+    Sign = case Integer < 0 of true -> 1; false -> 0 end,
+    Magnitude = binary:encode_unsigned(abs(Integer)),
+    <<2, Sign:8, (byte_size(Magnitude)):16/unsigned-big, Magnitude/binary>>;
+fts2_codec_encode_identity_value(Float) when is_float(Float) ->
+    <<3, Float:64/float>>;
+fts2_codec_encode_identity_value(Atom) when is_atom(Atom) ->
+    Name = atom_to_binary(Atom, utf8),
+    <<4, (byte_size(Name)):16/unsigned-big, Name/binary>>;
+fts2_codec_encode_identity_value(List) when is_list(List) ->
+    Encoded = [fts2_codec_encode_identity_framed(Item) || Item <- List],
+    <<5, (length(List)):32/unsigned-big, (iolist_to_binary(Encoded))/binary>>;
+fts2_codec_encode_identity_value(Tuple) when is_tuple(Tuple) ->
+    Items = tuple_to_list(Tuple),
+    Encoded = [fts2_codec_encode_identity_framed(Item) || Item <- Items],
+    <<6, (length(Items)):16/unsigned-big, (iolist_to_binary(Encoded))/binary>>;
+fts2_codec_encode_identity_value(#{
+    '$fts_text_blocks' := Blocks,
+    '$fts_text_bytes' := TextBytes,
+    udi := Udi,
+    content_version := Version
+} = Map) when
+    map_size(Map) =:= 4,
+    is_binary(Udi),
+    is_integer(Version),
+    is_integer(TextBytes),
+    is_list(Blocks),
+    length(Blocks) =< 16#FFFF
+->
+    Directory = fts2_codec_encode_identity_text_directory(Blocks),
+    <<8, (byte_size(Udi)):32/unsigned-big, Udi/binary,
+        Version:64/signed-big, TextBytes:32/unsigned-big,
+        (length(Blocks)):16/unsigned-big, Directory/binary>>;
+fts2_codec_encode_identity_value(#{
+    doc_key := DocKey,
+    record := #{udi := Udi} = Record,
+    text_blocks := Blocks,
+    text_bytes := TextBytes
+} = Map) when
+    map_size(Map) =:= 4,
+    map_size(Record) =:= 1,
+    is_binary(DocKey),
+    is_binary(Udi),
+    is_integer(TextBytes),
+    is_list(Blocks),
+    length(Blocks) =< 16#FFFF
+->
+    Directory = fts2_codec_encode_identity_text_directory(Blocks),
+    <<9, (byte_size(DocKey)):32/unsigned-big, DocKey/binary,
+        (byte_size(Udi)):32/unsigned-big, Udi/binary,
+        TextBytes:32/unsigned-big, (length(Blocks)):16/unsigned-big,
+        Directory/binary>>;
+fts2_codec_encode_identity_value(Map) when is_map(Map) ->
+    Pairs = lists:sort(maps:to_list(Map)),
+    Encoded = [
+        [fts2_codec_encode_identity_framed(Key), fts2_codec_encode_identity_framed(Value)]
+     || {Key, Value} <- Pairs
+    ],
+    <<7, (length(Pairs)):32/unsigned-big, (iolist_to_binary(Encoded))/binary>>;
+fts2_codec_encode_identity_value(Value) ->
+    erlang:error({unsupported_fts2_identity_value, Value}).
+
+fts2_codec_encode_identity_framed(Value) ->
+    Encoded = fts2_codec_encode_identity_value(Value),
+    <<(byte_size(Encoded)):32/unsigned-big, Encoded/binary>>.
+
+fts2_codec_decode_identity_value(<<1, Bytes:32/unsigned-big, Value:Bytes/binary,
+    Rest/binary>>) ->
+    {Value, Rest};
+fts2_codec_decode_identity_value(<<2, Sign:8, Bytes:16/unsigned-big,
+    Magnitude:Bytes/binary, Rest/binary>>) ->
+    Unsigned = binary:decode_unsigned(Magnitude),
+    {case Sign of 0 -> Unsigned; 1 -> -Unsigned end, Rest};
+fts2_codec_decode_identity_value(<<3, Value:64/float, Rest/binary>>) ->
+    {Value, Rest};
+fts2_codec_decode_identity_value(<<4, Bytes:16/unsigned-big, Name:Bytes/binary,
+    Rest/binary>>) ->
+    {binary_to_existing_atom(Name, utf8), Rest};
+fts2_codec_decode_identity_value(<<5, Count:32/unsigned-big, Rest/binary>>) ->
+    fts2_codec_decode_identity_sequence(Count, Rest, [], list);
+fts2_codec_decode_identity_value(<<6, Count:16/unsigned-big, Rest/binary>>) ->
+    fts2_codec_decode_identity_sequence(Count, Rest, [], tuple);
+fts2_codec_decode_identity_value(<<7, Count:32/unsigned-big, Rest/binary>>) ->
+    fts2_codec_decode_identity_pairs(Count, Rest, #{});
+fts2_codec_decode_identity_value(<<8, UdiBytes:32/unsigned-big,
+    Udi:UdiBytes/binary, Version:64/signed-big, TextBytes:32/unsigned-big,
+    Count:16/unsigned-big, Directory:(Count * 12)/binary, Rest/binary>>) ->
+    {#{
+        '$fts_text_blocks' => fts2_codec_decode_identity_text_directory(
+            Directory
+        ),
+        '$fts_text_bytes' => TextBytes,
+        udi => Udi,
+        content_version => Version
+    }, Rest};
+fts2_codec_decode_identity_value(<<9, DocKeyBytes:32/unsigned-big,
+    DocKey:DocKeyBytes/binary, UdiBytes:32/unsigned-big,
+    Udi:UdiBytes/binary, TextBytes:32/unsigned-big,
+    Count:16/unsigned-big, Directory:(Count * 12)/binary, Rest/binary>>) ->
+    {#{
+        doc_key => DocKey,
+        record => #{udi => Udi},
+        text_blocks => fts2_codec_decode_identity_text_directory(Directory),
+        text_bytes => TextBytes
+    }, Rest};
+fts2_codec_decode_identity_value(Bad) ->
+    erlang:error({invalid_fts2_identity_value, Bad}).
+
+fts2_codec_decode_identity_sequence(0, Rest, Acc, list) ->
+    {lists:reverse(Acc), Rest};
+fts2_codec_decode_identity_sequence(0, Rest, Acc, tuple) ->
+    {list_to_tuple(lists:reverse(Acc)), Rest};
+fts2_codec_decode_identity_sequence(Count, <<Bytes:32/unsigned-big,
+    Encoded:Bytes/binary, Rest/binary>>, Acc, Type) when Count > 0 ->
+    {Value, <<>>} = fts2_codec_decode_identity_value(Encoded),
+    fts2_codec_decode_identity_sequence(Count - 1, Rest, [Value | Acc], Type).
+
+fts2_codec_decode_identity_pairs(0, Rest, Acc) ->
+    {Acc, Rest};
+fts2_codec_decode_identity_pairs(Count, <<KeyBytes:32/unsigned-big,
+    KeyEncoded:KeyBytes/binary, ValueBytes:32/unsigned-big,
+    ValueEncoded:ValueBytes/binary, Rest/binary>>, Acc) when Count > 0 ->
+    {Key, <<>>} = fts2_codec_decode_identity_value(KeyEncoded),
+    {Value, <<>>} = fts2_codec_decode_identity_value(ValueEncoded),
+    fts2_codec_decode_identity_pairs(Count - 1, Rest, Acc#{Key => Value}).
+
+fts2_codec_encode_identity_text_directory(Blocks) ->
+    <<
+        <<BlockNo:32/unsigned-big, Ordinal:32/unsigned-big,
+            Offset:32/unsigned-big>>
+     || {BlockNo, Ordinal, Offset} <- Blocks
+    >>.
+
+fts2_codec_decode_identity_text_directory(Directory) ->
+    [
+        {BlockNo, Ordinal, Offset}
+     || <<BlockNo:32/unsigned-big, Ordinal:32/unsigned-big,
+            Offset:32/unsigned-big>> <= Directory
+    ].
+
+fts2_codec_encode_varint(Value) when Value < 128 ->
+    <<Value>>;
+fts2_codec_encode_varint(Value) ->
+    <<((Value band 127) bor 128), (fts2_codec_encode_varint(Value bsr 7))/binary>>.
+
+fts2_codec_decode_varint(<<Byte, Rest/binary>>, Shift, Acc) when Shift =< 63 ->
+    Value = Acc bor ((Byte band 127) bsl Shift),
+    case Byte band 128 of
+        0 -> {Value, Rest};
+        _ -> fts2_codec_decode_varint(Rest, Shift + 7, Value)
+    end;
+fts2_codec_decode_varint(Bad, _Shift, _Acc) ->
+    erlang:error({invalid_fts2_varint, Bad}).
+
+fts2_codec_type_id(header) -> 1;
+fts2_codec_type_id(delta) -> 5;
+fts2_codec_type_id(bigram_bundle) -> 6.
+
+fts2_codec_root_wire_atoms() ->
+    [
+        version,
+        generation,
+        fingerprint,
+        chunk_bits,
+        group_count,
+        chunk_count,
+        term_count,
+        bigram_count,
+        identity_page_count,
+        identity_page_shift,
+        total_length,
+        phrase_strategy,
+        previous_generation,
+        facet_domain,
+        position_order,
+        chunk,
+        uniform,
+        mixed,
+        bigram,
+        skip,
+        undefined
+    ].
+
+fts2_codec_row_wire_atoms() ->
+    [
+        group_df,
+        chunk_df,
+        collection_frequency,
+        champions,
+        entries,
+        positions,
+        group_id,
+        group_key,
+        group_version,
+        chunks,
+        chunk_id,
+        source_id,
+        doc_key,
+        doc_version,
+        doc_length,
+        base_length,
+        candidate_record,
+        hit_record,
+        status,
+        retired_ids,
+        posting,
+        live,
+        remove
+    ].
+
+
+%% ===========================================================================
+%% INTERNAL FTS-2 DELTA
+%% ===========================================================================
+
+%% Exact doc-major FTS2 delta reader/evaluator.
+
+fts2_delta_read(Bookie, #{index := Bucket}) ->
+    fts2_delta_read(Bookie, #{index => Bucket}, undefined).
+
+fts2_delta_read(Bookie, #{index := Bucket}, Hook) ->
+    Fold = fun
+        (B, {<<"f2:d">>, <<SourceId:64/unsigned-big>>}, Value, Acc) when
+            B =:= Bucket
+        ->
+            [{SourceId, fts2_codec_decode(delta, Value)} | Acc];
+        (_B, _Key, _Value, Acc) ->
+            Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {
+            {<<"f2:d">>, <<>>},
+            {<<"f2:d">>, <<16#FFFFFFFFFFFFFFFF:64/unsigned-big>>}
+        }},
+        {Fold, []},
+        false,
+        true,
+        false
+    ),
+    Deltas = lists:reverse(Runner()),
+    case Hook of
+        undefined -> ok;
+        Fun when is_function(Fun, 1) -> Fun({fts2, Deltas});
+        Fun when is_function(Fun, 0) -> Fun()
+    end,
+    Deltas.
+
+fts2_delta_read_for_search(Bookie, #{index := Bucket} = Schema, AST, Hook) ->
+    case leveled_bookie:book_headonly_many(
+        Bookie,
+        Bucket,
+        [{<<"f2:p">>, <<"ready">>}, {<<"f2:p">>, <<"mutated">>}]
+    ) of
+        [{ok, _Ready}, not_found] ->
+            Tokens = lists:usort(fts2_delta_presence_tokens(AST)),
+            Results = leveled_bookie:book_headonly_many(
+                Bookie,
+                Bucket,
+                [
+                    {<<"f2:p">>, <<(erlang:crc32(Token) band 16#FFFF):16/unsigned-big>>}
+                 || Token <- Tokens
+                ]
+            ),
+            Present = maps:from_list([
+                {Token, Result =/= not_found}
+             || {Token, Result} <- lists:zip(Tokens, Results)
+            ]),
+            case fts2_delta_presence_possible(AST, Present) of
+                true -> fts2_delta_read(Bookie, Schema, Hook);
+                false ->
+                    fts2_delta_presence_hook(Hook, []),
+                    []
+            end;
+        _LegacyOrMutatedTail ->
+            %% A tail created before presence markers were introduced cannot
+            %% be skipped safely.  Updates/removals also need the full overlay
+            %% to suppress retired immutable matches.
+            fts2_delta_read(Bookie, Schema, Hook)
+    end.
+
+fts2_delta_presence_tokens({term, Token, false, _Columns}) -> [Token];
+fts2_delta_presence_tokens({term, _Token, true, _Columns}) -> [];
+fts2_delta_presence_tokens({phrase, Specs, _Columns}) ->
+    [Token || {Token, false, _Offset} <- Specs];
+fts2_delta_presence_tokens({near, Items, _Distance, _Columns}) ->
+    lists:append([fts2_delta_presence_tokens(Item) || Item <- Items]);
+fts2_delta_presence_tokens({anchor, Child}) ->
+    fts2_delta_presence_tokens(Child);
+fts2_delta_presence_tokens({_Op, A, B}) ->
+    fts2_delta_presence_tokens(A) ++ fts2_delta_presence_tokens(B);
+fts2_delta_presence_tokens(_Other) -> [].
+
+fts2_delta_presence_possible({empty}, _Present) -> false;
+fts2_delta_presence_possible({all_docs}, _Present) -> true;
+fts2_delta_presence_possible({term, Token, false, _Columns}, Present) ->
+    maps:get(Token, Present, false);
+fts2_delta_presence_possible({term, _Token, true, _Columns}, _Present) ->
+    true;
+fts2_delta_presence_possible({phrase, Specs, _Columns}, Present) ->
+    lists:all(
+        fun
+            ({Token, false, _Offset}) -> maps:get(Token, Present, false);
+            ({_Prefix, true, _Offset}) -> true
+        end,
+        Specs
+    );
+fts2_delta_presence_possible({near, Items, _Distance, _Columns}, Present) ->
+    lists:all(
+        fun(Item) -> fts2_delta_presence_possible(Item, Present) end,
+        Items
+    );
+fts2_delta_presence_possible({anchor, Child}, Present) ->
+    fts2_delta_presence_possible(Child, Present);
+fts2_delta_presence_possible({'and', A, B}, Present) ->
+    fts2_delta_presence_possible(A, Present) andalso
+        fts2_delta_presence_possible(B, Present);
+fts2_delta_presence_possible({'or', A, B}, Present) ->
+    fts2_delta_presence_possible(A, Present) orelse
+        fts2_delta_presence_possible(B, Present);
+fts2_delta_presence_possible({'not', A, _B}, Present) ->
+    fts2_delta_presence_possible(A, Present);
+fts2_delta_presence_possible(_Other, _Present) -> true.
+
+fts2_delta_presence_hook(undefined, _Deltas) -> ok;
+fts2_delta_presence_hook(Fun, Deltas) when is_function(Fun, 1) ->
+    Fun({fts2, Deltas});
+fts2_delta_presence_hook(Fun, _Deltas) when is_function(Fun, 0) ->
+    Fun().
+
+fts2_delta_affected_sources(Deltas) ->
+    maps:from_list([
+        {SourceId, true}
+     || {_RowId, Delta} <- Deltas,
+        SourceId <- [maps:get(source_id, Delta) | maps:get(retired_ids, Delta, [])]
+    ]).
+
+fts2_delta_live_documents(Deltas) ->
+    fts2_delta_overlay_documents(#{}, Deltas).
+
+fts2_delta_overlay_documents(Documents, Deltas) ->
+    lists:foldl(
+        fun({_RowId, Delta}, Acc) ->
+            WithoutRetired = maps:without(maps:get(retired_ids, Delta, []), Acc),
+            SourceId = maps:get(source_id, Delta),
+            case maps:get(status, Delta) of
+                live -> WithoutRetired#{SourceId => Delta};
+                remove -> maps:remove(SourceId, WithoutRetired)
+            end
+        end,
+        Documents,
+        Deltas
+    ).
+
+fts2_delta_evaluate(Deltas, Schema, AST) ->
+    Documents = fts2_delta_live_documents(Deltas),
+    Dfs = fts2_delta_delta_dfs(Documents, Schema, AST),
+    maps:fold(
+        fun(SourceId, Document, Acc) ->
+            Posting = maps:get(posting, Document, #{}),
+            case fts2_delta_eval(AST, Posting, Schema) of
+                false ->
+                    Acc;
+                {true, Positions, TermTfs, Terms} ->
+                    Candidate = maps:get(candidate_record, Document),
+                    GroupFields = maps:get(candidate_group_fields, Schema, []),
+                    VersionField = maps:get(
+                        candidate_version_field, Schema, undefined
+                    ),
+                    LogicalGroup = case GroupFields of
+                        [] -> {source, SourceId};
+                        _ -> {group, [
+                            maps:get(Field, Candidate, undefined)
+                         || Field <- GroupFields
+                        ]}
+                    end,
+                    GroupVersion = case VersionField of
+                        undefined -> 0;
+                        _ -> maps:get(VersionField, Candidate, 0)
+                    end,
+                    Acc#{{delta, SourceId} => #fts2_match{
+                        chunk_id = {delta, SourceId},
+                        source_id = SourceId,
+                        doc_length = maps:get(doc_length, Document),
+                        tf = lists:sum(maps:values(TermTfs)),
+                        term_stats = [
+                            {Term, Tf, delta, maps:get(Term, Dfs, 0)}
+                         || {Term, Tf} <- maps:to_list(TermTfs)
+                        ],
+                        terms = Terms,
+                        match_positions = maps:to_list(Positions),
+                        match_count = fts2_delta_position_count(Positions),
+                        logical_group = LogicalGroup,
+                        group_version = GroupVersion,
+                        delta_document = Document
+                    }}
+            end
+        end,
+        #{},
+        Documents
+    ).
+
+fts2_delta_delta_dfs(Documents, Schema, AST) ->
+    Terms = lists:usort(fts2_delta_ast_terms(AST, Schema)),
+    maps:from_list([
+        {Term, length([
+            ok
+         || Document <- maps:values(Documents),
+            fts2_delta_term_tf(Term, maps:get(posting, Document, #{})) > 0
+        ])}
+     || Term <- Terms
+    ]).
+
+fts2_delta_ast_terms({term, Token, Prefix, Columns}, Schema) ->
+    [
+        {Column, Token, Prefix}
+     || Column <- fts2_delta_selector_ids(Columns, Schema)
+    ];
+fts2_delta_ast_terms({phrase, Specs, Columns}, Schema) ->
+    lists:append([
+        [{Column, Token, Prefix} || {Token, Prefix, _Offset} <- Specs]
+     || Column <- fts2_delta_selector_ids(Columns, Schema)
+    ]);
+fts2_delta_ast_terms({near, Items, _Distance, _Columns}, Schema) ->
+    lists:append([fts2_delta_ast_terms(Item, Schema) || Item <- Items]);
+fts2_delta_ast_terms({anchor, Child}, Schema) -> fts2_delta_ast_terms(Child, Schema);
+fts2_delta_ast_terms({_Op, A, B}, Schema) -> fts2_delta_ast_terms(A, Schema) ++ fts2_delta_ast_terms(B, Schema);
+fts2_delta_ast_terms(_Other, _Schema) -> [].
+
+fts2_delta_term_tf({Column, Token, false}, Posting) ->
+    case maps:find(Token, maps:get(Column, Posting, #{})) of
+        {ok, Entry} -> maps:get(count, Entry);
+        error -> 0
+    end;
+fts2_delta_term_tf({Column, Prefix, true}, Posting) ->
+    lists:sum([
+        maps:get(count, Entry)
+     || {Token, Entry} <- maps:to_list(maps:get(Column, Posting, #{})),
+        fts2_delta_binary_prefix(Token, Prefix)
+    ]).
+
+fts2_delta_eval({empty}, _Posting, _Schema) -> false;
+fts2_delta_eval({all_docs}, _Posting, _Schema) -> {true, #{}, #{}, []};
+fts2_delta_eval({term, Token, Prefix, Columns}, Posting, Schema) ->
+    Matches = lists:append([
+        [
+            {{Column, Actual, false}, Actual, maps:get(positions, Entry)}
+         || {Actual, Entry} <- maps:to_list(maps:get(Column, Posting, #{})),
+            fts2_delta_token_matches(Actual, Token, Prefix)
+        ]
+     || Column <- fts2_delta_selector_ids(Columns, Schema)
+    ]),
+    case Matches of
+        [] -> false;
+        _ ->
+            TermTfs = maps:from_list([
+                {Term, length(Positions)}
+             || {Term, _Actual, Positions} <- Matches
+            ]),
+            Positions = lists:append([Ps || {_Term, _Actual, Ps} <- Matches]),
+            {true, #{Token => Positions}, TermTfs,
+                lists:usort([Actual || {_Term, Actual, _Ps} <- Matches])}
+    end;
+fts2_delta_eval({phrase, Specs, Columns}, Posting, Schema) ->
+    Starts = lists:append([
+        fts2_delta_phrase_starts(Posting, Column, Specs)
+     || Column <- fts2_delta_selector_ids(Columns, Schema)
+    ]),
+    case Starts of
+        [] -> false;
+        _ ->
+            Terms = fts2_delta_phrase_term_tfs(Posting, Schema, Specs, Columns),
+            {true, #{phrase => Starts}, Terms,
+                [Token || {Token, _Prefix, _Offset} <- Specs]}
+    end;
+fts2_delta_eval({near, Items, Distance, Columns}, Posting, Schema) ->
+    Starts = lists:append([
+        fts2_delta_near_positions(
+            [fts2_delta_item_spans(Posting, Schema, Column, Item) || Item <- Items],
+            Distance
+        )
+     || Column <- fts2_delta_selector_ids(Columns, Schema)
+    ]),
+    case Starts of
+        [] -> false;
+        _ ->
+            Tfs = maps:from_list([
+                {Term, fts2_delta_term_tf(Term, Posting)}
+             || Term <- fts2_delta_ast_terms({near, Items, Distance, Columns}, Schema)
+            ]),
+            {true, #{near => Starts}, Tfs,
+                lists:usort([Token || {_Column, Token, _Prefix} <- maps:keys(Tfs)])}
+    end;
+fts2_delta_eval({anchor, Child}, Posting, Schema) ->
+    case fts2_delta_eval(Child, Posting, Schema) of
+        {true, Positions, Tfs, Terms} ->
+            case lists:member(0, fts2_delta_flatten_positions(Positions)) of
+                true -> {true, Positions, Tfs, Terms};
+                false -> false
+            end;
+        false -> false
+    end;
+fts2_delta_eval({'and', A, B}, Posting, Schema) ->
+    case {fts2_delta_eval(A, Posting, Schema), fts2_delta_eval(B, Posting, Schema)} of
+        {{true, PA, TA, TermsA}, {true, PB, TB, TermsB}} ->
+            {true, maps:merge(PA, PB), maps:merge(TA, TB),
+                lists:usort(TermsA ++ TermsB)};
+        _ -> false
+    end;
+fts2_delta_eval({'or', A, B}, Posting, Schema) ->
+    case {fts2_delta_eval(A, Posting, Schema), fts2_delta_eval(B, Posting, Schema)} of
+        {{true, PA, TA, TermsA}, {true, PB, TB, TermsB}} ->
+            {true, maps:merge(PA, PB), maps:merge(TA, TB),
+                lists:usort(TermsA ++ TermsB)};
+        {{true, PA, TA, TermsA}, false} -> {true, PA, TA, TermsA};
+        {false, {true, PB, TB, TermsB}} -> {true, PB, TB, TermsB};
+        _ -> false
+    end;
+fts2_delta_eval({'not', A, B}, Posting, Schema) ->
+    case {fts2_delta_eval(A, Posting, Schema), fts2_delta_eval(B, Posting, Schema)} of
+        {{true, PA, TA, TermsA}, false} -> {true, PA, TA, TermsA};
+        _ -> false
+    end.
+
+fts2_delta_phrase_term_tfs(Posting, Schema, Specs, Columns) ->
+    maps:from_list([
+        begin
+            Term = {Column, Token, Prefix},
+            {Term, fts2_delta_term_tf(Term, Posting)}
+        end
+     || Column <- fts2_delta_selector_ids(Columns, Schema),
+        {Token, Prefix, _Offset} <- Specs
+    ]).
+
+fts2_delta_phrase_starts(_Posting, _Column, []) -> [];
+fts2_delta_phrase_starts(Posting, Column, [{First, FirstPrefix, FirstOffset} | Rest]) ->
+    FirstPositions = fts2_delta_token_positions(Posting, Column, First, FirstPrefix),
+    [
+        Position - FirstOffset
+     || Position <- FirstPositions,
+        fts2_delta_phrase_rest(Posting, Column, Rest, Position - FirstOffset)
+    ].
+
+fts2_delta_phrase_rest(_Posting, _Column, [], _Start) -> true;
+fts2_delta_phrase_rest(Posting, Column, [{Token, Prefix, Offset} | Rest], Start) ->
+    lists:member(Start + Offset, fts2_delta_token_positions(Posting, Column, Token, Prefix))
+        andalso fts2_delta_phrase_rest(Posting, Column, Rest, Start).
+
+fts2_delta_item_spans(Posting, _Schema, Column, {term, Token, Prefix, _Columns}) ->
+    [{P, P} || P <- fts2_delta_token_positions(Posting, Column, Token, Prefix)];
+fts2_delta_item_spans(Posting, _Schema, Column, {phrase, Specs, _Columns}) ->
+    Starts = fts2_delta_phrase_starts(Posting, Column, Specs),
+    Last = lists:max([Offset || {_Token, _Prefix, Offset} <- Specs]),
+    [{Start, Start + Last} || Start <- Starts];
+fts2_delta_item_spans(Posting, Schema, Column, {anchor, Item}) ->
+    [Span || {Start, _End} = Span <- fts2_delta_item_spans(Posting, Schema, Column, Item),
+        Start =:= 0];
+fts2_delta_item_spans(_Posting, _Schema, _Column, _Item) -> [].
+
+fts2_delta_near_positions([], _Distance) -> [];
+fts2_delta_near_positions([[] | _], _Distance) -> [];
+fts2_delta_near_positions([First | Rest], Distance) ->
+    [
+        Start
+     || {Start, _End} = Span <- First,
+        fts2_delta_near_match([Span], Rest, Distance)
+    ].
+
+fts2_delta_near_match(_Chosen, [], _Distance) -> true;
+fts2_delta_near_match(Chosen, [Spans | Rest], Distance) ->
+    lists:any(
+        fun(Span) ->
+            lists:all(fun(Other) -> fts2_delta_span_distance(Span, Other) =< Distance end,
+                Chosen) andalso fts2_delta_near_match([Span | Chosen], Rest, Distance)
+        end,
+        Spans
+    ).
+
+fts2_delta_span_distance({_SA, EA}, {SB, _EB}) when EA < SB -> SB - EA - 1;
+fts2_delta_span_distance({SA, _EA}, {_SB, EB}) when EB < SA -> SA - EB - 1;
+fts2_delta_span_distance(_A, _B) -> 0.
+
+fts2_delta_token_positions(Posting, Column, Token, false) ->
+    case maps:find(Token, maps:get(Column, Posting, #{})) of
+        {ok, Entry} -> maps:get(positions, Entry);
+        error -> []
+    end;
+fts2_delta_token_positions(Posting, Column, Prefix, true) ->
+    lists:append([
+        maps:get(positions, Entry)
+     || {Token, Entry} <- maps:to_list(maps:get(Column, Posting, #{})),
+        fts2_delta_binary_prefix(Token, Prefix)
+    ]).
+
+fts2_delta_token_matches(Actual, Token, false) -> Actual =:= Token;
+fts2_delta_token_matches(Actual, Prefix, true) -> fts2_delta_binary_prefix(Actual, Prefix).
+
+fts2_delta_binary_prefix(Binary, Prefix) when byte_size(Binary) >= byte_size(Prefix) ->
+    binary:part(Binary, 0, byte_size(Prefix)) =:= Prefix;
+fts2_delta_binary_prefix(_Binary, _Prefix) -> false.
+
+fts2_delta_selector_ids(all, Schema) -> lists:seq(0, length(maps:get(columns, Schema)) - 1);
+fts2_delta_selector_ids({not_columns, Excluded}, Schema) ->
+    fts2_delta_selector_ids([C || C <- maps:get(columns, Schema), not lists:member(C, Excluded)],
+        Schema);
+fts2_delta_selector_ids(Columns, Schema) ->
+    Names = maps:get(columns, Schema),
+    [Index || {Name, Index} <- lists:zip(Names, lists:seq(0, length(Names) - 1)),
+        lists:member(Name, Columns)].
+
+fts2_delta_position_count(Value) when is_map(Value) ->
+    lists:sum([fts2_delta_position_count(V) || V <- maps:values(Value)]);
+fts2_delta_position_count(Value) when is_list(Value) -> length(Value);
+fts2_delta_position_count(_Value) -> 0.
+
+fts2_delta_flatten_positions(Value) when is_map(Value) ->
+    lists:append([fts2_delta_flatten_positions(V) || V <- maps:values(Value)]);
+fts2_delta_flatten_positions(Value) when is_list(Value) -> Value;
+fts2_delta_flatten_positions(_Value) -> [].
+
+
+%% ===========================================================================
+%% INTERNAL FTS-2 PHRASE
+%% ===========================================================================
+
+%% Frequent-bigram accelerator with an exact positional fallback.
+
+fts2_phrase_evaluate(
+    bigram,
+    Bookie,
+    Schema,
+    Root,
+    [{First, false, _}, {Second, false, _}],
+    Column,
+    Wanted
+) ->
+    case fts2_phrase_read_bundle(Bookie, Schema, Root, Column, First, Second) of
+        not_found -> {positions, Wanted};
+        Bundle ->
+            {matches,
+                fts2_phrase_matches(
+                    fts2_codec_bigram_entries(Bundle),
+                    Bundle,
+                    First,
+                    Second,
+                    Column,
+                    Wanted,
+                    true
+                )}
+    end;
+fts2_phrase_evaluate(_Strategy, _Bookie, _Schema, _Root, _Specs, _Column, Wanted) ->
+    {positions, Wanted}.
+
+fts2_phrase_fast(
+    Bookie,
+    Schema,
+    Root,
+    [{First, false, _}, {Second, false, _}],
+    Columns,
+    Opts,
+    all
+) ->
+    ColumnIds = fts2_phrase_selector_ids(Columns, Schema),
+    Window = maps:get(offset, Opts, 0) + maps:get(limit, Opts, 10000),
+    case
+        {
+            ColumnIds,
+            maps:get(rank, Opts, none),
+            maps:get(impact_facet, Opts, nil),
+            Window =< 256
+        }
+    of
+        {[Column], bm25, nil, true} ->
+            case fts2_phrase_read_bundle(Bookie, Schema, Root, Column, First, Second) of
+                not_found ->
+                    fts2_phrase_fast_from_terms(
+                        Bookie, Schema, Root, Column, First, Second, Opts
+                    );
+                Bundle ->
+                    NeedPositions = maps:get(return_positions, Opts, false),
+                    {ranked_champions,
+                        fts2_phrase_ranked_champions(
+                            Bundle, First, Second, Column, Root, NeedPositions
+                        ),
+                        maps:get(group_df, Bundle)}
+            end;
+        _ ->
+            no
+    end;
+fts2_phrase_fast(_Bookie, _Schema, _Root, _Specs, _Columns, _Opts, _Wanted) ->
+    no.
+
+fts2_phrase_ranked_champions(
+    Bundle, First, Second, Column, Root, NeedPositions
+) ->
+    Champions = maps:get(champions, Bundle),
+    Positions = case NeedPositions of
+        true -> fts2_codec_bigram_positions(
+            Bundle, [element(1, Entry) || Entry <- Champions]
+        );
+        false -> #{}
+    end,
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    FirstDf = maps:get(first_df, Bundle),
+    SecondDf = maps:get(second_df, Bundle),
+    FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
+    SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
+    [
+        begin
+            Starts = maps:get(ChunkId, Positions, []),
+            #fts2_match{
+                chunk_id = ChunkId,
+                group_id = GroupId,
+                source_id = SourceId,
+                doc_length = Length,
+                tf = FirstTf + SecondTf,
+                term_stats = [
+                    {{Column, First}, FirstTf, base, FirstDf},
+                    {{Column, Second}, SecondTf, base, SecondDf}
+                ],
+                terms = [First, Second],
+                columns = [{{Column, First}, Starts}],
+                match_positions = [{phrase, Starts}],
+                match_count = PhraseTf,
+                score =
+                    fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
+                    fts2_search_bm25(SecondTf, SecondIdf, Avg, Length)
+            }
+        end
+     || {ChunkId, GroupId, SourceId, Length, PhraseTf, FirstTf, SecondTf} <-
+            Champions
+    ].
+
+fts2_phrase_fast_from_terms(
+    Bookie, Schema, Root, Column, First, Second, _Opts
+) ->
+    case fts2_search_read_positional_pair(
+        Bookie, Schema, Root, Column, First, Second
+    ) of
+        not_found ->
+            {ranked_champions, [], 0};
+        {FirstHeader, SecondHeader, Rows0} ->
+            Rows = [
+                {Row, Starts}
+             || {Row, FirstPositions, SecondPositions} <- Rows0,
+                Starts <- [fts2_phrase_adjacent_positions(
+                    FirstPositions, SecondPositions
+                )],
+                Starts =/= []
+            ],
+            DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+            Avg = maps:get(total_length, Root, 0) / DocCount,
+            FirstDf = maps:get(chunk_df, FirstHeader),
+            SecondDf = maps:get(chunk_df, SecondHeader),
+            FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
+            SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
+            Scored = [
+                begin
+                    [{{_, First}, FirstTf, base, FirstDf},
+                        {{_, Second}, SecondTf, base, SecondDf}] = Stats,
+                    #fts2_match{
+                        chunk_id = ChunkId,
+                        group_id = GroupId,
+                        source_id = SourceId,
+                        doc_length = Length,
+                        tf = TotalTf,
+                        term_stats = Stats,
+                        terms = [First, Second],
+                        columns = [{{Column, First}, Starts}],
+                        match_positions = [{phrase, Starts}],
+                        match_count = length(Starts),
+                        score =
+                            fts2_search_bm25(
+                                FirstTf, FirstIdf, Avg, Length
+                            ) +
+                            fts2_search_bm25(
+                                SecondTf, SecondIdf, Avg, Length
+                            )
+                    }
+                end
+             || {{ChunkId, GroupId, SourceId, Length, Stats, TotalTf}, Starts} <-
+                    Rows
+            ],
+            Grouped = fts2_search_collapse_scored_groups(Scored, true),
+            {ranked_champions, Grouped, length(Grouped)}
+    end.
+
+fts2_phrase_adjacent_positions(FirstPositions, SecondPositions) ->
+    fts2_phrase_adjacent_positions(
+        FirstPositions, SecondPositions, []
+    ).
+
+fts2_phrase_adjacent_positions([], _Seconds, Acc) ->
+    lists:reverse(Acc);
+fts2_phrase_adjacent_positions(_Firsts, [], Acc) ->
+    lists:reverse(Acc);
+fts2_phrase_adjacent_positions(
+    [First | FirstRest] = Firsts,
+    [Second | SecondRest] = Seconds,
+    Acc
+) ->
+    case (First + 1) - Second of
+        Difference when Difference < 0 ->
+            fts2_phrase_adjacent_positions(FirstRest, Seconds, Acc);
+        Difference when Difference > 0 ->
+            fts2_phrase_adjacent_positions(Firsts, SecondRest, Acc);
+        0 ->
+            fts2_phrase_adjacent_positions(
+                FirstRest, SecondRest, [First | Acc]
+            )
+    end.
+
+fts2_phrase_read_bundle(Bookie, #{index := Bucket}, Root, Column, First, Second) ->
+    {Key, _} = fts2_codec_bigram_key(
+        maps:get(generation, Root), Column, First, Second
+    ),
+    case leveled_fts_residency:headonly(Bookie, Bucket, Key, <<"x">>) of
+        {ok, Value} -> fts2_codec_decode_bigram(Value);
+        not_found -> not_found
+    end.
+
+fts2_phrase_matches(Entries, Bundle, First, Second, Column, Wanted, NeedPositions) ->
+    Positions = case NeedPositions of
+        true -> fts2_codec_bigram_positions(Bundle);
+        false -> #{}
+    end,
+    FirstDf = maps:get(first_df, Bundle),
+    SecondDf = maps:get(second_df, Bundle),
+    lists:foldl(
+        fun(
+            {ChunkId, GroupId, SourceId, Length, PhraseTf, FirstTf, SecondTf},
+            Acc
+        ) ->
+            case fts2_phrase_wanted(SourceId, Wanted) of
+                false ->
+                    Acc;
+                true ->
+                    Starts = maps:get(ChunkId, Positions, []),
+                    FirstTerm = {Column, First},
+                    SecondTerm = {Column, Second},
+                    Acc#{ChunkId => #fts2_match{
+                        chunk_id = ChunkId,
+                        group_id = GroupId,
+                        source_id = SourceId,
+                        doc_length = Length,
+                        tf = FirstTf + SecondTf,
+                        term_stats = [
+                            {FirstTerm, FirstTf, base, FirstDf},
+                            {SecondTerm, SecondTf, base, SecondDf}
+                        ],
+                        terms = [First, Second],
+                        columns = [{{Column, First}, Starts}],
+                        match_positions = [{phrase, Starts}],
+                        match_count = PhraseTf
+                    }}
+            end
+        end,
+        #{},
+        Entries
+    ).
+
+fts2_phrase_selector_ids(all, Schema) ->
+    lists:seq(0, length(maps:get(columns, Schema)) - 1);
+fts2_phrase_selector_ids({not_columns, Excluded}, Schema) ->
+    fts2_phrase_selector_ids(
+        [C || C <- maps:get(columns, Schema), not lists:member(C, Excluded)],
+        Schema
+    );
+fts2_phrase_selector_ids(Columns, Schema) ->
+    Names = maps:get(columns, Schema),
+    [
+        Index
+     || {Name, Index} <- lists:zip(Names, lists:seq(0, length(Names) - 1)),
+        lists:member(Name, Columns)
+    ].
+
+fts2_phrase_wanted(_SourceId, all) -> true;
+fts2_phrase_wanted(SourceId, {all_except, Excluded}) -> not maps:is_key(SourceId, Excluded);
+fts2_phrase_wanted(SourceId, Wanted) -> maps:is_key(SourceId, Wanted).
+
+
+%% ===========================================================================
+%% INTERNAL FTS-2 SEARCH
+%% ===========================================================================
+
+%% FTS2 generation reader and chunk-grained evaluator.
+
+-define(MAX_RETURN_POSITIONS, 4096).
+
+fts2_search_root(Bookie, #{index := Bucket, fingerprint := Fingerprint}) ->
+    {Key, SubKey} = fts2_codec_root_key(),
+    case leveled_fts_residency:headonly(Bookie, Bucket, Key, SubKey) of
+        {ok, Value} ->
+            Root = fts2_codec_decode_root(Value),
+            case maps:get(fingerprint, Root) of
+                Fingerprint -> {ok, Root};
+                _ -> not_found
+            end;
+        not_found ->
+            not_found
+    end.
+
+fts2_search_search(Bookie, Schema, Root, AST, Opts) ->
+    fts2_search_run(Bookie, Schema, Root, AST, Opts, all, []).
+
+fts2_search_search_dirty(Bookie, Schema, Root, AST, Opts, Hook) ->
+    Deltas = fts2_delta_read_for_search(Bookie, Schema, AST, Hook),
+    Affected = fts2_delta_affected_sources(Deltas),
+    fts2_search_run(
+        Bookie,
+        Schema,
+        Root,
+        AST,
+        Opts,
+        {all_except, Affected},
+        Deltas
+    ).
+
+fts2_search_posting_read(Bookie, Schema, Root, AST, SourceIds, Opts) ->
+    fts2_search_run(
+        Bookie,
+        Schema,
+        Root,
+        AST,
+        Opts#{
+            offset => 0, limit => length(SourceIds), return_positions => true
+        },
+        maps:from_list([{SourceId, true} || SourceId <- SourceIds]),
+        []
+    ).
+
+fts2_search_posting_read_dirty(Bookie, Schema, Root, AST, SourceIds, Opts) ->
+    Deltas = fts2_delta_read_for_search(Bookie, Schema, AST, undefined),
+    Wanted = maps:from_list([{SourceId, true} || SourceId <- SourceIds]),
+    fts2_search_run(
+        Bookie,
+        Schema,
+        Root,
+        AST,
+        Opts#{
+            offset => 0, limit => length(SourceIds), return_positions => true
+        },
+        Wanted,
+        Deltas
+    ).
+
+fts2_search_export_documents(Bookie, #{index := Bucket} = Schema, Root) ->
+    GroupCount = maps:get(group_count, Root),
+    GroupIds = case GroupCount of
+        0 -> [];
+        _ -> lists:seq(0, GroupCount - 1)
+    end,
+    Identities = fts2_search_read_identities(Bookie, Schema, Root, GroupIds),
+    {Documents0, ByChunk} = maps:fold(
+        fun(_GroupId, Group, {Docs, Chunks}) ->
+            lists:foldl(
+                fun(Chunk, {DocAcc, ChunkAcc}) ->
+                    SourceId = maps:get(source_id, Chunk),
+                    Document = maps:with(
+                        [
+                            source_id,
+                            doc_key,
+                            doc_version,
+                            doc_length,
+                            candidate_record,
+                            hit_record
+                        ],
+                        Chunk
+                    ),
+                    {
+                        DocAcc#{SourceId => Document#{
+                            status => live, retired_ids => [], posting => #{}
+                        }},
+                        ChunkAcc#{maps:get(chunk_id, Chunk) => SourceId}
+                    }
+                end,
+                {Docs, Chunks},
+                maps:get(chunks, Group)
+            )
+        end,
+        {#{}, #{}},
+        Identities
+    ),
+    Generation = maps:get(generation, Root),
+    Prefix = <<"f2:b:">>,
+    Fold = fun
+        (B, {Key, <<"h">>}, Value, Acc) when B =:= Bucket ->
+            case Key of
+                <<"f2:t:", Generation:64/unsigned-big, Column:8, Token/binary>> ->
+                    Row = maps:get({Column, Token}, Acc, #{}),
+                    Acc#{{Column, Token} => Row#{
+                        header => fts2_codec_decode_header(Value)
+                    }};
+                _ -> Acc
+            end;
+        (B, {Key, <<"b">>}, Value, Acc) when B =:= Bucket ->
+            case Key of
+                <<"f2:b:", Generation:64/unsigned-big, Column:8, Token/binary>> ->
+                    Row = maps:get({Column, Token}, Acc, #{}),
+                    Acc#{{Column, Token} => Row#{
+                        entries => fts2_codec_decode_plane(Value)
+                    }};
+                _ -> Acc
+            end;
+        (B, {Key, <<"p">>}, Value, Acc) when B =:= Bucket ->
+            case Key of
+                <<"f2:p:", Generation:64/unsigned-big, Column:8, Token/binary>> ->
+                    Row = maps:get({Column, Token}, Acc, #{}),
+                    Acc#{{Column, Token} => Row#{
+                        positions => fts2_codec_decode_positions(Value)
+                    }};
+                _ -> Acc
+            end;
+        (_B, _Key, _Value, Acc) ->
+            Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {{Prefix, <<>>}, {<<"f2:u">>, <<255>>}}},
+        {Fold, #{}},
+        false,
+        true,
+        false
+    ),
+    TermRows = Runner(),
+    maps:fold(
+        fun({Column, Token}, Row, Docs) ->
+            Header = maps:get(header, Row, #{}),
+            Positions = case maps:find(positions, Row) of
+                {ok, StoredPositions} -> StoredPositions;
+                error ->
+                    {TermKey, _} = fts2_codec_term_key(
+                        Generation, Column, Token
+                    ),
+                    fts2_search_read_positions(
+                        Bookie, Bucket, TermKey, Header
+                    )
+            end,
+            Entries = case maps:find(entries, Row) of
+                {ok, StoredEntries} -> StoredEntries;
+                error -> case fts2_codec_header_has_entries(Header) of
+                    true -> fts2_codec_header_entries(Header);
+                    false -> []
+                end
+            end,
+            lists:foldl(
+                fun(
+                    {ChunkId, _GroupId, _StoredSourceId, _Length, Tf, _DenseId},
+                    Acc
+                ) ->
+                    SourceId = maps:get(ChunkId, ByChunk),
+                    Document = maps:get(SourceId, Acc),
+                    Posting = maps:get(posting, Document),
+                    Tokens = maps:get(Column, Posting, #{}),
+                    Entry = #{
+                        count => Tf,
+                        positions => maps:get(ChunkId, Positions, [])
+                    },
+                    Acc#{SourceId => Document#{posting => Posting#{
+                        Column => Tokens#{Token => Entry}
+                    }}}
+                end,
+                Docs,
+                Entries
+            )
+        end,
+        Documents0,
+        TermRows
+    ).
+
+fts2_search_lookup_documents(Bookie, Schema, SourceIds) ->
+    Existing = case fts2_search_root(Bookie, Schema) of
+        {ok, Root} -> fts2_search_export_documents(Bookie, Schema, Root);
+        not_found -> #{}
+    end,
+    Current = fts2_delta_overlay_documents(
+        Existing, fts2_delta_read(Bookie, Schema)
+    ),
+    maps:with(SourceIds, Current).
+
+fts2_search_run(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
+    case maps:get(count_only, Opts, false) of
+        true ->
+            fts2_search_count_only(
+                Bookie, Schema, Root, AST, Opts, WantedSources, Deltas
+            );
+        false ->
+            fts2_search_page(
+                Bookie, Schema, Root, AST, Opts, WantedSources, Deltas
+            )
+    end.
+
+%% Count-only serving settles a facet without scoring, ordering, positions or
+%% identity hydration. The common uniform facet is proved from the immutable
+%% root and returns a sentinel so the caller can use the page call's exact
+%% grouped count. A selective facet becomes an ordinary verbatim conjunction.
+fts2_search_count_only(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
+    fts2_search_check_cancellation(),
+    Facet = maps:get(impact_facet, Opts, nil),
+    case fts2_search_facet_uniform(Schema, Root, Facet) of
+        true ->
+            {ok, #{hits => [], count => undefined, count_kind => grouped,
+                facet_universal => true}};
+        false ->
+            Count = fts2_search_count_matches(
+                Bookie, Schema, Root,
+                fts2_search_facet_ast(Schema, Facet, AST),
+                WantedSources, Deltas
+            ),
+            {ok, #{hits => [], count => Count, count_kind => grouped,
+                facet_universal => false}}
+    end.
+
+fts2_search_facet_uniform(_Schema, _Root, nil) ->
+    true;
+fts2_search_facet_uniform(_Schema, undefined, _Facet) ->
+    false;
+fts2_search_facet_uniform(Schema, Root, Facet) when is_list(Facet) ->
+    Fields = maps:get(candidate_filter_fields, Schema, []),
+    Domain = maps:get(facet_domain, Root, #{}),
+    length(Fields) =:= length(Facet) andalso
+        lists:all(
+            fun({{Column, _Field}, Value}) ->
+                maps:get(Column, Domain, mixed) =:= {uniform, Value}
+            end,
+            lists:zip(Fields, Facet)
+        );
+fts2_search_facet_uniform(_Schema, _Root, _Facet) ->
+    false.
+
+fts2_search_facet_ast(_Schema, nil, AST) ->
+    AST;
+fts2_search_facet_ast(Schema, Facet, AST) when is_list(Facet) ->
+    Fields = maps:get(candidate_filter_fields, Schema, []),
+    case length(Fields) =:= length(Facet) of
+        false ->
+            AST;
+        true ->
+            lists:foldl(
+                fun
+                    ({{Column, _Field}, Value}, Acc) when is_binary(Value) ->
+                        {'and', Acc, {term, Value, false, [Column]}};
+                    (_Unsupported, Acc) ->
+                        Acc
+                end,
+                AST,
+                lists:zip(Fields, Facet)
+            )
+    end.
+
+fts2_search_count_matches(Bookie, Schema, Root, AST, WantedSources, Deltas) ->
+    Base0 = case Root of
+        undefined -> #{};
+        _ -> fts2_search_eval(Bookie, Schema, Root, AST, false, WantedSources)
+    end,
+    Base = case Deltas of
+        [] -> Base0;
+        _ -> fts2_search_enrich_base_groups(Bookie, Schema, Root, Base0)
+    end,
+    DeltaMatches = maps:filter(
+        fun(_Key, #fts2_match{source_id = SourceId}) ->
+            fts2_search_wanted_delta(SourceId, WantedSources)
+        end,
+        fts2_delta_evaluate(Deltas, Schema, AST)
+    ),
+    length(fts2_search_collapse_scored_groups(
+        fts2_search_score_matches(maps:merge(Base, DeltaMatches), undefined, false),
+        false
+    )).
+
+fts2_search_page(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
+    fts2_search_check_cancellation(),
+    NeedPositions = maps:get(return_positions, Opts, false),
+    Ranked = maps:get(rank, Opts, none) =:= bm25,
+    FastOrBase = case Root of
+        undefined -> {base, #{}, undefined};
+        _ ->
+            case fts2_search_fast_single_term(
+                Bookie, Schema, Root, AST, Opts, WantedSources, Deltas
+            ) of
+                {ranked_champions, FastMatches, FastCount} ->
+                    {ranked_champions, FastMatches, FastCount};
+                {ok, FastMatches, FastCount} ->
+                    {base, FastMatches, FastCount};
+                no ->
+                    {base,
+                        fts2_search_eval(
+                            Bookie, Schema, Root, AST, NeedPositions, WantedSources
+                        ),
+                        undefined}
+            end
+    end,
+    case FastOrBase of
+        {ranked_champions, [], 0} ->
+            case maps:get(return_count, Opts, false) of
+                true -> {ok, #{hits => [], count => 0, count_kind => grouped}};
+                false -> {ok, []}
+            end;
+        _ ->
+    {Scored0, BaseCountHint} = case FastOrBase of
+        {ranked_champions, ChampionMatches, ChampionCount} ->
+            {ChampionMatches, ChampionCount};
+        {base, BaseMatches0, CountHint} ->
+            BaseMatches = case Deltas of
+                [] -> BaseMatches0;
+                _ -> fts2_search_enrich_base_groups(
+                    Bookie, Schema, Root, BaseMatches0
+                )
+            end,
+            DeltaMatches0 = fts2_delta_evaluate(Deltas, Schema, AST),
+            DeltaMatches = maps:filter(
+                fun(_Key, #fts2_match{source_id = SourceId}) ->
+                    fts2_search_wanted_delta(SourceId, WantedSources)
+                end,
+                DeltaMatches0
+            ),
+            Matches0 = maps:merge(BaseMatches, DeltaMatches),
+            ScoreRoot = fts2_search_score_root(Root, Deltas),
+            {fts2_search_collapse_scored_groups(
+                fts2_search_score_matches(Matches0, ScoreRoot, Ranked), Ranked
+            ), CountHint}
+    end,
+    Count0 = case BaseCountHint of
+        ExactCount when is_integer(ExactCount), Deltas =:= [] -> ExactCount;
+        _ -> length(Scored0)
+    end,
+    Offset = maps:get(offset, Opts, 0),
+    Limit = maps:get(limit, Opts, ?DEFAULT_LIMIT),
+    PrePage = fts2_search_can_page_before_identity(Opts, Ranked),
+    {Scored, PageOffset} = case PrePage of
+        true -> fts2_search_prepage_matches(Scored0, Ranked, Offset, Limit);
+        false -> {Scored0, Offset}
+    end,
+    IdentityRequests = [
+        case Match of
+            #fts2_match{group_id = undefined} -> undefined;
+            #fts2_match{group_id = GroupId, chunk_id = ChunkId} ->
+                {GroupId, ChunkId}
+        end
+     || Match <- Scored
+    ],
+    TieFields = maps:get(rank_tie_fields, Opts, []),
+    {Hits, Count} = fts2_search_serve(
+        Bookie, Schema, Root, Scored, IdentityRequests, Opts, Ranked, PrePage,
+        Count0, PageOffset, Limit, TieFields
+    ),
+    case maps:get(return_count, Opts, false) of
+        true -> {ok, #{hits => Hits, count => Count, count_kind => grouped}};
+        false -> {ok, Hits}
+    end
+    end.
+
+%% Two-phase served path. Phase one projects only the tie columns from v4
+%% identity pages, orders the bounded score/tie window, and returns stable
+%% identity coordinates. Public records are materialised by hydrate_page/3.
+%%
+%% Fresh generations assign group ids in native group-key order. When the
+%% caller's tie fields are exactly that group key, the group id is already the
+%% required deterministic tie ordinal. Select the final addresses without an
+%% identity-page read; phase two still hydrates exactly the returned page.
+fts2_search_serve(
+    _Bookie, _Schema, Root, Scored, Requests, Opts, true, PrePage,
+    Count0, PageOffset, Limit, TieFields
+) when Root =/= undefined,
+    map_get(page_only, Opts) =:= true,
+    map_get(group_order, Root) =:= native,
+    map_get(group_tie_fields, Root) =:= TieFields
+->
+    Decorated = [
+        {{-Match#fts2_match.score, GroupId}, Match, Request}
+     || {Match, Request = {GroupId, _ChunkId}} <- lists:zip(Scored, Requests)
+    ],
+    Ordered = lists:sort(
+        fun({KeyA, _MatchA, _ReqA}, {KeyB, _MatchB, _ReqB}) ->
+            KeyA =< KeyB
+        end,
+        Decorated
+    ),
+    Window = lists:sublist(
+        fts2_search_drop(PageOffset, Ordered), Limit
+    ),
+    Hits = [
+        %% hydrate_page/3 replaces this private placeholder with the durable
+        %% document key before the hit leaves AshLeveled.
+        fts2_search_page_entry(Match, Request, <<>>, Opts)
+     || {_Key, Match, Request} <- Window
+    ],
+    Count = case PrePage of true -> Count0; false -> length(Ordered) end,
+    {Hits, Count};
+fts2_search_serve(
+    Bookie, Schema, Root, Scored, Requests, Opts, Ranked, PrePage,
+    Count0, PageOffset, Limit, TieFields
+) when Root =/= undefined, map_get(page_only, Opts) =:= true ->
+    Handles = fts2_search_identity_page_handles(
+        Bookie, Schema, Root, Requests
+    ),
+    Ordinals = maps:map(
+        fun(_Page, Handle) ->
+            fts2_codec_identity_page_ordinals(Handle, TieFields)
+        end,
+        Handles
+    ),
+    case Ranked of
+        false ->
+            %% The unranked pre-page is already source-key ordered and has
+            %% applied offset/limit. Preserve that order while projecting the
+            %% stable address and candidate key from the v4 identity page.
+            Hits = lists:filtermap(
+                fun({Match, Request}) ->
+                    case fts2_search_serve_probe(
+                        Handles, Ordinals, Root, Request, Match, TieFields
+                    ) of
+                        undefined -> false;
+                        {DocKey, _TieValues} ->
+                            {true, fts2_search_page_entry(
+                                Match, Request, DocKey, Opts
+                            )}
+                    end
+                end,
+                lists:zip(Scored, Requests)
+            ),
+            {Hits, Count0};
+        true ->
+            Decorated = lists:filtermap(
+                fun({Match, Request}) ->
+                    case fts2_search_serve_probe(
+                        Handles, Ordinals, Root, Request, Match, TieFields
+                    ) of
+                        undefined ->
+                            false;
+                        {DocKey, TieValues} ->
+                            {true, {{-Match#fts2_match.score,
+                                fts2_search_serve_tie(
+                                    TieFields, TieValues, DocKey
+                                )}, Match, Request, DocKey}}
+                    end
+                end,
+                lists:zip(Scored, Requests)
+            ),
+            Ordered = lists:sort(
+                fun({KeyA, _MatchA, _ReqA, _DocA},
+                    {KeyB, _MatchB, _ReqB, _DocB}) -> KeyA =< KeyB end,
+                Decorated
+            ),
+            Window = lists:sublist(
+                fts2_search_drop(PageOffset, Ordered), Limit
+            ),
+            Hits = [
+                fts2_search_page_entry(Match, Request, DocKey, Opts)
+             || {_Key, Match, Request, DocKey} <- Window
+            ],
+            Count = case PrePage of true -> Count0; false -> length(Ordered) end,
+            {Hits, Count}
+    end;
+fts2_search_serve(
+    Bookie, Schema, Root, Scored, Requests, Opts, Ranked, PrePage, Count0,
+    PageOffset, Limit, TieFields
+) ->
+    IdentityRows = case Root of
+        undefined -> [undefined || _ <- Scored];
+        _ -> fts2_search_read_identity_rows(Bookie, Schema, Root, Requests)
+    end,
+    Hydrated = lists:filtermap(
+        fun({Match, IdentityRow}) ->
+            fts2_search_hydrate_hit(Match, IdentityRow, Opts)
+        end,
+        lists:zip(Scored, IdentityRows)
+    ),
+    Hits0 = [
+        Hit
+     || Hit <- Hydrated,
+        fts2_search_facet_matches(Hit, Schema, maps:get(impact_facet, Opts, nil))
+    ],
+    Count = case PrePage of
+        true -> Count0;
+        false -> length(Hits0)
+    end,
+    fts2_search_check_cancellation(),
+    Hits1 = case {PrePage, Ranked, TieFields} of
+        {true, false, _} -> Hits0;
+        _ -> fts2_search_order_hits(Hits0, Ranked, TieFields)
+    end,
+    {lists:sublist(fts2_search_drop(PageOffset, Hits1), Limit), Count}.
+
+fts2_search_serve_tie([], _Values, DocKey) ->
+    DocKey;
+fts2_search_serve_tie(_Fields, Values, DocKey) ->
+    {Values, DocKey}.
+
+fts2_search_serve_probe(
+    _Handles, _Ordinals, _Root, undefined, Match, Fields
+) ->
+    case Match#fts2_match.delta_document of
+        undefined ->
+            undefined;
+        Document ->
+            Candidate = maps:get(candidate_record, Document),
+            {maps:get(doc_key, Document),
+                [maps:get(Field, Candidate, nil) || Field <- Fields]}
+    end;
+fts2_search_serve_probe(
+    Handles, PageOrdinals, Root, {GroupId, ChunkId}, _Match, Fields
+) ->
+    Shift = fts2_search_identity_page_shift(Root),
+    case fts2_search_identity_handle(Handles, GroupId, Shift) of
+        error ->
+            undefined;
+        {ok, Handle} ->
+            case maps:get(GroupId bsr Shift, PageOrdinals) of
+                fallback ->
+                    case fts2_codec_identity_page_row(Handle, GroupId, ChunkId) of
+                        undefined -> undefined;
+                        Row ->
+                            Candidate = element(8, Row),
+                            {element(5, Row),
+                                [maps:get(Field, Candidate, nil) || Field <- Fields]}
+                    end;
+                FieldOrdinals ->
+                    case fts2_codec_identity_page_project(
+                        Handle, GroupId, ChunkId, FieldOrdinals
+                    ) of
+                        undefined -> undefined;
+                        {ok, DocKey, Values} -> {DocKey, Values};
+                        {fallback, DocKey, Candidate} ->
+                            {DocKey,
+                                [maps:get(Field, Candidate, nil) || Field <- Fields]}
+                    end
+            end
+    end.
+
+fts2_search_page_entry(Match, undefined, _DocKey, Opts) ->
+    case Match#fts2_match.delta_document of
+        undefined -> #{};
+        _Document ->
+            {true, Hit} = fts2_search_hydrate_hit(Match, undefined, Opts),
+            Hit
+    end;
+fts2_search_page_entry(Match, {GroupId, ChunkId}, DocKey, Opts) ->
+    Base0 = #{
+        key => Match#fts2_match.source_id,
+        score => Match#fts2_match.score,
+        doc_length => Match#fts2_match.doc_length,
+        match_count => case Match#fts2_match.group_match_count of
+            undefined -> fts2_search_match_count(Match);
+            GroupCount -> GroupCount
+        end,
+        candidate_key => DocKey,
+        group_id => GroupId,
+        chunk_id => ChunkId
+    },
+    Base1 = case maps:get(return_positions, Opts, false) of
+        true -> Base0#{positions => fts2_search_window_positions(
+            Match#fts2_match.match_positions
+        )};
+        false -> Base0
+    end,
+    case maps:get(return_terms, Opts, false) of
+        true -> Base1#{matched_terms => Match#fts2_match.terms};
+        false -> Base1
+    end.
+
+fts2_search_fast_single_term(
+    Bookie,
+    Schema,
+    Root,
+    {phrase, Specs, Columns},
+    Opts,
+    all,
+    []
+) ->
+    fts2_phrase_fast(
+        Bookie, Schema, Root, Specs, Columns, Opts, all
+    );
+fts2_search_fast_single_term(
+    Bookie,
+    Schema,
+    Root,
+    {term, Token, false, Columns},
+    Opts,
+    all,
+    []
+) ->
+    ColumnIds = fts2_search_selector_ids(Columns, Schema),
+    Window = maps:get(offset, Opts, 0) + maps:get(limit, Opts, ?DEFAULT_LIMIT),
+    case
+        {
+            ColumnIds,
+            maps:get(rank, Opts, none),
+            maps:get(impact_facet, Opts, nil),
+            Window =< 256
+        }
+    of
+        {[Column], bm25, nil, true} ->
+            Generation = maps:get(generation, Root),
+            Bucket = maps:get(index, Schema),
+            {Key, _} = fts2_codec_term_key(
+                Generation, Column, Token
+            ),
+            NeedPositions = maps:get(return_positions, Opts, false),
+            Requests = [{Key, <<"h">>}],
+            case leveled_fts_residency:headonly_many(Bookie, Bucket, Requests) of
+                [not_found] ->
+                    {ranked_champions, [], 0};
+                [{ok, HeaderValue}] ->
+                    Header = fts2_codec_decode_header(HeaderValue),
+                    PositionMap = case NeedPositions of
+                        true -> fts2_codec_header_positions(Header);
+                        false -> #{}
+                    end,
+                    {ranked_champions,
+                        fts2_search_ranked_champions(
+                            maps:get(champions, Header), Column, Token,
+                            maps:get(chunk_df, Header), PositionMap, Root
+                        ), maps:get(group_df, Header)};
+                Bad ->
+                    erlang:error({invalid_fts2_term_header, Token, Bad})
+            end;
+        _ ->
+            no
+    end;
+fts2_search_fast_single_term(
+    Bookie,
+    Schema,
+    Root,
+    {term, Prefix, true, Columns},
+    Opts,
+    all,
+    []
+) ->
+    fts2_search_fast_prefix(Bookie, Schema, Root, Prefix, Columns, Opts);
+fts2_search_fast_single_term(
+    Bookie,
+    Schema,
+    Root,
+    {near, Items, Distance, Columns},
+    Opts,
+    all,
+    []
+) ->
+    fts2_search_fast_near(
+        Bookie, Schema, Root, Items, Distance, Columns, Opts
+    );
+fts2_search_fast_single_term(Bookie, Schema, Root, AST, Opts, all, []) ->
+    fts2_search_fast_boolean(Bookie, Schema, Root, AST, Opts);
+fts2_search_fast_single_term(_Bookie, _Schema, _Root, _AST, _Opts, _Wanted, _Deltas) ->
+    no.
+
+fts2_search_fast_boolean(Bookie, Schema, Root, AST, Opts) ->
+    Window = maps:get(offset, Opts, 0) + maps:get(limit, Opts, ?DEFAULT_LIMIT),
+    case {
+        maps:get(rank, Opts, none),
+        maps:get(impact_facet, Opts, nil),
+        Window =< 256,
+        fts2_search_boolean_terms(AST, Schema)
+    } of
+        {bm25, nil, true, {ok, Column, Tokens}} when length(Tokens) > 1 ->
+            Generation = maps:get(generation, Root),
+            Bucket = maps:get(index, Schema),
+            PureOrQuery = fts2_search_boolean_pure_or(AST),
+            Keys = [
+                begin
+                    {Key, _} = fts2_codec_term_key(Generation, Column, Token),
+                    {Token, Key}
+                end
+             || Token <- Tokens
+            ],
+            HeaderPlaneResults = leveled_fts_residency:headonly_many(
+                Bookie,
+                Bucket,
+                lists:append([
+                    [
+                        {Key, <<"h">>},
+                        {fts2_codec_term_plane_key(Key, boolean), <<"b">>}
+                    ]
+                 || {_Token, Key} <- Keys
+                ])
+            ),
+            {HeaderResults, BooleanResults} =
+                fts2_search_boolean_result_pairs(HeaderPlaneResults, [], []),
+            Headers = lists:zipwith(
+                fun
+                    ({Token, Key}, {ok, Value}) ->
+                        Header = case PureOrQuery of
+                            true -> fts2_codec_decode_header(Value);
+                            false -> fts2_codec_decode_header_metadata(Value)
+                        end,
+                        {Token, Key, Header};
+                    ({Token, Key}, not_found) ->
+                        {Token, Key, not_found}
+                end,
+                Keys,
+                HeaderResults
+            ),
+            ChampionExact = PureOrQuery andalso
+                fts2_search_or_champions_exact(Headers),
+            case ChampionExact of
+                true ->
+                    {MatchesByChunk, GroupBitmap} = lists:foldl(
+                        fun
+                            ({_Token, _Key, not_found}, State) ->
+                                State;
+                            ({Token, _Key, Header}, {MatchAcc, BitmapAcc}) ->
+                                Matches = fts2_search_ranked_champions(
+                                    maps:get(champions, Header),
+                                    Column,
+                                    Token,
+                                    maps:get(chunk_df, Header),
+                                    #{},
+                                    Root
+                                ),
+                                {
+                                    lists:foldl(
+                                        fun fts2_search_merge_champion_match/2,
+                                        MatchAcc,
+                                        Matches
+                                    ),
+                                    BitmapAcc bor
+                                        fts2_search_header_group_bitmap(Header)
+                                }
+                        end,
+                        {#{}, 0},
+                        Headers
+                    ),
+                    Grouped = fts2_search_collapse_scored_groups(
+                        maps:values(MatchesByChunk), true
+                    ),
+                    {ranked_champions,
+                        Grouped,
+                        fts2_search_bitmap_count(GroupBitmap)};
+                false ->
+                    fts2_search_fast_boolean_planes(
+                        Bookie, Bucket, Keys, Headers, AST, Column, Root,
+                        PureOrQuery, Window, BooleanResults
+                    )
+            end;
+        _ ->
+            no
+    end.
+
+fts2_search_boolean_result_pairs([], Headers, Planes) ->
+    {lists:reverse(Headers), lists:reverse(Planes)};
+fts2_search_boolean_result_pairs(
+    [Header, Plane | Rest], Headers, Planes
+) ->
+    fts2_search_boolean_result_pairs(
+        Rest, [Header | Headers], [Plane | Planes]
+    ).
+
+fts2_search_fast_boolean_planes(
+    _Bookie, _Bucket, Keys, Headers, AST, Column, Root, PureOrQuery, Window,
+    BooleanResults
+) ->
+    BooleanByToken = maps:from_list(lists:zip(
+        [Token || {Token, _Key} <- Keys], BooleanResults
+    )),
+    TermData = maps:from_list([
+        case Header of
+            not_found -> {Token, {0, <<>>, 0}};
+            _ ->
+                EntryPlane = fts2_search_header_entry_plane(
+                    Header, maps:get(Token, BooleanByToken), Token
+                ),
+                ChunkBitmap = case maps:find(chunk_bitmap, Header) of
+                    {ok, StoredBitmap} -> StoredBitmap;
+                    error -> fts2_search_plane_chunk_bitmap(EntryPlane, 0)
+                end,
+                {Token, {
+                    maps:get(chunk_df, Header), EntryPlane, ChunkBitmap
+                }}
+        end
+     || {Token, _Key, Header} <- Headers
+    ]),
+    case PureOrQuery andalso Window =< 20 of
+        true ->
+            case fts2_search_fast_or_bounded(
+                Headers, TermData, Column, Root, Window
+            ) of
+                no -> fts2_search_fast_boolean_full(
+                    AST, TermData, Column, Root
+                );
+                Result -> Result
+            end;
+        false ->
+            fts2_search_fast_boolean_full(AST, TermData, Column, Root)
+    end.
+
+fts2_search_fast_or_bounded(Headers, TermData, Column, Root, Window) ->
+    GroupBitmap = lists:foldl(
+        fun
+            ({_Token, _Key, not_found}, Bitmap) -> Bitmap;
+            ({_Token, _Key, Header}, Bitmap) ->
+                Bitmap bor fts2_search_header_group_bitmap(Header)
+        end,
+        0,
+        Headers
+    ),
+    GroupCount = fts2_search_bitmap_count(GroupBitmap),
+    case GroupCount =< 1024 of
+        false -> no;
+        true -> fts2_search_fast_or_prefixes(
+            [144, 256],
+            Headers,
+            TermData,
+            Column,
+            Root,
+            Window,
+            GroupCount
+        )
+    end.
+
+fts2_search_fast_or_prefixes(
+    [], _Headers, _TermData, _Column, _Root, _Window, _GroupCount
+) ->
+    no;
+fts2_search_fast_or_prefixes(
+    [PrefixSize | Rest], Headers, TermData, Column, Root, Window, GroupCount
+) ->
+    {ChampionGroups, Threshold} = fts2_search_or_prefix_proof(
+        Headers, Root, PrefixSize
+    ),
+    case map_size(ChampionGroups) >= Window of
+        false ->
+            fts2_search_fast_or_prefixes(
+                Rest, Headers, TermData, Column, Root, Window, GroupCount
+            );
+        true ->
+            Candidates = fts2_search_or_candidate_groups(
+                TermData, ChampionGroups, Column, Root
+            ),
+            Ordered = fts2_search_order_matches(Candidates, true),
+            case length(Ordered) >= Window andalso
+                (lists:nth(Window, Ordered))#fts2_match.score > Threshold
+            of
+                true ->
+                    {ranked_champions, Ordered, GroupCount};
+                false ->
+                    fts2_search_fast_or_prefixes(
+                        Rest,
+                        Headers,
+                        TermData,
+                        Column,
+                        Root,
+                        Window,
+                        GroupCount
+                    )
+            end
+    end.
+
+fts2_search_or_prefix_proof(Headers, Root, PrefixSize) ->
+    {Entries, Bounds} = lists:unzip([
+        fts2_search_or_header_prefix(Token, Header, Root, PrefixSize)
+     || {Token, _Key, Header} <- Headers,
+        Header =/= not_found
+    ]),
+    {
+        maps:from_keys(
+            [element(2, Entry) || Prefix <- Entries, Entry <- Prefix],
+            true
+        ),
+        lists:sum(Bounds)
+    }.
+
+fts2_search_or_header_prefix(Token, Header, Root, PrefixSize) ->
+    Champions = maps:get(champions, Header, []),
+    Prefix0 = lists:sublist(Champions, PrefixSize),
+    Prefix = case length(Prefix0) < length(Champions) of
+        false -> Prefix0;
+        true ->
+            Boundary = fts2_search_or_term_factor(lists:last(Prefix0), Root),
+            Prefix0 ++ lists:takewhile(
+                fun(Entry) ->
+                    fts2_search_or_term_factor(Entry, Root) =:= Boundary
+                end,
+                lists:nthtail(length(Prefix0), Champions)
+            )
+    end,
+    Bound = case length(Prefix) < length(Champions) of
+        false -> 0.0;
+        true ->
+            Unseen = lists:nth(length(Prefix) + 1, Champions),
+            fts2_search_or_term_score(
+                Unseen, Token, maps:get(chunk_df, Header), Root
+            )
+    end,
+    {Prefix, Bound}.
+
+fts2_search_or_term_factor(Entry, Root) ->
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    fts2_build_bm25_tf(element(5, Entry), element(4, Entry), Avg).
+
+fts2_search_or_term_score(Entry, _Token, Df, Root) ->
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    fts2_search_or_term_factor(Entry, Root) *
+        fts2_build_bm25_idf(DocCount, Df).
+
+fts2_search_or_candidate_groups(
+    TermData, ChampionGroups, Column, Root
+) ->
+    [{First, {FirstDf, FirstPlane, _FirstBitmap}},
+        {Second, {SecondDf, SecondPlane, _SecondBitmap}}] =
+            lists:sort(maps:to_list(TermData)),
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
+    SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
+    {Current, Acc} = fts2_search_or_candidate_planes(
+        FirstPlane,
+        First,
+        FirstDf,
+        FirstIdf,
+        SecondPlane,
+        Second,
+        SecondDf,
+        SecondIdf,
+        ChampionGroups,
+        Column,
+        Avg,
+        none,
+        []
+    ),
+    lists:reverse(fts2_search_or_finish_group(Current, Acc)).
+
+%% The Boolean planes are fixed-width and chunk ordered. Traverse their
+%% binaries directly so postings rejected by the champion proof allocate no
+%% cursor tuple or term-stat list.
+fts2_search_or_candidate_planes(
+    <<>>, _First, _FirstDf, _FirstIdf,
+    <<>>, _Second, _SecondDf, _SecondIdf,
+    _Groups, _Column, _Avg, Current, Acc
+) ->
+    {Current, Acc};
+fts2_search_or_candidate_planes(
+    <<>>, First, FirstDf, FirstIdf,
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        Tf:32/unsigned-big, _DenseId:32/unsigned-big, Rest/binary>>,
+    Second, SecondDf, SecondIdf,
+    Groups, Column, Avg, Current, Acc
+) ->
+    {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
+        ChunkId, GroupId, SourceId, Length,
+        [{Second, Tf, SecondDf, SecondIdf}], Groups, Column, Avg,
+        Current, Acc
+    ),
+    fts2_search_or_candidate_planes(
+        <<>>, First, FirstDf, FirstIdf,
+        Rest, Second, SecondDf, SecondIdf,
+        Groups, Column, Avg, NextCurrent, NextAcc
+    );
+fts2_search_or_candidate_planes(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        Tf:32/unsigned-big, _DenseId:32/unsigned-big, Rest/binary>>,
+    First, FirstDf, FirstIdf,
+    <<>>, Second, SecondDf, SecondIdf,
+    Groups, Column, Avg, Current, Acc
+) ->
+    {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
+        ChunkId, GroupId, SourceId, Length,
+        [{First, Tf, FirstDf, FirstIdf}], Groups, Column, Avg,
+        Current, Acc
+    ),
+    fts2_search_or_candidate_planes(
+        Rest, First, FirstDf, FirstIdf,
+        <<>>, Second, SecondDf, SecondIdf,
+        Groups, Column, Avg, NextCurrent, NextAcc
+    );
+fts2_search_or_candidate_planes(
+    <<FirstChunk:32/unsigned-big, FirstGroup:32/unsigned-big,
+        FirstSource:64/unsigned-big, FirstLength:32/unsigned-big,
+        FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
+        FirstRest/binary>> = FirstPlane,
+    First, FirstDf, FirstIdf,
+    <<SecondChunk:32/unsigned-big, SecondGroup:32/unsigned-big,
+        SecondSource:64/unsigned-big, SecondLength:32/unsigned-big,
+        SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
+        SecondRest/binary>> = SecondPlane,
+    Second, SecondDf, SecondIdf,
+    Groups, Column, Avg, Current, Acc
+) ->
+    case FirstChunk - SecondChunk of
+        Difference when Difference < 0 ->
+            {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
+                FirstChunk, FirstGroup, FirstSource, FirstLength,
+                [{First, FirstTf, FirstDf, FirstIdf}],
+                Groups, Column, Avg, Current, Acc
+            ),
+            fts2_search_or_candidate_planes(
+                FirstRest, First, FirstDf, FirstIdf,
+                SecondPlane, Second, SecondDf, SecondIdf,
+                Groups, Column, Avg, NextCurrent, NextAcc
+            );
+        Difference when Difference > 0 ->
+            {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
+                SecondChunk, SecondGroup, SecondSource, SecondLength,
+                [{Second, SecondTf, SecondDf, SecondIdf}],
+                Groups, Column, Avg, Current, Acc
+            ),
+            fts2_search_or_candidate_planes(
+                FirstPlane, First, FirstDf, FirstIdf,
+                SecondRest, Second, SecondDf, SecondIdf,
+                Groups, Column, Avg, NextCurrent, NextAcc
+            );
+        0 ->
+            true = {FirstGroup, FirstSource, FirstLength} =:=
+                {SecondGroup, SecondSource, SecondLength},
+            {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
+                FirstChunk, FirstGroup, FirstSource, FirstLength,
+                [
+                    {First, FirstTf, FirstDf, FirstIdf},
+                    {Second, SecondTf, SecondDf, SecondIdf}
+                ],
+                Groups, Column, Avg, Current, Acc
+            ),
+            fts2_search_or_candidate_planes(
+                FirstRest, First, FirstDf, FirstIdf,
+                SecondRest, Second, SecondDf, SecondIdf,
+                Groups, Column, Avg, NextCurrent, NextAcc
+            )
+    end.
+
+fts2_search_or_candidate_row(
+    _ChunkId,
+    GroupId,
+    _SourceId,
+    _Length,
+    _Terms,
+    Groups,
+    _Column,
+    _Avg,
+    Current,
+    Acc
+) when not is_map_key(GroupId, Groups) ->
+    {Current, Acc};
+fts2_search_or_candidate_row(
+    ChunkId,
+    GroupId,
+    SourceId,
+    Length,
+    Terms,
+    _Groups,
+    _Column,
+    Avg,
+    Current,
+    Acc
+) ->
+    Match = fts2_search_or_candidate_match(
+        ChunkId, GroupId, SourceId, Length, Terms, Avg
+    ),
+    fts2_search_or_add_group(Match, Current, Acc).
+
+fts2_search_or_candidate_match(
+    ChunkId,
+    GroupId,
+    SourceId,
+    Length,
+    [{Token, Tf, _Df, Idf}],
+    Avg
+) ->
+    #fts2_match{
+        chunk_id = ChunkId,
+        group_id = GroupId,
+        source_id = SourceId,
+        doc_length = Length,
+        tf = Tf,
+        terms = [Token],
+        score = fts2_search_bm25(Tf, Idf, Avg, Length)
+    };
+fts2_search_or_candidate_match(
+    ChunkId,
+    GroupId,
+    SourceId,
+    Length,
+    [{First, FirstTf, _FirstDf, FirstIdf},
+        {Second, SecondTf, _SecondDf, SecondIdf}],
+    Avg
+) ->
+    #fts2_match{
+        chunk_id = ChunkId,
+        group_id = GroupId,
+        source_id = SourceId,
+        doc_length = Length,
+        tf = FirstTf + SecondTf,
+        terms = [First, Second],
+        score =
+            fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
+                fts2_search_bm25(SecondTf, SecondIdf, Avg, Length)
+    }.
+
+fts2_search_or_add_group(Match, none, Acc) ->
+    {{Match#fts2_match.group_id, Match, fts2_search_match_count(Match)}, Acc};
+fts2_search_or_add_group(
+    #fts2_match{group_id = GroupId} = Match,
+    {GroupId, Winner, MatchCount},
+    Acc
+) ->
+    NextWinner = case fts2_search_better_chunk(Match, Winner, true) of
+        true -> Match;
+        false -> Winner
+    end,
+    {{GroupId, NextWinner,
+        MatchCount + fts2_search_match_count(Match)}, Acc};
+fts2_search_or_add_group(Match, Current, Acc) ->
+    NextAcc = fts2_search_or_finish_group(Current, Acc),
+    {{Match#fts2_match.group_id, Match, fts2_search_match_count(Match)},
+        NextAcc}.
+
+fts2_search_or_finish_group(none, Acc) ->
+    Acc;
+fts2_search_or_finish_group({_GroupId, Winner, MatchCount}, Acc) ->
+    [Winner#fts2_match{group_match_count = MatchCount} | Acc].
+
+fts2_search_fast_boolean_full(AST, TermData, Column, Root) ->
+    ResultBitmap = fts2_search_boolean_bitmap(AST, TermData),
+    ResultBytes = binary:encode_unsigned(ResultBitmap, little),
+    ResultCount = fts2_search_bitmap_count(ResultBitmap),
+    PositiveTokens = fts2_search_boolean_positive_tokens(AST),
+    RowsByChunk = lists:foldl(
+        fun(Token, Acc) ->
+            {Df, EntryPlane, _Bitmap} = maps:get(Token, TermData),
+            case ResultCount * 16 < Df of
+                true ->
+                    fts2_search_boolean_select_sparse(
+                        EntryPlane, ResultBytes, Column, Token, Df, Acc
+                    );
+                false ->
+                    fts2_search_boolean_select_plane(
+                        EntryPlane, ResultBytes, Column, Token, Df, Acc
+                    )
+            end
+        end,
+        #{},
+        PositiveTokens
+    ),
+    Rows = maps:values(RowsByChunk),
+    Scored = fts2_search_boolean_score_rows(Rows, TermData, Root),
+    Grouped = fts2_search_collapse_scored_groups(Scored, true),
+    {ranked_champions, Grouped, length(Grouped)}.
+
+fts2_search_boolean_score_rows(Rows, TermData, Root) ->
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    Idfs = maps:from_list([
+        {Token, fts2_build_bm25_idf(DocCount, Df)}
+     || {Token, {Df, _EntryPlane, _Bitmap}} <- maps:to_list(TermData)
+    ]),
+    [
+        #fts2_match{
+            chunk_id = ChunkId,
+            group_id = GroupId,
+            source_id = SourceId,
+            doc_length = Length,
+            tf = TotalTf,
+            term_stats = Stats,
+            terms = [Token ||
+                {{_Column, Token}, _Tf, _Source, _Df} <- Stats],
+            score = lists:sum([
+                fts2_search_bm25(
+                    Tf, maps:get(Token, Idfs), Avg, Length
+                )
+             || {{_Column, Token}, Tf, _Source, _Df} <- Stats
+            ])
+        }
+     || {ChunkId, GroupId, SourceId, Length, Stats, TotalTf} <- Rows
+    ].
+
+fts2_search_or_champions_exact(Headers) ->
+    lists:all(
+        fun
+            ({_Token, _Key, not_found}) ->
+                true;
+            ({_Token, _Key, Header}) ->
+                length(maps:get(champions, Header, [])) >=
+                    maps:get(chunk_df, Header, 0)
+        end,
+        Headers
+    ).
+
+fts2_search_fast_prefix(Bookie, Schema, Root, Prefix, Columns, Opts) ->
+    Window = maps:get(offset, Opts, 0) + maps:get(limit, Opts, ?DEFAULT_LIMIT),
+    case {
+        fts2_search_selector_ids(Columns, Schema),
+        maps:get(rank, Opts, none),
+        maps:get(impact_facet, Opts, nil),
+        Window =< 256
+    } of
+        {[Column], bm25, nil, true} ->
+            Generation = maps:get(generation, Root),
+            Bucket = maps:get(index, Schema),
+            Headers = [
+                {Token, Header}
+             || {_Key, Token, Header} <- fts2_search_prefix_headers(
+                    Bookie, Bucket, Generation, Column, Prefix,
+                    fun fts2_codec_decode_header/1
+                )
+            ],
+            {MatchesByChunk, GroupBitmap} = lists:foldl(
+                fun({Token, Header}, {MatchAcc, BitmapAcc}) ->
+                    Matches = fts2_search_ranked_champions(
+                        maps:get(champions, Header),
+                        Column,
+                        Token,
+                        maps:get(chunk_df, Header),
+                        #{},
+                        Root
+                    ),
+                    {
+                        lists:foldl(
+                            fun fts2_search_merge_champion_match/2,
+                            MatchAcc,
+                            Matches
+                        ),
+                        BitmapAcc bor fts2_search_header_group_bitmap(Header)
+                    }
+                end,
+                {#{}, 0},
+                Headers
+            ),
+            Grouped = fts2_search_collapse_scored_groups(
+                maps:values(MatchesByChunk), true
+            ),
+            {ranked_champions,
+                Grouped,
+                fts2_search_bitmap_count(GroupBitmap)};
+        _ ->
+            no
+    end.
+
+fts2_search_read_positional_pair(
+    Bookie, Schema, Root, Column, First, Second
+) ->
+    Generation = maps:get(generation, Root),
+    Bucket = maps:get(index, Schema),
+    {FirstKey, _} = fts2_codec_term_key(Generation, Column, First),
+    {SecondKey, _} = fts2_codec_term_key(Generation, Column, Second),
+    FirstBooleanKey = fts2_codec_term_plane_key(FirstKey, boolean),
+    SecondBooleanKey = fts2_codec_term_plane_key(SecondKey, boolean),
+    FirstPositionKey = fts2_codec_term_plane_key(FirstKey, positions),
+    SecondPositionKey = fts2_codec_term_plane_key(SecondKey, positions),
+    case leveled_fts_residency:headonly_many(
+        Bookie,
+        Bucket,
+        [
+            {FirstKey, <<"h">>},
+            {SecondKey, <<"h">>},
+            {FirstBooleanKey, <<"b">>},
+            {SecondBooleanKey, <<"b">>},
+            {FirstPositionKey, <<"p">>},
+            {SecondPositionKey, <<"p">>}
+        ]
+    ) of
+        [{ok, FirstValue}, {ok, SecondValue}, FirstBoolean, SecondBoolean,
+            FirstPosition, SecondPosition] ->
+            FirstHeader = fts2_codec_decode_header_metadata(FirstValue),
+            SecondHeader = fts2_codec_decode_header_metadata(SecondValue),
+            FirstDf = maps:get(chunk_df, FirstHeader),
+            SecondDf = maps:get(chunk_df, SecondHeader),
+            FirstEntries = fts2_search_header_entry_plane(
+                FirstHeader, FirstBoolean, First
+            ),
+            SecondEntries = fts2_search_header_entry_plane(
+                SecondHeader, SecondBoolean, Second
+            ),
+            Rows = case maps:get(position_order, Root, legacy) of
+                chunk ->
+                    fts2_search_positional_pair_rows(
+                        FirstEntries,
+                        fts2_search_header_position_plane(
+                            FirstHeader, FirstPosition, First
+                        ),
+                        First,
+                        FirstDf,
+                        SecondEntries,
+                        fts2_search_header_position_plane(
+                            SecondHeader, SecondPosition, Second
+                        ),
+                        Second,
+                        SecondDf,
+                        Column,
+                        []
+                    );
+                legacy ->
+                    LegacyRows = fts2_search_positional_intersect(
+                        FirstEntries, Column, First, FirstDf,
+                        SecondEntries, Second, SecondDf, []
+                    ),
+                    ChunkIds = [element(1, Row) || Row <- LegacyRows],
+                    FirstPositions = fts2_search_header_positions(
+                        FirstHeader, FirstPosition, ChunkIds, First
+                    ),
+                    SecondPositions = fts2_search_header_positions(
+                        SecondHeader, SecondPosition, ChunkIds, Second
+                    ),
+                    [
+                        {Row,
+                            maps:get(element(1, Row), FirstPositions, []),
+                            maps:get(element(1, Row), SecondPositions, [])}
+                     || Row <- LegacyRows
+                    ]
+            end,
+            {FirstHeader, SecondHeader, Rows};
+        _ ->
+            not_found
+    end.
+
+fts2_search_header_position_plane(Header, _External, _Token) when
+    is_map_key(positions_packed, Header)
+->
+    fts2_codec_decode_header_tail(maps:get(positions_packed, Header));
+fts2_search_header_position_plane(_Header, {ok, Value}, _Token) ->
+    Value;
+fts2_search_header_position_plane(_Header, Bad, Token) ->
+    erlang:error({invalid_fts2_position_row, Token, Bad}).
+
+%% Boolean and position rows have the same posting order. Merge both term
+%% pairs in one pass, decoding positions only for chunks present in both.
+fts2_search_positional_pair_rows(
+    FirstPlane,
+    <<?POSITION_VERSION:8, _FirstCount:32/unsigned-big,
+        FirstPositions/binary>>,
+    First,
+    FirstDf,
+    SecondPlane,
+    <<?POSITION_VERSION:8, _SecondCount:32/unsigned-big,
+        SecondPositions/binary>>,
+    Second,
+    SecondDf,
+    Column,
+    Acc
+) ->
+    fts2_search_positional_pair_rows_raw(
+        FirstPlane, FirstPositions, First, FirstDf,
+        SecondPlane, SecondPositions, Second, SecondDf,
+        Column, Acc
+    ).
+
+fts2_search_positional_pair_rows_raw(
+    <<>>, _FirstPositions, _First, _FirstDf,
+    _SecondPlane, _SecondPositions, _Second, _SecondDf, _Column, Acc
+) ->
+    lists:reverse(Acc);
+fts2_search_positional_pair_rows_raw(
+    _FirstPlane, _FirstPositions, _First, _FirstDf,
+    <<>>, _SecondPositions, _Second, _SecondDf, _Column, Acc
+) ->
+    lists:reverse(Acc);
+fts2_search_positional_pair_rows_raw(
+    <<FirstChunk:32/unsigned-big, FirstGroup:32/unsigned-big,
+        FirstSource:64/unsigned-big, FirstLength:32/unsigned-big,
+        FirstTf:32/unsigned-big, FirstDense:32/unsigned-big,
+        FirstRest/binary>> = FirstPlane,
+    <<FirstChunk:32/unsigned-big, FirstPositionCount:32/unsigned-big,
+        FirstBytes:32/unsigned-big, FirstEncoded:FirstBytes/binary,
+        FirstPositionRest/binary>> = FirstPositions,
+    First,
+    FirstDf,
+    <<SecondChunk:32/unsigned-big, SecondGroup:32/unsigned-big,
+        SecondSource:64/unsigned-big, SecondLength:32/unsigned-big,
+        SecondTf:32/unsigned-big, SecondDense:32/unsigned-big,
+        SecondRest/binary>> = SecondPlane,
+    <<SecondChunk:32/unsigned-big, SecondPositionCount:32/unsigned-big,
+        SecondBytes:32/unsigned-big, SecondEncoded:SecondBytes/binary,
+        SecondPositionRest/binary>> = SecondPositions,
+    Second,
+    SecondDf,
+    Column,
+    Acc
+) ->
+    case FirstChunk - SecondChunk of
+        Difference when Difference < 0 ->
+            fts2_search_positional_pair_rows_raw(
+                FirstRest, FirstPositionRest, First, FirstDf,
+                SecondPlane, SecondPositions, Second, SecondDf,
+                Column, Acc
+            );
+        Difference when Difference > 0 ->
+            fts2_search_positional_pair_rows_raw(
+                FirstPlane, FirstPositions, First, FirstDf,
+                SecondRest, SecondPositionRest, Second, SecondDf,
+                Column, Acc
+            );
+        0 ->
+            true = {FirstGroup, FirstSource, FirstLength, FirstDense} =:=
+                {SecondGroup, SecondSource, SecondLength, SecondDense},
+            Row = {
+                FirstChunk,
+                FirstGroup,
+                FirstSource,
+                FirstLength,
+                [
+                    {{Column, First}, FirstTf, base, FirstDf},
+                    {{Column, Second}, SecondTf, base, SecondDf}
+                ],
+                FirstTf + SecondTf
+            },
+            FirstDecoded = fts2_codec_decode_position_list(
+                FirstPositionCount, FirstEncoded, 0, []
+            ),
+            SecondDecoded = fts2_codec_decode_position_list(
+                SecondPositionCount, SecondEncoded, 0, []
+            ),
+            fts2_search_positional_pair_rows_raw(
+                FirstRest, FirstPositionRest, First, FirstDf,
+                SecondRest, SecondPositionRest, Second, SecondDf,
+                Column, [{Row, FirstDecoded, SecondDecoded} | Acc]
+            )
+    end.
+
+%% Legacy helper retained for the older inline-position test surface.
+fts2_search_positional_intersect(
+    <<>>, _Column, _First, _FirstDf, _SecondPlane, _Second, _SecondDf, Acc
+) ->
+    lists:reverse(Acc);
+fts2_search_positional_intersect(
+    _FirstPlane, _Column, _First, _FirstDf, <<>>, _Second, _SecondDf, Acc
+) ->
+    lists:reverse(Acc);
+fts2_search_positional_intersect(
+    <<FirstChunk:32/unsigned-big, _FirstGroup:32/unsigned-big,
+        _FirstSource:64/unsigned-big, _FirstLength:32/unsigned-big,
+        _FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
+        FirstRest/binary>>,
+    Column,
+    First,
+    FirstDf,
+    <<SecondChunk:32/unsigned-big, _SecondGroup:32/unsigned-big,
+        _SecondSource:64/unsigned-big, _SecondLength:32/unsigned-big,
+        _SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
+        _SecondRest/binary>> = SecondPlane,
+    Second,
+    SecondDf,
+    Acc
+) when FirstChunk < SecondChunk ->
+    fts2_search_positional_intersect(
+        FirstRest,
+        Column,
+        First,
+        FirstDf,
+        SecondPlane,
+        Second,
+        SecondDf,
+        Acc
+    );
+fts2_search_positional_intersect(
+    <<FirstChunk:32/unsigned-big, _FirstGroup:32/unsigned-big,
+        _FirstSource:64/unsigned-big, _FirstLength:32/unsigned-big,
+        _FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
+        _FirstRest/binary>> = FirstPlane,
+    Column,
+    First,
+    FirstDf,
+    <<SecondChunk:32/unsigned-big, _SecondGroup:32/unsigned-big,
+        _SecondSource:64/unsigned-big, _SecondLength:32/unsigned-big,
+        _SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
+        SecondRest/binary>>,
+    Second,
+    SecondDf,
+    Acc
+) when SecondChunk < FirstChunk ->
+    fts2_search_positional_intersect(
+        FirstPlane,
+        Column,
+        First,
+        FirstDf,
+        SecondRest,
+        Second,
+        SecondDf,
+        Acc
+    );
+fts2_search_positional_intersect(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        FirstTf:32/unsigned-big, DenseId:32/unsigned-big,
+        FirstRest/binary>>,
+    Column,
+    First,
+    FirstDf,
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        SecondTf:32/unsigned-big, DenseId:32/unsigned-big,
+        SecondRest/binary>>,
+    Second,
+    SecondDf,
+    Acc
+) ->
+    Row = {
+        ChunkId,
+        GroupId,
+        SourceId,
+        Length,
+        [
+            {{Column, First}, FirstTf, base, FirstDf},
+            {{Column, Second}, SecondTf, base, SecondDf}
+        ],
+        FirstTf + SecondTf
+    },
+    fts2_search_positional_intersect(
+        FirstRest,
+        Column,
+        First,
+        FirstDf,
+        SecondRest,
+        Second,
+        SecondDf,
+        [Row | Acc]
+    ).
+
+fts2_search_header_entry_plane(Header, _External, _Token) when
+    is_map_key(entries_packed, Header)
+->
+    fts2_codec_header_entry_plane(Header);
+fts2_search_header_entry_plane(_Header, {ok, Value}, _Token) ->
+    fts2_codec_plane_payload(Value);
+fts2_search_header_entry_plane(_Header, Bad, Token) ->
+    erlang:error({invalid_fts2_boolean_row, Token, Bad}).
+
+fts2_search_header_positions(Header, _External, ChunkIds, _Token) when
+    is_map_key(positions_packed, Header)
+->
+    fts2_codec_header_positions(Header, ChunkIds);
+fts2_search_header_positions(_Header, {ok, Value}, ChunkIds, _Token) ->
+    fts2_codec_decode_positions(Value, ChunkIds);
+fts2_search_header_positions(_Header, Bad, _ChunkIds, Token) ->
+    erlang:error({invalid_fts2_position_row, Token, Bad}).
+
+fts2_search_fast_near(
+    Bookie,
+    Schema,
+    Root,
+    [{term, First, false, _}, {term, Second, false, _}],
+    Distance,
+    Columns,
+    Opts
+) ->
+    Window = maps:get(offset, Opts, 0) + maps:get(limit, Opts, ?DEFAULT_LIMIT),
+    case {
+        fts2_search_selector_ids(Columns, Schema),
+        maps:get(rank, Opts, none),
+        maps:get(impact_facet, Opts, nil),
+        Window =< 256
+    } of
+        {[Column], bm25, nil, true} ->
+            case fts2_search_read_positional_pair(
+                Bookie, Schema, Root, Column, First, Second
+            ) of
+                {FirstHeader, SecondHeader, Rows0} ->
+                    FirstDf = maps:get(chunk_df, FirstHeader),
+                    SecondDf = maps:get(chunk_df, SecondHeader),
+                    Rows = [
+                        {Row, Starts}
+                     || {Row, FirstPositions, SecondPositions} <- Rows0,
+                        Starts <- [fts2_search_near_term_positions(
+                            FirstPositions, SecondPositions, Distance, []
+                        )],
+                        Starts =/= []
+                    ],
+                    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+                    Avg = maps:get(total_length, Root, 0) / DocCount,
+                    FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
+                    SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
+                    Scored = [
+                        begin
+                            [{{_, First}, FirstTf, base, FirstDf},
+                                {{_, Second}, SecondTf, base, SecondDf}] =
+                                    Stats,
+                            #fts2_match{
+                                chunk_id = ChunkId,
+                                group_id = GroupId,
+                                source_id = SourceId,
+                                doc_length = Length,
+                                tf = TotalTf,
+                                term_stats = Stats,
+                                terms = [First, Second],
+                                match_positions = [{near, Starts}],
+                                match_count = length(Starts),
+                                score =
+                                    fts2_search_bm25(
+                                        FirstTf, FirstIdf, Avg, Length
+                                    ) +
+                                    fts2_search_bm25(
+                                        SecondTf, SecondIdf, Avg, Length
+                                    )
+                            }
+                        end
+                     || {{ChunkId, GroupId, SourceId, Length, Stats, TotalTf},
+                            Starts} <- Rows
+                    ],
+                    Grouped = fts2_search_collapse_scored_groups(Scored, true),
+                    {ranked_champions, Grouped, length(Grouped)};
+                not_found ->
+                    {ranked_champions, [], 0}
+            end;
+        _ ->
+            no
+    end;
+fts2_search_fast_near(
+    _Bookie, _Schema, _Root, _Items, _Distance, _Columns, _Opts
+) ->
+    no.
+
+fts2_search_boolean_terms(AST, Schema) ->
+    case fts2_search_boolean_terms(AST, Schema, undefined, []) of
+        {ok, Column, Tokens} -> {ok, Column, lists:usort(Tokens)};
+        no -> no
+    end.
+
+fts2_search_boolean_terms({term, Token, false, Columns}, Schema, Column0, Acc) ->
+    case fts2_search_selector_ids(Columns, Schema) of
+        [Column] when Column0 =:= undefined; Column =:= Column0 ->
+            {ok, Column, [Token | Acc]};
+        _ -> no
+    end;
+fts2_search_boolean_terms({Op, A, B}, Schema, Column0, Acc) when
+    Op =:= 'and'; Op =:= 'or'; Op =:= 'not'
+->
+    case fts2_search_boolean_terms(A, Schema, Column0, Acc) of
+        {ok, Column, Acc1} ->
+            fts2_search_boolean_terms(B, Schema, Column, Acc1);
+        no -> no
+    end;
+fts2_search_boolean_terms(_AST, _Schema, _Column, _Acc) ->
+    no.
+
+fts2_search_boolean_pure_or(
+    {'or', {term, _First, false, _}, {term, _Second, false, _}}
+) ->
+    true;
+fts2_search_boolean_pure_or(_AST) ->
+    false.
+
+fts2_search_plane_chunk_bitmap(<<>>, Bitmap) ->
+    Bitmap;
+fts2_search_plane_chunk_bitmap(
+    <<_ChunkId:32/unsigned-big, _GroupId:32/unsigned-big,
+        _SourceId:64/unsigned-big, _Length:32/unsigned-big,
+        _Tf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    Bitmap
+) ->
+    fts2_search_plane_chunk_bitmap(Rest, Bitmap bor (1 bsl DenseId)).
+
+fts2_search_header_group_bitmap(Header) ->
+    case maps:find(group_bitmap, Header) of
+        {ok, Bitmap} ->
+            Bitmap;
+        error ->
+            lists:foldl(
+                fun(Entry, Bitmap) ->
+                    Bitmap bor (1 bsl element(2, Entry))
+                end,
+                0,
+                maps:get(champions, Header)
+            )
+    end.
+
+fts2_search_boolean_bitmap({term, Token, false, _Columns}, TermData) ->
+    {_Df, _EntryPlane, Bitmap} = maps:get(Token, TermData),
+    Bitmap;
+fts2_search_boolean_bitmap({'and', A, B}, TermData) ->
+    fts2_search_boolean_bitmap(A, TermData) band
+        fts2_search_boolean_bitmap(B, TermData);
+fts2_search_boolean_bitmap({'or', A, B}, TermData) ->
+    fts2_search_boolean_bitmap(A, TermData) bor
+        fts2_search_boolean_bitmap(B, TermData);
+fts2_search_boolean_bitmap({'not', A, B}, TermData) ->
+    fts2_search_boolean_bitmap(A, TermData) band
+        bnot fts2_search_boolean_bitmap(B, TermData).
+
+fts2_search_boolean_positive_tokens(AST) ->
+    lists:usort(fts2_search_boolean_positive_tokens(AST, true, [])).
+
+fts2_search_boolean_positive_tokens(
+    {term, Token, false, _Columns}, true, Acc
+) ->
+    [Token | Acc];
+fts2_search_boolean_positive_tokens(
+    {term, _Token, false, _Columns}, false, Acc
+) ->
+    Acc;
+fts2_search_boolean_positive_tokens({Op, A, B}, Positive, Acc) when
+    Op =:= 'and'; Op =:= 'or'
+->
+    fts2_search_boolean_positive_tokens(
+        B,
+        Positive,
+        fts2_search_boolean_positive_tokens(A, Positive, Acc)
+    );
+fts2_search_boolean_positive_tokens({'not', A, B}, Positive, Acc) ->
+    fts2_search_boolean_positive_tokens(
+        B,
+        false,
+        fts2_search_boolean_positive_tokens(A, Positive, Acc)
+    ).
+
+fts2_search_boolean_select_plane(<<>>, _Result, _Column, _Token, _Df, Acc) ->
+    Acc;
+fts2_search_boolean_select_plane(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        Tf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    Result,
+    Column,
+    Token,
+    Df,
+    Acc
+) ->
+    ByteIndex = DenseId bsr 3,
+    Selected = ByteIndex < byte_size(Result) andalso
+        (binary:at(Result, ByteIndex) band (1 bsl (DenseId band 7))) =/= 0,
+    NextAcc = case Selected of
+        false ->
+            Acc;
+        true ->
+            Stat = {{Column, Token}, Tf, base, Df},
+            case maps:find(ChunkId, Acc) of
+                error ->
+                    Acc#{ChunkId => {
+                        ChunkId, GroupId, SourceId, Length, [Stat], Tf
+                    }};
+                {ok, {ChunkId, GroupId, SourceId, Length, Stats, TotalTf}} ->
+                    Acc#{ChunkId => {
+                        ChunkId,
+                        GroupId,
+                        SourceId,
+                        Length,
+                        [Stat | Stats],
+                        TotalTf + Tf
+                    }}
+            end
+    end,
+    fts2_search_boolean_select_plane(
+        Rest, Result, Column, Token, Df, NextAcc
+    ).
+
+fts2_search_boolean_select_sparse(Plane, Result, Column, Token, Df, Acc) ->
+    DenseIds = fts2_search_bitmap_dense_ids(Result, 0, []),
+    lists:foldl(
+        fun(DenseId, RowAcc) ->
+            case fts2_search_plane_find_dense(
+                Plane, DenseId, 0, byte_size(Plane) div 28
+            ) of
+                not_found ->
+                    RowAcc;
+                {ChunkId, GroupId, SourceId, Length, Tf, DenseId} ->
+                    Stat = {{Column, Token}, Tf, base, Df},
+                    case maps:find(ChunkId, RowAcc) of
+                        error ->
+                            RowAcc#{ChunkId => {
+                                ChunkId, GroupId, SourceId, Length, [Stat], Tf
+                            }};
+                        {ok, {ChunkId, GroupId, SourceId, Length,
+                                Stats, TotalTf}} ->
+                            RowAcc#{ChunkId => {
+                                ChunkId, GroupId, SourceId, Length,
+                                [Stat | Stats], TotalTf + Tf
+                            }}
+                    end
+            end
+        end,
+        Acc,
+        DenseIds
+    ).
+
+fts2_search_bitmap_dense_ids(<<>>, _Base, Acc) ->
+    lists:reverse(Acc);
+fts2_search_bitmap_dense_ids(<<Byte, Rest/binary>>, Base, Acc) ->
+    Next = fts2_search_bitmap_byte_ids(Byte, Base, 0, Acc),
+    fts2_search_bitmap_dense_ids(Rest, Base + 8, Next).
+
+fts2_search_bitmap_byte_ids(_Byte, _Base, 8, Acc) ->
+    Acc;
+fts2_search_bitmap_byte_ids(Byte, Base, Bit, Acc) ->
+    Next = case Byte band (1 bsl Bit) of
+        0 -> Acc;
+        _ -> [Base + Bit | Acc]
+    end,
+    fts2_search_bitmap_byte_ids(Byte, Base, Bit + 1, Next).
+
+fts2_search_plane_find_dense(_Plane, _DenseId, Low, High) when Low >= High ->
+    not_found;
+fts2_search_plane_find_dense(Plane, DenseId, Low, High) ->
+    Mid = (Low + High) bsr 1,
+    Offset = Mid * 28,
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        Tf:32/unsigned-big, Found:32/unsigned-big>> =
+            binary:part(Plane, Offset, 28),
+    case Found of
+        DenseId ->
+            {ChunkId, GroupId, SourceId, Length, Tf, Found};
+        _ when Found < DenseId ->
+            fts2_search_plane_find_dense(
+                Plane, DenseId, Mid + 1, High
+            );
+        _ ->
+            fts2_search_plane_find_dense(Plane, DenseId, Low, Mid)
+    end.
+
+fts2_search_ranked_champions(Entries, Column, Token, Df, PositionMap, Root) ->
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    Idf = fts2_build_bm25_idf(DocCount, Df),
+    Term = {Column, Token},
+    [
+        #fts2_match{
+            chunk_id = ChunkId,
+            group_id = GroupId,
+            source_id = SourceId,
+            doc_length = Length,
+            tf = Tf,
+            term_stats = [{Term, Tf, base, Df}],
+            terms = [Token],
+            columns = [{Term, Positions}],
+            match_positions = [{Token, Positions}],
+            score = fts2_search_bm25(Tf, Idf, Avg, Length)
+        }
+     || {ChunkId, GroupId, SourceId, Length, Tf} <- Entries,
+        Positions <- [maps:get(ChunkId, PositionMap, [])]
+    ].
+
+fts2_search_merge_champion_match(
+    #fts2_match{chunk_id = ChunkId} = Match, Acc
+) ->
+    case maps:find(ChunkId, Acc) of
+        error ->
+            Acc#{ChunkId => Match};
+        {ok, Existing} ->
+            Acc#{ChunkId => Existing#fts2_match{
+                tf = Existing#fts2_match.tf + Match#fts2_match.tf,
+                term_stats = Existing#fts2_match.term_stats ++
+                    Match#fts2_match.term_stats,
+                terms = Existing#fts2_match.terms ++ Match#fts2_match.terms,
+                score = Existing#fts2_match.score + Match#fts2_match.score
+            }}
+    end.
+
+fts2_search_bitmap_count(0) ->
+    0;
+fts2_search_bitmap_count(Bitmap) ->
+    fts2_search_bitmap_count_binary(binary:encode_unsigned(Bitmap), 0).
+
+fts2_search_bitmap_count_binary(<<>>, Count) ->
+    Count;
+fts2_search_bitmap_count_binary(<<Byte, Rest/binary>>, Count) ->
+    Nibbles = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4},
+    Bits = element((Byte band 15) + 1, Nibbles) +
+        element((Byte bsr 4) + 1, Nibbles),
+    fts2_search_bitmap_count_binary(Rest, Count + Bits).
+
+fts2_search_can_page_before_identity(Opts, true) ->
+    maps:get(impact_facet, Opts, nil) =:= nil;
+fts2_search_can_page_before_identity(Opts, false) ->
+    maps:get(impact_facet, Opts, nil) =:= nil andalso
+        maps:get(resolve_hits, Opts, true) =:= false.
+
+fts2_search_prepage_matches(Matches, false, Offset, Limit) ->
+    {lists:sublist(fts2_search_drop(Offset, fts2_search_order_matches(Matches, false)), Limit), 0};
+fts2_search_prepage_matches(Matches, true, Offset, Limit) ->
+    Ordered = fts2_search_order_matches(Matches, true),
+    case lists:sublist(fts2_search_drop(Offset, Ordered), Limit) of
+        [] ->
+            {[], 0};
+        Page ->
+            StartScore = (hd(Page))#fts2_match.score,
+            EndScore = (lists:last(Page))#fts2_match.score,
+            Higher = length([
+                Match
+             || Match <- Ordered,
+                Match#fts2_match.score > StartScore
+            ]),
+            TiedWindow = [
+                Match
+             || Match <- Ordered,
+                Match#fts2_match.score =< StartScore,
+                Match#fts2_match.score >= EndScore
+            ],
+            {TiedWindow, Offset - Higher}
+    end.
+
+fts2_search_order_matches(Matches, true) ->
+    [
+        Match
+     || {_Key, Match} <- lists:keysort(
+            1,
+            [
+                {{-Match#fts2_match.score, Match#fts2_match.source_id}, Match}
+             || Match <- Matches
+            ]
+        )
+    ];
+fts2_search_order_matches(Matches, false) ->
+    [
+        Match
+     || {_SourceId, Match} <- lists:keysort(
+            1,
+            [{Match#fts2_match.source_id, Match} || Match <- Matches]
+        )
+    ].
+
+fts2_search_enrich_base_groups(_Bookie, _Schema, undefined, Matches) ->
+    Matches;
+fts2_search_enrich_base_groups(Bookie, Schema, Root, Matches) ->
+    GroupIds = lists:usort([
+        Meta#fts2_match.group_id
+     || Meta <- maps:values(Matches)
+    ]),
+    Identities = fts2_search_read_identities(Bookie, Schema, Root, GroupIds),
+    VersionField = maps:get(candidate_version_field, Schema, undefined),
+    maps:map(
+        fun(_ChunkId, Meta) ->
+            Group = maps:get(Meta#fts2_match.group_id, Identities),
+            SourceId = Meta#fts2_match.source_id,
+            [Chunk] = [
+                C
+             || C <- maps:get(chunks, Group),
+                maps:get(source_id, C) =:= SourceId
+            ],
+            Candidate = maps:get(candidate_record, Chunk),
+            Version = case VersionField of
+                undefined -> 0;
+                _ -> maps:get(VersionField, Candidate, 0)
+            end,
+            Meta#fts2_match{
+                logical_group = maps:get(group_key, Group),
+                group_version = Version
+            }
+        end,
+        Matches
+    ).
+
+fts2_search_score_root(undefined, Deltas) ->
+    Live = fts2_delta_live_documents(Deltas),
+    #{
+        chunk_count => map_size(Live),
+        group_count => map_size(Live),
+        total_length => lists:sum([
+            maps:get(doc_length, Document)
+         || Document <- maps:values(Live)
+        ])
+    };
+fts2_search_score_root(Root, []) ->
+    Root;
+fts2_search_score_root(Root, Deltas) ->
+    Live = fts2_delta_live_documents(Deltas),
+    Removed = [
+        Delta
+     || {_RowId, Delta} <- Deltas,
+        maps:get(status, Delta) =:= remove orelse
+            (maps:get(status, Delta) =:= live andalso
+                maps:get(retired_ids, Delta, []) =:= [] andalso
+                is_integer(maps:get(base_length, Delta, none)))
+    ],
+    Root#{
+        chunk_count => erlang:max(
+            0,
+            maps:get(chunk_count, Root) - length(Removed) + map_size(Live)
+        ),
+        total_length => erlang:max(
+            0,
+            maps:get(total_length, Root) -
+                lists:sum([maps:get(doc_length, D) || D <- Removed]) +
+                lists:sum([
+                    maps:get(doc_length, Document)
+                 || Document <- maps:values(Live)
+                ])
+        )
+    }.
+
+fts2_search_eval(_Bookie, _Schema, _Root, {empty}, _NeedPositions, _Wanted) ->
+    #{};
+fts2_search_eval(Bookie, Schema, Root, {all_docs}, _NeedPositions, Wanted) ->
+    fts2_search_all_chunks(Bookie, Schema, Root, Wanted);
+fts2_search_eval(
+    Bookie, Schema, Root, {term, Token, Prefix, Columns}, NeedPositions, Wanted
+) ->
+    fts2_search_read_term(
+        Bookie, Schema, Root, Token, Prefix, Columns, NeedPositions, Wanted
+    );
+fts2_search_eval(Bookie, Schema, Root, {phrase, Specs, Columns}, _NeedPositions, Wanted) ->
+    fts2_search_eval_phrase(Bookie, Schema, Root, Specs, Columns, Wanted);
+fts2_search_eval(
+    Bookie,
+    Schema,
+    Root,
+    {near, Items, Distance, Columns},
+    _NeedPositions,
+    Wanted
+) ->
+    fts2_search_eval_near(Bookie, Schema, Root, Items, Distance, Columns, Wanted);
+fts2_search_eval(
+    Bookie,
+    Schema,
+    Root,
+    {anchor, {term, Token, false, Columns}},
+    _NeedPositions,
+    Wanted
+) ->
+    lists:foldl(
+        fun(Column, Acc) ->
+            fts2_search_read_anchor(Bookie, Schema, Root, Column, Token, Wanted, Acc)
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    );
+fts2_search_eval(Bookie, Schema, Root, {anchor, Child}, NeedPositions, Wanted) ->
+    maps:filter(
+        fun(_ChunkId, Meta) ->
+            lists:member(
+                0,
+                fts2_search_flatten_positions(
+                    Meta#fts2_match.match_positions
+                )
+            )
+        end,
+        fts2_search_eval(Bookie, Schema, Root, Child, NeedPositions, Wanted)
+    );
+fts2_search_eval(Bookie, Schema, Root, {'and', A, B}, NeedPositions, Wanted) ->
+    fts2_search_intersect(
+        fts2_search_eval(Bookie, Schema, Root, A, NeedPositions, Wanted),
+        fts2_search_eval(Bookie, Schema, Root, B, NeedPositions, Wanted)
+    );
+fts2_search_eval(Bookie, Schema, Root, {'or', A, B}, NeedPositions, Wanted) ->
+    fts2_search_union(
+        fts2_search_eval(Bookie, Schema, Root, A, NeedPositions, Wanted),
+        fts2_search_eval(Bookie, Schema, Root, B, NeedPositions, Wanted)
+    );
+fts2_search_eval(Bookie, Schema, Root, {'not', A, B}, NeedPositions, Wanted) ->
+    Positive = fts2_search_eval(Bookie, Schema, Root, A, NeedPositions, Wanted),
+    Negative = fts2_search_eval(Bookie, Schema, Root, B, false, Wanted),
+    maps:without(maps:keys(Negative), Positive).
+
+fts2_search_read_anchor(
+    Bookie, #{index := Bucket}, Root, Column, Token, Wanted, Acc
+) ->
+    {Key, _} = fts2_codec_term_key(
+        maps:get(generation, Root), Column, Token
+    ),
+    case leveled_fts_residency:headonly_many(
+        Bookie, Bucket, [{Key, <<"h">>}, {Key, <<"a">>}]
+    ) of
+        [{ok, HeaderValue}, {ok, AnchorValue}] ->
+            Header = fts2_codec_decode_header_metadata(HeaderValue),
+            Entries = fts2_codec_decode_plane(AnchorValue),
+            PositionMap = maps:from_list([
+                {element(1, Entry), [0]} || Entry <- Entries
+            ]),
+            fts2_search_add_entries(
+                Entries,
+                Column,
+                Token,
+                maps:get(chunk_df, Header),
+                PositionMap,
+                Wanted,
+                Acc
+            );
+        [{ok, _HeaderValue}, not_found] ->
+            Acc;
+        [not_found, not_found] ->
+            Acc;
+        Bad ->
+            erlang:error({invalid_fts2_anchor_rows, Token, Bad})
+    end.
+
+fts2_search_read_term(Bookie, Schema, Root, Token, false, Columns, NeedPositions, Wanted) ->
+    lists:foldl(
+        fun(Column, Acc) ->
+            fts2_search_merge_term_row(
+                Bookie, Schema, Root, Column, Token, NeedPositions, Wanted, Acc
+            )
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    );
+fts2_search_read_term(Bookie, Schema, Root, Prefix, true, Columns, NeedPositions, Wanted) ->
+    lists:foldl(
+        fun(Column, Acc) ->
+            fts2_search_fold_prefix_rows(
+                Bookie, Schema, Root, Column, Prefix, NeedPositions, Wanted, Acc
+            )
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    ).
+
+fts2_search_merge_term_row(
+    Bookie, #{index := Bucket}, Root, Column, Token, NeedPositions, Wanted, Acc
+) ->
+    Generation = maps:get(generation, Root),
+    {Key, _} = fts2_codec_term_key(Generation, Column, Token),
+    BooleanKey = fts2_codec_term_plane_key(Key, boolean),
+    case
+        leveled_fts_residency:headonly_many(
+            Bookie, Bucket, [{Key, <<"h">>}, {BooleanKey, <<"b">>}]
+        )
+    of
+        [not_found, not_found] ->
+            Acc;
+        [{ok, HeaderValue}, BooleanResult] ->
+            Header = fts2_codec_decode_header_metadata(HeaderValue),
+            Entries = fts2_search_row_entries(
+                Bookie, Bucket, Key, Header, BooleanResult, Token
+            ),
+            fts2_search_note_term_read(Token, NeedPositions),
+            PositionMap =
+                case NeedPositions of
+                    true -> fts2_search_read_positions(
+                        Bookie, Bucket, Key, Header,
+                        fts2_search_wanted_chunk_ids(Entries, Wanted)
+                    );
+                    false -> #{}
+                end,
+            fts2_search_add_entries(
+                Entries,
+                Column,
+                Token,
+                maps:get(chunk_df, Header),
+                PositionMap,
+                Wanted,
+                Acc
+            );
+        Bad ->
+            erlang:error({invalid_fts2_term_rows, Token, Bad})
+    end.
+
+fts2_search_fold_prefix_rows(
+    Bookie,
+    #{index := Bucket},
+    Root,
+    Column,
+    Prefix,
+    NeedPositions,
+    Wanted,
+    Acc0
+) ->
+    Generation = maps:get(generation, Root),
+    Headers = fts2_search_prefix_headers(
+        Bookie, Bucket, Generation, Column, Prefix,
+        fun fts2_codec_decode_header_metadata/1
+    ),
+    fts2_search_check_cancellation(),
+    Requests = lists:append([
+        fts2_search_prefix_requests(Key, Header, NeedPositions)
+     || {Key, _Token, Header} <- Headers
+    ]),
+    Values = case Requests of
+        [] -> [];
+        _ -> leveled_fts_residency:headonly_many(Bookie, Bucket, Requests)
+    end,
+    External = maps:from_list(lists:zip(Requests, Values)),
+    lists:foldl(
+        fun({Key, Token, Header}, Acc) ->
+            Entries = case fts2_codec_header_has_entries(Header) of
+                true -> fts2_codec_header_entries(Header);
+                false -> fts2_search_row_entries(
+                    Bookie,
+                    Bucket,
+                    Key,
+                    Header,
+                    maps:get({fts2_codec_term_plane_key(Key, boolean), <<"b">>},
+                        External),
+                    Token
+                )
+            end,
+            PositionMap = case NeedPositions of
+                false -> #{};
+                true -> fts2_search_read_positions(
+                    Bookie, Bucket, Key, Header,
+                    fts2_search_wanted_chunk_ids(Entries, Wanted)
+                )
+            end,
+            fts2_search_note_term_read(Token, NeedPositions),
+            fts2_search_add_entries(
+                Entries,
+                Column,
+                Token,
+                maps:get(chunk_df, Header),
+                PositionMap,
+                Wanted,
+                Acc
+            )
+        end,
+        Acc0,
+        Headers
+    ).
+
+fts2_search_prefix_headers(
+    Bookie, Bucket, Generation, Column, Prefix, Decode
+) ->
+    case leveled_fts_residency:header_values(
+        Bookie, Bucket, Generation, Column, Prefix
+    ) of
+        {resident, Values} ->
+            [{Key, Token, Decode(Value)} || {Key, Token, Value} <- Values];
+        fallback ->
+            {Start, Finish} = fts2_codec_term_range(
+                Generation, Column, Prefix
+            ),
+            Fold = fun
+                (B, {Key, <<"h">>}, Value, Acc) when B =:= Bucket ->
+                    case Key of
+                        <<"f2:t:", Generation:64/unsigned-big,
+                            Column:8, Token/binary>> ->
+                            [{Key, Token, Decode(Value)} | Acc];
+                        _ -> Acc
+                    end;
+                (_B, _Key, _Value, Acc) -> Acc
+            end,
+            {async, Runner} = leveled_bookie:book_headfold(
+                Bookie,
+                ?HEAD_TAG,
+                {range, Bucket, {{Start, <<>>}, {Finish, <<255>>}}},
+                {Fold, []},
+                false,
+                true,
+                false
+            ),
+            Runner()
+    end.
+
+fts2_search_prefix_requests(Key, Header, NeedPositions) ->
+    Boolean = case fts2_codec_header_has_entries(Header) of
+        true -> [];
+        false -> [{fts2_codec_term_plane_key(Key, boolean), <<"b">>}]
+    end,
+    Position = case NeedPositions andalso
+        not fts2_codec_header_has_positions(Header) of
+        true -> [{fts2_codec_term_plane_key(Key, positions), <<"p">>}];
+        false -> []
+    end,
+    Boolean ++ Position.
+
+fts2_search_row_entries(Header, not_found, Token) ->
+    case fts2_codec_header_has_entries(Header) of
+        true -> fts2_codec_header_entries(Header);
+        false -> erlang:error({invalid_fts2_boolean_row, Token, not_found})
+    end;
+fts2_search_row_entries(_Header, {ok, Value}, _Token) ->
+    fts2_codec_decode_plane(Value);
+fts2_search_row_entries(_Header, Bad, Token) ->
+    erlang:error({invalid_fts2_boolean_row, Token, Bad}).
+
+%% A multi-key SST lookup can conservatively miss a key while its block-index
+%% cache is still cold.  A single-key lookup takes the established lookup path
+%% and distinguishes that transient miss from a genuinely incomplete immutable
+%% generation.  The fallback is paid only for a batch miss.
+fts2_search_row_entries(
+    Bookie, Bucket, Key, Header, not_found, Token
+) ->
+    fts2_search_row_entries(
+        Header,
+        fts2_search_required_head(
+            Bookie, Bucket, fts2_codec_term_plane_key(Key, boolean), <<"b">>
+        ),
+        Token
+    );
+fts2_search_row_entries(
+    _Bookie, _Bucket, _Key, Header, Result, Token
+) ->
+    fts2_search_row_entries(Header, Result, Token).
+
+fts2_search_required_head(Bookie, Bucket, Key, SubKey) ->
+    case leveled_fts_residency:headonly(Bookie, Bucket, Key, SubKey) of
+        not_found ->
+            %% The first uncached SST lookup also installs the slot's block
+            %% index.  Retry once through that now-authoritative index.
+            leveled_fts_residency:headonly(Bookie, Bucket, Key, SubKey);
+        Result ->
+            Result
+    end.
+
+fts2_search_read_positions(Bookie, Bucket, Key, Header) ->
+    fts2_search_read_positions(Bookie, Bucket, Key, Header, all).
+
+fts2_search_read_positions(Bookie, Bucket, Key, Header, all) ->
+    case fts2_codec_header_has_positions(Header) of
+        true -> fts2_codec_header_positions(Header);
+        false -> fts2_search_position_result(
+            leveled_fts_residency:headonly(
+                Bookie, Bucket, fts2_codec_term_plane_key(Key, positions), <<"p">>
+            ), Key
+        )
+    end;
+fts2_search_read_positions(Bookie, Bucket, Key, Header, ChunkIds) ->
+    case fts2_codec_header_has_positions(Header) of
+        true -> fts2_codec_header_positions(Header, ChunkIds);
+        false -> fts2_search_selected_position_result(
+            leveled_fts_residency:headonly(
+                Bookie, Bucket, fts2_codec_term_plane_key(Key, positions), <<"p">>
+            ), Key,
+            ChunkIds
+        )
+    end.
+
+fts2_search_selected_position_result({ok, Value}, _Token, ChunkIds) ->
+    fts2_codec_decode_positions(Value, ChunkIds);
+fts2_search_selected_position_result(Bad, Token, _ChunkIds) ->
+    erlang:error({invalid_fts2_position_row, Token, Bad}).
+
+fts2_search_wanted_chunk_ids(_Entries, all) ->
+    all;
+fts2_search_wanted_chunk_ids(_Entries, {all_except, _Excluded}) ->
+    all;
+fts2_search_wanted_chunk_ids(Entries, Wanted) ->
+    [
+        ChunkId
+     || {ChunkId, _GroupId, SourceId, _Length, _Tf, _DenseId} <- Entries,
+        fts2_search_wanted(SourceId, Wanted)
+    ].
+
+fts2_search_position_result({ok, Value}, _Token) ->
+    fts2_codec_decode_positions(Value);
+fts2_search_position_result(Bad, Token) ->
+    erlang:error({invalid_fts2_position_row, Token, Bad}).
+
+fts2_search_add_entries(Entries, Column, Token, Df0, PositionMap, Wanted, Acc) ->
+    Selected = [
+        Entry
+     || {_ChunkId, _GroupId, SourceId, _Length, _Tf, _DenseId} = Entry <- Entries,
+        fts2_search_wanted(SourceId, Wanted)
+    ],
+    Df = case Df0 of
+        StoredDf when is_integer(StoredDf) -> StoredDf;
+        _ -> length(Selected)
+    end,
+    fts2_search_note_plane_decode(),
+    lists:foldl(
+        fun({ChunkId, GroupId, SourceId, Length, Tf, _DenseId}, Inner) ->
+            Positions = maps:get(ChunkId, PositionMap, []),
+            Term = {Column, Token},
+            Meta = #fts2_match{
+                chunk_id = ChunkId,
+                group_id = GroupId,
+                source_id = SourceId,
+                doc_length = Length,
+                tf = Tf,
+                term_stats = [{Term, Tf, base, Df}],
+                terms = [Token],
+                columns = [{Term, Positions}],
+                match_positions = [{Token, Positions}]
+            },
+            case maps:find(ChunkId, Inner) of
+                error ->
+                    Inner#{ChunkId => Meta};
+                {ok, Existing} ->
+                    Inner#{ChunkId => fts2_search_merge_meta(Existing, Meta)}
+            end
+        end,
+        Acc,
+        Selected
+    ).
+
+fts2_search_eval_phrase(Bookie, Schema, Root, Specs, Columns, Wanted) ->
+    lists:foldl(
+        fun(Column, Acc) ->
+            Strategy = maps:get(
+                phrase_strategy,
+                Schema,
+                maps:get(phrase_strategy, Root, skip)
+            ),
+            ColumnMatches = case fts2_phrase_evaluate(
+                Strategy, Bookie, Schema, Root, Specs, Column, Wanted
+            ) of
+                {matches, Matches} -> Matches;
+                {positions, PositionWanted} ->
+                    fts2_search_eval_phrase_positions(
+                        Bookie,
+                        Schema,
+                        Root,
+                        Specs,
+                        Column,
+                        PositionWanted
+                    )
+            end,
+            fts2_search_union(Acc, ColumnMatches)
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    ).
+
+fts2_search_eval_phrase_positions(Bookie, Schema, Root, Specs, Column, Wanted) ->
+    TermMaps = [
+        fts2_search_read_term(
+            Bookie,
+            Schema,
+            Root,
+            Token,
+            Prefix,
+            [fts2_search_column_name(Column, Schema)],
+            true,
+            Wanted
+        )
+     || {Token, Prefix, _Offset} <- Specs
+    ],
+    Candidates = fts2_search_intersect_many(TermMaps),
+    maps:fold(
+        fun(ChunkId, Meta, Inner) ->
+            Starts = fts2_search_phrase_starts(Meta, Column, Specs),
+            case Starts of
+                [] ->
+                    Inner;
+                _ ->
+                    Inner#{ChunkId => Meta#fts2_match{
+                        match_positions = [{phrase, Starts}],
+                        match_count = length(Starts)
+                    }}
+            end
+        end,
+        #{},
+        Candidates
+    ).
+
+fts2_search_phrase_starts(_Meta, _Column, []) ->
+    [];
+fts2_search_phrase_starts(Meta, Column, [{First, Prefix, FirstOffset} | Rest]) ->
+    Positions = fts2_search_column_token_positions(Meta, Column, First, Prefix),
+    [
+        Position - FirstOffset
+     || Position <- Positions,
+        fts2_search_phrase_rest(Meta, Column, Rest, Position - FirstOffset)
+    ].
+
+fts2_search_phrase_rest(_Meta, _Column, [], _Start) ->
+    true;
+fts2_search_phrase_rest(Meta, Column, [{Token, Prefix, Offset} | Rest], Start) ->
+    lists:member(
+        Start + Offset, fts2_search_column_token_positions(Meta, Column, Token, Prefix)
+    ) andalso
+        fts2_search_phrase_rest(Meta, Column, Rest, Start).
+
+fts2_search_eval_near(Bookie, Schema, Root, Items, Distance, Columns, Wanted) ->
+    lists:foldl(
+        fun(Column, Acc) ->
+            ColumnName = fts2_search_column_name(Column, Schema),
+            ItemMaps = [
+                fts2_search_eval(
+                    Bookie,
+                    Schema,
+                    Root,
+                    fts2_search_restrict_columns(Item, [ColumnName]),
+                    true,
+                    Wanted
+                )
+             || Item <- Items
+            ],
+            Candidates = fts2_search_intersect_many(ItemMaps),
+            maps:fold(
+                fun(ChunkId, Meta, Inner) ->
+                    SpanLists = [
+                        fts2_search_item_spans(Meta, Column, Item)
+                     || Item <- Items
+                    ],
+                    Starts = fts2_search_near_positions(SpanLists, Distance),
+                    case Starts of
+                        [] ->
+                            Inner;
+                        _ ->
+                            Match = Meta#fts2_match{
+                                match_positions = [{near, Starts}],
+                                match_count = length(Starts)
+                            },
+                            case maps:find(ChunkId, Inner) of
+                                error ->
+                                    Inner#{ChunkId => Match};
+                                {ok, Existing} ->
+                                    Inner#{
+                                        ChunkId => fts2_search_merge_meta(Existing, Match)
+                                    }
+                            end
+                    end
+                end,
+                Acc,
+                Candidates
+            )
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    ).
+
+fts2_search_item_spans(Meta, Column, {term, Token, Prefix, _Columns}) ->
+    [{P, P} || P <- fts2_search_column_token_positions(Meta, Column, Token, Prefix)];
+fts2_search_item_spans(Meta, Column, {phrase, Specs, _Columns}) ->
+    Starts = fts2_search_phrase_starts(Meta, Column, Specs),
+    LastOffset = lists:max([Offset || {_Token, _Prefix, Offset} <- Specs]),
+    [{Start, Start + LastOffset} || Start <- Starts];
+fts2_search_item_spans(Meta, Column, {anchor, Item}) ->
+    [
+        {Start, End}
+     || {Start, End} <- fts2_search_item_spans(Meta, Column, Item), Start =:= 0
+    ];
+fts2_search_item_spans(Meta, _Column, _Other) ->
+    [
+        {P, P}
+     || P <- fts2_search_flatten_positions(
+            Meta#fts2_match.match_positions
+        )
+    ].
+
+fts2_search_near_positions(SpanLists, _Distance) when SpanLists =:= [] -> [];
+fts2_search_near_positions(SpanLists, _Distance) when
+    length(SpanLists) > 0,
+    hd(SpanLists) =:= []
+->
+    [];
+fts2_search_near_positions([First, Second], Distance) ->
+    fts2_search_near_pair_positions(First, Second, Distance, []);
+fts2_search_near_positions([First | Rest], Distance) ->
+    [
+        Start
+     || {Start, _End} = Span <- First,
+        fts2_search_near_position_matches([Span], Rest, Distance)
+    ].
+
+fts2_search_near_term_positions([], _Second, _Distance, Acc) ->
+    lists:reverse(Acc);
+fts2_search_near_term_positions(
+    [First | Rest], Second0, Distance, Acc
+) ->
+    Second = fts2_search_near_term_drop_before(
+        Second0, First - Distance - 1
+    ),
+    NextAcc = case Second of
+        [SecondPosition | _] when SecondPosition =< First + Distance + 1 ->
+            [First | Acc];
+        _ ->
+            Acc
+    end,
+    fts2_search_near_term_positions(Rest, Second, Distance, NextAcc).
+
+fts2_search_near_term_drop_before(
+    [Position | Rest], Minimum
+) when Position < Minimum ->
+    fts2_search_near_term_drop_before(Rest, Minimum);
+fts2_search_near_term_drop_before(Positions, _Minimum) ->
+    Positions.
+
+%% Both position planes are ordered. For the common two-item NEAR grammar,
+%% advance the second cursor monotonically instead of probing every pair of
+%% spans. A second span matches when its interval is no more than Distance
+%% token gaps before or after the first interval.
+fts2_search_near_pair_positions([], _Second, _Distance, Acc) ->
+    lists:reverse(Acc);
+fts2_search_near_pair_positions(
+    [{Start, End} | Rest], Second0, Distance, Acc
+) ->
+    Second = fts2_search_near_drop_before(
+        Second0, Start - Distance - 1
+    ),
+    NextAcc = case Second of
+        [{SecondStart, _SecondEnd} | _] when
+            SecondStart =< End + Distance + 1
+        ->
+            [Start | Acc];
+        _ ->
+            Acc
+    end,
+    fts2_search_near_pair_positions(Rest, Second, Distance, NextAcc).
+
+fts2_search_near_drop_before(
+    [{_Start, End} | Rest], MinimumEnd
+) when End < MinimumEnd ->
+    fts2_search_near_drop_before(Rest, MinimumEnd);
+fts2_search_near_drop_before(Spans, _MinimumEnd) ->
+    Spans.
+
+fts2_search_near_position_matches(_Chosen, [], _Distance) ->
+    true;
+fts2_search_near_position_matches(Chosen, [Spans | Rest], Distance) ->
+    lists:any(
+        fun(Span) ->
+            lists:all(
+                fun(Other) -> fts2_search_span_distance(Span, Other) =< Distance end,
+                Chosen
+            ) andalso fts2_search_near_position_matches([Span | Chosen], Rest, Distance)
+        end,
+        Spans
+    ).
+
+fts2_search_span_distance({_SA, EA}, {SB, _EB}) when EA < SB -> SB - EA - 1;
+fts2_search_span_distance({SA, _EA}, {_SB, EB}) when EB < SA -> SA - EB - 1;
+fts2_search_span_distance(_A, _B) -> 0.
+
+fts2_search_intersect_many([]) -> #{};
+fts2_search_intersect_many([First | Rest]) -> lists:foldl(fun fts2_search_intersect/2, First, Rest).
+
+fts2_search_intersect(A, B) ->
+    maps:fold(
+        fun(ChunkId, MetaA, Acc) ->
+            case maps:find(ChunkId, B) of
+                {ok, MetaB} -> Acc#{ChunkId => fts2_search_merge_meta(MetaA, MetaB)};
+                error -> Acc
+            end
+        end,
+        #{},
+        A
+    ).
+
+fts2_search_union(A, B) ->
+    maps:fold(
+        fun(ChunkId, Meta, Acc) ->
+            case maps:find(ChunkId, Acc) of
+                error -> Acc#{ChunkId => Meta};
+                {ok, Existing} -> Acc#{ChunkId => fts2_search_merge_meta(Existing, Meta)}
+            end
+        end,
+        A,
+        B
+    ).
+
+fts2_search_merge_meta(A, B) ->
+    A#fts2_match{
+        columns = lists:ukeysort(
+            1, B#fts2_match.columns ++ A#fts2_match.columns
+        ),
+        terms = lists:usort(B#fts2_match.terms ++ A#fts2_match.terms),
+        term_stats = lists:ukeysort(
+            1, B#fts2_match.term_stats ++ A#fts2_match.term_stats
+        ),
+        tf = A#fts2_match.tf + B#fts2_match.tf,
+        match_positions = lists:ukeysort(
+            1,
+            B#fts2_match.match_positions ++ A#fts2_match.match_positions
+        )
+    }.
+
+fts2_search_collapse_scored_groups(Chunks, Ranked) ->
+    Groups = lists:foldl(
+        fun(Meta, Acc) ->
+            GroupKey = case Meta#fts2_match.logical_group of
+                undefined -> {generation, Meta#fts2_match.group_id};
+                LogicalGroup -> LogicalGroup
+            end,
+            Version = Meta#fts2_match.group_version,
+            case maps:find(GroupKey, Acc) of
+                error ->
+                    Acc#{GroupKey => Meta};
+                {ok, Existing} ->
+                    ExistingVersion = Existing#fts2_match.group_version,
+                    if
+                        Version > ExistingVersion ->
+                            Acc#{GroupKey => Meta};
+                        Version < ExistingVersion ->
+                            Acc;
+                        true ->
+                            CombinedCount =
+                                fts2_search_match_count(Existing) + fts2_search_match_count(Meta),
+                            Winner = case fts2_search_better_chunk(Meta, Existing, Ranked) of
+                                true -> Meta;
+                                false -> Existing
+                            end,
+                            Acc#{GroupKey => Winner#fts2_match{
+                                group_match_count = CombinedCount
+                            }}
+                    end
+            end
+        end,
+        #{},
+        Chunks
+    ),
+    maps:values(Groups).
+
+fts2_search_better_chunk(A, B, true) ->
+    {-A#fts2_match.score, A#fts2_match.source_id} <
+        {-B#fts2_match.score, B#fts2_match.source_id};
+fts2_search_better_chunk(A, B, false) ->
+    A#fts2_match.source_id < B#fts2_match.source_id.
+
+fts2_search_match_count(#fts2_match{match_count = undefined, tf = Tf}) -> Tf;
+fts2_search_match_count(#fts2_match{match_count = Count}) -> Count.
+
+fts2_search_score_matches(Matches, _Root, false) ->
+    [Meta#fts2_match{score = 0.0} || Meta <- maps:values(Matches)];
+fts2_search_score_matches(Matches, Root, true) ->
+    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    MatchValues = maps:values(Matches),
+    Terms = lists:usort(
+        [Term || Meta <- MatchValues,
+            {Term, _Tf, _Source, _Df} <- Meta#fts2_match.term_stats]
+    ),
+    Parts = lists:ukeysort(
+        1,
+        [
+            {{Source, Term}, Df}
+         || Meta <- MatchValues,
+            {Term, _Tf, Source, Df} <- Meta#fts2_match.term_stats
+        ]
+    ),
+    Idfs = maps:from_list([
+        begin
+            NHit0 = lists:sum([
+                Df
+             || {{_Source, PartTerm}, Df} <- Parts,
+                PartTerm =:= Term
+            ]),
+            NHit = erlang:max(1, NHit0),
+            Idf0 = math:log((DocCount - NHit + 0.5) / (NHit + 0.5)),
+            {Term, erlang:max(Idf0, 1.0e-6)}
+        end
+     || Term <- Terms
+    ]),
+    [
+        Meta#fts2_match{
+            score = lists:sum([
+                fts2_search_bm25(
+                    Tf,
+                    maps:get(Term, Idfs),
+                    Avg,
+                    Meta#fts2_match.doc_length
+                )
+             || {Term, Tf, _Source, _Df} <- Meta#fts2_match.term_stats,
+                Tf > 0
+            ])
+        }
+     || Meta <- MatchValues
+    ].
+
+fts2_search_bm25(Tf, Idf, Avg, Length) ->
+    Ratio =
+        case Avg > 0.0 of
+            true -> Length / Avg;
+            false -> 1.0
+        end,
+    Idf * (Tf * 2.2) / (Tf + 1.2 * (0.25 + 0.75 * Ratio)).
+
+fts2_search_read_identities(_Bookie, _Schema, _Root, []) ->
+    #{};
+fts2_search_read_identities(Bookie, #{index := Bucket} = Schema, Root, GroupIds) ->
+    Generation = maps:get(generation, Root),
+    Shift = fts2_search_identity_page_shift(Root, Schema),
+    IdentityBookie = maps:get(identity_bookie, Schema, Bookie),
+    Key = fts2_codec_identity_key(Generation),
+    Pages = lists:usort([
+        GroupId bsr Shift
+     || GroupId <- GroupIds
+    ]),
+    Values = leveled_fts_residency:headonly_many(
+        IdentityBookie,
+        Bucket,
+        [
+            {Key, fts2_codec_identity_subkey(Page)}
+         || Page <- Pages
+        ]
+    ),
+    lists:foldl(
+        fun
+            ({Page, {ok, Value}}, Acc) ->
+                Wanted = [
+                    GroupId
+                 || GroupId <- GroupIds,
+                    GroupId bsr Shift =:= Page
+                ],
+                maps:merge(
+                    Acc,
+                    fts2_search_groups_to_map(
+                        fts2_codec_decode_identity_page(Value, Wanted)
+                    )
+                );
+            ({_Page, not_found}, Acc) ->
+                Acc
+        end,
+        #{},
+        lists:zip(Pages, Values)
+    ).
+
+fts2_search_identity_page_handles(_Bookie, _Schema, _Root, []) ->
+    #{};
+fts2_search_identity_page_handles(
+    Bookie, #{index := Bucket} = Schema, Root, Requests
+) ->
+    Generation = maps:get(generation, Root),
+    Shift = fts2_search_identity_page_shift(Root, Schema),
+    IdentityBookie = maps:get(identity_bookie, Schema, Bookie),
+    Key = fts2_codec_identity_key(Generation),
+    Pages = lists:usort([
+        GroupId bsr Shift
+     || {GroupId, _ChunkId} <- Requests
+    ]),
+    Values = leveled_fts_residency:headonly_many(
+        IdentityBookie,
+        Bucket,
+        [
+            {Key, fts2_codec_identity_subkey(Page)}
+         || Page <- Pages
+        ]
+    ),
+    maps:from_list([
+        {Page, fts2_codec_identity_page_handle(Value)}
+     || {Page, {ok, Value}} <- lists:zip(Pages, Values)
+    ]).
+
+fts2_search_identity_handle(Handles, GroupId, Shift) ->
+    maps:find(GroupId bsr Shift, Handles).
+
+fts2_search_read_identity_rows(_Bookie, _Schema, _Root, []) ->
+    [];
+fts2_search_read_identity_rows(Bookie, Schema, Root, Requests) ->
+    Shift = fts2_search_identity_page_shift(Root, Schema),
+    Handles = fts2_search_identity_page_handles(
+        Bookie, Schema, Root, Requests
+    ),
+    [
+        case Request of
+            undefined ->
+                undefined;
+            {GroupId, ChunkId} ->
+                case fts2_search_identity_handle(Handles, GroupId, Shift) of
+                    {ok, Handle} ->
+                        fts2_codec_identity_page_row(Handle, GroupId, ChunkId);
+                    error ->
+                        undefined
+                end
+        end
+     || Request <- Requests
+    ].
+
+fts2_search_identity_page_shift(Root) ->
+    maps:get(
+        identity_page_shift, Root, ?LEGACY_IDENTITY_PAGE_SHIFT
+    ).
+
+fts2_search_identity_page_shift(Root, Schema) ->
+    maps:get(
+        identity_page_shift,
+        Schema,
+        fts2_search_identity_page_shift(Root)
+    ).
+
+fts2_search_groups_to_map(Rows) ->
+    lists:foldl(
+        fun(
+            {GroupId, GroupKey, ChunkId, SourceId, DocKey, DocVersion,
+                DocLength, Candidate, Hit},
+            Acc
+        ) ->
+            Chunk = #{
+                chunk_id => ChunkId,
+                group_id => GroupId,
+                source_id => SourceId,
+                doc_key => DocKey,
+                doc_version => DocVersion,
+                doc_length => DocLength,
+                candidate_record => Candidate,
+                hit_record => Hit
+            },
+            case maps:find(GroupId, Acc) of
+                error ->
+                    Acc#{GroupId => #{
+                        group_id => GroupId,
+                        group_key => GroupKey,
+                        chunks => [Chunk]
+                    }};
+                {ok, Group} ->
+                    Acc#{GroupId => Group#{
+                        chunks => maps:get(chunks, Group) ++ [Chunk]
+                    }}
+            end
+        end,
+        #{},
+        Rows
+    ).
+
+fts2_search_hydrate_hit(
+    #fts2_match{delta_document = Document} = Match, undefined, Opts
+) when Document =/= undefined ->
+    fts2_search_hydrate_hit(
+        Match,
+        {undefined, undefined, Match#fts2_match.chunk_id,
+            maps:get(source_id, Document), maps:get(doc_key, Document),
+            maps:get(doc_version, Document), maps:get(doc_length, Document),
+            maps:get(candidate_record, Document),
+            maps:get(hit_record, Document)},
+        Opts
+    );
+fts2_search_hydrate_hit(_Match, undefined, _Opts) ->
+    false;
+fts2_search_hydrate_hit(
+    Match,
+    {_GroupId, _GroupKey, _ChunkId, SourceId, DocKey, DocVersion, _StoredLength,
+        Candidate, HitRecord},
+    Opts
+) ->
+            Base0 = #{
+                key => SourceId,
+                score => Match#fts2_match.score,
+                doc_length => Match#fts2_match.doc_length,
+                match_count => case Match#fts2_match.group_match_count of
+                    undefined -> fts2_search_match_count(Match);
+                    GroupCount -> GroupCount
+                end,
+                candidate_key => DocKey,
+                candidate_version => DocVersion,
+                candidate_record => Candidate
+            },
+            Base1 =
+                case maps:get(return_positions, Opts, false) of
+                    true ->
+                        Base0#{
+                            positions => fts2_search_window_positions(
+                                Match#fts2_match.match_positions
+                            )
+                        };
+                    false ->
+                        Base0
+                end,
+            Base2 =
+                case maps:get(return_terms, Opts, false) of
+                    true -> Base1#{matched_terms => Match#fts2_match.terms};
+                    false -> Base1
+                end,
+            Base3 =
+                case
+                    {
+                        maps:find('$fts_text_blocks', Candidate),
+                        maps:find('$fts_text_bytes', Candidate)
+                    }
+                of
+                    {{ok, Blocks}, {ok, Bytes}} ->
+                        Base2#{
+                            text_blocks => Blocks,
+                            text_bytes => Bytes,
+                            index_resident_complete => true
+                        };
+                    _ ->
+                        Base2
+                end,
+            case maps:get(resolve_hits, Opts, true) of
+                false ->
+                    {true, Base3};
+                true ->
+                    Resolved0 = Base3#{
+                        key => DocKey, doc_id => SourceId
+                    },
+                    Resolved =
+                        case HitRecord of
+                            #{
+                                record := Record,
+                                text_blocks := HitBlocks,
+                                text_bytes := HitBytes
+                            } ->
+                                WithText = Resolved0#{
+                                    text_blocks => HitBlocks,
+                                    text_bytes => HitBytes
+                                },
+                                case map_size(Record) of
+                                    0 -> WithText;
+                                    _ -> WithText#{record => Record}
+                                end;
+                            _ ->
+                                Resolved0
+                    end,
+                    {true, Resolved}
+            end.
+
+fts2_search_order_hits(Hits, false, _TieFields) ->
+    lists:sort(fun(A, B) -> maps:get(key, A) =< maps:get(key, B) end, Hits);
+fts2_search_order_hits(Hits, true, TieFields) ->
+    lists:sort(
+        fun(A, B) ->
+            {-maps:get(score, A), fts2_search_tie_key(A, TieFields)} =<
+                {-maps:get(score, B), fts2_search_tie_key(B, TieFields)}
+        end,
+        Hits
+    ).
+
+fts2_search_tie_key(Hit, []) ->
+    maps:get(candidate_key, Hit, maps:get(key, Hit));
+fts2_search_tie_key(Hit, Fields) ->
+    Candidate = maps:get(candidate_record, Hit, #{}),
+    {
+        [maps:get(Field, Candidate, nil) || Field <- Fields],
+        maps:get(candidate_key, Hit)
+    }.
+
+fts2_search_facet_matches(_Hit, _Schema, nil) ->
+    true;
+fts2_search_facet_matches(Hit, Schema, Facet) when is_list(Facet) ->
+    Candidate = maps:get(candidate_record, Hit, #{}),
+    Fields = maps:get(candidate_filter_fields, Schema, []),
+    Facet =:=
+        [maps:get(Field, Candidate, undefined) || {_Column, Field} <- Fields];
+fts2_search_facet_matches(_Hit, _Schema, _Facet) ->
+    false.
+
+fts2_search_all_chunks(Bookie, Schema, Root, Wanted) ->
+    GroupCount = maps:get(group_count, Root),
+    Identity = fts2_search_read_identities(
+        Bookie, Schema, Root, lists:seq(0, GroupCount - 1)
+    ),
+    maps:fold(
+        fun(_GroupId, Group, Acc) ->
+            lists:foldl(
+                fun(Chunk, Inner) ->
+                    SourceId = maps:get(source_id, Chunk),
+                    case fts2_search_wanted(SourceId, Wanted) of
+                        false ->
+                            Inner;
+                        true ->
+                            ChunkId = maps:get(chunk_id, Chunk),
+                            Inner#{ChunkId => #fts2_match{
+                                chunk_id = ChunkId,
+                                group_id = maps:get(group_id, Chunk),
+                                source_id = SourceId,
+                                doc_length = maps:get(doc_length, Chunk)
+                            }}
+                    end
+                end,
+                Acc,
+                maps:get(chunks, Group)
+            )
+        end,
+        #{},
+        Identity
+    ).
+
+fts2_search_column_token_positions(Meta, Column, Token) ->
+    proplists:get_value(
+        {Column, Token}, Meta#fts2_match.columns, []
+    ).
+
+fts2_search_column_token_positions(Meta, Column, Token, false) ->
+    fts2_search_column_token_positions(Meta, Column, Token);
+fts2_search_column_token_positions(Meta, Column, Prefix, true) ->
+    lists:usort(lists:append([
+        Positions
+     || {{EntryColumn, Token}, Positions} <- Meta#fts2_match.columns,
+        EntryColumn =:= Column,
+        binary:match(Token, Prefix) =:= {0, byte_size(Prefix)}
+    ])).
+
+fts2_search_selector_ids(all, Schema) ->
+    lists:seq(0, length(maps:get(columns, Schema)) - 1);
+fts2_search_selector_ids({not_columns, Excluded}, Schema) ->
+    fts2_search_selector_ids(
+        [C || C <- maps:get(columns, Schema), not lists:member(C, Excluded)],
+        Schema
+    );
+fts2_search_selector_ids(Columns, Schema) ->
+    Names = maps:get(columns, Schema),
+    [
+        Index
+     || {Name, Index} <- lists:zip(Names, lists:seq(0, length(Names) - 1)),
+        lists:member(Name, Columns)
+    ].
+
+fts2_search_column_name(Column, Schema) -> lists:nth(Column + 1, maps:get(columns, Schema)).
+
+fts2_search_restrict_columns({term, T, P, _}, Columns) ->
+    {term, T, P, Columns};
+fts2_search_restrict_columns({phrase, Specs, _}, Columns) ->
+    {phrase, Specs, Columns};
+fts2_search_restrict_columns({near, Items, D, _}, Columns) ->
+    {near, [fts2_search_restrict_columns(I, Columns) || I <- Items], D, Columns};
+fts2_search_restrict_columns({anchor, A}, Columns) ->
+    {anchor, fts2_search_restrict_columns(A, Columns)};
+fts2_search_restrict_columns({'and', A, B}, Columns) ->
+    {'and', fts2_search_restrict_columns(A, Columns), fts2_search_restrict_columns(B, Columns)};
+fts2_search_restrict_columns({'or', A, B}, Columns) ->
+    {'or', fts2_search_restrict_columns(A, Columns), fts2_search_restrict_columns(B, Columns)};
+fts2_search_restrict_columns({'not', A, B}, Columns) ->
+    {'not', fts2_search_restrict_columns(A, Columns), fts2_search_restrict_columns(B, Columns)};
+fts2_search_restrict_columns(Other, _Columns) ->
+    Other.
+
+fts2_search_wanted(_SourceId, all) -> true;
+fts2_search_wanted(SourceId, {all_except, Excluded}) -> not maps:is_key(SourceId, Excluded);
+fts2_search_wanted(SourceId, Wanted) -> maps:is_key(SourceId, Wanted).
+
+fts2_search_wanted_delta(_SourceId, all) -> true;
+fts2_search_wanted_delta(_SourceId, {all_except, _Excluded}) -> true;
+fts2_search_wanted_delta(SourceId, Wanted) -> maps:is_key(SourceId, Wanted).
+
+fts2_search_window_positions(Value) ->
+    {Windowed, _Remaining} = lists:foldl(
+        fun({Key, Nested}, {Acc, Left}) ->
+            {Kept, Next} = fts2_search_window_positions(Nested, Left),
+            {Acc#{Key => Kept}, Next}
+        end,
+        {#{}, ?MAX_RETURN_POSITIONS},
+        lists:sort(Value)
+    ),
+    Windowed.
+
+fts2_search_window_positions(Value, Remaining) when is_map(Value) ->
+    lists:foldl(
+        fun({Key, Nested}, {Acc, Left}) ->
+            {Windowed, Next} = fts2_search_window_positions(Nested, Left),
+            {Acc#{Key => Windowed}, Next}
+        end,
+        {#{}, Remaining},
+        lists:sort(maps:to_list(Value))
+    );
+fts2_search_window_positions(Value, Remaining) when is_list(Value) ->
+    Kept = lists:sublist(lists:sort(Value), Remaining),
+    {Kept, Remaining - length(Kept)};
+fts2_search_window_positions(Value, Remaining) ->
+    {Value, Remaining}.
+
+fts2_search_flatten_positions(Value) when is_map(Value) ->
+    lists:append([fts2_search_flatten_positions(V) || V <- maps:values(Value)]);
+fts2_search_flatten_positions([{_Key, _Nested} | _] = Value) ->
+    lists:append([
+        fts2_search_flatten_positions(Nested)
+     || {_, Nested} <- Value
+    ]);
+fts2_search_flatten_positions(Value) when is_list(Value) -> Value;
+fts2_search_flatten_positions(_Value) ->
+    [].
+
+fts2_search_drop(0, Values) -> Values;
+fts2_search_drop(_Count, []) -> [];
+fts2_search_drop(Count, [_ | Rest]) -> fts2_search_drop(Count - 1, Rest).
+
+fts2_search_note_plane_decode() ->
+    case erlang:get({leveled_fts, direct_page_decodes}) of
+        Count when is_integer(Count) ->
+            erlang:put({leveled_fts, direct_page_decodes}, Count + 1);
+        _ ->
+            ok
+    end.
+
+fts2_search_note_term_read(Token, true) ->
+    case erlang:get({leveled_fts, term_run_folds}) of
+        Counts when is_map(Counts) ->
+            erlang:put(
+                {leveled_fts, term_run_folds},
+                Counts#{Token => maps:get(Token, Counts, 0) + 1}
+            );
+        _ ->
+            ok
+    end;
+fts2_search_note_term_read(_Token, false) ->
+    ok.
+
+fts2_search_check_cancellation() ->
+    case erlang:get(ash_leveled_search_cancellation) of
+        #{owner := Owner, deadline_at := DeadlineAt, cancel_token := Token} ->
+            receive
+                {ash_leveled_cancel, Token, Reason} ->
+                    throw({fts_error, {search_cancelled, Reason}})
+            after 0 ->
+                case erlang:is_process_alive(Owner) of
+                    false ->
+                        throw({fts_error, {search_cancelled, caller_down}});
+                    true ->
+                        case
+                            DeadlineAt =/= infinity andalso
+                                erlang:monotonic_time(millisecond) >= DeadlineAt
+                        of
+                            true ->
+                                throw(
+                                    {fts_error, {search_cancelled, deadline}}
+                                );
+                            false ->
+                                ok
+                        end
+                end
+            end;
+        _ ->
+            ok
+    end.

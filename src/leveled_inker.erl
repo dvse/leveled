@@ -161,6 +161,8 @@
     compaction_pending = false :: boolean(),
     bookie_monref :: reference() | undefined,
     is_snapshot = false :: boolean(),
+    snapshot_deadline_ms = infinity :: integer() | infinity,
+    snapshot_expired = false :: boolean(),
     compression_method = native :: lz4 | native | none,
     compress_on_receipt = false :: boolean(),
     snap_timeout = 0 :: non_neg_integer(),
@@ -290,7 +292,8 @@ ink_fetch(Pid, PrimaryKey, SQN) ->
 ink_keycheck(Pid, PrimaryKey, SQN) ->
     gen_server:call(Pid, {key_check, PrimaryKey, SQN}, infinity).
 
--spec ink_registersnapshot(pid(), pid()) -> {list(), pid(), integer()}.
+-spec ink_registersnapshot(pid(), pid()) ->
+    {list(), pid(), integer(), pos_integer()}.
 %% @doc
 %% Register a snapshot clone for the process, returning the Manifest and the
 %% pid of the active journal, as well as the JournalSQN.
@@ -545,14 +548,21 @@ init([LogOpts, InkerOpts]) ->
             BookieMonitor = erlang:monitor(
                 process, InkerOpts#inker_options.bookies_pid
             ),
-            {Manifest, ActiveJournalDB, JournalSQN} = ink_registersnapshot(
+            {Manifest, ActiveJournalDB, JournalSQN, SnapshotLease} =
+                ink_registersnapshot(
                 SrcInker, self()
+            ),
+            Deadline = erlang:monotonic_time(millisecond) +
+                SnapshotLease * 1000,
+            _ = erlang:send_after(
+                SnapshotLease * 1000, self(), snapshot_lease_expired
             ),
             {ok, #state{
                 manifest = Manifest,
                 active_journaldb = ActiveJournalDB,
                 source_inker = SrcInker,
                 journal_sqn = JournalSQN,
+                snapshot_deadline_ms = Deadline,
                 bookie_monref = BookieMonitor,
                 is_snapshot = true
             }};
@@ -561,6 +571,26 @@ init([LogOpts, InkerOpts]) ->
             start_from_file(InkerOpts)
     end.
 
+handle_call(
+    {fetch, _Key, _SQN}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
+handle_call(
+    {get, _Key, _SQN}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
+handle_call(
+    {key_check, _Key, _SQN}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
+handle_call(
+    {fold, _StartSQN, _FoldFuns, _Acc, _By}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
 handle_call(
     {put, Key, Object, KeyChanges, DataSync},
     _From,
@@ -580,24 +610,39 @@ handle_call(
             {reply, {ok, UpdState#state.journal_sqn}, UpdState}
     end;
 handle_call({fetch, Key, SQN}, _From, State) ->
-    case get_object(Key, SQN, State#state.manifest, true) of
-        {{SQN, Key}, {Value, _IndexSpecs}} ->
-            {reply, {ok, Value}, State};
-        Other ->
-            ?STD_LOG(i0001, [Key, SQN, Other]),
-            {reply, not_present, State}
+    case snapshot_expired_now(State) of
+        true ->
+            {reply, {error, snapshot_expired}, expire_snapshot_state(State)};
+        false ->
+            case get_object(Key, SQN, State#state.manifest, true) of
+                {{SQN, Key}, {Value, _IndexSpecs}} ->
+                    {reply, {ok, Value}, State};
+                Other ->
+                    ?STD_LOG(i0001, [Key, SQN, Other]),
+                    {reply, not_present, State}
+            end
     end;
 handle_call({get, Key, SQN}, _From, State) ->
-    {reply, get_object(Key, SQN, State#state.manifest), State};
+    case snapshot_expired_now(State) of
+        true ->
+            {reply, {error, snapshot_expired}, expire_snapshot_state(State)};
+        false ->
+            {reply, get_object(Key, SQN, State#state.manifest), State}
+    end;
 handle_call({key_check, Key, SQN}, _From, State) ->
-    {reply, key_check(Key, SQN, State#state.manifest), State};
+    case snapshot_expired_now(State) of
+        true ->
+            {reply, {error, snapshot_expired}, expire_snapshot_state(State)};
+        false ->
+            {reply, key_check(Key, SQN, State#state.manifest), State}
+    end;
 handle_call(
     {fold, StartSQN, {FilterFun, InitAccFun, FoldFun}, Acc, By},
     _From,
     State
 ) ->
     Manifest = lists:reverse(leveled_imanifest:to_list(State#state.manifest)),
-    Folder =
+    Folder0 =
         fun() ->
             fold_from_sequence(
                 StartSQN,
@@ -607,6 +652,7 @@ handle_call(
                 Manifest
             )
         end,
+    Folder = snapshot_guarded_folder(Folder0, State),
     case By of
         as_ink ->
             {reply, Folder(), State};
@@ -627,7 +673,8 @@ handle_call(
         {
             State#state.manifest,
             State#state.active_journaldb,
-            State#state.journal_sqn
+            State#state.journal_sqn,
+            State#state.snap_timeout
         },
         State#state{registered_snapshots = Rs}};
 handle_call(get_manifest, _From, State) ->
@@ -815,7 +862,11 @@ handle_cast(
     leveled_imanifest:writer(Man1, NewManifestSQN, State#state.root_path),
     lists:foreach(
         fun({_SQN, _FN, J2D, _LK}) ->
-            leveled_cdb:cdb_deletepending(J2D, NewManifestSQN, self())
+            leveled_cdb:cdb_deletepending(J2D, NewManifestSQN, self()),
+            case State#state.registered_snapshots of
+                [] -> ok = leveled_cdb:cdb_close(J2D);
+                _ -> ok
+            end
         end,
         FilesToDelete
     ),
@@ -924,6 +975,15 @@ handle_cast({complete_shutdown, ShutdownType, From}, State) ->
         )
     ),
     shutdown_manifest(State#state.manifest),
+    lists:foreach(
+        fun({_SQN, _FN, PendingPid, _LK}) ->
+            case is_process_alive(PendingPid) of
+                true -> ok = leveled_cdb:cdb_close(PendingPid);
+                false -> ok
+            end
+        end,
+        State#state.pending_removals
+    ),
     case ShutdownType of
         doom ->
             FPs =
@@ -939,6 +999,18 @@ handle_cast({complete_shutdown, ShutdownType, From}, State) ->
     end,
     {stop, normal, State}.
 
+handle_info(
+    snapshot_lease_expired,
+    State = #state{
+        is_snapshot = true,
+        snapshot_expired = false,
+        source_inker = SrcInker
+    }
+) when ?IS_DEF(SrcInker) ->
+    ok = ink_releasesnapshot(SrcInker, self()),
+    {noreply, State#state{snapshot_expired = true}};
+handle_info(snapshot_lease_expired, State) ->
+    {noreply, State};
 %% handle the bookie stopping and stop this snapshot
 handle_info(
     {'DOWN', BookieMonRef, process, _BookiePid, _Info},
@@ -959,6 +1031,37 @@ terminate(Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+snapshot_guarded_folder(Folder, #state{
+    is_snapshot = true, snapshot_deadline_ms = Deadline
+}) when is_integer(Deadline) ->
+    fun() ->
+        case erlang:monotonic_time(millisecond) >= Deadline of
+            true -> {error, snapshot_expired};
+            false -> Folder()
+        end
+    end;
+snapshot_guarded_folder(Folder, _State) ->
+    Folder.
+
+snapshot_expired_now(#state{snapshot_expired = true}) ->
+    true;
+snapshot_expired_now(#state{
+    is_snapshot = true, snapshot_deadline_ms = Deadline
+}) when is_integer(Deadline) ->
+    erlang:monotonic_time(millisecond) >= Deadline;
+snapshot_expired_now(_State) ->
+    false.
+
+expire_snapshot_state(State = #state{
+    is_snapshot = true,
+    snapshot_expired = false,
+    source_inker = SrcInker
+}) when ?IS_DEF(SrcInker) ->
+    ok = ink_releasesnapshot(SrcInker, self()),
+    State#state{snapshot_expired = true};
+expire_snapshot_state(State) ->
+    State.
 
 %%%============================================================================
 %%% Internal functions
@@ -1336,16 +1439,34 @@ open_all_manifest(Man0, RootPath, CDBOpts) ->
         end,
     lists:foreach(
         fun(FN) ->
-            NewName =
-                filename:flatten([filename:rootname(FN), "." ++ ?ARCHIVE_FILEX]),
             ?STD_LOG(i0029, [FN]),
-            file:rename(FN, NewName)
+            retire_orphan_journal(FN, CDBOpts)
         end,
         sets:to_list(
             sets:del_element(CompleteHeadFN, FilteredOnDiskJournalSet)
         )
     ),
+    cleanup_archived_journals(RootPath, CDBOpts),
     StartedManifest.
+
+retire_orphan_journal(FN, #cdb_options{waste_path = undefined}) ->
+    file:delete(FN);
+retire_orphan_journal(FN, _CDBOpts) ->
+    NewName =
+        filename:flatten([filename:rootname(FN), "." ++ ?ARCHIVE_FILEX]),
+    file:rename(FN, NewName).
+
+cleanup_archived_journals(RootPath, #cdb_options{waste_path = undefined}) ->
+    lists:foreach(
+        fun file:delete/1,
+        [
+            FN
+         || FN <- list_dir(filepath(RootPath, journal_dir)),
+            filename:extension(FN) == ("." ++ ?ARCHIVE_FILEX)
+        ]
+    );
+cleanup_archived_journals(_RootPath, _CDBOpts) ->
+    ok.
 
 -spec get_all_completejournals(string()) -> list(file:filename()).
 get_all_completejournals(RootPath) ->

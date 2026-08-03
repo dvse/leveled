@@ -37,6 +37,8 @@
 -define(BLOCK_TYPE4, 4).
 % Nolookup block with first/last terms at head, and block split into L/M/R
 % 56 KV blocks only
+-define(ROW_DIRECTORY_ENTRY_BYTES, 8).
+-define(ROW_DIRECTORY_PREFIX_BYTES, 5).
 -define(COMPRESSION_FACTOR, 1).
 % When using native compression - how hard should the compression code
 % try to reduce the size of the compressed output. 1 Is to imply minimal
@@ -60,7 +62,10 @@
         serialise_block/3,
         get_all/2,
         get_topandtail/2,
-        get_nth/3
+        get_nth/3,
+        get_row/2,
+        row_location/2,
+        row_pointer/2
     ]
 ).
 
@@ -74,6 +79,12 @@
     {leveled_sst:block_version(), leveled_sst:press_method()},
     list(leveled_codec:ledger_kv())) ->
         binary().
+serialise_block(
+    _Lookup,
+    {2, PressMethod},
+    TermList
+) ->
+    serialise_row_block(TermList, PressMethod);
 serialise_block(
     lookup,
     {1, PressMethod},
@@ -262,7 +273,17 @@ get_all(Block, {0, PressMethod}) ->
         fun(CheckedBlock) ->
             deserialise_checkedblock(CheckedBlock, PressMethod)
         end,
-    check_block(Block, [], ExtractFun).
+    check_block(Block, [], ExtractFun);
+get_all(Block, {2, PressMethod}) ->
+    case row_directory(Block) of
+        {ok, Directory, Rows} ->
+            [
+                get_row(binary:part(Rows, Offset, Length), PressMethod)
+             || {Offset, Length} <- Directory
+            ];
+        error ->
+            []
+    end.
 
 -spec get_topandtail(
     binary(), leveled_sst:block_method()
@@ -291,7 +312,31 @@ get_topandtail(Block, {1, PressMethod}) ->
         Block,
         {not_present, not_present, fun(_) -> [] end},
         ExtractFun
-    ).
+    );
+get_topandtail(Block, {2, PressMethod}) ->
+    case row_directory(Block) of
+        {ok, Directory, Rows} when Directory =/= [] ->
+            {FirstOffset, FirstLength} = hd(Directory),
+            {LastOffset, LastLength} = lists:last(Directory),
+            First = get_row(
+                binary:part(Rows, FirstOffset, FirstLength), PressMethod
+            ),
+            Last = get_row(
+                binary:part(Rows, LastOffset, LastLength), PressMethod
+            ),
+            {
+                element(1, First),
+                element(1, Last),
+                fun(_) ->
+                    [
+                        get_row(binary:part(Rows, Offset, Length), PressMethod)
+                     || {Offset, Length} <- Directory
+                    ]
+                end
+            };
+        _ ->
+            {not_present, not_present, fun(_) -> [] end}
+    end.
 
 -spec get_nth(
     pos_integer(), binary(), leveled_sst:block_method()
@@ -311,7 +356,126 @@ get_nth(N, Block, {0, PressMethod}) ->
                 deserialise_checkedblock(CheckedBlock, PressMethod)
             )
         end,
-    check_block(Block, not_present, ExtractFun).
+    check_block(Block, not_present, ExtractFun);
+get_nth(N, Block, {2, PressMethod}) ->
+    case row_location(Block, N) of
+        {ok, RowStart, RowLength} ->
+            get_row(binary:part(Block, RowStart, RowLength), PressMethod);
+        error ->
+            not_present
+    end.
+
+-spec get_row(binary(), leveled_sst:press_method()) ->
+    leveled_codec:ledger_kv() | not_present.
+get_row(Row, PressMethod) when byte_size(Row) > 4 ->
+    PayloadSize = byte_size(Row) - 4,
+    <<Payload:PayloadSize/binary, CRC32:32/integer>> = Row,
+    try
+        CRC32 = leveled_sst:hmac(Payload),
+        decode_row(Payload, PressMethod)
+    catch
+        _Exception:Reason ->
+            ?STD_LOG(sst15, [Reason]),
+            not_present
+    end;
+get_row(_Row, _PressMethod) ->
+    not_present.
+
+-spec row_location(binary(), pos_integer()) ->
+    {ok, non_neg_integer(), non_neg_integer()} | error.
+row_location(Block, N) when N > 0, byte_size(Block) >= ?ROW_DIRECTORY_PREFIX_BYTES ->
+    case row_pointer(Block, N) of
+        {ok, RowStart, Length} when RowStart + Length =< byte_size(Block) ->
+            {ok, RowStart, Length};
+        _ ->
+            error
+    end;
+row_location(_Block, _N) ->
+    error.
+
+-spec row_pointer(binary(), pos_integer()) ->
+    {ok, non_neg_integer(), non_neg_integer()} | error.
+row_pointer(Block, N) when N > 0, byte_size(Block) >= ?ROW_DIRECTORY_PREFIX_BYTES ->
+    <<Count:8/integer, DirectoryCRC:32/integer, Rest/binary>> = Block,
+    DirectorySize = Count * ?ROW_DIRECTORY_ENTRY_BYTES,
+    case {N =< Count, byte_size(Rest) >= DirectorySize} of
+        {true, true} ->
+            <<Directory:DirectorySize/binary, _Rows/binary>> = Rest,
+            case leveled_sst:hmac(Directory) of
+                DirectoryCRC ->
+                    EntryOffset = (N - 1) * ?ROW_DIRECTORY_ENTRY_BYTES,
+                    <<_Prefix:EntryOffset/binary, Offset:32/integer,
+                        Length:32/integer, _/binary>> = Directory,
+                    RowStart = ?ROW_DIRECTORY_PREFIX_BYTES + DirectorySize + Offset,
+                    {ok, RowStart, Length};
+                _ ->
+                    error
+            end;
+        _ ->
+            error
+    end;
+row_pointer(_Block, _N) ->
+    error.
+
+serialise_row_block(TermList, PressMethod) when length(TermList) =< 255 ->
+    {Directory, Rows, _Offset} =
+        lists:foldl(
+            fun(Term, {DirectoryAcc, RowsAcc, Offset}) ->
+                Row = serialise_row(Term, PressMethod),
+                Length = byte_size(Row),
+                {
+                    <<DirectoryAcc/binary, Offset:32/integer, Length:32/integer>>,
+                    <<RowsAcc/binary, Row/binary>>,
+                    Offset + Length
+                }
+            end,
+            {<<>>, <<>>, 0},
+            TermList
+        ),
+    DirectoryCRC = leveled_sst:hmac(Directory),
+    <<(length(TermList)):8/integer, DirectoryCRC:32/integer,
+        Directory/binary, Rows/binary>>.
+
+serialise_row(Term, PressMethod) ->
+    Payload =
+        case PressMethod of
+            native -> term_to_binary(Term, ?BINARY_SETTINGS);
+            none -> term_to_binary(Term);
+            lz4 -> compress_block(term_to_binary(Term), lz4);
+            zstd -> compress_block(term_to_binary(Term), zstd)
+        end,
+    crc_validate_bin(Payload).
+
+decode_row(Payload, native) -> binary_to_term(Payload);
+decode_row(Payload, none) -> binary_to_term(Payload);
+decode_row(Payload, lz4) -> binary_to_term(decompress_block(Payload, lz4));
+decode_row(Payload, zstd) -> binary_to_term(decompress_block(Payload, zstd)).
+
+row_directory(Block) ->
+    case Block of
+        <<Count:8/integer, DirectoryCRC:32/integer, Rest/binary>> ->
+            DirectorySize = Count * ?ROW_DIRECTORY_ENTRY_BYTES,
+            case byte_size(Rest) >= DirectorySize of
+                true ->
+                    <<Directory:DirectorySize/binary, Rows/binary>> = Rest,
+                    case leveled_sst:hmac(Directory) of
+                        DirectoryCRC ->
+                            {ok, row_directory_entries(Directory, []), Rows};
+                        _ ->
+                            error
+                    end;
+                false ->
+                    error
+            end;
+        _ ->
+            error
+    end.
+
+row_directory_entries(<<>>, Acc) -> lists:reverse(Acc);
+row_directory_entries(
+    <<Offset:32/integer, Length:32/integer, Rest/binary>>, Acc
+) ->
+    row_directory_entries(Rest, [{Offset, Length} | Acc]).
 
 %%%============================================================================
 %%% General internal functions - v1
@@ -709,6 +873,27 @@ v1_block_test() ->
     v1_block_tester(lookup, {1, native}, 32),
     v1_block_tester(lookup, {1, native}, 31),
     v1_block_tester(no_lookup, {1, zstd}, 24).
+
+v2_row_addressable_block_test() ->
+    v1_block_tester(lookup, {2, native}, 32),
+    v1_block_tester(lookup, {2, none}, 24),
+    v1_block_tester(lookup, {2, lz4}, 24),
+    v1_block_tester(lookup, {2, zstd}, 32),
+    v1_block_tester(no_lookup, {2, native}, 56).
+
+v2_row_crc_isolation_test() ->
+    Big = crypto:strong_rand_bytes(1024 * 1024),
+    Rows = [{{row, 1}, <<"wanted">>}, {{row, 2}, Big}, {{row, 3}, Big}],
+    Block = serialise_block(lookup, {2, native}, Rows),
+    {ok, LastStart, LastLength} = row_location(Block, 3),
+    <<Prefix:LastStart/binary, LastRow:LastLength/binary, Suffix/binary>> = Block,
+    LastPayloadSize = LastLength - 1,
+    <<LastPrefix:LastPayloadSize/binary, LastByte:8/integer>> = LastRow,
+    Corrupt =
+        <<Prefix/binary, LastPrefix/binary, (LastByte bxor 16#FF):8/integer,
+            Suffix/binary>>,
+    ?assertEqual(hd(Rows), get_nth(1, Corrupt, {2, native})),
+    ?assertEqual(not_present, get_nth(3, Corrupt, {2, native})).
 
 v1_bigblock_test() ->
     BigBlob = crypto:strong_rand_bytes(16384),

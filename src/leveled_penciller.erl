@@ -187,12 +187,15 @@
     pcl_confirml0complete/5,
     pcl_confirmdelete/3,
     pcl_close/1,
+    pcl_close_and_return_sqn/1,
     pcl_doom/1,
     pcl_releasesnapshot/2,
     pcl_registersnapshot/5,
     pcl_getstartupsequencenumber/1,
     pcl_checkbloomtest/2,
     pcl_checkforwork/1,
+    pcl_reclaim/1,
+    pcl_retentionstatus/1,
     pcl_persistedsqn/1,
     pcl_loglevel/2,
     pcl_addlogs/2,
@@ -269,6 +272,8 @@
     is_snapshot = false :: boolean(),
     snapshot_fully_loaded = false :: boolean(),
     snapshot_time :: pos_integer() | undefined,
+    snapshot_deadline_ms = infinity :: integer() | infinity,
+    snapshot_expired = false :: boolean(),
     source_penciller :: pid() | undefined,
     bookie_monref :: reference() | undefined,
 
@@ -637,6 +642,13 @@ pcl_persistedsqn(Pid) ->
 pcl_close(Pid) ->
     gen_server:call(Pid, close, infinity).
 
+-spec pcl_close_and_return_sqn(pid()) -> {ok, non_neg_integer()}.
+%% @doc Close after persisting the final in-memory window and return the SQN
+%% now durable in the ledger. Head-only bookies use this boundary to reclaim
+%% the corresponding journal prefix during the same close cycle.
+pcl_close_and_return_sqn(Pid) ->
+    gen_server:call(Pid, close_with_sqn, infinity).
+
 -spec pcl_snapclose(pid()) -> ok.
 %% @doc
 %% Specifically to be used when closing snpashots on shutdown, will handle a
@@ -674,6 +686,18 @@ pcl_checkbloomtest(Pid, Key) ->
 %% Used in test only to confim compaction work complete before closing
 pcl_checkforwork(Pid) ->
     gen_server:call(Pid, check_for_work, 2000).
+
+-spec pcl_reclaim(pid()) -> idle | busy.
+%% @doc Force the current memory/L0 state through the normal manifest and
+%% clerk machinery, returning idle only after snapshots and pending deletes no
+%% longer protect superseded SSTs.
+pcl_reclaim(Pid) ->
+    gen_server:call(Pid, reclaim, infinity).
+
+-spec pcl_retentionstatus(pid()) -> map().
+%% @doc Return the live ledger snapshot/pending-delete retention report.
+pcl_retentionstatus(Pid) ->
+    gen_server:call(Pid, retention_status, infinity).
 
 -spec pcl_loglevel(pid(), leveled_log:log_level()) -> ok.
 %% @doc
@@ -732,6 +756,12 @@ init([LogOpts, PCLopts]) ->
                 pcl_registersnapshot(
                     SrcPenciller, self(), Query, BookiesMem, LongRunning
                 ),
+            Delay = erlang:max(
+                0,
+                State#state.snapshot_deadline_ms -
+                    erlang:monotonic_time(millisecond)
+            ),
+            _ = erlang:send_after(Delay, self(), snapshot_lease_expired),
             ?STD_LOG(p0001, [self()]),
             {ok, State#state{
                 is_snapshot = true,
@@ -743,6 +773,28 @@ init([LogOpts, PCLopts]) ->
             start_from_file(PCLopts)
     end.
 
+handle_call(
+    {fetch, _Key, _Hash, _UseL0Index}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
+handle_call(
+    {fetch_many, _Keys, _UseL0Index}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
+handle_call(
+    {check_sqn, _Key, _Hash, _SQN}, _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
+handle_call(
+    {fetch_keys, _StartKey, _EndKey, _AccFun, _InitAcc, _SegmentList,
+        _LastModRange, _MaxKeys, _By},
+    _From,
+    State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
 handle_call(
     {push_mem, {LedgerTable, PushedIdx, MinSQN, MaxSQN}},
     _From,
@@ -821,40 +873,46 @@ handle_call(
 ) when
     ?IS_DEF(M)
 ->
-    L0Idx =
-        case UseL0Index of
-            true ->
-                State#state.levelzero_index;
-            false ->
-                none
-        end,
-    R =
-        timed_fetch_mem(
-            Key,
-            Hash,
-            M,
-            State#state.levelzero_cache,
-            L0Idx,
-            State#state.monitor
-        ),
-    {reply, R, State};
+    case snapshot_expired_now(State) of
+        true ->
+            {reply, {error, snapshot_expired}, expire_snapshot_state(State)};
+        false ->
+            L0Idx =
+                case UseL0Index of
+                    true -> State#state.levelzero_index;
+                    false -> none
+                end,
+            R = timed_fetch_mem(
+                Key,
+                Hash,
+                M,
+                State#state.levelzero_cache,
+                L0Idx,
+                State#state.monitor
+            ),
+            {reply, R, State}
+    end;
 handle_call(
     {fetch_many, Keys, UseL0Index}, _From, State = #state{manifest = M}
 ) when
     ?IS_DEF(M), is_list(Keys)
 ->
-    L0Idx =
-        case UseL0Index of
-            true -> State#state.levelzero_index;
-            false -> none
-        end,
-    R = fetch_many_mem(
-        Keys,
-        M,
-        State#state.levelzero_cache,
-        L0Idx
-    ),
-    {reply, R, State};
+    case snapshot_expired_now(State) of
+        true ->
+            {reply, {error, snapshot_expired}, expire_snapshot_state(State)};
+        false ->
+            L0Idx = case UseL0Index of
+                true -> State#state.levelzero_index;
+                false -> none
+            end,
+            R = fetch_many_mem(
+                Keys,
+                M,
+                State#state.levelzero_cache,
+                L0Idx
+            ),
+            {reply, R, State}
+    end;
 handle_call(
     {check_sqn, Key, Hash, SQN},
     _From,
@@ -866,7 +924,14 @@ handle_call(
     % complete)
     ?IS_DEF(M), ?IS_DEF(L0C), ?IS_DEF(L0I)
 ->
-    {reply, compare_to_sqn(fetch_sqn(Key, Hash, M, L0C, L0I), SQN), State};
+    case snapshot_expired_now(State) of
+        true ->
+            {reply, {error, snapshot_expired}, expire_snapshot_state(State)};
+        false ->
+            {reply,
+                compare_to_sqn(fetch_sqn(Key, Hash, M, L0C, L0I), SQN),
+                State}
+    end;
 handle_call(
     {fetch_keys, StartKey, EndKey, AccFun, InitAcc, SegmentList, LastModRange,
         MaxKeys, By},
@@ -939,7 +1004,7 @@ handle_call(
         end,
     SnapshotTime = State#state.snapshot_time,
     PersistedIterator = maps:from_list(SSTiter),
-    Folder =
+    Folder0 =
         fun() ->
             keyfolder(
                 maps:put(-1, FilteredL0, PersistedIterator),
@@ -948,6 +1013,7 @@ handle_call(
                 {SegChecker, LastModRange0, MaxKeys}
             )
         end,
+    Folder = snapshot_guarded_folder(Folder0, State),
     case By of
         as_pcl ->
             {reply, Folder(), State};
@@ -1070,6 +1136,8 @@ handle_call(
         {ok, CloneState#state{
             snapshot_fully_loaded = true,
             snapshot_time = leveled_util:integer_now(),
+            snapshot_deadline_ms =
+                erlang:monotonic_time(millisecond) + TimeO * 1000,
             manifest = ManifestClone,
             query_manifest = QueryManifest
         }},
@@ -1080,13 +1148,14 @@ handle_call(close, _From, State = #state{is_snapshot = Snap}) when
     ok = pcl_releasesnapshot(State#state.source_penciller, self()),
     {stop, normal, ok, State};
 handle_call(
-    close,
+    ShutdownType,
     From,
     State = #state{manifest = Manifest, clerk = Clerk, levelzero_cache = L0C}
 ) when
     % By definition not a snapshot (as snapshot covered by clause above),
     % so manifest, clerk and cache must all be present
-    ?IS_DEF(Manifest), ?IS_DEF(Clerk), ?IS_DEF(L0C)
+    ?IS_DEF(Manifest), ?IS_DEF(Clerk), ?IS_DEF(L0C),
+    (ShutdownType =:= close orelse ShutdownType =:= close_with_sqn)
 ->
     % Level 0 files lie outside of the manifest, and so if there is no L0
     % file present it is safe to write the current contents of memory.  If
@@ -1100,11 +1169,13 @@ handle_call(
     ok = leveled_pclerk:clerk_close(Clerk),
     ?STD_LOG(p0008, [close]),
     L0Left = State#state.levelzero_size > 0,
-    case (not State#state.levelzero_pending and L0Left) of
+    State0 = case (not State#state.levelzero_pending and L0Left) of
         true ->
-            {Constructor, _} =
+            NextManifestSQN =
+                leveled_pmanifest:get_manifest_sqn(Manifest) + 1,
+            {Constructor, Bloom} =
                 roll_memory(
-                    leveled_pmanifest:get_manifest_sqn(Manifest) + 1,
+                    NextManifestSQN,
                     State#state.ledger_sqn,
                     State#state.root_path,
                     L0C,
@@ -1112,12 +1183,33 @@ handle_call(
                     State#state.sst_options,
                     true
                 ),
-            ok = leveled_sst:sst_close(Constructor);
+            {ok, Filename, StartKey, EndKey} =
+                leveled_sst:sst_checkready(Constructor),
+            Entry = leveled_pmanifest:new_entry(
+                StartKey, EndKey, Constructor, Filename, Bloom
+            ),
+            ShutdownManifest = leveled_pmanifest:insert_manifest_entry(
+                Manifest, NextManifestSQN, 0, Entry
+            ),
+            %% A head-only close may trim the journal only after the final
+            %% memory window has a durable manifest reference.  Merely
+            %% writing the conventional next L0 filename is insufficient:
+            %% a busy clerk can advance the manifest sequence before close,
+            %% making that file undiscoverable on the next open.
+            ok = leveled_pmanifest:save_manifest(
+                ShutdownManifest, State#state.root_path
+            ),
+            State#state{
+                manifest = ShutdownManifest,
+                levelzero_constructor = undefined,
+                persisted_sqn = State#state.ledger_sqn
+            };
         false ->
-            ?STD_LOG(p0010, [State#state.levelzero_size])
+            ?STD_LOG(p0010, [State#state.levelzero_size]),
+            State
     end,
-    gen_server:cast(self(), {maybe_defer_shutdown, close, From}),
-    {noreply, State};
+    gen_server:cast(self(), {maybe_defer_shutdown, ShutdownType, From}),
+    {noreply, State0};
 handle_call(
     doom, From, State = #state{clerk = Clerk}
 ) when
@@ -1154,8 +1246,72 @@ handle_call(
 ->
     {_WL, WC} = leveled_pmanifest:check_for_work(Manifest),
     {reply, WC > 0, State};
+handle_call(
+    reclaim,
+    _From,
+    State = #state{
+        manifest = Manifest,
+        clerk = Clerk,
+        levelzero_cache = L0Cache
+    }
+) when ?IS_DEF(Manifest), ?IS_DEF(Clerk), ?IS_DEF(L0Cache) ->
+    Manifest0 = leveled_pmanifest:expire_snapshots(Manifest),
+    State0 = State#state{manifest = Manifest0},
+    L0Present = leveled_pmanifest:levelzero_present(Manifest0),
+    {_WorkLevels, WorkCount} = leveled_pmanifest:check_for_work(Manifest0),
+    Snapshots = leveled_pmanifest:snapshot_pids(Manifest0),
+    PendingDeleteCount = leveled_pmanifest:pending_delete_count(Manifest0),
+    case {Snapshots, PendingDeleteCount} of
+        {[], Count} when Count > 0 ->
+            lists:foreach(
+                fun({Filename, FilePid}) ->
+                    pcl_confirmdelete(self(), Filename, FilePid)
+                end,
+                leveled_pmanifest:pending_delete_requests(Manifest0)
+            );
+        _ProtectedOrClear ->
+            ok
+    end,
+    Protected = Snapshots =/= [] orelse PendingDeleteCount > 0,
+    case {
+        State0#state.levelzero_pending,
+        State0#state.work_ongoing,
+        L0Present,
+        State0#state.levelzero_size,
+        WorkCount,
+        Protected
+    } of
+        {false, false, false, 0, 0, false} ->
+            {reply, idle, State0};
+        {false, false, false, Size, _Work, _Protected} when Size > 0 ->
+            NextSQN = leveled_pmanifest:get_manifest_sqn(Manifest0) + 1,
+            {Constructor, none} = roll_memory(
+                NextSQN,
+                State0#state.ledger_sqn,
+                State0#state.root_path,
+                none,
+                length(L0Cache),
+                State0#state.sst_options,
+                false
+            ),
+            {reply, busy, State0#state{
+                levelzero_pending = true,
+                levelzero_constructor = Constructor,
+                work_backlog = false
+            }};
+        _Busy ->
+            ok = leveled_pclerk:clerk_prompt(Clerk),
+            {reply, busy, State0}
+    end;
 handle_call(persisted_sqn, _From, State) ->
     {reply, State#state.persisted_sqn, State};
+handle_call(
+    retention_status, _From, State = #state{manifest = Manifest}
+) when ?IS_DEF(Manifest) ->
+    Manifest0 = leveled_pmanifest:expire_snapshots(Manifest),
+    {reply,
+        leveled_pmanifest:retention_status(Manifest0),
+        State#state{manifest = Manifest0}};
 handle_call(
     get_sstpids, _From, State = #state{manifest = Manifest}
 ) when
@@ -1195,7 +1351,12 @@ handle_cast(
                 pending_removals = [],
                 maybe_release = false,
                 work_ongoing = false
-            }}
+            }};
+        true ->
+            %% A synchronous shutdown flush may already have persisted and
+            %% installed a later manifest before a previously queued clerk
+            %% notification is handled.  The current manifest is authoritative.
+            {noreply, State}
     end;
 handle_cast(
     {release_snapshot, Snapshot}, State = #state{manifest = Manifest}
@@ -1225,37 +1386,39 @@ handle_cast(
     % blocking the delete confirmation
     % When an updated manifest is submitted by the clerk, the pending_removals
     % will be cleared from pending using the maybe_release boolean
-    case leveled_pmanifest:ready_to_delete(State#state.manifest, PDFN) of
+    Manifest0 = leveled_pmanifest:expire_snapshots(State#state.manifest),
+    State0 = State#state{manifest = Manifest0},
+    case leveled_pmanifest:ready_to_delete(Manifest0, PDFN) of
         true ->
             ?STD_LOG(p0005, [PDFN]),
             ok = leveled_sst:sst_deleteconfirmed(FilePid),
-            case State#state.work_ongoing of
+            case State0#state.work_ongoing of
                 true ->
-                    {noreply, State#state{
+                    {noreply, State0#state{
                         pending_removals =
-                            [PDFN | State#state.pending_removals]
+                            [PDFN | State0#state.pending_removals]
                     }};
                 false ->
                     UpdManifest =
                         leveled_pmanifest:clear_pending(
-                            State#state.manifest,
+                            Manifest0,
                             [PDFN],
                             false
                         ),
-                    {noreply, State#state{manifest = UpdManifest}}
+                    {noreply, State0#state{manifest = UpdManifest}}
             end;
         false ->
-            case State#state.work_ongoing of
+            case State0#state.work_ongoing of
                 true ->
-                    {noreply, State#state{maybe_release = true}};
+                    {noreply, State0#state{maybe_release = true}};
                 false ->
                     UpdManifest =
                         leveled_pmanifest:clear_pending(
-                            State#state.manifest,
+                            Manifest0,
                             [],
                             true
                         ),
-                    {noreply, State#state{manifest = UpdManifest}}
+                    {noreply, State0#state{manifest = UpdManifest}}
             end
     end;
 handle_cast(
@@ -1447,10 +1610,29 @@ handle_cast(
             FilesFP = State#state.root_path ++ "/" ++ ?FILES_FP ++ "/",
             gen_server:reply(From, {ok, [ManifestFP, FilesFP]});
         close ->
-            gen_server:reply(From, ok)
+            gen_server:reply(From, ok);
+        close_with_sqn ->
+            %% `ledger_sqn` can include the still-memory-resident suffix when
+            %% shutdown began with an existing L0 file.  Only the persisted
+            %% watermark is safe for the inker trim performed by the bookie.
+            gen_server:reply(From, {ok, State#state.persisted_sqn})
     end,
     {stop, normal, State}.
 
+handle_info(
+    snapshot_lease_expired,
+    State = #state{
+        is_snapshot = true,
+        snapshot_expired = false,
+        source_penciller = SrcPCL
+    }
+) when ?IS_DEF(SrcPCL) ->
+    %% Release the source pin but keep the clone alive so every later read can
+    %% return an explicit error instead of racing a deleted SST process.
+    ok = pcl_releasesnapshot(SrcPCL, self()),
+    {noreply, State#state{snapshot_expired = true}};
+handle_info(snapshot_lease_expired, State) ->
+    {noreply, State};
 %% handle the bookie stopping and stop this snapshot
 handle_info(
     {'DOWN', BookieMonRef, process, _BookiePid, _Info},
@@ -1488,6 +1670,37 @@ format_status(Status) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+snapshot_guarded_folder(Folder, #state{
+    is_snapshot = true, snapshot_deadline_ms = Deadline
+}) when is_integer(Deadline) ->
+    fun() ->
+        case erlang:monotonic_time(millisecond) >= Deadline of
+            true -> {error, snapshot_expired};
+            false -> Folder()
+        end
+    end;
+snapshot_guarded_folder(Folder, _State) ->
+    Folder.
+
+snapshot_expired_now(#state{snapshot_expired = true}) ->
+    true;
+snapshot_expired_now(#state{
+    is_snapshot = true, snapshot_deadline_ms = Deadline
+}) when is_integer(Deadline) ->
+    erlang:monotonic_time(millisecond) >= Deadline;
+snapshot_expired_now(_State) ->
+    false.
+
+expire_snapshot_state(State = #state{
+    is_snapshot = true,
+    snapshot_expired = false,
+    source_penciller = SrcPCL
+}) when ?IS_DEF(SrcPCL) ->
+    ok = pcl_releasesnapshot(SrcPCL, self()),
+    State#state{snapshot_expired = true};
+expire_snapshot_state(State) ->
+    State.
 
 %%%============================================================================
 %%% Path functions

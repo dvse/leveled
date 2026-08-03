@@ -25,13 +25,13 @@
 -define(OPEN_LASTMOD_RANGE, {0, infinity}).
 % 15 minutes
 -define(SNAPTIMEOUT_SHORT, 900).
-% 12 hours
--define(SNAPTIMEOUT_LONG, 43200).
+% 30 minutes: hard upper bound on superseded-file retention by a snapshot
+-define(SNAPTIMEOUT_LONG, 1800).
 -define(SST_PAGECACHELEVEL_NOLOOKUP, 1).
 -define(SST_PAGECACHELEVEL_LOOKUP, 4).
 -define(DEFAULT_STATS_PERC, 10).
 -define(DEFAULT_SYNC_STRATEGY, none).
--define(DEFAULT_BLOCK_VERSION, 1).
+-define(DEFAULT_BLOCK_VERSION, 2).
 %%%============================================================================
 
 %%%============================================================================
@@ -234,7 +234,7 @@
     singlefile_compactionperc :: float() | undefined,
     maxrunlength_compactionperc :: float() | undefined,
     score_onein = 1 :: pos_integer(),
-    snaptimeout_long = 60 :: pos_integer(),
+    snaptimeout_long = ?SNAPTIMEOUT_LONG :: pos_integer(),
     monitor = {no_monitor, 0} ::
         leveled_monitor:monitor()
 }).
@@ -253,8 +253,8 @@
     compression_method = ?COMPRESSION_METHOD ::
         lz4 | native | none,
     levelzero_cointoss = false :: boolean(),
-    snaptimeout_short :: pos_integer() | undefined,
-    snaptimeout_long :: pos_integer() | undefined,
+    snaptimeout_short = ?SNAPTIMEOUT_SHORT :: pos_integer(),
+    snaptimeout_long = ?SNAPTIMEOUT_LONG :: pos_integer(),
     monitor = {no_monitor, 0} ::
         leveled_monitor:monitor()
 }).

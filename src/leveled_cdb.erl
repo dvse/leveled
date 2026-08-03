@@ -131,6 +131,9 @@
     inker :: pid() | undefined,
     % undefined until delete_pending
     deferred_delete = false :: boolean(),
+    % a close arriving while the immutable hash table is being calculated
+    % must wait for the calculation; the ETS table is owned by this process
+    deferred_close = undefined :: gen_statem:from() | undefined,
     waste_path :: string() | undefined,
     % undefined has functional meaning
     % - no sending to waste on delete
@@ -722,17 +725,29 @@ rolling(
         filename = NewName,
         hash_index = Index
     },
-    case State#state.deferred_delete of
-        true ->
+    case {State#state.deferred_delete, State#state.deferred_close} of
+        {true, undefined} ->
             {next_state, delete_pending, State0, [{reply, From, ok}]};
-        false ->
+        {false, undefined} ->
             ?TMR_LOG(cdb18, [], SW),
-            {next_state, reader, State0, [{reply, From, ok}, hibernate]}
+            {next_state, reader, State0, [{reply, From, ok}, hibernate]};
+        {true, CloseFrom} ->
+            close_pendingdelete(NewHandle, NewName, State#state.waste_path),
+            {stop_and_reply, normal, [
+                {reply, From, ok}, {reply, CloseFrom, ok}
+            ]};
+        {false, CloseFrom} ->
+            ok = file:close(NewHandle),
+            {stop_and_reply, normal, [
+                {reply, From, ok}, {reply, CloseFrom, ok}
+            ]}
     end;
 rolling({call, From}, check_hashtable, _State) ->
     {keep_state_and_data, [{reply, From, false}]};
 rolling({call, From}, cdb_isrolling, _State) ->
     {keep_state_and_data, [{reply, From, true}]};
+rolling({call, From}, cdb_close, State) ->
+    {keep_state, State#state{deferred_close = From}};
 rolling({call, From}, Event, State) ->
     handle_sync_event(Event, From, State);
 rolling(cast, {delete_pending, ManSQN, Inker}, State) ->
@@ -2626,6 +2641,24 @@ empty_roll_test() ->
     ),
     ok = cdb_close(P2),
     ok = file:delete("test/test_area/empty_roll.cdb").
+
+close_during_roll_test() ->
+    Pending = "test/test_area/close_during_roll.pnd",
+    Complete = "test/test_area/close_during_roll.cdb",
+    file:delete(Pending),
+    file:delete(Complete),
+    {ok, Writer} = cdb_open_writer(
+        Pending, #cdb_options{binary_mode = true}
+    ),
+    ok = cdb_put(Writer, <<"key">>, <<"value">>),
+    ok = cdb_roll(Writer),
+    ok = cdb_close(Writer),
+    {ok, Reader} = cdb_open_reader(
+        Complete, #cdb_options{binary_mode = true}
+    ),
+    ?assertMatch({<<"key">>, <<"value">>}, cdb_get(Reader, <<"key">>)),
+    ok = cdb_close(Reader),
+    ok = file:delete(Complete).
 
 find_lastkey_test() ->
     file:delete("test/test_area/lastkey.pnd"),

@@ -41,6 +41,7 @@
     mergefile_selector/3,
     add_snapshot/3,
     release_snapshot/2,
+    expire_snapshots/1,
     merge_snapshot/2,
     ready_to_delete/2,
     clear_pending/3,
@@ -50,6 +51,9 @@
     check_bloom/3,
     report_manifest_level/2,
     snapshot_pids/1,
+    pending_delete_count/1,
+    pending_delete_requests/1,
+    retention_status/1,
     get_sstpids/1
 ]).
 
@@ -132,7 +136,7 @@
 }).
 
 -type snapshot() ::
-    {pid(), non_neg_integer(), pos_integer(), pos_integer()}.
+    {pid(), non_neg_integer(), integer(), pos_integer()}.
 -type manifest() :: #manifest{}.
 -type manifest_entry() :: #manifest_entry{}.
 -type manifest_owner() :: pid().
@@ -657,7 +661,7 @@ release_snapshot(Manifest, Pid) ->
                 Pid ->
                     {Acc, MinSQN, true};
                 _ ->
-                    case seconds_now() > (ST + TO) of
+                    case seconds_now() >= (ST + TO) of
                         true ->
                             ?STD_LOG(p0038, [P, SQN, ST, TO]),
                             {Acc, MinSQN, Found};
@@ -687,6 +691,13 @@ release_snapshot(Manifest, Pid) ->
                 snapshots = SnapList0, min_snapshot_sqn = MinSnapSQN
             }
     end.
+
+-spec expire_snapshots(manifest()) -> manifest().
+%% @doc Remove every snapshot whose configured storage-pinning lease has
+%% elapsed. This is intentionally independent of process liveness: a zombie
+%% holder must not retain superseded SST files indefinitely.
+expire_snapshots(Manifest) ->
+    release_snapshot(Manifest, ?PHANTOM_PID).
 
 %% @doc
 %% A SST file which is in the delete_pending state can check to see if it is
@@ -785,6 +796,34 @@ check_bloom(Manifest, FP, Hash) ->
 %% Return a list of snapshot_pids - to be shutdown on shutdown
 snapshot_pids(Manifest) ->
     lists:map(fun(S) -> element(1, S) end, Manifest#manifest.snapshots).
+
+-spec pending_delete_count(manifest()) -> non_neg_integer().
+pending_delete_count(Manifest) ->
+    dict:size(Manifest#manifest.pending_deletes).
+
+-spec retention_status(manifest()) -> map().
+%% @doc Operational view of the state which can retain superseded SST files.
+retention_status(Manifest) ->
+    Now = seconds_now(),
+    Ages = [erlang:max(0, Now - Started) ||
+        {_Pid, _SQN, Started, _Timeout} <- Manifest#manifest.snapshots],
+    #{
+        ledger_delete_pending_files =>
+            dict:size(Manifest#manifest.pending_deletes),
+        ledger_snapshot_count => length(Ages),
+        ledger_oldest_snapshot_age_seconds => case Ages of
+            [] -> undefined;
+            _ -> lists:max(Ages)
+        end
+    }.
+
+-spec pending_delete_requests(manifest()) -> [{string(), pid()}].
+pending_delete_requests(Manifest) ->
+    [
+        {Filename, Entry#manifest_entry.owner}
+     || {Filename, {_ChangeSQN, Entry}} <-
+            dict:to_list(Manifest#manifest.pending_deletes)
+    ].
 
 -spec get_sstpids(manifest()) -> list(pid()).
 %% @doc
@@ -1185,20 +1224,61 @@ open_manifestfile(RootPath, [TopManSQN | Rest]) ->
     <<CRC:32/integer, BinaryOfTerm/binary>> = FileBin,
     case erlang:crc32(BinaryOfTerm) of
         CRC ->
-            ?STD_LOG(p0012, [TopManSQN]),
             Manifest = binary_to_term(BinaryOfTerm),
-            Manifest#manifest{
-                pending_deletes = new_pending_deletions(),
-                blooms = new_blooms()
-            };
+            case manifest_sst_files_readable(RootPath, Manifest) of
+                true ->
+                    ?STD_LOG(p0012, [TopManSQN]),
+                    Manifest#manifest{
+                        pending_deletes = new_pending_deletions(),
+                        blooms = new_blooms()
+                    };
+                false ->
+                    ?STD_LOG(p0033, [CurrManFile, "referenced SST missing"]),
+                    open_manifestfile(RootPath, Rest)
+            end;
         _ ->
             ?STD_LOG(p0033, [CurrManFile, "crc wonky"]),
             open_manifestfile(RootPath, Rest)
     end.
 
+%% A checksum-valid manifest is still torn when the root publication reached
+%% disk but one of its immutable SSTs did not.  Reject that generation before
+%% any SST process is started so journal replay can continue from the previous
+%% complete ledger manifest.  Historical unit fixtures use symbolic filenames;
+%% only real `.sst` entries participate in this on-disk validation.
+manifest_sst_files_readable(RootPath, Manifest) ->
+    SSTRoot = filename:join(RootPath, "ledger_files"),
+    lists:all(
+        fun(Filename) ->
+            case filename:extension(Filename) of
+                ".sst" ->
+                    Path = filename:join(SSTRoot, filename:basename(Filename)),
+                    filelib:is_regular(Path) andalso filelib:file_size(Path) > 0;
+                _FixtureOrLegacyName ->
+                    true
+            end
+        end,
+        manifest_entry_filenames(Manifest)
+    ).
+
+manifest_entry_filenames(Manifest) ->
+    lists:append([
+        begin
+            Level = array:get(LevelIndex, Manifest#manifest.levels),
+            Entries = case LevelIndex =< 1 of
+                true -> Level;
+                false -> leveled_tree:to_list(Level)
+            end,
+            [
+                (get_manifest_entry(Entry))#manifest_entry.filename
+             || Entry <- Entries
+            ]
+        end
+     || LevelIndex <- lists:seq(0, Manifest#manifest.basement)
+    ]).
+
 seconds_now() ->
-    {MegaNow, SecNow, _} = os:timestamp(),
-    MegaNow * 1000000 + SecNow.
+    erlang:monotonic_time(second).
 
 new_blooms() -> dict:new().
 
@@ -1432,6 +1512,35 @@ keylookup_manifest_test() ->
 
     ?assertMatch(PY3, key_lookup(Man13, 1, LK1_4)),
     ?assertMatch(PZ5, key_lookup(Man13, 2, LK1_4)).
+
+torn_latest_manifest_falls_back_test() ->
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    RootPath = "test/test_torn_manifest_" ++ Suffix,
+    ok = leveled_penciller:clean_testdir(RootPath),
+    SSTPath = filename:join(RootPath, "ledger_files"),
+    ok = filelib:ensure_dir(filename:join(SSTPath, "placeholder")),
+    OldFilename = "./1_1_1.sst",
+    NewFilename = "./2_1_1.sst",
+    ok = file:write_file(filename:join(SSTPath, filename:basename(OldFilename)), <<1>>),
+    ok = file:write_file(filename:join(SSTPath, filename:basename(NewFilename)), <<2>>),
+    OldEntry = #manifest_entry{
+        start_key = {o, <<"bucket">>, <<"a">>, null},
+        end_key = {o, <<"bucket">>, <<"z">>, null},
+        filename = OldFilename,
+        owner = self(),
+        bloom = none
+    },
+    NewEntry = OldEntry#manifest_entry{filename = NewFilename},
+    OldManifest = insert_manifest_entry(new_manifest(), 1, 1, OldEntry),
+    ok = save_manifest(OldManifest, RootPath),
+    NewManifest = replace_manifest_entry(
+        OldManifest, 2, 1, OldEntry, NewEntry
+    ),
+    ok = save_manifest(NewManifest, RootPath),
+    ?assertEqual(2, get_manifest_sqn(open_manifest(RootPath))),
+    ok = file:delete(filename:join(SSTPath, filename:basename(NewFilename))),
+    ?assertEqual(1, get_manifest_sqn(open_manifest(RootPath))),
+    ok = leveled_penciller:clean_testdir(RootPath).
 
 ext_keylookup_manifest_test() ->
     RP = "test/test_area",

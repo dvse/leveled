@@ -121,6 +121,17 @@ These set the period in seconds before a snapshot which has not shutdown, is dec
 
 This covers only silently failing snapshots.  Snapshots that shutdown neatly will be released from locking deleted files when they shutdown.  The 'short' timeout is used for snapshots which support index queries and bucket listing.  The 'long' timeout is used for all other folds (e.g. key lists, head folds and object folds).
 
+## FTS generation residency
+
+`fts_residency_budget` is the maximum charged byte size of an immutable FTS
+generation that may be made resident in memory. It defaults to 402,653,184
+bytes (384 MiB); set it to zero to disable residency. Loading is generation
+scoped and ordered by expected serving value: root/bloom control data, term
+headers, Boolean and anchor planes, identity pages, position planes, then
+bigrams. A family that does not fit remains on the ordinary SST path. Resident
+state has no TTL, eviction, or serving-read population and is removed when the
+generation's state/root is superseded or its store closes.
+
 ## Statistic gathering
 
 Leveled will gather monitoring statistics on HEAD/GET/PUT requests, with timing points taken throughout the store.  These timings are gathered by the `leveled_monitor`, and there are three configuration options.  The two primary options are: `stats_percentage` is an integer between 0 and 100 which informs the store of the proprtion of the requests which should be timed at each part; and `stats_logfrequency` which controls the frequency (in seconds) with which the leveled_monitor will write a log file (for one of the stats types in its queue).

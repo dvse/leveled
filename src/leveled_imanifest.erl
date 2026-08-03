@@ -121,11 +121,21 @@ find_persistedentries(SQN, ManifestAsList) ->
         end,
     Entries = lists:dropwhile(DropFun, ManifestAsList),
     case Entries of
-        [_Head | Tail] ->
-            Tail;
+        [{_ME_SQN, _FN, _ME_P, LastKey} = Head | Tail] ->
+            case persisted_last_key(LastKey, SQN) of
+                true -> [Head | Tail];
+                false -> Tail
+            end;
         [] ->
             []
     end.
+
+persisted_last_key({LastSQN, _Op, _Key}, PersistedSQN) when
+    is_integer(LastSQN)
+->
+    LastSQN =< PersistedSQN;
+persisted_last_key(_LastKey, _PersistedSQN) ->
+    false.
 
 -spec head_entry(manifest()) -> manifest_entry().
 %% @doc
@@ -320,7 +330,13 @@ findpersisted_test() ->
     FilesToDelete4 = find_persistedentries(999, to_list(Man)),
     ?assertMatch([], FilesToDelete4),
     FilesToDelete5 = find_persistedentries(0, to_list(Man)),
-    ?assertMatch([], FilesToDelete5).
+    ?assertMatch([], FilesToDelete5),
+    Boundary = {1, "boundary", set_pid(99), {3000, mput, dummy}},
+    ?assertEqual(
+        [Boundary],
+        find_persistedentries(3000, [{3001, "active", set_pid(98), empty},
+            Boundary])
+    ).
 
 buildrandomfashion_test() ->
     ManL0 = build_testmanifest_aslist(),

@@ -70,6 +70,7 @@
     book_compactjournal/2,
     book_islastcompactionpending/1,
     book_trimjournal/1,
+    book_reclaimledger/2,
     book_hotbackup/1,
     book_close/1,
     book_destroy/1,
@@ -79,6 +80,7 @@
     book_addlogs/2,
     book_removelogs/2,
     book_headstatus/1,
+    book_fts_residency_budget/1,
     book_status/1
 ]).
 
@@ -135,7 +137,7 @@
     {ledger_preloadpagecache_level, ?SST_PAGECACHELEVEL_LOOKUP},
     {compression_method, ?COMPRESSION_METHOD},
     {ledger_compression, as_store},
-    {block_version, 1},
+    {block_version, 2},
     {compression_point, ?COMPRESSION_POINT},
     {compression_level, ?COMPRESSION_LEVEL},
     {log_level, ?LOG_LEVEL},
@@ -144,6 +146,7 @@
     {override_functions, []},
     {snapshot_timeout_short, ?SNAPTIMEOUT_SHORT},
     {snapshot_timeout_long, ?SNAPTIMEOUT_LONG},
+    {fts_residency_budget, 402653184},
     {stats_percentage, ?DEFAULT_STATS_PERC},
     {stats_logfrequency, element(1, leveled_monitor:get_defaults())},
     {monitor_loglist, element(2, leveled_monitor:get_defaults())}
@@ -171,6 +174,9 @@
     head_lookup = true :: boolean(),
     ink_checking = ?MAX_KEYCHECK_FREQUENCY :: integer(),
     bookie_monref :: reference() | undefined,
+    snapshot_lease_seconds = ?SNAPTIMEOUT_LONG :: pos_integer(),
+    fts_residency_budget = 402653184 :: non_neg_integer(),
+    snapshot_expired = false :: boolean(),
     monitor = {no_monitor, 0} :: leveled_monitor:monitor()
 }).
 
@@ -327,7 +333,7 @@
         % Define an alternative to the compression method to be used by the
         % ledger only.  Default is as_store - use the method defined as
         % compression_method for the whole store
-        | {block_version, 0 | 1}
+        | {block_version, 0 | 1 | 2}
         % Version of the leveled_sst blocks.  Block version 0 does not use
         % sub-blocks, whereas block version 1 has multiple types of blocks
         % which can be split into sub-blocks
@@ -372,10 +378,12 @@
         % short timeout is applied to queries where long_running is set to
         % false
         | {snapshot_timeout_long, pos_integer()}
+        | {fts_residency_budget, non_neg_integer()}
         % Time in seconds before a snapshot that has not been shutdown is
-        % assumed to have failed, and so requires to be torndown.  The
-        % short timeout is applied to queries where long_running is set to
-        % true
+        % expired and no longer allowed to pin superseded files. Subsequent
+        % reads return {error, snapshot_expired}. This is the hard storage
+        % lease for long_running queries and snapshot bookies; the default is
+        % 1800 seconds (30 minutes).
         | {stats_percentage, 0..100}
         % Probability that stats will be collected for an individual
         % request.
@@ -1289,6 +1297,7 @@ book_snapshot(Pid, SnapType, Query, LongRunning) ->
 -spec book_compactjournal(pid(), integer()) -> ok | busy.
 -spec book_islastcompactionpending(pid()) -> boolean().
 -spec book_trimjournal(pid()) -> ok.
+-spec book_reclaimledger(pid(), pos_integer()) -> ok | {error, timeout}.
 
 %% @doc Call for compaction of the Journal
 %%
@@ -1311,6 +1320,31 @@ book_islastcompactionpending(Pid) ->
 
 book_trimjournal(Pid) ->
     gen_server:call(Pid, trim, infinity).
+
+%% @doc Persist the complete live ledger and drive its normal LSM clerk until
+%% superseded SSTs are no longer protected.  This is a bounded operational
+%% barrier; it never bypasses manifest snapshot protection.
+book_reclaimledger(Pid, Timeout) when is_integer(Timeout), Timeout > 0 ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    book_reclaimledger_loop(Pid, Deadline).
+
+book_reclaimledger_loop(Pid, Deadline) ->
+    Result = case gen_server:call(Pid, flush_ledger, infinity) of
+        ok -> gen_server:call(Pid, reclaim_ledger, infinity);
+        busy -> busy
+    end,
+    case Result of
+        idle ->
+            ok;
+        busy ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(10),
+                    book_reclaimledger_loop(Pid, Deadline);
+                false ->
+                    {error, timeout}
+            end
+    end.
 
 -spec book_close(pid()) -> ok.
 -spec book_destroy(pid()) -> ok.
@@ -1391,9 +1425,15 @@ book_headstatus(Pid) ->
 %% * last compaction result (journal) e.g. files compacted and compaction score;
 %% * ratio of metadata to object size (recent PUTs);
 %% * PUT/GET/HEAD recent time/count metrics;
-%% * mean level for recent fetches.
+%% * mean level for recent fetches;
+%% * delete-pending ledger files, active snapshot count, and oldest snapshot
+%%   age in seconds (also returned when performance monitoring is disabled).
 book_status(Pid) ->
     gen_server:call(Pid, status, infinity).
+
+-spec book_fts_residency_budget(pid()) -> non_neg_integer().
+book_fts_residency_budget(Pid) ->
+    gen_server:call(Pid, fts_residency_budget, infinity).
 
 %%%============================================================================
 %%% gen_server callbacks
@@ -1492,17 +1532,25 @@ init([Opts]) ->
                 is_snapshot = false,
                 head_only = HeadOnly,
                 head_lookup = HeadLookup,
+                snapshot_lease_seconds =
+                    proplists:get_value(snapshot_timeout_long, Opts),
+                fts_residency_budget =
+                    proplists:get_value(fts_residency_budget, Opts),
                 inker = Inker,
                 penciller = Penciller,
                 ledger_cache = #ledger_cache{mem = NewETS},
                 monitor = {Monitor, StatLogFrequency}
             }};
         {Bookie, undefined} ->
+            {HeadOnly, Lookup, SnapshotLease} =
+                gen_server:call(Bookie, snapshot_config, infinity),
             {ok, Penciller, Inker} =
                 book_snapshot(Bookie, store, undefined, true),
             BookieMonitor = erlang:monitor(process, Bookie),
             NewETS = ets:new(mem, [ordered_set]),
-            {HeadOnly, Lookup} = leveled_bookie:book_headstatus(Bookie),
+            _ = erlang:send_after(
+                SnapshotLease * 1000, self(), snapshot_lease_expired
+            ),
             ?STD_LOG(b0002, [Inker, Penciller]),
             {ok, #state{
                 penciller = Penciller,
@@ -1510,11 +1558,24 @@ init([Opts]) ->
                 ledger_cache = #ledger_cache{mem = NewETS},
                 head_only = HeadOnly,
                 head_lookup = Lookup,
+                snapshot_lease_seconds = SnapshotLease,
                 bookie_monref = BookieMonitor,
                 is_snapshot = true
             }}
     end.
 
+handle_call(
+    close, _From, State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {stop, normal, ok, State};
+handle_call(
+    status, _From, State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, #{snapshot_expired => true}, State};
+handle_call(
+    _Msg, _From, State = #state{is_snapshot = true, snapshot_expired = true}
+) ->
+    {reply, {error, snapshot_expired}, State};
 handle_call(
     {put, Bucket, Key, Object, IndexSpecs, Tag, TTL, DataSync},
     From,
@@ -1833,8 +1894,41 @@ handle_call(confirm_compact, _From, State) when
 ->
     {reply, leveled_inker:ink_compactionpending(State#state.inker), State};
 handle_call(trim, _From, State) when State#state.head_only == true ->
+    %% The active journal is not represented in the manifest and therefore
+    %% cannot be selected by the trim clerk.  Seal it first so a trim after a
+    %% clean ledger flush can actually retire the complete persisted prefix.
+    ok = leveled_inker:ink_roll(State#state.inker),
     PSQN = leveled_penciller:pcl_persistedsqn(State#state.penciller),
     {reply, leveled_inker:ink_trim(State#state.inker, PSQN), State};
+handle_call(flush_ledger, _From, State) ->
+    Cache = State#state.ledger_cache,
+    Tab = Cache#ledger_cache.mem,
+    case ets:info(Tab, size) of
+        0 ->
+            {reply, ok, State};
+        _Size ->
+            CacheToLoad = {
+                Tab,
+                Cache#ledger_cache.index,
+                Cache#ledger_cache.min_sqn,
+                Cache#ledger_cache.max_sqn
+            },
+            case leveled_penciller:pcl_pushmem(
+                State#state.penciller, CacheToLoad
+            ) of
+                ok ->
+                    true = ets:delete(Tab),
+                    NewTab = ets:new(mem, [ordered_set]),
+                    {reply, ok, State#state{
+                        ledger_cache = #ledger_cache{mem = NewTab},
+                        slow_offer = false
+                    }};
+                returned ->
+                    {reply, busy, State#state{slow_offer = true}}
+            end
+    end;
+handle_call(reclaim_ledger, _From, State) ->
+    {reply, leveled_penciller:pcl_reclaim(State#state.penciller), State};
 handle_call(hot_backup, _From, State) when State#state.head_only == false ->
     ok = leveled_inker:ink_roll(State#state.inker),
     BackupFun =
@@ -1852,6 +1946,25 @@ handle_call(hot_backup, _From, State) when State#state.head_only == false ->
         },
     {ok, Snapshot} = leveled_inker:ink_snapstart(InkerOpts),
     {reply, {async, BackupFun(Snapshot)}, State};
+handle_call(
+    close,
+    _From,
+    State = #state{
+        inker = Inker,
+        penciller = Pcl,
+        head_only = true,
+        is_snapshot = false
+    }
+) when
+    is_pid(Inker), is_pid(Pcl)
+->
+    {ok, PersistedSQN} =
+        leveled_penciller:pcl_close_and_return_sqn(Pcl),
+    ok = leveled_inker:ink_roll(Inker),
+    ok = leveled_inker:ink_trim(Inker, PersistedSQN),
+    ok = leveled_inker:ink_close(Inker),
+    leveled_monitor:monitor_close(element(1, State#state.monitor)),
+    {stop, normal, ok, State};
 handle_call(
     close, _From, State = #state{inker = Inker, penciller = Pcl}
 ) when
@@ -1875,8 +1988,18 @@ handle_call(return_actors, _From, State) ->
     {reply, {ok, State#state.inker, State#state.penciller}, State};
 handle_call(head_status, _From, State) ->
     {reply, {State#state.head_only, State#state.head_lookup}, State};
+handle_call(snapshot_config, _From, State) ->
+    {reply,
+        {
+            State#state.head_only,
+            State#state.head_lookup,
+            State#state.snapshot_lease_seconds
+        },
+        State};
 handle_call(status, _From, State) ->
     {reply, status(State), State};
+handle_call(fts_residency_budget, _From, State) ->
+    {reply, State#state.fts_residency_budget, State};
 handle_call(Msg, _From, State) ->
     {reply, {unsupported_message, element(1, Msg)}, State}.
 
@@ -1926,6 +2049,25 @@ handle_cast(
     ok = leveled_log:remove_forcedlogs(ForcedLogs),
     {noreply, State}.
 
+handle_info(
+    snapshot_lease_expired,
+    State = #state{is_snapshot = true, snapshot_expired = false}
+) ->
+    case State#state.inker of
+        Ink when is_pid(Ink) -> ok = leveled_inker:ink_close(Ink);
+        _ -> ok
+    end,
+    case State#state.penciller of
+        Pcl when is_pid(Pcl) -> ok = leveled_penciller:pcl_close(Pcl);
+        _ -> ok
+    end,
+    {noreply, State#state{
+        inker = null,
+        penciller = undefined,
+        snapshot_expired = true
+    }};
+handle_info(snapshot_lease_expired, State) ->
+    {noreply, State};
 %% handle the bookie stopping and stop this snapshot
 handle_info(
     {'DOWN', BookieMonRef, process, BookiePid, Info},
@@ -2806,6 +2948,7 @@ do_mput(ObjectSpecs, TTL, From, State) ->
             {ObjectSpecs, TTL}
         ),
     Cache0 = addto_ledgercache(Changes, State#state.ledger_cache),
+    ok = leveled_fts_residency:invalidate_specs(self(), ObjectSpecs),
     case State#state.slow_offer of
         true ->
             gen_server:reply(From, pause);
@@ -3319,10 +3462,21 @@ maybelog_snap_timing({Pid, _StatsFreq}, BookieTime, PCLTime) when
 maybelog_snap_timing(_Monitor, _, _) ->
     ok.
 
-status(#state{monitor = {no_monitor, 0}}) ->
-    #{};
-status(#state{monitor = {Monitor, _}}) ->
-    leveled_monitor:get_bookie_status(Monitor).
+status(#state{monitor = {no_monitor, 0}, penciller = Penciller,
+        fts_residency_budget = Budget}) ->
+    maps:merge(
+        leveled_penciller:pcl_retentionstatus(Penciller),
+        leveled_fts_residency:status(self(), Budget)
+    );
+status(#state{monitor = {Monitor, _}, penciller = Penciller,
+        fts_residency_budget = Budget}) ->
+    maps:merge(
+        maps:merge(
+            leveled_monitor:get_bookie_status(Monitor),
+            leveled_penciller:pcl_retentionstatus(Penciller)
+        ),
+        leveled_fts_residency:status(self(), Budget)
+    ).
 
 %%%============================================================================
 %%% Test
@@ -3364,6 +3518,60 @@ generate_multiple_objects(Count, KeyNumber, ObjL) ->
         KeyNumber + 1,
         ObjL ++ [{Key, Value, IndexSpec}]
     ).
+
+headonly_many_sst_boundaries_test_() ->
+    {timeout, 60, fun headonly_many_sst_boundaries_tester/0}.
+
+headonly_many_sst_boundaries_tester() ->
+    RootPath = reset_filestructure(),
+    Opts = [
+        {root_path, RootPath},
+        {head_only, with_lookup},
+        {cache_size, 100},
+        {max_pencillercachesize, 500},
+        {max_sstslots, 1}
+    ],
+    {ok, Bookie0} = book_start(Opts),
+    Key = fun(I) -> <<I:32/unsigned-big>> end,
+    lists:foreach(
+        fun(I) ->
+            case
+                book_mput(
+                    Bookie0,
+                    [{add, <<"many">>, Key(I), null, {v, I}}]
+                )
+            of
+                ok -> ok;
+                pause -> timer:sleep(10)
+            end
+        end,
+        lists:seq(1, 3000)
+    ),
+    ok = book_close(Bookie0),
+    {ok, Bookie1} = book_start(Opts),
+    {ok, _Inker, Penciller} = book_returnactors(Bookie1),
+    ?assert(length(leveled_penciller:pcl_getsstpids(Penciller)) > 1),
+    %% These positions straddle physical blocks, slots, and SST files. Keep
+    %% them unordered and duplicate one key to verify result-order semantics.
+    Present = [
+        1537, 23, 24, 25, 127, 128, 129, 511, 512, 513, 1023, 1024,
+        1025, 1535, 1536, 1537
+    ],
+    Request =
+        [{Key(I), null} || I <- Present] ++
+            [{Key(0), null}, {Key(3001), null}],
+    Expected = [{ok, {v, I}} || I <- Present] ++ [not_found, not_found],
+    ?assertEqual(
+        Expected,
+        book_headonly_many(Bookie1, <<"many">>, Request)
+    ),
+    %% Reusing the warmed reader-state caches must not change the result.
+    ?assertEqual(
+        Expected,
+        book_headonly_many(Bookie1, <<"many">>, Request)
+    ),
+    ok = book_close(Bookie1),
+    reset_filestructure().
 
 casmput_conditions_test_() ->
     {timeout, 60, fun casmput_conditions_tester/0}.
