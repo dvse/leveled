@@ -2091,7 +2091,8 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
 
 client_empty_search_result(Opts) ->
     case maps:get(return_count, Opts, false) of
-        true -> {ok, #{hits => [], count => 0, count_kind => grouped}};
+        true -> {ok, #{hits => [], count => 0,
+            count_kind => fts2_search_count_kind(Opts)}};
         false -> {ok, []}
     end.
 
@@ -2661,6 +2662,12 @@ validate_search_option_list([{rank, bm25} | Rest]) ->
     validate_search_option_list(Rest);
 validate_search_option_list([{rank, _Other} | _Rest]) ->
     {error, invalid_rank_option};
+validate_search_option_list([{grouping, grouped} | Rest]) ->
+    validate_search_option_list(Rest);
+validate_search_option_list([{grouping, ungrouped} | Rest]) ->
+    validate_search_option_list(Rest);
+validate_search_option_list([{grouping, _Other} | _Rest]) ->
+    {error, invalid_grouping_option};
 validate_search_option_list([{limit, Limit} | Rest]) when
     is_integer(Limit), Limit >= 0
 ->
@@ -5555,7 +5562,7 @@ fts2_build_publish(
         Groups, BuildConcurrency
     ),
     TermRowCount = fts2_build_write_terms_parallel(
-        Bookie, Bucket, Generation, TermRows, ChunkCount,
+        Bookie, Bucket, Generation, TermRows, length(Groups),
         SelectedTotalLength, BuildConcurrency
     ),
     BigramRowCount = fts2_build_write_bigrams_parallel(
@@ -5978,6 +5985,9 @@ fts2_build_group_sources(Schema, CandidateRecords, HitRecords, SourceLengths) ->
                 end,
                 Rows0
             ),
+            GroupLength = lists:sum([
+                maps:get(doc_length, Row, 0) || Row <- Rows
+            ]),
             true = length(Rows) =< ?CHUNKS_PER_GROUP,
             {ChunkRows, NextSources, _Local, NextDenseId} = lists:foldl(
                 fun(Row, {ChunkAcc, SourceAcc, Local, DenseId}) ->
@@ -5985,7 +5995,8 @@ fts2_build_group_sources(Schema, CandidateRecords, HitRecords, SourceLengths) ->
                     Chunk = Row#{
                         chunk_id => ChunkId,
                         group_id => GroupId,
-                        dense_id => DenseId
+                        dense_id => DenseId,
+                        group_length => GroupLength
                     },
                     {
                         [Chunk | ChunkAcc],
@@ -6136,12 +6147,17 @@ fts2_build_add_term_entry(Column, Token, Entry, Chunk, Terms, Chunks) ->
     Length = maps:get(doc_length, Chunk),
     Tf = maps:get(count, Entry),
     DenseId = maps:get(dense_id, Chunk),
+    GroupLength = maps:get(group_length, Chunk),
     Positions = maps:get(positions, Entry),
     PlaneEntry = {ChunkId, GroupId, SourceId, Length, Tf, DenseId},
     Key = {Column, Token},
     Row0 = maps:get(Key, Terms, #{entries => [], positions => []}),
     Row = Row0#{
         entries := [PlaneEntry | maps:get(entries, Row0)],
+        group_entries => [
+            {ChunkId, GroupId, SourceId, GroupLength, Tf, GroupId}
+            | maps:get(group_entries, Row0, [])
+        ],
         positions := [{ChunkId, Positions} | maps:get(positions, Row0)]
     },
     ChunkTerms = maps:get({Column, ChunkId}, Chunks, []),
@@ -6298,7 +6314,7 @@ fts2_build_write_identities_parallel(
     ).
 
 fts2_build_write_terms_parallel(
-    Bookie, Bucket, Generation, TermRows, ChunkCount, TotalLength,
+    Bookie, Bucket, Generation, TermRows, GroupCount, TotalLength,
     Concurrency
 ) ->
     fts2_build_parallel(
@@ -6307,7 +6323,7 @@ fts2_build_write_terms_parallel(
         fun(RowBatch) ->
             Specs = lists:append([
                 fts2_build_term_row_specs(
-                    Bucket, Generation, Column, Token, Row, ChunkCount,
+                    Bucket, Generation, Column, Token, Row, GroupCount,
                     TotalLength
                 )
              || {{Column, Token}, Row} <- RowBatch
@@ -6318,12 +6334,17 @@ fts2_build_write_terms_parallel(
     ).
 
 fts2_build_term_row_specs(
-    Bucket, Generation, Column, Token, Row, ChunkCount, TotalLength
+    Bucket, Generation, Column, Token, Row, GroupCount, TotalLength
 ) ->
     Entries = lists:sort(maps:get(entries, Row)),
+    GroupEntries = fts2_build_group_entries(
+        maps:get(group_entries, Row)
+    ),
     Positions = lists:sort(maps:get(positions, Row)),
     PositionMap = maps:from_list(Positions),
-    Header = fts2_build_header(Entries, ChunkCount, TotalLength),
+    Header = fts2_build_header(
+        Entries, GroupEntries, GroupCount, TotalLength
+    ),
     Anchor = [
         Entry
      || Entry <- Entries,
@@ -6335,6 +6356,8 @@ fts2_build_term_row_specs(
     [
         {add, Bucket, Key, <<"h">>, fts2_codec_encode_header(Header)},
         {add, Bucket, BooleanKey, <<"b">>, fts2_codec_encode_plane(Entries)},
+        {add, Bucket, BooleanKey, <<"g">>,
+            fts2_codec_encode_plane(GroupEntries)},
         {add, Bucket, PositionKey, <<"p">>,
             fts2_codec_encode_positions(maps:to_list(PositionMap))}
     ] ++ case Anchor of
@@ -6511,12 +6534,11 @@ fts2_build_bm25_idf(DocCount, Df) ->
         math:log((DocCount - Df + 0.5) / (Df + 0.5)), 1.0e-6
     ).
 
-fts2_build_header(Entries, ChunkCount, TotalLength) ->
-    Avg = case ChunkCount of
+fts2_build_header(Entries, GroupEntries, GroupCount, TotalLength) ->
+    Avg = case GroupCount of
         0 -> 0.0;
-        _ -> TotalLength / ChunkCount
+        _ -> TotalLength / GroupCount
     end,
-    Anchors = fts2_build_best_group_entries(Entries, Avg),
     TermScore = fun(Entry) ->
         fts2_build_bm25_tf(element(5, Entry), element(4, Entry), Avg)
     end,
@@ -6526,12 +6548,12 @@ fts2_build_header(Entries, ChunkCount, TotalLength) ->
                 {-TermScore(A), element(2, A), element(3, A)} =<
                     {-TermScore(B), element(2, B), element(3, B)}
             end,
-            Anchors
+            GroupEntries
         ),
         TermScore
     ),
     #{
-        group_df => length(Anchors),
+        group_df => length(GroupEntries),
         chunk_df => length(Entries),
         collection_frequency => lists:sum([element(5, E) || E <- Entries]),
         chunk_bitmap => case length(Entries) >= 64 of
@@ -6570,23 +6592,26 @@ fts2_build_champion_window(Ordered, ScoreFun) ->
             )
     end.
 
-fts2_build_best_group_entries(Entries, Avg) ->
-    Best = lists:foldl(
+%% The immutable group plane is document-grain: one deterministic identity
+%% coordinate, full document length, and total term frequency per logical
+%% group.  It is the candidate/scoring plane for grouped searches.  The chunk
+%% plane remains unchanged for explicit ungrouped retrieval and positions.
+fts2_build_group_entries(Entries) ->
+    Groups = lists:foldl(
         fun(Entry, Acc) ->
             GroupId = element(2, Entry),
             case maps:find(GroupId, Acc) of
                 error ->
                     Acc#{GroupId => Entry};
                 {ok, Existing} ->
-                    EntryScore = fts2_build_bm25_tf(element(5, Entry), element(4, Entry), Avg),
-                    ExistingScore = fts2_build_bm25_tf(
-                        element(5, Existing), element(4, Existing), Avg
-                    ),
-                    case {EntryScore, -element(3, Entry)} >
-                        {ExistingScore, -element(3, Existing)} of
-                        true -> Acc#{GroupId => Entry};
-                        false -> Acc
-                    end
+                    Anchor = case {element(1, Entry), element(3, Entry)} <
+                        {element(1, Existing), element(3, Existing)} of
+                        true -> Entry;
+                        false -> Existing
+                    end,
+                    Acc#{GroupId => setelement(
+                        5, Anchor, element(5, Existing) + element(5, Entry)
+                    )}
             end
         end,
         #{},
@@ -6594,7 +6619,7 @@ fts2_build_best_group_entries(Entries, Avg) ->
     ),
     lists:sort(
         fun(A, B) -> element(2, A) =< element(2, B) end,
-        maps:values(Best)
+        maps:values(Groups)
     ).
 
 fts2_build_bm25_tf(Tf, Length, Avg) ->
@@ -6741,7 +6766,7 @@ fts2_build_trim_journals(Bookie, Schema) ->
 
 -define(ROOT_VERSION, 1).
 -define(ROW_VERSION, 1).
--define(HEADER_VERSION, 2).
+-define(HEADER_VERSION, 4).
 -define(BIGRAM_VERSION, 1).
 -define(PLANE_VERSION, 1).
 -define(POSITION_VERSION, 1).
@@ -6810,9 +6835,10 @@ fts2_codec_decode(Type, _Bad) ->
 fts2_codec_encode_header(Header) ->
     Champions = maps:get(champions, Header),
     ChampionPayload = iolist_to_binary([
-        <<ChunkId:32/unsigned-big, DocLength:32/unsigned-big,
-            Tf:32/unsigned-big>>
-     || {ChunkId, _GroupId, _SourceId, DocLength, Tf, _DenseId} <- Champions
+        <<ChunkId:32/unsigned-big, GroupLength:32/unsigned-big,
+            GroupTf:64/unsigned-big>>
+     || {ChunkId, _GroupId, _SourceId, GroupLength, GroupTf, _DenseId} <-
+            Champions
     ]),
     InlineEntries = case maps:find(entries, Header) of
         {ok, Entries} -> fts2_codec_encode_header_tail(
@@ -6915,15 +6941,15 @@ fts2_codec_decode_header_champions(0, <<>>, Acc) ->
     lists:reverse(Acc);
 fts2_codec_decode_header_champions(
     Count,
-    <<ChunkId:32/unsigned-big, DocLength:32/unsigned-big,
-        Tf:32/unsigned-big, Rest/binary>>,
+    <<ChunkId:32/unsigned-big, GroupLength:32/unsigned-big,
+        GroupTf:64/unsigned-big, Rest/binary>>,
     Acc
 ) when Count > 0 ->
     GroupId = ChunkId bsr ?CHUNK_BITS,
     fts2_codec_decode_header_champions(
         Count - 1,
         Rest,
-        [{ChunkId, GroupId, 0, DocLength, Tf} | Acc]
+        [{ChunkId, GroupId, 0, GroupLength, GroupTf, GroupTf} | Acc]
     );
 fts2_codec_decode_header_champions(_Count, Bad, _Acc) ->
     erlang:error({invalid_fts2_header_champions, Bad}).
@@ -6983,6 +7009,36 @@ fts2_codec_header_positions(Header, WantedChunkIds) ->
     fts2_codec_decode_selected_positions(
         Count, Payload, maps:from_keys(WantedChunkIds, true), #{}
     ).
+
+%% Payload selection for generations whose position rows are not chunk
+%% ordered: the wanted chunks keep their encoded payload so the phrase and
+%% NEAR verifiers can stream them, instead of becoming position lists.
+fts2_codec_select_position_payloads(
+    <<?POSITION_VERSION:8, Count:32/unsigned-big, Payload/binary>>,
+    WantedChunkIds
+) ->
+    fts2_codec_select_position_payloads(
+        Count, Payload, maps:from_keys(WantedChunkIds, true), #{}
+    );
+fts2_codec_select_position_payloads(Bad, _WantedChunkIds) ->
+    erlang:error({invalid_fts2_positions, Bad}).
+
+fts2_codec_select_position_payloads(0, <<>>, _Wanted, Acc) ->
+    Acc;
+fts2_codec_select_position_payloads(
+    Count,
+    <<ChunkId:32/unsigned-big, PositionCount:32/unsigned-big,
+        Bytes:32/unsigned-big, Encoded:Bytes/binary, Rest/binary>>,
+    Wanted,
+    Acc
+) when Count > 0 ->
+    NextAcc = case maps:is_key(ChunkId, Wanted) of
+        true -> Acc#{ChunkId => {PositionCount, Encoded}};
+        false -> Acc
+    end,
+    fts2_codec_select_position_payloads(Count - 1, Rest, Wanted, NextAcc);
+fts2_codec_select_position_payloads(_Count, Bad, _Wanted, _Acc) ->
+    erlang:error({invalid_fts2_positions, Bad}).
 
 fts2_codec_decode_selected_positions(0, <<>>, _Wanted, Acc) ->
     Acc;
@@ -8024,6 +8080,172 @@ fts2_delta_evaluate(Deltas, Schema, AST) ->
         Documents
     ).
 
+%% Dirty-tail Boolean evaluation must use the same logical-document grain as
+%% the immutable group plane.  Positional leaves are still checked per chunk,
+%% so phrase and NEAR never bridge a chunk boundary; only their verified
+%% results are collapsed to the logical group.
+fts2_delta_evaluate_grouped(Deltas, Schema, AST) ->
+    Documents = fts2_delta_live_documents(Deltas),
+    Groups = fts2_delta_document_groups(Documents, Schema),
+    Dfs = fts2_delta_group_dfs(Groups, Schema, AST),
+    fts2_delta_eval_grouped(AST, Groups, Schema, Dfs).
+
+fts2_delta_eval_grouped({empty}, _Groups, _Schema, _Dfs) ->
+    #{};
+fts2_delta_eval_grouped({'and', A, B}, Groups, Schema, Dfs) ->
+    fts2_search_intersect(
+        fts2_delta_eval_grouped(A, Groups, Schema, Dfs),
+        fts2_delta_eval_grouped(B, Groups, Schema, Dfs)
+    );
+fts2_delta_eval_grouped({'or', A, B}, Groups, Schema, Dfs) ->
+    fts2_search_union(
+        fts2_delta_eval_grouped(A, Groups, Schema, Dfs),
+        fts2_delta_eval_grouped(B, Groups, Schema, Dfs)
+    );
+fts2_delta_eval_grouped({'not', A, B}, Groups, Schema, Dfs) ->
+    Positive = fts2_delta_eval_grouped(A, Groups, Schema, Dfs),
+    Negative = fts2_delta_eval_grouped(B, Groups, Schema, Dfs),
+    maps:without(maps:keys(Negative), Positive);
+fts2_delta_eval_grouped(Leaf, Groups, Schema, Dfs) ->
+    maps:fold(
+        fun(LogicalGroup, {Version, Documents}, Acc) ->
+            Matches = lists:filtermap(
+                fun({SourceId, Document}) ->
+                    case fts2_delta_eval(
+                        Leaf, maps:get(posting, Document, #{}), Schema
+                    ) of
+                        false -> false;
+                        Result -> {true, {SourceId, Document, Result}}
+                    end
+                end,
+                Documents
+            ),
+            case Matches of
+                [] ->
+                    Acc;
+                [{AnchorSource, AnchorDocument, _} | _] ->
+                    StatTerms = fts2_delta_group_stat_terms(
+                        Leaf, Schema, Documents
+                    ),
+                    TermTfs = [{Term, lists:sum([
+                        fts2_delta_term_tf(
+                            Term, maps:get(posting, Document, #{})
+                        )
+                     || {_Source, Document} <- Documents
+                    ])} || Term <- StatTerms],
+                    MatchCount = lists:sum([
+                        fts2_delta_position_count(Positions)
+                     || {_Source, _Document,
+                            {true, Positions, _Tfs, _Terms}} <- Matches
+                    ]),
+                    GroupLength = lists:sum([
+                        maps:get(doc_length, Document, 0)
+                     || {_Source, Document} <- Documents
+                    ]),
+                    Acc#{LogicalGroup => #fts2_match{
+                        chunk_id = {delta, AnchorSource},
+                        source_id = AnchorSource,
+                        doc_length = GroupLength,
+                        tf = lists:sum([Tf || {_Term, Tf} <- TermTfs]),
+                        term_stats = [
+                            {Term, Tf, delta, maps:get(Term, Dfs, 0)}
+                         || {Term, Tf} <- TermTfs,
+                            Tf > 0
+                        ],
+                        terms = lists:usort([
+                            Token
+                         || {{_Column, Token, _Prefix}, Tf} <- TermTfs,
+                            Tf > 0
+                        ]),
+                        match_positions = lists:append([
+                            maps:to_list(Positions)
+                         || {_Source, _Document,
+                                {true, Positions, _Tfs, _Terms}} <- Matches
+                        ]),
+                        match_count = MatchCount,
+                        group_match_count = MatchCount,
+                        logical_group = LogicalGroup,
+                        group_version = Version,
+                        delta_document = AnchorDocument
+                    }}
+            end
+        end,
+        #{},
+        Groups
+    ).
+
+fts2_delta_document_groups(Documents, Schema) ->
+    GroupFields = maps:get(candidate_group_fields, Schema, []),
+    VersionField = maps:get(candidate_version_field, Schema, undefined),
+    maps:fold(
+        fun(SourceId, Document, Acc) ->
+            Candidate = maps:get(candidate_record, Document),
+            LogicalGroup = case GroupFields of
+                [] -> {source, SourceId};
+                _ -> {group, [
+                    maps:get(Field, Candidate, undefined)
+                 || Field <- GroupFields
+                ]}
+            end,
+            Version = case VersionField of
+                undefined -> 0;
+                _ -> maps:get(VersionField, Candidate, 0)
+            end,
+            case maps:find(LogicalGroup, Acc) of
+                error ->
+                    Acc#{LogicalGroup => {Version, [{SourceId, Document}]}};
+                {ok, {Older, _}} when Version > Older ->
+                    Acc#{LogicalGroup => {Version, [{SourceId, Document}]}};
+                {ok, {Version, Existing}} ->
+                    Acc#{LogicalGroup => {Version,
+                        lists:sort([{SourceId, Document} | Existing])}};
+                {ok, {_Newer, _}} ->
+                    Acc
+            end
+        end,
+        #{},
+        Documents
+    ).
+
+fts2_delta_group_dfs(Groups, Schema, AST) ->
+    Terms = lists:usort(lists:append([
+        fts2_delta_group_stat_terms(AST, Schema, Documents)
+     || {_Version, Documents} <- maps:values(Groups)
+    ])),
+    maps:from_list([
+        {Term, length([
+            ok
+         || {_Version, Documents} <- maps:values(Groups),
+            lists:any(
+                fun({_Source, Document}) ->
+                    fts2_delta_term_tf(
+                        Term, maps:get(posting, Document, #{})
+                    ) > 0
+                end,
+                Documents
+            )
+        ])}
+     || Term <- Terms
+    ]).
+
+fts2_delta_group_stat_terms(AST, Schema, Documents) ->
+    lists:usort(lists:append([
+        case Prefix of
+            false -> [{Column, Token, false}];
+            true -> lists:usort(lists:append([
+                [
+                    {Column, Actual, false}
+                 || Actual <- maps:keys(maps:get(
+                        Column, maps:get(posting, Document, #{}), #{}
+                    )),
+                    fts2_delta_binary_prefix(Actual, Token)
+                ]
+             || {_Source, Document} <- Documents
+            ]))
+        end
+     || {Column, Token, Prefix} <- fts2_delta_ast_terms(AST, Schema)
+    ])).
+
 fts2_delta_delta_dfs(Documents, Schema, AST) ->
     Terms = lists:usort(fts2_delta_ast_terms(AST, Schema)),
     maps:from_list([
@@ -8295,19 +8517,12 @@ fts2_phrase_fast(
         }
     of
         {[Column], bm25, nil, true} ->
-            case fts2_phrase_read_bundle(Bookie, Schema, Root, Column, First, Second) of
-                not_found ->
-                    fts2_phrase_fast_from_terms(
-                        Bookie, Schema, Root, Column, First, Second, Opts
-                    );
-                Bundle ->
-                    NeedPositions = maps:get(return_positions, Opts, false),
-                    {ranked_champions,
-                        fts2_phrase_ranked_champions(
-                            Bundle, First, Second, Column, Root, NeedPositions
-                        ),
-                        maps:get(group_df, Bundle)}
-            end;
+            %% Bigram champions are chunk-grain accelerators.  Document-grain
+            %% ranking verifies candidates on the positional chunk plane, then
+            %% scores the matching groups from the complete group term planes.
+            fts2_phrase_fast_from_terms(
+                Bookie, Schema, Root, Column, First, Second, Opts
+            );
         _ ->
             no
     end;
@@ -8315,21 +8530,29 @@ fts2_phrase_fast(_Bookie, _Schema, _Root, _Specs, _Columns, _Opts, _Wanted) ->
     no.
 
 fts2_phrase_ranked_champions(
-    Bundle, First, Second, Column, Root, NeedPositions
+    Bundle, First, Second, Column, Root, NeedPositions, Window
 ) ->
-    Champions = maps:get(champions, Bundle),
-    Positions = case NeedPositions of
-        true -> fts2_codec_bigram_positions(
-            Bundle, [element(1, Entry) || Entry <- Champions]
-        );
-        false -> #{}
-    end,
     DocCount = erlang:max(maps:get(chunk_count, Root), 1),
     Avg = maps:get(total_length, Root, 0) / DocCount,
     FirstDf = maps:get(first_df, Bundle),
     SecondDf = maps:get(second_df, Bundle),
     FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
     SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
+    Champions = fts2_search_impact_window(
+        maps:get(champions, Bundle),
+        Window,
+        fun({_ChunkId, _GroupId, _SourceId, Length, _PhraseTf, FirstTf,
+                SecondTf}) ->
+            fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
+                fts2_search_bm25(SecondTf, SecondIdf, Avg, Length)
+        end
+    ),
+    Positions = case NeedPositions of
+        true -> fts2_codec_bigram_positions(
+            Bundle, [element(1, Entry) || Entry <- Champions]
+        );
+        false -> #{}
+    end,
     [
         begin
             Starts = maps:get(ChunkId, Positions, []),
@@ -8357,58 +8580,101 @@ fts2_phrase_ranked_champions(
     ].
 
 fts2_phrase_fast_from_terms(
-    Bookie, Schema, Root, Column, First, Second, _Opts
+    Bookie, Schema, Root, Column, First, Second, Opts
 ) ->
-    case fts2_search_read_positional_pair(
-        Bookie, Schema, Root, Column, First, Second
+    NeedPositions = maps:get(return_positions, Opts, false),
+    case fts2_search_positional_pair(
+        Bookie, Schema, Root, Column, First, Second, phrase, NeedPositions
     ) of
         not_found ->
             {ranked_champions, [], 0};
-        {FirstHeader, SecondHeader, Rows0} ->
-            Rows = [
-                {Row, Starts}
-             || {Row, FirstPositions, SecondPositions} <- Rows0,
-                Starts <- [fts2_phrase_adjacent_positions(
-                    FirstPositions, SecondPositions
-                )],
-                Starts =/= []
-            ],
-            DocCount = erlang:max(maps:get(chunk_count, Root), 1),
-            Avg = maps:get(total_length, Root, 0) / DocCount,
-            FirstDf = maps:get(chunk_df, FirstHeader),
-            SecondDf = maps:get(chunk_df, SecondHeader),
-            FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
-            SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
-            Scored = [
-                begin
-                    [{{_, First}, FirstTf, base, FirstDf},
-                        {{_, Second}, SecondTf, base, SecondDf}] = Stats,
-                    #fts2_match{
-                        chunk_id = ChunkId,
-                        group_id = GroupId,
-                        source_id = SourceId,
-                        doc_length = Length,
-                        tf = TotalTf,
-                        term_stats = Stats,
-                        terms = [First, Second],
-                        columns = [{{Column, First}, Starts}],
-                        match_positions = [{phrase, Starts}],
-                        match_count = length(Starts),
-                        score =
-                            fts2_search_bm25(
-                                FirstTf, FirstIdf, Avg, Length
-                            ) +
-                            fts2_search_bm25(
-                                SecondTf, SecondIdf, Avg, Length
-                            )
-                    }
-                end
-             || {{ChunkId, GroupId, SourceId, Length, Stats, TotalTf}, Starts} <-
-                    Rows
-            ],
-            Grouped = fts2_search_collapse_scored_groups(Scored, true),
-            {ranked_champions, Grouped, length(Grouped)}
+        {FirstHeader, SecondHeader, Rows} ->
+            fts2_search_rank_positional_groups(
+                Bookie, Schema, Root, Column, First, Second,
+                FirstHeader, SecondHeader, Rows, phrase
+            )
     end.
+
+fts2_search_rank_positional_groups(
+    Bookie, #{index := Bucket}, Root, Column, First, Second,
+    FirstHeader, SecondHeader, Rows, Kind
+) ->
+    Generation = maps:get(generation, Root),
+    {FirstKey, _} = fts2_codec_term_key(Generation, Column, First),
+    {SecondKey, _} = fts2_codec_term_key(Generation, Column, Second),
+    [{ok, FirstGroupsValue}, {ok, SecondGroupsValue}] =
+        leveled_fts_residency:headonly_many(
+            Bookie,
+            Bucket,
+            [
+                {fts2_codec_term_plane_key(FirstKey, boolean), <<"g">>},
+                {fts2_codec_term_plane_key(SecondKey, boolean), <<"g">>}
+            ]
+        ),
+    FirstGroups = maps:from_list([
+        {element(2, Entry), Entry}
+     || Entry <- fts2_codec_decode_plane(FirstGroupsValue)
+    ]),
+    SecondGroups = maps:from_list([
+        {element(2, Entry), Entry}
+     || Entry <- fts2_codec_decode_plane(SecondGroupsValue)
+    ]),
+    PositionalGroups = lists:foldl(
+        fun({ChunkId, GroupId, SourceId, _Length, _FirstTf, _SecondTf,
+                MatchCount, Starts}, Acc) ->
+            case maps:find(GroupId, Acc) of
+                error ->
+                    Acc#{GroupId => {
+                        ChunkId, SourceId, MatchCount, Starts
+                    }};
+                {ok, {AnchorChunk, AnchorSource, ExistingCount,
+                        ExistingStarts}} ->
+                    Acc#{GroupId => {
+                        AnchorChunk, AnchorSource,
+                        ExistingCount + MatchCount,
+                        ExistingStarts ++ Starts
+                    }}
+            end
+        end,
+        #{},
+        Rows
+    ),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    FirstDf = maps:get(group_df, FirstHeader),
+    SecondDf = maps:get(group_df, SecondHeader),
+    FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
+    SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
+    Matches = maps:fold(
+        fun(GroupId, {ChunkId, SourceId, MatchCount, Starts}, Acc) ->
+            {_, GroupId, _, GroupLength, FirstTf, _} =
+                maps:get(GroupId, FirstGroups),
+            {_, GroupId, _, GroupLength, SecondTf, _} =
+                maps:get(GroupId, SecondGroups),
+            [#fts2_match{
+                chunk_id = ChunkId,
+                group_id = GroupId,
+                source_id = SourceId,
+                doc_length = GroupLength,
+                tf = FirstTf + SecondTf,
+                term_stats = [
+                    {{Column, First}, FirstTf, base, FirstDf},
+                    {{Column, Second}, SecondTf, base, SecondDf}
+                ],
+                terms = [First, Second],
+                columns = [{{Column, First}, Starts}],
+                match_positions = [{Kind, Starts}],
+                match_count = MatchCount,
+                group_match_count = MatchCount,
+                score =
+                    fts2_search_bm25(FirstTf, FirstIdf, Avg, GroupLength) +
+                    fts2_search_bm25(SecondTf, SecondIdf, Avg, GroupLength)
+            } | Acc]
+        end,
+        [],
+        PositionalGroups
+    ),
+    {ranked_champions, Matches, map_size(PositionalGroups)}.
 
 fts2_phrase_adjacent_positions(FirstPositions, SecondPositions) ->
     fts2_phrase_adjacent_positions(
@@ -8777,7 +9043,9 @@ fts2_search_facet_ast(Schema, Facet, AST) when is_list(Facet) ->
 fts2_search_count_matches(Bookie, Schema, Root, AST, WantedSources, Deltas) ->
     Base0 = case Root of
         undefined -> #{};
-        _ -> fts2_search_eval(Bookie, Schema, Root, AST, false, WantedSources)
+        _ -> fts2_search_eval_grouped(
+            Bookie, Schema, Root, AST, false, WantedSources
+        )
     end,
     Base = case Deltas of
         [] -> Base0;
@@ -8787,7 +9055,7 @@ fts2_search_count_matches(Bookie, Schema, Root, AST, WantedSources, Deltas) ->
         fun(_Key, #fts2_match{source_id = SourceId}) ->
             fts2_search_wanted_delta(SourceId, WantedSources)
         end,
-        fts2_delta_evaluate(Deltas, Schema, AST)
+        fts2_delta_evaluate_grouped(Deltas, Schema, AST)
     ),
     length(fts2_search_collapse_scored_groups(
         fts2_search_score_matches(maps:merge(Base, DeltaMatches), undefined, false),
@@ -8810,16 +9078,24 @@ fts2_search_page(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
                     {base, FastMatches, FastCount};
                 no ->
                     {base,
-                        fts2_search_eval(
-                            Bookie, Schema, Root, AST, NeedPositions, WantedSources
-                        ),
+                        case maps:get(grouping, Opts, grouped) of
+                            grouped -> fts2_search_eval_grouped(
+                                Bookie, Schema, Root, AST, NeedPositions,
+                                WantedSources
+                            );
+                            ungrouped -> fts2_search_eval(
+                                Bookie, Schema, Root, AST, NeedPositions,
+                                WantedSources
+                            )
+                        end,
                         undefined}
             end
     end,
     case FastOrBase of
         {ranked_champions, [], 0} ->
             case maps:get(return_count, Opts, false) of
-                true -> {ok, #{hits => [], count => 0, count_kind => grouped}};
+                true -> {ok, #{hits => [], count => 0,
+                    count_kind => fts2_search_count_kind(Opts)}};
                 false -> {ok, []}
             end;
         _ ->
@@ -8833,7 +9109,10 @@ fts2_search_page(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
                     Bookie, Schema, Root, BaseMatches0
                 )
             end,
-            DeltaMatches0 = fts2_delta_evaluate(Deltas, Schema, AST),
+            DeltaMatches0 = case maps:get(grouping, Opts, grouped) of
+                grouped -> fts2_delta_evaluate_grouped(Deltas, Schema, AST);
+                ungrouped -> fts2_delta_evaluate(Deltas, Schema, AST)
+            end,
             DeltaMatches = maps:filter(
                 fun(_Key, #fts2_match{source_id = SourceId}) ->
                     fts2_search_wanted_delta(SourceId, WantedSources)
@@ -8841,10 +9120,19 @@ fts2_search_page(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
                 DeltaMatches0
             ),
             Matches0 = maps:merge(BaseMatches, DeltaMatches),
-            ScoreRoot = fts2_search_score_root(Root, Deltas),
-            {fts2_search_collapse_scored_groups(
-                fts2_search_score_matches(Matches0, ScoreRoot, Ranked), Ranked
-            ), CountHint}
+            ScoreRoot = (fts2_search_score_root(Root, Deltas, Schema))#{
+                scoring_grouping => maps:get(grouping, Opts, grouped)
+            },
+            ScoredMatches = fts2_search_score_matches(
+                Matches0, ScoreRoot, Ranked
+            ),
+            GroupedMatches = case maps:get(grouping, Opts, grouped) of
+                grouped -> fts2_search_collapse_scored_groups(
+                    ScoredMatches, Ranked
+                );
+                ungrouped -> ScoredMatches
+            end,
+            {GroupedMatches, CountHint}
     end,
     Count0 = case BaseCountHint of
         ExactCount when is_integer(ExactCount), Deltas =:= [] -> ExactCount;
@@ -8871,10 +9159,14 @@ fts2_search_page(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
         Count0, PageOffset, Limit, TieFields
     ),
     case maps:get(return_count, Opts, false) of
-        true -> {ok, #{hits => Hits, count => Count, count_kind => grouped}};
+        true -> {ok, #{hits => Hits, count => Count,
+            count_kind => fts2_search_count_kind(Opts)}};
         false -> {ok, Hits}
     end
     end.
+
+fts2_search_count_kind(#{grouping := ungrouped}) -> raw;
+fts2_search_count_kind(_Opts) -> grouped.
 
 %% Two-phase served path. Phase one projects only the tie columns from v4
 %% identity pages, orders the bounded score/tie window, and returns stable
@@ -9086,6 +9378,10 @@ fts2_search_page_entry(Match, {GroupId, ChunkId}, DocKey, Opts) ->
     end.
 
 fts2_search_fast_single_term(
+    _Bookie, _Schema, _Root, _AST, #{grouping := ungrouped}, _Wanted, _Deltas
+) ->
+    no;
+fts2_search_fast_single_term(
     Bookie,
     Schema,
     Root,
@@ -9129,14 +9425,21 @@ fts2_search_fast_single_term(
                     {ranked_champions, [], 0};
                 [{ok, HeaderValue}] ->
                     Header = fts2_codec_decode_header(HeaderValue),
+                    Df = maps:get(group_df, Header),
+                    Champions = fts2_search_impact_window(
+                        maps:get(champions, Header),
+                        Window,
+                        fts2_search_term_impact(Df, Root)
+                    ),
                     PositionMap = case NeedPositions of
-                        true -> fts2_codec_header_positions(Header);
+                        true -> fts2_codec_header_positions(
+                            Header, [element(1, Entry) || Entry <- Champions]
+                        );
                         false -> #{}
                     end,
                     {ranked_champions,
                         fts2_search_ranked_champions(
-                            maps:get(champions, Header), Column, Token,
-                            maps:get(chunk_df, Header), PositionMap, Root
+                            Champions, Column, Token, Df, PositionMap, Root
                         ), maps:get(group_df, Header)};
                 Bad ->
                     erlang:error({invalid_fts2_term_header, Token, Bad})
@@ -9174,12 +9477,13 @@ fts2_search_fast_single_term(_Bookie, _Schema, _Root, _AST, _Opts, _Wanted, _Del
 fts2_search_fast_boolean(Bookie, Schema, Root, AST, Opts) ->
     Window = maps:get(offset, Opts, 0) + maps:get(limit, Opts, ?DEFAULT_LIMIT),
     case {
+        maps:get(return_positions, Opts, false),
         maps:get(rank, Opts, none),
         maps:get(impact_facet, Opts, nil),
         Window =< 256,
         fts2_search_boolean_terms(AST, Schema)
     } of
-        {bm25, nil, true, {ok, Column, Tokens}} when length(Tokens) > 1 ->
+        {false, bm25, nil, true, {ok, Column, Tokens}} when length(Tokens) > 1 ->
             Generation = maps:get(generation, Root),
             Bucket = maps:get(index, Schema),
             PureOrQuery = fts2_search_boolean_pure_or(AST),
@@ -9196,7 +9500,7 @@ fts2_search_fast_boolean(Bookie, Schema, Root, AST, Opts) ->
                 lists:append([
                     [
                         {Key, <<"h">>},
-                        {fts2_codec_term_plane_key(Key, boolean), <<"b">>}
+                        {fts2_codec_term_plane_key(Key, boolean), <<"g">>}
                     ]
                  || {_Token, Key} <- Keys
                 ])
@@ -9230,7 +9534,7 @@ fts2_search_fast_boolean(Bookie, Schema, Root, AST, Opts) ->
                                     maps:get(champions, Header),
                                     Column,
                                     Token,
-                                    maps:get(chunk_df, Header),
+                                    maps:get(group_df, Header),
                                     #{},
                                     Root
                                 ),
@@ -9286,12 +9590,12 @@ fts2_search_fast_boolean_planes(
                 EntryPlane = fts2_search_header_entry_plane(
                     Header, maps:get(Token, BooleanByToken), Token
                 ),
-                ChunkBitmap = case maps:find(chunk_bitmap, Header) of
+                GroupBitmap = case maps:find(group_bitmap, Header) of
                     {ok, StoredBitmap} -> StoredBitmap;
                     error -> fts2_search_plane_chunk_bitmap(EntryPlane, 0)
                 end,
                 {Token, {
-                    maps:get(chunk_df, Header), EntryPlane, ChunkBitmap
+                    maps:get(group_df, Header), EntryPlane, GroupBitmap
                 }}
         end
      || {Token, _Key, Header} <- Headers
@@ -9302,12 +9606,14 @@ fts2_search_fast_boolean_planes(
                 Headers, TermData, Column, Root, Window
             ) of
                 no -> fts2_search_fast_boolean_full(
-                    AST, TermData, Column, Root
+                    AST, TermData, Column, Root, Window
                 );
                 Result -> Result
             end;
         false ->
-            fts2_search_fast_boolean_full(AST, TermData, Column, Root)
+            fts2_search_fast_boolean_full(
+                AST, TermData, Column, Root, Window
+            )
     end.
 
 fts2_search_fast_or_bounded(Headers, TermData, Column, Root, Window) ->
@@ -9324,7 +9630,7 @@ fts2_search_fast_or_bounded(Headers, TermData, Column, Root, Window) ->
     case GroupCount =< 1024 of
         false -> no;
         true -> fts2_search_fast_or_prefixes(
-            [144, 256],
+            [Size || Size <- [144, ?HEAD_WINDOW], Size >= Window],
             Headers,
             TermData,
             Column,
@@ -9353,12 +9659,19 @@ fts2_search_fast_or_prefixes(
             Candidates = fts2_search_or_candidate_groups(
                 TermData, ChampionGroups, Column, Root
             ),
-            Ordered = fts2_search_order_matches(Candidates, true),
-            case length(Ordered) >= Window andalso
-                (lists:nth(Window, Ordered))#fts2_match.score > Threshold
+            case length(Candidates) >= Window andalso
+                fts2_search_or_compact_score(lists:nth(Window, Candidates)) >
+                    Threshold
             of
                 true ->
-                    {ranked_champions, Ordered, GroupCount};
+                    Proven = fts2_search_impact_window(
+                        Candidates,
+                        Window,
+                        fun fts2_search_or_compact_score/1
+                    ),
+                    {ranked_champions,
+                        fts2_search_or_candidate_records(Proven, TermData),
+                        GroupCount};
                 false ->
                     fts2_search_fast_or_prefixes(
                         Rest,
@@ -9400,272 +9713,719 @@ fts2_search_or_header_prefix(Token, Header, Root, PrefixSize) ->
                 lists:nthtail(length(Prefix0), Champions)
             )
     end,
+    Df = maps:get(group_df, Header),
     Bound = case length(Prefix) < length(Champions) of
-        false -> 0.0;
         true ->
             Unseen = lists:nth(length(Prefix) + 1, Champions),
-            fts2_search_or_term_score(
-                Unseen, Token, maps:get(chunk_df, Header), Root
-            )
+            fts2_search_or_term_score(Unseen, Token, Df, Root);
+        false when Champions =:= [] ->
+            0.0;
+        false ->
+            case length(Champions) >= Df of
+                true -> 0.0;
+                false -> fts2_search_or_term_score(
+                    lists:last(Champions), Token, Df, Root
+                )
+            end
     end,
     {Prefix, Bound}.
 
 fts2_search_or_term_factor(Entry, Root) ->
-    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
     Avg = maps:get(total_length, Root, 0) / DocCount,
     fts2_build_bm25_tf(element(5, Entry), element(4, Entry), Avg).
 
 fts2_search_or_term_score(Entry, _Token, Df, Root) ->
-    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
     fts2_search_or_term_factor(Entry, Root) *
         fts2_build_bm25_idf(DocCount, Df).
 
 fts2_search_or_candidate_groups(
-    TermData, ChampionGroups, Column, Root
+    TermData, ChampionGroups, _Column, Root
 ) ->
-    [{First, {FirstDf, FirstPlane, _FirstBitmap}},
-        {Second, {SecondDf, SecondPlane, _SecondBitmap}}] =
+    [{_First, {FirstDf, FirstPlane, _FirstBitmap}},
+        {_Second, {SecondDf, SecondPlane, _SecondBitmap}}] =
             lists:sort(maps:to_list(TermData)),
-    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
     Avg = maps:get(total_length, Root, 0) / DocCount,
     FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
     SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
-    {Current, Acc} = fts2_search_or_candidate_planes(
-        FirstPlane,
-        First,
-        FirstDf,
-        FirstIdf,
-        SecondPlane,
-        Second,
-        SecondDf,
-        SecondIdf,
-        ChampionGroups,
-        Column,
-        Avg,
-        none,
-        []
+    Groups = fts2_search_or_target_groups(
+        lists:sort(maps:keys(ChampionGroups)),
+        FirstPlane, FirstIdf, SecondPlane, SecondIdf, Avg, []
     ),
-    lists:reverse(fts2_search_or_finish_group(Current, Acc)).
+    [
+        Entry
+     || {_Key, Entry} <- lists:keysort(
+            1,
+            [
+                {{-element(6, Chunk), element(3, Chunk)}, Entry}
+             || {Chunk, _GroupTf} = Entry <- Groups
+            ]
+        )
+    ].
 
-%% The Boolean planes are fixed-width and chunk ordered. Traverse their
-%% binaries directly so postings rejected by the champion proof allocate no
-%% cursor tuple or term-stat list.
-fts2_search_or_candidate_planes(
-    <<>>, _First, _FirstDf, _FirstIdf,
-    <<>>, _Second, _SecondDf, _SecondIdf,
-    _Groups, _Column, _Avg, Current, Acc
+fts2_search_or_target_groups(
+    [], _FirstPlane, _FirstIdf, _SecondPlane, _SecondIdf, _Avg, Acc
 ) ->
-    {Current, Acc};
-fts2_search_or_candidate_planes(
-    <<>>, First, FirstDf, FirstIdf,
+    lists:reverse(Acc);
+fts2_search_or_target_groups(
+    [GroupId | Rest], FirstPlane, FirstIdf, SecondPlane, SecondIdf, Avg, Acc
+) ->
+    FirstAtGroup = fts2_search_plane_seek_group(FirstPlane, GroupId),
+    SecondAtGroup = fts2_search_plane_seek_group(SecondPlane, GroupId),
+    {NextFirst, NextSecond, Winner, GroupTf} =
+        fts2_search_or_target_group(
+            FirstAtGroup, FirstIdf, SecondAtGroup, SecondIdf,
+            GroupId, Avg, none, 0
+        ),
+    NextAcc = case Winner of
+        none -> Acc;
+        _ -> [{Winner, GroupTf} | Acc]
+    end,
+    fts2_search_or_target_groups(
+        Rest, NextFirst, FirstIdf, NextSecond, SecondIdf, Avg, NextAcc
+    ).
+
+fts2_search_plane_seek_group(<<>>, _GroupId) ->
+    <<>>;
+fts2_search_plane_seek_group(
+    <<_ChunkId:32/unsigned-big, FoundGroup:32/unsigned-big,
+        _SourceId:64/unsigned-big, _Length:32/unsigned-big,
+        _Tf:32/unsigned-big, _DenseId:32/unsigned-big, Rest/binary>>,
+    GroupId
+) when FoundGroup < GroupId ->
+    fts2_search_plane_seek_group(Rest, GroupId);
+fts2_search_plane_seek_group(Plane, _GroupId) ->
+    Plane.
+
+fts2_search_or_target_group(
+    FirstPlane, FirstIdf, SecondPlane, SecondIdf,
+    GroupId, Avg, Winner, GroupTf
+) ->
+    FirstIn = fts2_search_plane_group(FirstPlane) =:= GroupId,
+    SecondIn = fts2_search_plane_group(SecondPlane) =:= GroupId,
+    case {FirstIn, SecondIn} of
+        {false, false} ->
+            {FirstPlane, SecondPlane, Winner, GroupTf};
+        {true, false} ->
+            {NextFirst, Candidate} = fts2_search_or_take_plane(
+                FirstPlane, 1, FirstIdf, Avg
+            ),
+            {NextWinner, NextTf} = fts2_search_or_target_add(
+                Candidate, Winner, GroupTf
+            ),
+            fts2_search_or_target_group(
+                NextFirst, FirstIdf, SecondPlane, SecondIdf,
+                GroupId, Avg, NextWinner, NextTf
+            );
+        {false, true} ->
+            {NextSecond, Candidate} = fts2_search_or_take_plane(
+                SecondPlane, 2, SecondIdf, Avg
+            ),
+            {NextWinner, NextTf} = fts2_search_or_target_add(
+                Candidate, Winner, GroupTf
+            ),
+            fts2_search_or_target_group(
+                FirstPlane, FirstIdf, NextSecond, SecondIdf,
+                GroupId, Avg, NextWinner, NextTf
+            );
+        {true, true} ->
+            <<FirstChunk:32/unsigned-big, _/binary>> = FirstPlane,
+            <<SecondChunk:32/unsigned-big, _/binary>> = SecondPlane,
+            case FirstChunk - SecondChunk of
+                Difference when Difference < 0 ->
+                    {NextFirst, Candidate} = fts2_search_or_take_plane(
+                        FirstPlane, 1, FirstIdf, Avg
+                    ),
+                    {NextWinner, NextTf} = fts2_search_or_target_add(
+                        Candidate, Winner, GroupTf
+                    ),
+                    fts2_search_or_target_group(
+                        NextFirst, FirstIdf, SecondPlane, SecondIdf,
+                        GroupId, Avg, NextWinner, NextTf
+                    );
+                Difference when Difference > 0 ->
+                    {NextSecond, Candidate} = fts2_search_or_take_plane(
+                        SecondPlane, 2, SecondIdf, Avg
+                    ),
+                    {NextWinner, NextTf} = fts2_search_or_target_add(
+                        Candidate, Winner, GroupTf
+                    ),
+                    fts2_search_or_target_group(
+                        FirstPlane, FirstIdf, NextSecond, SecondIdf,
+                        GroupId, Avg, NextWinner, NextTf
+                    );
+                0 ->
+                    {NextFirst, NextSecond, Candidate} =
+                        fts2_search_or_take_both(
+                            FirstPlane, FirstIdf, SecondPlane, SecondIdf, Avg
+                        ),
+                    {NextWinner, NextTf} = fts2_search_or_target_add(
+                        Candidate, Winner, GroupTf
+                    ),
+                    fts2_search_or_target_group(
+                        NextFirst, FirstIdf, NextSecond, SecondIdf,
+                        GroupId, Avg, NextWinner, NextTf
+                    )
+            end
+    end.
+
+fts2_search_plane_group(<<_ChunkId:32/unsigned-big,
+        GroupId:32/unsigned-big, _/binary>>) ->
+    GroupId;
+fts2_search_plane_group(<<>>) ->
+    none.
+
+fts2_search_or_take_plane(
     <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
         SourceId:64/unsigned-big, Length:32/unsigned-big,
         Tf:32/unsigned-big, _DenseId:32/unsigned-big, Rest/binary>>,
-    Second, SecondDf, SecondIdf,
-    Groups, Column, Avg, Current, Acc
+    Bit, Idf, Avg
 ) ->
-    {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
-        ChunkId, GroupId, SourceId, Length,
-        [{Second, Tf, SecondDf, SecondIdf}], Groups, Column, Avg,
-        Current, Acc
-    ),
-    fts2_search_or_candidate_planes(
-        <<>>, First, FirstDf, FirstIdf,
-        Rest, Second, SecondDf, SecondIdf,
-        Groups, Column, Avg, NextCurrent, NextAcc
-    );
-fts2_search_or_candidate_planes(
+    {Rest, {ChunkId, GroupId, SourceId, Length, Tf,
+        fts2_search_bm25(Tf, Idf, Avg, Length), Bit}}.
+
+fts2_search_or_take_both(
     <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
         SourceId:64/unsigned-big, Length:32/unsigned-big,
-        Tf:32/unsigned-big, _DenseId:32/unsigned-big, Rest/binary>>,
-    First, FirstDf, FirstIdf,
-    <<>>, Second, SecondDf, SecondIdf,
-    Groups, Column, Avg, Current, Acc
-) ->
-    {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
-        ChunkId, GroupId, SourceId, Length,
-        [{First, Tf, FirstDf, FirstIdf}], Groups, Column, Avg,
-        Current, Acc
-    ),
-    fts2_search_or_candidate_planes(
-        Rest, First, FirstDf, FirstIdf,
-        <<>>, Second, SecondDf, SecondIdf,
-        Groups, Column, Avg, NextCurrent, NextAcc
-    );
-fts2_search_or_candidate_planes(
-    <<FirstChunk:32/unsigned-big, FirstGroup:32/unsigned-big,
-        FirstSource:64/unsigned-big, FirstLength:32/unsigned-big,
         FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
-        FirstRest/binary>> = FirstPlane,
-    First, FirstDf, FirstIdf,
-    <<SecondChunk:32/unsigned-big, SecondGroup:32/unsigned-big,
-        SecondSource:64/unsigned-big, SecondLength:32/unsigned-big,
+        FirstRest/binary>>,
+    FirstIdf,
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
         SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
-        SecondRest/binary>> = SecondPlane,
-    Second, SecondDf, SecondIdf,
-    Groups, Column, Avg, Current, Acc
+        SecondRest/binary>>,
+    SecondIdf,
+    Avg
 ) ->
-    case FirstChunk - SecondChunk of
-        Difference when Difference < 0 ->
-            {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
-                FirstChunk, FirstGroup, FirstSource, FirstLength,
-                [{First, FirstTf, FirstDf, FirstIdf}],
-                Groups, Column, Avg, Current, Acc
+    {FirstRest, SecondRest,
+        {ChunkId, GroupId, SourceId, Length, FirstTf + SecondTf,
+            fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
+                fts2_search_bm25(SecondTf, SecondIdf, Avg, Length),
+            3}}.
+
+fts2_search_or_target_add(Candidate, none, GroupTf) ->
+    {Candidate, GroupTf + element(5, Candidate)};
+fts2_search_or_target_add(Candidate, Winner, GroupTf) ->
+    NextWinner = case {-element(6, Candidate), element(3, Candidate)} <
+        {-element(6, Winner), element(3, Winner)} of
+        true -> Candidate;
+        false -> Winner
+    end,
+    {NextWinner, GroupTf + element(5, Candidate)}.
+
+fts2_search_or_compact_score({{_ChunkId, _GroupId, _SourceId, _Length,
+        _Tf, Score, _Mask}, _GroupTf}) ->
+    Score.
+
+fts2_search_or_candidate_records(Entries, TermData) ->
+    [{First, _}, {Second, _}] = lists:sort(maps:to_list(TermData)),
+    [
+        #fts2_match{
+            chunk_id = ChunkId,
+            group_id = GroupId,
+            source_id = SourceId,
+            doc_length = Length,
+            tf = Tf,
+            terms = case Mask of
+                1 -> [First];
+                2 -> [Second];
+                3 -> [First, Second]
+            end,
+            group_match_count = GroupTf,
+            score = Score
+        }
+     || {{ChunkId, GroupId, SourceId, Length, Tf, Score, Mask}, GroupTf} <-
+            Entries
+    ].
+
+fts2_search_fast_boolean_full(AST, TermData, Column, Root, Window) ->
+    ResultBitmap = fts2_search_boolean_bitmap(AST, TermData),
+    ResultBytes = binary:encode_unsigned(ResultBitmap, little),
+    PositiveTokens = fts2_search_boolean_positive_tokens(AST),
+    case fts2_search_boolean_required_tokens(AST) of
+        [] ->
+            ResultCount = fts2_search_bitmap_count(ResultBitmap),
+            RowsByChunk = lists:foldl(
+                fun(Token, Acc) ->
+                    {Df, EntryPlane, _Bitmap} = maps:get(Token, TermData),
+                    case ResultCount * 16 < Df of
+                        true ->
+                            fts2_search_boolean_select_sparse(
+                                EntryPlane, ResultBytes, Column, Token, Df, Acc
+                            );
+                        false ->
+                            fts2_search_boolean_select_plane(
+                                EntryPlane, ResultBytes, Column, Token, Df, Acc
+                            )
+                    end
+                end,
+                #{},
+                PositiveTokens
             ),
-            fts2_search_or_candidate_planes(
-                FirstRest, First, FirstDf, FirstIdf,
-                SecondPlane, Second, SecondDf, SecondIdf,
-                Groups, Column, Avg, NextCurrent, NextAcc
-            );
-        Difference when Difference > 0 ->
-            {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
-                SecondChunk, SecondGroup, SecondSource, SecondLength,
-                [{Second, SecondTf, SecondDf, SecondIdf}],
-                Groups, Column, Avg, Current, Acc
+            Rows = maps:values(RowsByChunk),
+            Scored = fts2_search_boolean_score_rows(Rows, TermData, Root),
+            Grouped = fts2_search_collapse_scored_groups(Scored, true),
+            {ranked_champions, Grouped, length(Grouped)};
+        RequiredTokens ->
+            Driver = fts2_search_boolean_smallest_required(
+                RequiredTokens, TermData
             ),
-            fts2_search_or_candidate_planes(
-                FirstPlane, First, FirstDf, FirstIdf,
-                SecondRest, Second, SecondDf, SecondIdf,
-                Groups, Column, Avg, NextCurrent, NextAcc
-            );
-        0 ->
-            true = {FirstGroup, FirstSource, FirstLength} =:=
-                {SecondGroup, SecondSource, SecondLength},
-            {NextCurrent, NextAcc} = fts2_search_or_candidate_row(
-                FirstChunk, FirstGroup, FirstSource, FirstLength,
-                [
-                    {First, FirstTf, FirstDf, FirstIdf},
-                    {Second, SecondTf, SecondDf, SecondIdf}
+            case length(PositiveTokens) =< 3 of
+                true -> fts2_search_boolean_compact_ranked(
+                    Driver, PositiveTokens, TermData, ResultBytes, Column,
+                    Root, Window
+                );
+                false -> fts2_search_boolean_driver_ranked(
+                    Driver, PositiveTokens, TermData, ResultBytes, Column,
+                    Root, Window
+                )
+            end
+    end.
+
+%% Every satisfying assignment of an AND/NOT expression contains its required
+%% terms.  OR keeps only terms required by both arms.  A non-empty required set
+%% therefore provides a complete driver plane: no result row can exist outside
+%% the smallest required plane.
+fts2_search_boolean_required_tokens({term, Token, false, _Columns}) ->
+    [Token];
+fts2_search_boolean_required_tokens({'and', A, B}) ->
+    lists:usort(
+        fts2_search_boolean_required_tokens(A) ++
+            fts2_search_boolean_required_tokens(B)
+    );
+fts2_search_boolean_required_tokens({'or', A, B}) ->
+    ordsets:intersection(
+        fts2_search_boolean_required_tokens(A),
+        fts2_search_boolean_required_tokens(B)
+    );
+fts2_search_boolean_required_tokens({'not', A, _B}) ->
+    fts2_search_boolean_required_tokens(A).
+
+fts2_search_boolean_smallest_required([First | Rest], TermData) ->
+    lists:foldl(
+        fun(Token, Best) ->
+            {Df, _Plane, _Bitmap} = maps:get(Token, TermData),
+            {BestDf, _BestPlane, _BestBitmap} = maps:get(Best, TermData),
+            case Df < BestDf of
+                true -> Token;
+                false -> Best
+            end
+        end,
+        First,
+        Rest
+    ).
+
+fts2_search_boolean_compact_ranked(
+    Driver, PositiveTokens, TermData, Result, Column, Root, Window
+) ->
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    Descriptors = [
+        begin
+            {Df, Plane, _Bitmap} = maps:get(Token, TermData),
+            {Token, Df, fts2_build_bm25_idf(DocCount, Df), Plane}
+        end
+     || Token <- lists:reverse(PositiveTokens)
+    ],
+    Groups = fts2_search_boolean_compact_groups(
+        Driver, Descriptors, Result, Avg
+    ),
+    Ordered = [
+        Entry
+     || {_Key, Entry} <- lists:keysort(
+            1,
+            [
+                {{-element(1, Chunk), element(2, Chunk)}, Entry}
+             || {Chunk, _GroupTf} = Entry <- Groups
+            ]
+        )
+    ],
+    Proven = fts2_search_impact_window(
+        Ordered,
+        Window,
+        fun({Chunk, _GroupTf}) -> element(1, Chunk) end
+    ),
+    Specs = [{Token, Df} || {Token, Df, _Idf, _Plane} <- Descriptors],
+    Matches = [
+        begin
+            TokenTfs = [
+                {Token, Tf, Df}
+             || {{Token, Df}, Tf} <- lists:zip(Specs, tuple_to_list(Tfs)),
+                Tf > 0
+            ],
+            #fts2_match{
+                chunk_id = ChunkId,
+                group_id = GroupId,
+                source_id = SourceId,
+                doc_length = Length,
+                tf = TotalTf,
+                term_stats = [
+                    {{Column, Token}, Tf, base, Df}
+                 || {Token, Tf, Df} <- TokenTfs
                 ],
-                Groups, Column, Avg, Current, Acc
+                terms = [Token || {Token, _Tf, _Df} <- TokenTfs],
+                group_match_count = GroupTf,
+                score = Score
+            }
+        end
+     || {{Score, SourceId, GroupId, ChunkId, Length, TotalTf, Tfs},
+            GroupTf} <- Proven
+    ],
+    {ranked_champions, Matches, length(Groups)}.
+
+fts2_search_boolean_compact_groups(
+    Driver,
+    [{Token, _Df, Idf, Plane}],
+    Result,
+    Avg
+) when Token =:= Driver ->
+    fts2_search_boolean_compact_one(
+        Plane, Idf, Result, Avg, none, []
+    );
+fts2_search_boolean_compact_groups(
+    Driver,
+    [{First, _FirstDf, FirstIdf, FirstPlane},
+        {Second, _SecondDf, SecondIdf, SecondPlane}],
+    Result,
+    Avg
+) ->
+    {DriverPlane, OtherPlane, DriverSide} = case Driver of
+        First -> {FirstPlane, SecondPlane, first};
+        Second -> {SecondPlane, FirstPlane, second}
+    end,
+    fts2_search_boolean_compact_two(
+        DriverPlane, OtherPlane, DriverSide, FirstIdf, SecondIdf,
+        Result, Avg, none, []
+    );
+fts2_search_boolean_compact_groups(
+    Driver,
+    [{First, _FirstDf, FirstIdf, FirstPlane},
+        {Second, _SecondDf, SecondIdf, SecondPlane},
+        {Third, _ThirdDf, ThirdIdf, ThirdPlane}],
+    Result,
+    Avg
+) ->
+    {DriverPlane, OtherOne, OtherTwo, DriverSide} = case Driver of
+        First -> {FirstPlane, SecondPlane, ThirdPlane, first};
+        Second -> {SecondPlane, FirstPlane, ThirdPlane, second};
+        Third -> {ThirdPlane, FirstPlane, SecondPlane, third}
+    end,
+    fts2_search_boolean_compact_three(
+        DriverPlane, OtherOne, OtherTwo, DriverSide,
+        FirstIdf, SecondIdf, ThirdIdf, Result, Avg, none, []
+    ).
+
+fts2_search_boolean_compact_one(
+    <<>>, _Idf, _Result, _Avg, Current, Acc
+) ->
+    lists:reverse(fts2_search_boolean_compact_finish(Current, Acc));
+fts2_search_boolean_compact_one(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        Tf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    Idf, Result, Avg, Current, Acc
+) ->
+    {NextCurrent, NextAcc} = case fts2_search_boolean_selected(
+        Result, DenseId
+    ) of
+        false -> {Current, Acc};
+        true -> fts2_search_boolean_compact_add(
+            {fts2_search_bm25(Tf, Idf, Avg, Length), SourceId, GroupId,
+                ChunkId, Length, Tf, {Tf}},
+            Current,
+            Acc
+        )
+    end,
+    fts2_search_boolean_compact_one(
+        Rest, Idf, Result, Avg, NextCurrent, NextAcc
+    ).
+
+fts2_search_boolean_compact_two(
+    <<>>, _Other, _Side, _FirstIdf, _SecondIdf, _Result, _Avg, Current, Acc
+) ->
+    lists:reverse(fts2_search_boolean_compact_finish(Current, Acc));
+fts2_search_boolean_compact_two(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        DriverTf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    Other, Side, FirstIdf, SecondIdf, Result, Avg, Current, Acc
+) ->
+    case fts2_search_boolean_selected(Result, DenseId) of
+        false ->
+            fts2_search_boolean_compact_two(
+                Rest, Other, Side, FirstIdf, SecondIdf, Result, Avg,
+                Current, Acc
+            );
+        true ->
+            {Found, NextOther} = fts2_search_plane_seek_dense(Other, DenseId),
+            OtherTf = case Found of not_found -> 0; {ok, Tf} -> Tf end,
+            {FirstTf, SecondTf} = case Side of
+                first -> {DriverTf, OtherTf};
+                second -> {OtherTf, DriverTf}
+            end,
+            Score = fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
+                fts2_search_bm25(SecondTf, SecondIdf, Avg, Length),
+            {NextCurrent, NextAcc} = fts2_search_boolean_compact_add(
+                {Score, SourceId, GroupId, ChunkId, Length,
+                    FirstTf + SecondTf, {FirstTf, SecondTf}},
+                Current,
+                Acc
             ),
-            fts2_search_or_candidate_planes(
-                FirstRest, First, FirstDf, FirstIdf,
-                SecondRest, Second, SecondDf, SecondIdf,
-                Groups, Column, Avg, NextCurrent, NextAcc
+            fts2_search_boolean_compact_two(
+                Rest, NextOther, Side, FirstIdf, SecondIdf, Result, Avg,
+                NextCurrent, NextAcc
             )
     end.
 
-fts2_search_or_candidate_row(
-    _ChunkId,
-    GroupId,
-    _SourceId,
-    _Length,
-    _Terms,
-    Groups,
-    _Column,
-    _Avg,
-    Current,
-    Acc
-) when not is_map_key(GroupId, Groups) ->
-    {Current, Acc};
-fts2_search_or_candidate_row(
-    ChunkId,
-    GroupId,
-    SourceId,
-    Length,
-    Terms,
-    _Groups,
-    _Column,
-    Avg,
-    Current,
-    Acc
+fts2_search_boolean_compact_three(
+    <<>>, _OtherOne, _OtherTwo, _Side,
+    _FirstIdf, _SecondIdf, _ThirdIdf, _Result, _Avg, Current, Acc
 ) ->
-    Match = fts2_search_or_candidate_match(
-        ChunkId, GroupId, SourceId, Length, Terms, Avg
-    ),
-    fts2_search_or_add_group(Match, Current, Acc).
+    lists:reverse(fts2_search_boolean_compact_finish(Current, Acc));
+fts2_search_boolean_compact_three(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        DriverTf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    OtherOne, OtherTwo, Side, FirstIdf, SecondIdf, ThirdIdf,
+    Result, Avg, Current, Acc
+) ->
+    case fts2_search_boolean_selected(Result, DenseId) of
+        false ->
+            fts2_search_boolean_compact_three(
+                Rest, OtherOne, OtherTwo, Side,
+                FirstIdf, SecondIdf, ThirdIdf, Result, Avg, Current, Acc
+            );
+        true ->
+            {FoundOne, NextOtherOne} = fts2_search_plane_seek_dense(
+                OtherOne, DenseId
+            ),
+            {FoundTwo, NextOtherTwo} = fts2_search_plane_seek_dense(
+                OtherTwo, DenseId
+            ),
+            TfOne = case FoundOne of not_found -> 0; {ok, TfA} -> TfA end,
+            TfTwo = case FoundTwo of not_found -> 0; {ok, TfB} -> TfB end,
+            {FirstTf, SecondTf, ThirdTf} = case Side of
+                first -> {DriverTf, TfOne, TfTwo};
+                second -> {TfOne, DriverTf, TfTwo};
+                third -> {TfOne, TfTwo, DriverTf}
+            end,
+            Score = fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
+                fts2_search_bm25(SecondTf, SecondIdf, Avg, Length) +
+                fts2_search_bm25(ThirdTf, ThirdIdf, Avg, Length),
+            {NextCurrent, NextAcc} = fts2_search_boolean_compact_add(
+                {Score, SourceId, GroupId, ChunkId, Length,
+                    FirstTf + SecondTf + ThirdTf,
+                    {FirstTf, SecondTf, ThirdTf}},
+                Current,
+                Acc
+            ),
+            fts2_search_boolean_compact_three(
+                Rest, NextOtherOne, NextOtherTwo, Side,
+                FirstIdf, SecondIdf, ThirdIdf, Result, Avg,
+                NextCurrent, NextAcc
+            )
+    end.
 
-fts2_search_or_candidate_match(
-    ChunkId,
-    GroupId,
-    SourceId,
-    Length,
-    [{Token, Tf, _Df, Idf}],
-    Avg
-) ->
-    #fts2_match{
-        chunk_id = ChunkId,
-        group_id = GroupId,
-        source_id = SourceId,
-        doc_length = Length,
-        tf = Tf,
-        terms = [Token],
-        score = fts2_search_bm25(Tf, Idf, Avg, Length)
-    };
-fts2_search_or_candidate_match(
-    ChunkId,
-    GroupId,
-    SourceId,
-    Length,
-    [{First, FirstTf, _FirstDf, FirstIdf},
-        {Second, SecondTf, _SecondDf, SecondIdf}],
-    Avg
-) ->
-    #fts2_match{
-        chunk_id = ChunkId,
-        group_id = GroupId,
-        source_id = SourceId,
-        doc_length = Length,
-        tf = FirstTf + SecondTf,
-        terms = [First, Second],
-        score =
-            fts2_search_bm25(FirstTf, FirstIdf, Avg, Length) +
-                fts2_search_bm25(SecondTf, SecondIdf, Avg, Length)
-    }.
+fts2_search_boolean_selected(Result, DenseId) ->
+    ByteIndex = DenseId bsr 3,
+    ByteIndex < byte_size(Result) andalso
+        (binary:at(Result, ByteIndex) band (1 bsl (DenseId band 7))) =/= 0.
 
-fts2_search_or_add_group(Match, none, Acc) ->
-    {{Match#fts2_match.group_id, Match, fts2_search_match_count(Match)}, Acc};
-fts2_search_or_add_group(
-    #fts2_match{group_id = GroupId} = Match,
-    {GroupId, Winner, MatchCount},
+fts2_search_boolean_compact_add(
+    {_Score, _SourceId, GroupId, _ChunkId, _Length, Tf, _Tfs} = Chunk,
+    none,
     Acc
 ) ->
-    NextWinner = case fts2_search_better_chunk(Match, Winner, true) of
-        true -> Match;
-        false -> Winner
+    {{GroupId, Chunk, Tf}, Acc};
+fts2_search_boolean_compact_add(
+    {Score, SourceId, GroupId, _ChunkId, _Length, Tf, _Tfs} = Chunk,
+    {GroupId, Existing, GroupTf},
+    Acc
+) ->
+    Winner = case {-Score, SourceId} <
+        {-element(1, Existing), element(2, Existing)} of
+        true -> Chunk;
+        false -> Existing
     end,
-    {{GroupId, NextWinner,
-        MatchCount + fts2_search_match_count(Match)}, Acc};
-fts2_search_or_add_group(Match, Current, Acc) ->
-    NextAcc = fts2_search_or_finish_group(Current, Acc),
-    {{Match#fts2_match.group_id, Match, fts2_search_match_count(Match)},
-        NextAcc}.
+    {{GroupId, Winner, GroupTf + Tf}, Acc};
+fts2_search_boolean_compact_add(Chunk, Current, Acc) ->
+    NextAcc = fts2_search_boolean_compact_finish(Current, Acc),
+    {{element(3, Chunk), Chunk, element(6, Chunk)}, NextAcc}.
 
-fts2_search_or_finish_group(none, Acc) ->
+fts2_search_boolean_compact_finish(none, Acc) ->
     Acc;
-fts2_search_or_finish_group({_GroupId, Winner, MatchCount}, Acc) ->
-    [Winner#fts2_match{group_match_count = MatchCount} | Acc].
+fts2_search_boolean_compact_finish({_GroupId, Winner, GroupTf}, Acc) ->
+    [{Winner, GroupTf} | Acc].
 
-fts2_search_fast_boolean_full(AST, TermData, Column, Root) ->
-    ResultBitmap = fts2_search_boolean_bitmap(AST, TermData),
-    ResultBytes = binary:encode_unsigned(ResultBitmap, little),
-    ResultCount = fts2_search_bitmap_count(ResultBitmap),
-    PositiveTokens = fts2_search_boolean_positive_tokens(AST),
-    RowsByChunk = lists:foldl(
-        fun(Token, Acc) ->
-            {Df, EntryPlane, _Bitmap} = maps:get(Token, TermData),
-            case ResultCount * 16 < Df of
-                true ->
-                    fts2_search_boolean_select_sparse(
-                        EntryPlane, ResultBytes, Column, Token, Df, Acc
-                    );
-                false ->
-                    fts2_search_boolean_select_plane(
-                        EntryPlane, ResultBytes, Column, Token, Df, Acc
-                    )
+fts2_search_boolean_driver_ranked(
+    Driver, PositiveTokens, TermData, Result, Column, Root, Window
+) ->
+    Chunks = fts2_search_boolean_driver_rows(
+        Driver, PositiveTokens, TermData, Result, Column, Root
+    ),
+    Groups = lists:foldl(
+        fun({_Score, SourceId, GroupId, _ChunkId, _Length, TotalTf,
+                _Stats} = Chunk, Acc) ->
+            case maps:find(GroupId, Acc) of
+                error ->
+                    Acc#{GroupId => {Chunk, TotalTf}};
+                {ok, {Existing, GroupTf}} ->
+                    Winner = case {-element(1, Chunk), SourceId} <
+                        {-element(1, Existing), element(2, Existing)} of
+                        true -> Chunk;
+                        false -> Existing
+                    end,
+                    Acc#{GroupId => {Winner, GroupTf + TotalTf}}
             end
         end,
         #{},
-        PositiveTokens
+        Chunks
     ),
-    Rows = maps:values(RowsByChunk),
-    Scored = fts2_search_boolean_score_rows(Rows, TermData, Root),
-    Grouped = fts2_search_collapse_scored_groups(Scored, true),
-    {ranked_champions, Grouped, length(Grouped)}.
+    Ordered = [
+        Entry
+     || {_Key, Entry} <- lists:keysort(
+            1,
+            [
+                {{-element(1, Chunk), element(2, Chunk)}, Entry}
+             || {Chunk, _GroupTf} = Entry <- maps:values(Groups)
+            ]
+        )
+    ],
+    Proven = fts2_search_impact_window(
+        Ordered,
+        Window,
+        fun({Chunk, _GroupTf}) -> element(1, Chunk) end
+    ),
+    Matches = [
+        #fts2_match{
+            chunk_id = ChunkId,
+            group_id = GroupId,
+            source_id = SourceId,
+            doc_length = Length,
+            tf = TotalTf,
+            term_stats = Stats,
+            terms = [Token ||
+                {{_StatColumn, Token}, _Tf, _Source, _Df} <- Stats],
+            group_match_count = GroupTf,
+            score = Score
+        }
+     || {{Score, SourceId, GroupId, ChunkId, Length, TotalTf, Stats},
+            GroupTf} <- Proven
+    ],
+    {ranked_champions, Matches, map_size(Groups)}.
+
+fts2_search_boolean_driver_rows(
+    Driver, PositiveTokens, TermData, Result, Column, Root
+) ->
+    {DriverDf, DriverPlane, _DriverBitmap} = maps:get(Driver, TermData),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    Idfs = maps:from_list([
+        {Token, fts2_build_bm25_idf(DocCount, Df)}
+     || {Token, {Df, _Plane, _Bitmap}} <- maps:to_list(TermData)
+    ]),
+    StatTokens = lists:reverse(PositiveTokens),
+    Cursors = [
+        {Token, Df, Plane}
+     || Token <- StatTokens,
+        Token =/= Driver,
+        {Df, Plane, _Bitmap} <- [maps:get(Token, TermData)]
+    ],
+    fts2_search_boolean_driver_plane(
+        DriverPlane, Driver, DriverDf, StatTokens, Result, Column, Avg, Idfs,
+        Cursors, []
+    ).
+
+fts2_search_boolean_driver_plane(
+    <<>>, _Driver, _DriverDf, _Tokens, _Result, _Column, _Avg, _Idfs,
+    _Cursors, Acc
+) ->
+    lists:reverse(Acc);
+fts2_search_boolean_driver_plane(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        DriverTf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    Driver, DriverDf, Tokens, Result, Column, Avg, Idfs, Cursors, Acc
+) ->
+    ByteIndex = DenseId bsr 3,
+    Selected = ByteIndex < byte_size(Result) andalso
+        (binary:at(Result, ByteIndex) band (1 bsl (DenseId band 7))) =/= 0,
+    {NextCursors, NextAcc} = case Selected of
+        false ->
+            {Cursors, Acc};
+        true ->
+            {Stats, TotalTf, AdvancedCursors} =
+                fts2_search_boolean_driver_stats(
+                    Tokens, Driver, DriverTf, DriverDf, DenseId, Column,
+                    Cursors, [], 0
+                ),
+            Score = lists:sum([
+                fts2_search_bm25(
+                    Tf, maps:get(Token, Idfs), Avg, Length
+                )
+             || {{_StatColumn, Token}, Tf, _Source, _Df} <- Stats
+            ]),
+            {AdvancedCursors, [{
+                Score, SourceId, GroupId, ChunkId, Length, TotalTf, Stats
+            } | Acc]}
+    end,
+    fts2_search_boolean_driver_plane(
+        Rest, Driver, DriverDf, Tokens, Result, Column, Avg, Idfs,
+        NextCursors, NextAcc
+    ).
+
+fts2_search_boolean_driver_stats(
+    [], _Driver, _DriverTf, _DriverDf, _DenseId, _Column, Cursors, Acc, TotalTf
+) ->
+    {lists:reverse(Acc), TotalTf, Cursors};
+fts2_search_boolean_driver_stats(
+    [Driver | Rest], Driver, DriverTf, DriverDf, DenseId, Column,
+    Cursors, Acc, TotalTf
+) ->
+    fts2_search_boolean_driver_stats(
+        Rest, Driver, DriverTf, DriverDf, DenseId, Column, Cursors,
+        [{{Column, Driver}, DriverTf, base, DriverDf} | Acc],
+        TotalTf + DriverTf
+    );
+fts2_search_boolean_driver_stats(
+    [Token | Rest], Driver, DriverTf, DriverDf, DenseId, Column,
+    [{Token, Df, Plane} | Cursors], Acc, TotalTf
+) ->
+    {Found, NextPlane} = fts2_search_plane_seek_dense(Plane, DenseId),
+    {NextAcc, NextTotal} = case Found of
+        not_found -> {Acc, TotalTf};
+        {ok, Tf} ->
+            {[{{Column, Token}, Tf, base, Df} | Acc], TotalTf + Tf}
+    end,
+    {Stats, FinalTotal, NextCursors} = fts2_search_boolean_driver_stats(
+        Rest, Driver, DriverTf, DriverDf, DenseId, Column, Cursors,
+        NextAcc, NextTotal
+    ),
+    {Stats, FinalTotal, [{Token, Df, NextPlane} | NextCursors]}.
+
+%% The tail of a skipped row is passed only to this immediate self-call.  The
+%% BEAM keeps the match context instead of allocating one sub-binary per row.
+fts2_search_plane_seek_dense(<<>>, _DenseId) ->
+    {not_found, <<>>};
+fts2_search_plane_seek_dense(
+    <<_ChunkId:32/unsigned-big, _GroupId:32/unsigned-big,
+        _SourceId:64/unsigned-big, _Length:32/unsigned-big,
+        Tf:32/unsigned-big, Found:32/unsigned-big, Rest/binary>> = Plane,
+    DenseId
+) ->
+    case Found - DenseId of
+        Difference when Difference < 0 ->
+            fts2_search_plane_seek_dense(Rest, DenseId);
+        0 ->
+            {{ok, Tf}, Plane};
+        _ ->
+            {not_found, Plane}
+    end.
 
 fts2_search_boolean_score_rows(Rows, TermData, Root) ->
-    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
     Avg = maps:get(total_length, Root, 0) / DocCount,
     Idfs = maps:from_list([
         {Token, fts2_build_bm25_idf(DocCount, Df)}
@@ -9698,7 +10458,7 @@ fts2_search_or_champions_exact(Headers) ->
                 true;
             ({_Token, _Key, Header}) ->
                 length(maps:get(champions, Header, [])) >=
-                    maps:get(chunk_df, Header, 0)
+                    maps:get(group_df, Header, 0)
         end,
         Headers
     ).
@@ -9714,47 +10474,140 @@ fts2_search_fast_prefix(Bookie, Schema, Root, Prefix, Columns, Opts) ->
         {[Column], bm25, nil, true} ->
             Generation = maps:get(generation, Root),
             Bucket = maps:get(index, Schema),
-            Headers = [
-                {Token, Header}
-             || {_Key, Token, Header} <- fts2_search_prefix_headers(
-                    Bookie, Bucket, Generation, Column, Prefix,
-                    fun fts2_codec_decode_header/1
-                )
+            %% A prefix can make a document competitive by accumulating many
+            %% individually non-champion expansions.  Enumerate the complete
+            %% group plane for every expansion; champion-only enumeration is
+            %% not a sound document-grain proof.
+            HeaderRange = fts2_search_prefix_headers(
+                Bookie, Bucket, Generation, Column, Prefix,
+                fun fts2_codec_decode_header_metadata/1
+            ),
+            Requests = [
+                {fts2_codec_term_plane_key(Key, boolean), <<"g">>}
+             || {Key, _Token, _Header} <- HeaderRange
             ],
-            {MatchesByChunk, GroupBitmap} = lists:foldl(
-                fun({Token, Header}, {MatchAcc, BitmapAcc}) ->
-                    Matches = fts2_search_ranked_champions(
-                        maps:get(champions, Header),
-                        Column,
-                        Token,
-                        maps:get(chunk_df, Header),
-                        #{},
-                        Root
+            Values = case Requests of
+                [] -> [];
+                _ -> leveled_fts_residency:headonly_many(
+                    Bookie, Bucket, Requests
+                )
+            end,
+            TermData = maps:from_list([
+                begin
+                    Plane = case Value of
+                        {ok, EncodedPlane} ->
+                            fts2_codec_plane_payload(EncodedPlane);
+                        Bad ->
+                            erlang:error({invalid_fts2_group_plane, Token, Bad})
+                    end,
+                    {Token, {
+                        maps:get(group_df, Header),
+                        Plane,
+                        case maps:find(group_bitmap, Header) of
+                            {ok, Bitmap} -> Bitmap;
+                            error -> fts2_search_plane_chunk_bitmap(Plane, 0)
+                        end
+                    }}
+                end
+             || {{_Key, Token, Header}, Value} <-
+                    lists:zip(HeaderRange, Values)
+            ]),
+            case maps:keys(TermData) of
+                [] ->
+                    {ranked_champions, [], 0};
+                [Only] ->
+                    fts2_search_fast_boolean_full(
+                        {term, Only, false, []},
+                        TermData, Column, Root, Window
+                    );
+                [First | Rest] ->
+                    PrefixAST = lists:foldl(
+                        fun(Token, AST) ->
+                            {'or', AST, {term, Token, false, []}}
+                        end,
+                        {term, First, false, []},
+                        Rest
                     ),
-                    {
-                        lists:foldl(
-                            fun fts2_search_merge_champion_match/2,
-                            MatchAcc,
-                            Matches
-                        ),
-                        BitmapAcc bor fts2_search_header_group_bitmap(Header)
-                    }
-                end,
-                {#{}, 0},
-                Headers
-            ),
-            Grouped = fts2_search_collapse_scored_groups(
-                maps:values(MatchesByChunk), true
-            ),
-            {ranked_champions,
-                Grouped,
-                fts2_search_bitmap_count(GroupBitmap)};
+                    fts2_search_fast_boolean_full(
+                        PrefixAST, TermData, Column, Root, Window
+                    )
+            end;
         _ ->
             no
     end.
 
-fts2_search_read_positional_pair(
-    Bookie, Schema, Root, Column, First, Second
+fts2_search_prefix_group_records(Chunks, Column, Window) ->
+    Groups = lists:foldl(
+        fun({_ChunkId, GroupId, SourceId, _Length, Tf, Score, _Stats} = Chunk,
+                Acc) ->
+            case maps:find(GroupId, Acc) of
+                error ->
+                    Acc#{GroupId => {Chunk, Tf, false}};
+                {ok, {Existing, CombinedTf, _Collided}} ->
+                    Winner = case {-Score, SourceId} <
+                        {-element(6, Existing), element(3, Existing)} of
+                        true -> Chunk;
+                        false -> Existing
+                    end,
+                    Acc#{GroupId => {Winner, CombinedTf + Tf, true}}
+            end
+        end,
+        #{},
+        Chunks
+    ),
+    Ordered = [
+        Entry
+     || {_Key, Entry} <- lists:keysort(
+            1,
+            [
+                {{-element(6, Chunk), element(3, Chunk)}, Entry}
+             || {Chunk, _CombinedTf, _Collided} = Entry <- maps:values(Groups)
+            ]
+        )
+    ],
+    Proven = fts2_search_impact_window(
+        Ordered,
+        Window,
+        fun({Chunk, _CombinedTf, _Collided}) -> element(6, Chunk) end
+    ),
+    [
+        begin
+            OrderedStats = lists:reverse(Stats),
+            LastToken = element(1, lists:last(Stats)),
+            #fts2_match{
+                chunk_id = ChunkId,
+                group_id = GroupId,
+                source_id = SourceId,
+                doc_length = Length,
+                tf = Tf,
+                term_stats = [
+                    {{Column, Token}, TokenTf, base, Df}
+                 || {Token, TokenTf, Df} <- OrderedStats
+                ],
+                terms = [Token || {Token, _TokenTf, _Df} <- OrderedStats],
+                columns = [{{Column, LastToken}, []}],
+                match_positions = [{LastToken, []}],
+                group_match_count = case Collided of
+                    true -> CombinedTf;
+                    false -> undefined
+                end,
+                score = Score
+            }
+        end
+     || {{ChunkId, GroupId, SourceId, Length, Tf, Score, Stats}, CombinedTf,
+            Collided} <- Proven
+    ].
+
+%% Phrase and NEAR verification over the positional planes.
+%%
+%% The intersection of the two entry planes is driven by chunk ids alone, so a
+%% plane row that only one term posts costs one binary step and nothing else.
+%% A chunk's position payload is sliced out only after both terms are known to
+%% post there, and verification then streams the two delta-encoded payloads
+%% through monotonic cursors: no position list is ever materialised, and match
+%% starts are collected only when the caller asked for positions.
+fts2_search_positional_pair(
+    Bookie, Schema, Root, Column, First, Second, Verify, NeedPositions
 ) ->
     Generation = maps:get(generation, Root),
     Bucket = maps:get(index, Schema),
@@ -9780,8 +10633,6 @@ fts2_search_read_positional_pair(
             FirstPosition, SecondPosition] ->
             FirstHeader = fts2_codec_decode_header_metadata(FirstValue),
             SecondHeader = fts2_codec_decode_header_metadata(SecondValue),
-            FirstDf = maps:get(chunk_df, FirstHeader),
-            SecondDf = maps:get(chunk_df, SecondHeader),
             FirstEntries = fts2_search_header_entry_plane(
                 FirstHeader, FirstBoolean, First
             ),
@@ -9790,45 +10641,359 @@ fts2_search_read_positional_pair(
             ),
             Rows = case maps:get(position_order, Root, legacy) of
                 chunk ->
-                    fts2_search_positional_pair_rows(
+                    fts2_search_pair_rows(
+                        fts2_search_position_payload(
+                            fts2_search_header_position_plane(
+                                FirstHeader, FirstPosition, First
+                            ),
+                            First
+                        ),
+                        fts2_search_position_payload(
+                            fts2_search_header_position_plane(
+                                SecondHeader, SecondPosition, Second
+                            ),
+                            Second
+                        ),
                         FirstEntries,
-                        fts2_search_header_position_plane(
-                            FirstHeader, FirstPosition, First
-                        ),
-                        First,
-                        FirstDf,
-                        SecondEntries,
-                        fts2_search_header_position_plane(
-                            SecondHeader, SecondPosition, Second
-                        ),
-                        Second,
-                        SecondDf,
-                        Column,
-                        []
+                        Verify,
+                        NeedPositions
                     );
                 legacy ->
-                    LegacyRows = fts2_search_positional_intersect(
-                        FirstEntries, Column, First, FirstDf,
-                        SecondEntries, Second, SecondDf, []
-                    ),
-                    ChunkIds = [element(1, Row) || Row <- LegacyRows],
-                    FirstPositions = fts2_search_header_positions(
-                        FirstHeader, FirstPosition, ChunkIds, First
-                    ),
-                    SecondPositions = fts2_search_header_positions(
-                        SecondHeader, SecondPosition, ChunkIds, Second
-                    ),
-                    [
-                        {Row,
-                            maps:get(element(1, Row), FirstPositions, []),
-                            maps:get(element(1, Row), SecondPositions, [])}
-                     || Row <- LegacyRows
-                    ]
+                    fts2_search_pair_legacy(
+                        FirstEntries, FirstHeader, FirstPosition, First,
+                        SecondEntries, SecondHeader, SecondPosition, Second,
+                        Verify, NeedPositions
+                    )
             end,
             {FirstHeader, SecondHeader, Rows};
         _ ->
             not_found
     end.
+
+fts2_search_position_payload(
+    <<?POSITION_VERSION:8, _Count:32/unsigned-big, Payload/binary>>, _Token
+) ->
+    Payload;
+fts2_search_position_payload(Bad, Token) ->
+    erlang:error({invalid_fts2_position_row, Token, Bad}).
+
+%% The position rows already carry the chunk id and, as their position count,
+%% the term frequency, so the whole intersection runs on the two position
+%% planes. Each cursor is advanced by a self-recursive skip run, which the
+%% compiler keeps as one match context: a row that only one term posts costs
+%% no term at all. The payload is sliced out only for a chunk both terms post,
+%% and the doc metadata is read from the first term's entry plane only for a
+%% chunk that verifies.
+fts2_search_pair_rows(FirstPositions, SecondPositions, Entries, Verify,
+        NeedPositions) ->
+    fts2_search_pair_seek_second(
+        FirstPositions, SecondPositions, Entries, byte_size(Entries) div 28,
+        0, Verify, NeedPositions, []
+    ).
+
+fts2_search_pair_seek_second(<<>>, _SecondPositions, _Entries, _High, _Low,
+        _Verify, _NeedPositions, Acc) ->
+    lists:reverse(Acc);
+fts2_search_pair_seek_second(
+    <<FirstChunk:32/unsigned-big, _/binary>> = FirstPositions,
+    SecondPositions, Entries, High, Low, Verify, NeedPositions, Acc
+) ->
+    case fts2_search_position_advance(SecondPositions, FirstChunk) of
+        done ->
+            lists:reverse(Acc);
+        {FirstChunk, Matched} ->
+            fts2_search_pair_match(
+                FirstChunk, FirstPositions, Matched, Entries, High, Low,
+                Verify, NeedPositions, Acc
+            );
+        {SecondChunk, Ahead} ->
+            fts2_search_pair_seek_first(
+                FirstPositions, SecondChunk, Ahead, Entries, High, Low,
+                Verify, NeedPositions, Acc
+            )
+    end.
+
+fts2_search_pair_seek_first(
+    FirstPositions, SecondChunk, SecondPositions, Entries, High, Low, Verify,
+    NeedPositions, Acc
+) ->
+    case fts2_search_position_advance(FirstPositions, SecondChunk) of
+        done ->
+            lists:reverse(Acc);
+        {SecondChunk, Matched} ->
+            fts2_search_pair_match(
+                SecondChunk, Matched, SecondPositions, Entries, High, Low,
+                Verify, NeedPositions, Acc
+            );
+        {_FirstChunk, Ahead} ->
+            fts2_search_pair_seek_second(
+                Ahead, SecondPositions, Entries, High, Low, Verify,
+                NeedPositions, Acc
+            )
+    end.
+
+%% Advance a cursor to the first row at or after Target. The tail is only ever
+%% the argument of the immediate self call, so a skipped row allocates nothing.
+fts2_search_position_advance(
+    <<ChunkId:32/unsigned-big, _Count:32/unsigned-big, Bytes:32/unsigned-big,
+        _:Bytes/binary, Rest/binary>>,
+    Target
+) when ChunkId < Target ->
+    fts2_search_position_advance(Rest, Target);
+fts2_search_position_advance(
+    <<ChunkId:32/unsigned-big, _/binary>> = Positions, _Target
+) ->
+    {ChunkId, Positions};
+fts2_search_position_advance(<<>>, _Target) ->
+    done.
+
+fts2_search_pair_match(
+    ChunkId,
+    <<_FirstChunk:32/unsigned-big, FirstCount:32/unsigned-big,
+        FirstBytes:32/unsigned-big, FirstEncoded:FirstBytes/binary,
+        FirstRest/binary>>,
+    <<_SecondChunk:32/unsigned-big, SecondCount:32/unsigned-big,
+        SecondBytes:32/unsigned-big, SecondEncoded:SecondBytes/binary,
+        SecondRest/binary>>,
+    Entries, High, Low, Verify, NeedPositions, Acc
+) ->
+    {MatchCount, Starts} = fts2_search_pair_verify(
+        Verify, FirstCount, FirstEncoded, SecondCount, SecondEncoded,
+        NeedPositions
+    ),
+    {NextLow, NextAcc} = case MatchCount of
+        0 ->
+            {Low, Acc};
+        _ ->
+            case fts2_search_plane_find_chunk(Entries, ChunkId, Low, High) of
+                {Index, GroupId, SourceId, Length} ->
+                    {Index + 1,
+                        [{ChunkId, GroupId, SourceId, Length, FirstCount,
+                            SecondCount, MatchCount, Starts} | Acc]};
+                not_found ->
+                    erlang:error({invalid_fts2_plane_alignment, ChunkId})
+            end
+    end,
+    fts2_search_pair_seek_second(
+        FirstRest, SecondRest, Entries, High, NextLow, Verify, NeedPositions,
+        NextAcc
+    ).
+
+%% Verified chunks arrive in plane order, so the entry-plane search never
+%% rewinds: each lookup starts after the previous verified row.
+fts2_search_plane_find_chunk(_Entries, _ChunkId, Low, High) when Low >= High ->
+    not_found;
+fts2_search_plane_find_chunk(Entries, ChunkId, Low, High) ->
+    Mid = (Low + High) bsr 1,
+    <<Found:32/unsigned-big, GroupId:32/unsigned-big, SourceId:64/unsigned-big,
+        Length:32/unsigned-big>> = binary:part(Entries, Mid * 28, 20),
+    case Found of
+        ChunkId ->
+            {Mid, GroupId, SourceId, Length};
+        _ when Found < ChunkId ->
+            fts2_search_plane_find_chunk(Entries, ChunkId, Mid + 1, High);
+        _ ->
+            fts2_search_plane_find_chunk(Entries, ChunkId, Low, Mid)
+    end.
+
+fts2_search_pair_verify(
+    phrase, FirstCount, FirstEncoded, SecondCount, SecondEncoded,
+    NeedPositions
+) when FirstCount > 0, SecondCount > 0 ->
+    {First, FirstRest} = fts2_codec_decode_varint(FirstEncoded, 0, 0),
+    {Second, SecondRest} = fts2_codec_decode_varint(SecondEncoded, 0, 0),
+    fts2_search_stream_phrase(
+        FirstCount - 1, FirstRest, First, SecondCount - 1, SecondRest, Second,
+        NeedPositions, 0, []
+    );
+fts2_search_pair_verify(
+    {near, Distance}, FirstCount, FirstEncoded, SecondCount, SecondEncoded,
+    NeedPositions
+) when FirstCount > 0, SecondCount > 0 ->
+    {First, FirstRest} = fts2_codec_decode_varint(FirstEncoded, 0, 0),
+    {Second, SecondRest} = fts2_codec_decode_varint(SecondEncoded, 0, 0),
+    fts2_search_stream_near(
+        FirstCount - 1, FirstRest, First, SecondCount - 1, SecondRest, Second,
+        Distance, NeedPositions, 0, []
+    );
+fts2_search_pair_verify(_Verify, _FirstCount, _FirstEncoded, _SecondCount,
+        _SecondEncoded, _NeedPositions) ->
+    {0, []}.
+
+%% A phrase match is a first position immediately before a second position.
+%% Both cursors advance in position order; neither payload is decoded past the
+%% point where the other is exhausted.
+fts2_search_stream_phrase(
+    FirstCount, FirstEncoded, First, SecondCount, SecondEncoded, Second,
+    NeedPositions, Count, Acc
+) ->
+    case (First + 1) - Second of
+        Difference when Difference < 0, FirstCount > 0 ->
+            {Delta, Rest} = fts2_codec_decode_varint(FirstEncoded, 0, 0),
+            fts2_search_stream_phrase(
+                FirstCount - 1, Rest, First + Delta, SecondCount,
+                SecondEncoded, Second, NeedPositions, Count, Acc
+            );
+        Difference when Difference > 0, SecondCount > 0 ->
+            {Delta, Rest} = fts2_codec_decode_varint(SecondEncoded, 0, 0),
+            fts2_search_stream_phrase(
+                FirstCount, FirstEncoded, First, SecondCount - 1, Rest,
+                Second + Delta, NeedPositions, Count, Acc
+            );
+        0 when FirstCount > 0, SecondCount > 0 ->
+            {FirstDelta, FirstRest} = fts2_codec_decode_varint(FirstEncoded, 0, 0),
+            {SecondDelta, SecondRest} = fts2_codec_decode_varint(SecondEncoded, 0, 0),
+            fts2_search_stream_phrase(
+                FirstCount - 1, FirstRest, First + FirstDelta,
+                SecondCount - 1, SecondRest, Second + SecondDelta,
+                NeedPositions, Count + 1,
+                fts2_search_stream_collect(NeedPositions, First, Acc)
+            );
+        0 ->
+            {Count + 1, lists:reverse(
+                fts2_search_stream_collect(NeedPositions, First, Acc)
+            )};
+        _Exhausted ->
+            {Count, lists:reverse(Acc)}
+    end.
+
+%% A NEAR match is a first position with a second position no more than
+%% Distance token gaps away on either side. The second cursor is monotonic:
+%% once a second position is behind the window it can never re-enter it.
+fts2_search_stream_near(
+    FirstCount, FirstEncoded, First, SecondCount, SecondEncoded, Second,
+    Distance, NeedPositions, Count, Acc
+) ->
+    case Second < First - Distance - 1 of
+        true when SecondCount > 0 ->
+            {Delta, Rest} = fts2_codec_decode_varint(SecondEncoded, 0, 0),
+            fts2_search_stream_near(
+                FirstCount, FirstEncoded, First, SecondCount - 1, Rest,
+                Second + Delta, Distance, NeedPositions, Count, Acc
+            );
+        true ->
+            {Count, lists:reverse(Acc)};
+        false ->
+            {NextCount, NextAcc} = case Second =< First + Distance + 1 of
+                true ->
+                    {Count + 1,
+                        fts2_search_stream_collect(NeedPositions, First, Acc)};
+                false ->
+                    {Count, Acc}
+            end,
+            case FirstCount of
+                0 ->
+                    {NextCount, lists:reverse(NextAcc)};
+                _ ->
+                    {Delta, Rest} = fts2_codec_decode_varint(FirstEncoded, 0, 0),
+                    fts2_search_stream_near(
+                        FirstCount - 1, Rest, First + Delta, SecondCount,
+                        SecondEncoded, Second, Distance, NeedPositions,
+                        NextCount, NextAcc
+                    )
+            end
+    end.
+
+fts2_search_stream_collect(true, Position, Acc) -> [Position | Acc];
+fts2_search_stream_collect(false, _Position, Acc) -> Acc.
+
+%% Generations written before chunk-ordered position rows cannot be merged
+%% cursor against cursor, so the candidates come from the entry planes and the
+%% wanted payloads are selected in one pass per term. Verification is the same
+%% streaming walk: even here no position list is materialised.
+fts2_search_pair_legacy(
+    FirstEntries, FirstHeader, FirstPosition, First,
+    SecondEntries, SecondHeader, SecondPosition, Second,
+    Verify, NeedPositions
+) ->
+    Pairs = fts2_search_pair_legacy_entries(FirstEntries, SecondEntries, []),
+    ChunkIds = [element(1, Pair) || Pair <- Pairs],
+    FirstPayloads = fts2_search_header_position_payloads(
+        FirstHeader, FirstPosition, ChunkIds, First
+    ),
+    SecondPayloads = fts2_search_header_position_payloads(
+        SecondHeader, SecondPosition, ChunkIds, Second
+    ),
+    [
+        {ChunkId, GroupId, SourceId, Length, FirstTf, SecondTf, MatchCount,
+            Starts}
+     || {ChunkId, GroupId, SourceId, Length, FirstTf, SecondTf} <- Pairs,
+        {FirstCount, FirstEncoded} <- [
+            maps:get(ChunkId, FirstPayloads, {0, <<>>})
+        ],
+        {SecondCount, SecondEncoded} <- [
+            maps:get(ChunkId, SecondPayloads, {0, <<>>})
+        ],
+        {MatchCount, Starts} <- [
+            fts2_search_pair_verify(
+                Verify, FirstCount, FirstEncoded, SecondCount, SecondEncoded,
+                NeedPositions
+            )
+        ],
+        MatchCount > 0
+    ].
+
+fts2_search_header_position_payloads(Header, _External, ChunkIds, _Token) when
+    is_map_key(positions_packed, Header)
+->
+    fts2_codec_select_position_payloads(
+        fts2_codec_decode_header_tail(maps:get(positions_packed, Header)),
+        ChunkIds
+    );
+fts2_search_header_position_payloads(_Header, {ok, Value}, ChunkIds, _Token) ->
+    fts2_codec_select_position_payloads(Value, ChunkIds);
+fts2_search_header_position_payloads(_Header, Bad, _ChunkIds, Token) ->
+    erlang:error({invalid_fts2_position_row, Token, Bad}).
+
+%% Entry planes are chunk ordered in every generation, so the candidate walk
+%% uses the same allocation-free skip runs as the chunk-ordered merge.
+fts2_search_pair_legacy_entries(<<>>, _SecondEntries, Acc) ->
+    lists:reverse(Acc);
+fts2_search_pair_legacy_entries(
+    <<FirstChunk:32/unsigned-big, _/binary>> = FirstEntries, SecondEntries, Acc
+) ->
+    case fts2_search_entry_advance(SecondEntries, FirstChunk) of
+        done ->
+            lists:reverse(Acc);
+        {FirstChunk, Matched} ->
+            fts2_search_pair_legacy_row(FirstEntries, Matched, Acc);
+        {SecondChunk, Ahead} ->
+            case fts2_search_entry_advance(FirstEntries, SecondChunk) of
+                done ->
+                    lists:reverse(Acc);
+                {SecondChunk, Caught} ->
+                    fts2_search_pair_legacy_row(Caught, Ahead, Acc);
+                {_FirstChunk, Advanced} ->
+                    fts2_search_pair_legacy_entries(Advanced, Ahead, Acc)
+            end
+    end.
+
+fts2_search_pair_legacy_row(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, Length:32/unsigned-big,
+        FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
+        FirstRest/binary>>,
+    <<_SecondChunk:32/unsigned-big, _SecondGroup:32/unsigned-big,
+        _SecondSource:64/unsigned-big, _SecondLength:32/unsigned-big,
+        SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
+        SecondRest/binary>>,
+    Acc
+) ->
+    fts2_search_pair_legacy_entries(
+        FirstRest, SecondRest,
+        [{ChunkId, GroupId, SourceId, Length, FirstTf, SecondTf} | Acc]
+    ).
+
+fts2_search_entry_advance(
+    <<ChunkId:32/unsigned-big, _:24/binary, Rest/binary>>, Target
+) when ChunkId < Target ->
+    fts2_search_entry_advance(Rest, Target);
+fts2_search_entry_advance(
+    <<ChunkId:32/unsigned-big, _/binary>> = Entries, _Target
+) ->
+    {ChunkId, Entries};
+fts2_search_entry_advance(<<>>, _Target) ->
+    done.
 
 fts2_search_header_position_plane(Header, _External, _Token) when
     is_map_key(positions_packed, Header)
@@ -9838,199 +11003,6 @@ fts2_search_header_position_plane(_Header, {ok, Value}, _Token) ->
     Value;
 fts2_search_header_position_plane(_Header, Bad, Token) ->
     erlang:error({invalid_fts2_position_row, Token, Bad}).
-
-%% Boolean and position rows have the same posting order. Merge both term
-%% pairs in one pass, decoding positions only for chunks present in both.
-fts2_search_positional_pair_rows(
-    FirstPlane,
-    <<?POSITION_VERSION:8, _FirstCount:32/unsigned-big,
-        FirstPositions/binary>>,
-    First,
-    FirstDf,
-    SecondPlane,
-    <<?POSITION_VERSION:8, _SecondCount:32/unsigned-big,
-        SecondPositions/binary>>,
-    Second,
-    SecondDf,
-    Column,
-    Acc
-) ->
-    fts2_search_positional_pair_rows_raw(
-        FirstPlane, FirstPositions, First, FirstDf,
-        SecondPlane, SecondPositions, Second, SecondDf,
-        Column, Acc
-    ).
-
-fts2_search_positional_pair_rows_raw(
-    <<>>, _FirstPositions, _First, _FirstDf,
-    _SecondPlane, _SecondPositions, _Second, _SecondDf, _Column, Acc
-) ->
-    lists:reverse(Acc);
-fts2_search_positional_pair_rows_raw(
-    _FirstPlane, _FirstPositions, _First, _FirstDf,
-    <<>>, _SecondPositions, _Second, _SecondDf, _Column, Acc
-) ->
-    lists:reverse(Acc);
-fts2_search_positional_pair_rows_raw(
-    <<FirstChunk:32/unsigned-big, FirstGroup:32/unsigned-big,
-        FirstSource:64/unsigned-big, FirstLength:32/unsigned-big,
-        FirstTf:32/unsigned-big, FirstDense:32/unsigned-big,
-        FirstRest/binary>> = FirstPlane,
-    <<FirstChunk:32/unsigned-big, FirstPositionCount:32/unsigned-big,
-        FirstBytes:32/unsigned-big, FirstEncoded:FirstBytes/binary,
-        FirstPositionRest/binary>> = FirstPositions,
-    First,
-    FirstDf,
-    <<SecondChunk:32/unsigned-big, SecondGroup:32/unsigned-big,
-        SecondSource:64/unsigned-big, SecondLength:32/unsigned-big,
-        SecondTf:32/unsigned-big, SecondDense:32/unsigned-big,
-        SecondRest/binary>> = SecondPlane,
-    <<SecondChunk:32/unsigned-big, SecondPositionCount:32/unsigned-big,
-        SecondBytes:32/unsigned-big, SecondEncoded:SecondBytes/binary,
-        SecondPositionRest/binary>> = SecondPositions,
-    Second,
-    SecondDf,
-    Column,
-    Acc
-) ->
-    case FirstChunk - SecondChunk of
-        Difference when Difference < 0 ->
-            fts2_search_positional_pair_rows_raw(
-                FirstRest, FirstPositionRest, First, FirstDf,
-                SecondPlane, SecondPositions, Second, SecondDf,
-                Column, Acc
-            );
-        Difference when Difference > 0 ->
-            fts2_search_positional_pair_rows_raw(
-                FirstPlane, FirstPositions, First, FirstDf,
-                SecondRest, SecondPositionRest, Second, SecondDf,
-                Column, Acc
-            );
-        0 ->
-            true = {FirstGroup, FirstSource, FirstLength, FirstDense} =:=
-                {SecondGroup, SecondSource, SecondLength, SecondDense},
-            Row = {
-                FirstChunk,
-                FirstGroup,
-                FirstSource,
-                FirstLength,
-                [
-                    {{Column, First}, FirstTf, base, FirstDf},
-                    {{Column, Second}, SecondTf, base, SecondDf}
-                ],
-                FirstTf + SecondTf
-            },
-            FirstDecoded = fts2_codec_decode_position_list(
-                FirstPositionCount, FirstEncoded, 0, []
-            ),
-            SecondDecoded = fts2_codec_decode_position_list(
-                SecondPositionCount, SecondEncoded, 0, []
-            ),
-            fts2_search_positional_pair_rows_raw(
-                FirstRest, FirstPositionRest, First, FirstDf,
-                SecondRest, SecondPositionRest, Second, SecondDf,
-                Column, [{Row, FirstDecoded, SecondDecoded} | Acc]
-            )
-    end.
-
-%% Legacy helper retained for the older inline-position test surface.
-fts2_search_positional_intersect(
-    <<>>, _Column, _First, _FirstDf, _SecondPlane, _Second, _SecondDf, Acc
-) ->
-    lists:reverse(Acc);
-fts2_search_positional_intersect(
-    _FirstPlane, _Column, _First, _FirstDf, <<>>, _Second, _SecondDf, Acc
-) ->
-    lists:reverse(Acc);
-fts2_search_positional_intersect(
-    <<FirstChunk:32/unsigned-big, _FirstGroup:32/unsigned-big,
-        _FirstSource:64/unsigned-big, _FirstLength:32/unsigned-big,
-        _FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
-        FirstRest/binary>>,
-    Column,
-    First,
-    FirstDf,
-    <<SecondChunk:32/unsigned-big, _SecondGroup:32/unsigned-big,
-        _SecondSource:64/unsigned-big, _SecondLength:32/unsigned-big,
-        _SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
-        _SecondRest/binary>> = SecondPlane,
-    Second,
-    SecondDf,
-    Acc
-) when FirstChunk < SecondChunk ->
-    fts2_search_positional_intersect(
-        FirstRest,
-        Column,
-        First,
-        FirstDf,
-        SecondPlane,
-        Second,
-        SecondDf,
-        Acc
-    );
-fts2_search_positional_intersect(
-    <<FirstChunk:32/unsigned-big, _FirstGroup:32/unsigned-big,
-        _FirstSource:64/unsigned-big, _FirstLength:32/unsigned-big,
-        _FirstTf:32/unsigned-big, _FirstDense:32/unsigned-big,
-        _FirstRest/binary>> = FirstPlane,
-    Column,
-    First,
-    FirstDf,
-    <<SecondChunk:32/unsigned-big, _SecondGroup:32/unsigned-big,
-        _SecondSource:64/unsigned-big, _SecondLength:32/unsigned-big,
-        _SecondTf:32/unsigned-big, _SecondDense:32/unsigned-big,
-        SecondRest/binary>>,
-    Second,
-    SecondDf,
-    Acc
-) when SecondChunk < FirstChunk ->
-    fts2_search_positional_intersect(
-        FirstPlane,
-        Column,
-        First,
-        FirstDf,
-        SecondRest,
-        Second,
-        SecondDf,
-        Acc
-    );
-fts2_search_positional_intersect(
-    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
-        SourceId:64/unsigned-big, Length:32/unsigned-big,
-        FirstTf:32/unsigned-big, DenseId:32/unsigned-big,
-        FirstRest/binary>>,
-    Column,
-    First,
-    FirstDf,
-    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
-        SourceId:64/unsigned-big, Length:32/unsigned-big,
-        SecondTf:32/unsigned-big, DenseId:32/unsigned-big,
-        SecondRest/binary>>,
-    Second,
-    SecondDf,
-    Acc
-) ->
-    Row = {
-        ChunkId,
-        GroupId,
-        SourceId,
-        Length,
-        [
-            {{Column, First}, FirstTf, base, FirstDf},
-            {{Column, Second}, SecondTf, base, SecondDf}
-        ],
-        FirstTf + SecondTf
-    },
-    fts2_search_positional_intersect(
-        FirstRest,
-        Column,
-        First,
-        FirstDf,
-        SecondRest,
-        Second,
-        SecondDf,
-        [Row | Acc]
-    ).
 
 fts2_search_header_entry_plane(Header, _External, _Token) when
     is_map_key(entries_packed, Header)
@@ -10067,53 +11039,16 @@ fts2_search_fast_near(
         Window =< 256
     } of
         {[Column], bm25, nil, true} ->
-            case fts2_search_read_positional_pair(
-                Bookie, Schema, Root, Column, First, Second
+            NeedPositions = maps:get(return_positions, Opts, false),
+            case fts2_search_positional_pair(
+                Bookie, Schema, Root, Column, First, Second,
+                {near, Distance}, NeedPositions
             ) of
-                {FirstHeader, SecondHeader, Rows0} ->
-                    FirstDf = maps:get(chunk_df, FirstHeader),
-                    SecondDf = maps:get(chunk_df, SecondHeader),
-                    Rows = [
-                        {Row, Starts}
-                     || {Row, FirstPositions, SecondPositions} <- Rows0,
-                        Starts <- [fts2_search_near_term_positions(
-                            FirstPositions, SecondPositions, Distance, []
-                        )],
-                        Starts =/= []
-                    ],
-                    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
-                    Avg = maps:get(total_length, Root, 0) / DocCount,
-                    FirstIdf = fts2_build_bm25_idf(DocCount, FirstDf),
-                    SecondIdf = fts2_build_bm25_idf(DocCount, SecondDf),
-                    Scored = [
-                        begin
-                            [{{_, First}, FirstTf, base, FirstDf},
-                                {{_, Second}, SecondTf, base, SecondDf}] =
-                                    Stats,
-                            #fts2_match{
-                                chunk_id = ChunkId,
-                                group_id = GroupId,
-                                source_id = SourceId,
-                                doc_length = Length,
-                                tf = TotalTf,
-                                term_stats = Stats,
-                                terms = [First, Second],
-                                match_positions = [{near, Starts}],
-                                match_count = length(Starts),
-                                score =
-                                    fts2_search_bm25(
-                                        FirstTf, FirstIdf, Avg, Length
-                                    ) +
-                                    fts2_search_bm25(
-                                        SecondTf, SecondIdf, Avg, Length
-                                    )
-                            }
-                        end
-                     || {{ChunkId, GroupId, SourceId, Length, Stats, TotalTf},
-                            Starts} <- Rows
-                    ],
-                    Grouped = fts2_search_collapse_scored_groups(Scored, true),
-                    {ranked_champions, Grouped, length(Grouped)};
+                {FirstHeader, SecondHeader, Rows} ->
+                    fts2_search_rank_positional_groups(
+                        Bookie, Schema, Root, Column, First, Second,
+                        FirstHeader, SecondHeader, Rows, near
+                    );
                 not_found ->
                     {ranked_champions, [], 0}
             end;
@@ -10322,8 +11257,40 @@ fts2_search_plane_find_dense(Plane, DenseId, Low, High) ->
             fts2_search_plane_find_dense(Plane, DenseId, Low, Mid)
     end.
 
+%% Champion lists are stored in descending impact order.  Keep the requested
+%% window and its complete boundary tie before any match record is built.
+fts2_search_impact_window(Entries, Window, ScoreFun) when Window >= 1 ->
+    fts2_search_impact_window(Entries, Window, ScoreFun, 0.0, []);
+fts2_search_impact_window(Entries, _Window, _ScoreFun) ->
+    Entries.
+
+fts2_search_impact_window([], _Window, _ScoreFun, _Boundary, Acc) ->
+    lists:reverse(Acc);
+fts2_search_impact_window([Entry | Rest], Window, ScoreFun, Boundary, Acc) ->
+    Score = ScoreFun(Entry),
+    if
+        Window > 0 ->
+            fts2_search_impact_window(
+                Rest, Window - 1, ScoreFun, Score, [Entry | Acc]
+            );
+        Score >= Boundary ->
+            fts2_search_impact_window(
+                Rest, 0, ScoreFun, Boundary, [Entry | Acc]
+            );
+        true ->
+            lists:reverse(Acc)
+    end.
+
+fts2_search_term_impact(Df, Root) ->
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
+    Avg = maps:get(total_length, Root, 0) / DocCount,
+    Idf = fts2_build_bm25_idf(DocCount, Df),
+    fun({_ChunkId, _GroupId, _SourceId, Length, Tf, _GroupTf}) ->
+        fts2_search_bm25(Tf, Idf, Avg, Length)
+    end.
+
 fts2_search_ranked_champions(Entries, Column, Token, Df, PositionMap, Root) ->
-    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    DocCount = erlang:max(maps:get(group_count, Root), 1),
     Avg = maps:get(total_length, Root, 0) / DocCount,
     Idf = fts2_build_bm25_idf(DocCount, Df),
     Term = {Column, Token},
@@ -10338,24 +11305,33 @@ fts2_search_ranked_champions(Entries, Column, Token, Df, PositionMap, Root) ->
             terms = [Token],
             columns = [{Term, Positions}],
             match_positions = [{Token, Positions}],
+            group_match_count = GroupTf,
             score = fts2_search_bm25(Tf, Idf, Avg, Length)
         }
-     || {ChunkId, GroupId, SourceId, Length, Tf} <- Entries,
+     || {ChunkId, GroupId, SourceId, Length, Tf, GroupTf} <- Entries,
         Positions <- [maps:get(ChunkId, PositionMap, [])]
     ].
 
 fts2_search_merge_champion_match(
-    #fts2_match{chunk_id = ChunkId} = Match, Acc
+    #fts2_match{group_id = GroupId} = Match, Acc
 ) ->
-    case maps:find(ChunkId, Acc) of
+    case maps:find(GroupId, Acc) of
         error ->
-            Acc#{ChunkId => Match};
+            Acc#{GroupId => Match};
         {ok, Existing} ->
-            Acc#{ChunkId => Existing#fts2_match{
+            Base = case Match#fts2_match.chunk_id <
+                Existing#fts2_match.chunk_id of
+                true -> Match;
+                false -> Existing
+            end,
+            Acc#{GroupId => Base#fts2_match{
                 tf = Existing#fts2_match.tf + Match#fts2_match.tf,
                 term_stats = Existing#fts2_match.term_stats ++
                     Match#fts2_match.term_stats,
                 terms = Existing#fts2_match.terms ++ Match#fts2_match.terms,
+                group_match_count =
+                    fts2_search_group_match_count(Existing) +
+                        fts2_search_group_match_count(Match),
                 score = Existing#fts2_match.score + Match#fts2_match.score
             }}
     end.
@@ -10454,19 +11430,19 @@ fts2_search_enrich_base_groups(Bookie, Schema, Root, Matches) ->
         Matches
     ).
 
-fts2_search_score_root(undefined, Deltas) ->
+fts2_search_score_root(undefined, Deltas, Schema) ->
     Live = fts2_delta_live_documents(Deltas),
     #{
         chunk_count => map_size(Live),
-        group_count => map_size(Live),
+        group_count => map_size(fts2_delta_document_groups(Live, Schema)),
         total_length => lists:sum([
             maps:get(doc_length, Document)
          || Document <- maps:values(Live)
         ])
     };
-fts2_search_score_root(Root, []) ->
+fts2_search_score_root(Root, [], _Schema) ->
     Root;
-fts2_search_score_root(Root, Deltas) ->
+fts2_search_score_root(Root, Deltas, _Schema) ->
     Live = fts2_delta_live_documents(Deltas),
     Removed = [
         Delta
@@ -10554,6 +11530,353 @@ fts2_search_eval(Bookie, Schema, Root, {'not', A, B}, NeedPositions, Wanted) ->
     Positive = fts2_search_eval(Bookie, Schema, Root, A, NeedPositions, Wanted),
     Negative = fts2_search_eval(Bookie, Schema, Root, B, false, Wanted),
     maps:without(maps:keys(Negative), Positive).
+
+%% Grouped evaluation is deliberately keyed by logical group from its first
+%% term read.  Boolean AND/OR/NOT therefore operates at the same grain as a
+%% document engine even when different chunks satisfy different clauses.
+fts2_search_eval_grouped(
+    _Bookie, _Schema, _Root, {empty}, _NeedPositions, _Wanted
+) ->
+    #{};
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {all_docs}, _NeedPositions, Wanted
+) ->
+    fts2_search_group_chunk_matches(
+        Bookie, Schema, Root,
+        fts2_search_all_chunks(Bookie, Schema, Root, Wanted)
+    );
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {term, Token, Prefix, Columns}, NeedPositions, Wanted
+) ->
+    Groups = fts2_search_read_group_term(
+        Bookie, Schema, Root, Token, Prefix, Columns, Wanted
+    ),
+    case NeedPositions of
+        false -> Groups;
+        true -> fts2_search_attach_group_term_positions(
+            Groups,
+            fts2_search_read_term(
+                Bookie, Schema, Root, Token, Prefix, Columns, true, Wanted
+            )
+        )
+    end;
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {phrase, Specs, Columns}, _NeedPositions, Wanted
+) ->
+    Groups = fts2_search_group_chunk_matches(
+        Bookie, Schema, Root,
+        fts2_search_eval_phrase(Bookie, Schema, Root, Specs, Columns, Wanted)
+    ),
+    fts2_search_enrich_group_score_terms(
+        Bookie, Schema, Root,
+        [{term, Token, Prefix, Columns}
+         || {Token, Prefix, _Offset} <- Specs],
+        Wanted, Groups
+    );
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {near, Items, Distance, Columns}, _NeedPositions, Wanted
+) ->
+    Groups = fts2_search_group_chunk_matches(
+        Bookie, Schema, Root,
+        fts2_search_eval_near(
+            Bookie, Schema, Root, Items, Distance, Columns, Wanted
+        )
+    ),
+    fts2_search_enrich_group_score_terms(
+        Bookie, Schema, Root,
+        fts2_search_group_score_specs(Items, Columns),
+        Wanted, Groups
+    );
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {anchor, Child}, NeedPositions, Wanted
+) ->
+    fts2_search_group_chunk_matches(
+        Bookie, Schema, Root,
+        fts2_search_eval(
+            Bookie, Schema, Root, {anchor, Child}, NeedPositions, Wanted
+        )
+    );
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {'and', A, B}, NeedPositions, Wanted
+) ->
+    fts2_search_intersect(
+        fts2_search_eval_grouped(
+            Bookie, Schema, Root, A, NeedPositions, Wanted
+        ),
+        fts2_search_eval_grouped(
+            Bookie, Schema, Root, B, NeedPositions, Wanted
+        )
+    );
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {'or', A, B}, NeedPositions, Wanted
+) ->
+    fts2_search_union(
+        fts2_search_eval_grouped(
+            Bookie, Schema, Root, A, NeedPositions, Wanted
+        ),
+        fts2_search_eval_grouped(
+            Bookie, Schema, Root, B, NeedPositions, Wanted
+        )
+    );
+fts2_search_eval_grouped(
+    Bookie, Schema, Root, {'not', A, B}, NeedPositions, Wanted
+) ->
+    Positive = fts2_search_eval_grouped(
+        Bookie, Schema, Root, A, NeedPositions, Wanted
+    ),
+    Negative = fts2_search_eval_grouped(
+        Bookie, Schema, Root, B, false, Wanted
+    ),
+    maps:without(maps:keys(Negative), Positive).
+
+fts2_search_read_group_term(
+    Bookie, Schema, Root, Token, false, Columns, Wanted
+) ->
+    lists:foldl(
+        fun(Column, Acc) ->
+            fts2_search_merge_group_term_row(
+                Bookie, Schema, Root, Column, Token, Wanted, Acc
+            )
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    );
+fts2_search_read_group_term(
+    Bookie, #{index := Bucket} = Schema, Root, Prefix, true, Columns, Wanted
+) ->
+    Generation = maps:get(generation, Root),
+    lists:foldl(
+        fun(Column, ColumnAcc) ->
+            Headers = fts2_search_prefix_headers(
+                Bookie, Bucket, Generation, Column, Prefix,
+                fun fts2_codec_decode_header_metadata/1
+            ),
+            Requests = [
+                {fts2_codec_term_plane_key(Key, boolean), <<"g">>}
+             || {Key, _Token, _Header} <- Headers
+            ],
+            Values = case Requests of
+                [] -> [];
+                _ -> leveled_fts_residency:headonly_many(
+                    Bookie, Bucket, Requests
+                )
+            end,
+            lists:foldl(
+                fun({{_Key, Token, Header}, Value}, Acc) ->
+                    Entries = case Value of
+                        {ok, Encoded} -> fts2_codec_decode_plane(Encoded);
+                        Bad -> erlang:error({
+                            invalid_fts2_group_plane, Token, Bad
+                        })
+                    end,
+                    fts2_search_add_group_entries(
+                        Entries, Column, Token,
+                        maps:get(group_df, Header), Wanted, Acc
+                    )
+                end,
+                ColumnAcc,
+                lists:zip(Headers, Values)
+            )
+        end,
+        #{},
+        fts2_search_selector_ids(Columns, Schema)
+    ).
+
+fts2_search_merge_group_term_row(
+    Bookie, #{index := Bucket}, Root, Column, Token, Wanted, Acc
+) ->
+    {Key, _} = fts2_codec_term_key(
+        maps:get(generation, Root), Column, Token
+    ),
+    GroupKey = fts2_codec_term_plane_key(Key, boolean),
+    case leveled_fts_residency:headonly_many(
+        Bookie, Bucket, [{Key, <<"h">>}, {GroupKey, <<"g">>}]
+    ) of
+        [not_found, not_found] ->
+            Acc;
+        [{ok, HeaderValue}, {ok, GroupValue}] ->
+            Header = fts2_codec_decode_header_metadata(HeaderValue),
+            fts2_search_add_group_entries(
+                fts2_codec_decode_plane(GroupValue), Column, Token,
+                maps:get(group_df, Header), Wanted, Acc
+            );
+        Bad ->
+            erlang:error({invalid_fts2_group_rows, Token, Bad})
+    end.
+
+fts2_search_add_group_entries(
+    Entries, Column, Token, Df, Wanted, Acc
+) ->
+    lists:foldl(
+        fun({ChunkId, GroupId, SourceId, GroupLength, GroupTf, _DenseId}, Inner) ->
+            case fts2_search_wanted(SourceId, Wanted) of
+                false ->
+                    Inner;
+                true ->
+                    Term = {Column, Token},
+                    Meta = #fts2_match{
+                        chunk_id = ChunkId,
+                        group_id = GroupId,
+                        source_id = SourceId,
+                        doc_length = GroupLength,
+                        tf = GroupTf,
+                        term_stats = [{Term, GroupTf, base, Df}],
+                        terms = [Token],
+                        columns = [{Term, []}],
+                        match_positions = [{Token, []}],
+                        group_match_count = GroupTf
+                    },
+                    case maps:find(GroupId, Inner) of
+                        error -> Inner#{GroupId => Meta};
+                        {ok, Existing} -> Inner#{
+                            GroupId => fts2_search_merge_meta(Existing, Meta)
+                        }
+                    end
+            end
+        end,
+        Acc,
+        Entries
+    ).
+
+fts2_search_attach_group_term_positions(Groups, ChunkMatches) ->
+    PositionsByGroup = maps:fold(
+        fun(_ChunkId, Meta, Acc) ->
+            GroupId = Meta#fts2_match.group_id,
+            Existing = maps:get(GroupId, Acc, #{}),
+            PositionMap = lists:foldl(
+                fun({Term, Positions}, Inner) ->
+                    Inner#{Term => maps:get(Term, Inner, []) ++ Positions}
+                end,
+                Existing,
+                Meta#fts2_match.columns
+            ),
+            Acc#{GroupId => PositionMap}
+        end,
+        #{},
+        ChunkMatches
+    ),
+    maps:map(
+        fun(GroupId, Meta) ->
+            PositionMap = maps:get(GroupId, PositionsByGroup, #{}),
+            Columns = [
+                {Term, maps:get(Term, PositionMap, [])}
+             || {Term, _Positions} <- Meta#fts2_match.columns
+            ],
+            MatchPositions = [
+                {Token, lists:append([
+                    Positions
+                 || {{_Column, PositionToken}, Positions} <-
+                        maps:to_list(PositionMap),
+                    PositionToken =:= Token
+                ])}
+             || Token <- Meta#fts2_match.terms
+            ],
+            Meta#fts2_match{
+                columns = Columns,
+                match_positions = MatchPositions
+            }
+        end,
+        Groups
+    ).
+
+fts2_search_group_score_specs(Items, DefaultColumns) ->
+    lists:append([
+        fts2_search_group_score_spec(Item, DefaultColumns)
+     || Item <- Items
+    ]).
+
+fts2_search_group_score_spec(
+    {term, Token, Prefix, Columns}, _DefaultColumns
+) ->
+    [{term, Token, Prefix, Columns}];
+fts2_search_group_score_spec(
+    {phrase, Specs, Columns}, _DefaultColumns
+) ->
+    [{term, Token, Prefix, Columns}
+     || {Token, Prefix, _Offset} <- Specs];
+fts2_search_group_score_spec({anchor, Child}, DefaultColumns) ->
+    fts2_search_group_score_spec(Child, DefaultColumns);
+fts2_search_group_score_spec(
+    {Op, A, B}, DefaultColumns
+) when Op =:= 'and'; Op =:= 'or'; Op =:= 'not' ->
+    fts2_search_group_score_spec(A, DefaultColumns) ++
+        fts2_search_group_score_spec(B, DefaultColumns);
+fts2_search_group_score_spec(
+    {near, Nested, _Distance, Columns}, _DefaultColumns
+) ->
+    fts2_search_group_score_specs(Nested, Columns);
+fts2_search_group_score_spec(_Other, _DefaultColumns) ->
+    [].
+
+fts2_search_enrich_group_score_terms(
+    _Bookie, _Schema, _Root, [], _Wanted, Groups
+) ->
+    Groups;
+fts2_search_enrich_group_score_terms(
+    Bookie, Schema, Root, Specs0, Wanted, Groups
+) ->
+    Specs = lists:usort(Specs0),
+    TermMaps = [
+        fts2_search_read_group_term(
+            Bookie, Schema, Root, Token, Prefix, Columns, Wanted
+        )
+     || {term, Token, Prefix, Columns} <- Specs
+    ],
+    maps:map(
+        fun(GroupId, MatchMeta) ->
+            Stats = [
+                maps:get(GroupId, TermMap)
+             || TermMap <- TermMaps,
+                maps:is_key(GroupId, TermMap)
+            ],
+            case Stats of
+                [] ->
+                    MatchMeta;
+                [First | Rest] ->
+                    ScoreMeta = lists:foldl(
+                        fun(Meta, Acc) ->
+                            fts2_search_merge_meta(Acc, Meta)
+                        end,
+                        First,
+                        Rest
+                    ),
+                    MatchMeta#fts2_match{
+                        doc_length = ScoreMeta#fts2_match.doc_length,
+                        tf = ScoreMeta#fts2_match.tf,
+                        term_stats = ScoreMeta#fts2_match.term_stats,
+                        terms = ScoreMeta#fts2_match.terms
+                    }
+            end
+        end,
+        Groups
+    ).
+
+fts2_search_group_chunk_matches(_Bookie, _Schema, undefined, Matches) ->
+    maps:from_list([
+        {Meta#fts2_match.source_id, Meta}
+     || Meta <- fts2_search_collapse_scored_groups(
+            maps:values(Matches), false
+        )
+    ]);
+fts2_search_group_chunk_matches(Bookie, Schema, Root, Matches) ->
+    Collapsed = fts2_search_collapse_scored_groups(
+        maps:values(Matches), false
+    ),
+    GroupIds = [Meta#fts2_match.group_id || Meta <- Collapsed],
+    Identities = fts2_search_read_identities(
+        Bookie, Schema, Root, GroupIds
+    ),
+    maps:from_list([
+        begin
+            Group = maps:get(GroupId, Identities),
+            GroupLength = lists:sum([
+                maps:get(doc_length, Chunk, 0)
+             || Chunk <- maps:get(chunks, Group, [])
+            ]),
+            {GroupId, Meta#fts2_match{doc_length = GroupLength}}
+        end
+     || Meta = #fts2_match{group_id = GroupId} <- Collapsed
+    ]).
 
 fts2_search_read_anchor(
     Bookie, #{index := Bucket}, Root, Column, Token, Wanted, Acc
@@ -11142,6 +12465,14 @@ fts2_search_merge_meta(A, B) ->
             1, B#fts2_match.term_stats ++ A#fts2_match.term_stats
         ),
         tf = A#fts2_match.tf + B#fts2_match.tf,
+        group_match_count = case {
+            A#fts2_match.group_match_count,
+            B#fts2_match.group_match_count
+        } of
+            {undefined, undefined} -> undefined;
+            _ -> fts2_search_group_match_count(A) +
+                fts2_search_group_match_count(B)
+        end,
         match_positions = lists:ukeysort(
             1,
             B#fts2_match.match_positions ++ A#fts2_match.match_positions
@@ -11168,7 +12499,8 @@ fts2_search_collapse_scored_groups(Chunks, Ranked) ->
                             Acc;
                         true ->
                             CombinedCount =
-                                fts2_search_match_count(Existing) + fts2_search_match_count(Meta),
+                                fts2_search_group_match_count(Existing) +
+                                    fts2_search_group_match_count(Meta),
                             Winner = case fts2_search_better_chunk(Meta, Existing, Ranked) of
                                 true -> Meta;
                                 false -> Existing
@@ -11193,10 +12525,21 @@ fts2_search_better_chunk(A, B, false) ->
 fts2_search_match_count(#fts2_match{match_count = undefined, tf = Tf}) -> Tf;
 fts2_search_match_count(#fts2_match{match_count = Count}) -> Count.
 
+fts2_search_group_match_count(
+    #fts2_match{group_match_count = undefined} = Match
+) ->
+    fts2_search_match_count(Match);
+fts2_search_group_match_count(#fts2_match{group_match_count = Count}) ->
+    Count.
+
 fts2_search_score_matches(Matches, _Root, false) ->
     [Meta#fts2_match{score = 0.0} || Meta <- maps:values(Matches)];
 fts2_search_score_matches(Matches, Root, true) ->
-    DocCount = erlang:max(maps:get(chunk_count, Root), 1),
+    CountKey = case maps:get(scoring_grouping, Root, grouped) of
+        grouped -> group_count;
+        ungrouped -> chunk_count
+    end,
+    DocCount = erlang:max(maps:get(CountKey, Root), 1),
     Avg = maps:get(total_length, Root, 0) / DocCount,
     MatchValues = maps:values(Matches),
     Terms = lists:usort(
@@ -11218,7 +12561,7 @@ fts2_search_score_matches(Matches, Root, true) ->
              || {{_Source, PartTerm}, Df} <- Parts,
                 PartTerm =:= Term
             ]),
-            NHit = erlang:max(1, NHit0),
+            NHit = erlang:min(DocCount, erlang:max(1, NHit0)),
             Idf0 = math:log((DocCount - NHit + 0.5) / (NHit + 0.5)),
             {Term, erlang:max(Idf0, 1.0e-6)}
         end

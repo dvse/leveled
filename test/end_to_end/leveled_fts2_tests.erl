@@ -302,6 +302,274 @@ generation_and_identity_bookie() ->
 ranked_page_ties_use_candidate_order_test_() ->
     {timeout, 60, fun ranked_page_ties_use_candidate_order/0}.
 
+ranked_group_total_and_ungrouped_retrieval_test_() ->
+    {timeout, 60, fun ranked_group_total_and_ungrouped_retrieval/0}.
+
+ranked_group_document_bm25_test_() ->
+    {timeout, 60, fun ranked_group_document_bm25/0}.
+
+grouped_boolean_uses_document_candidates_test_() ->
+    {timeout, 60, fun grouped_boolean_uses_document_candidates/0}.
+
+grouped_prefix_uses_complete_group_planes_test_() ->
+    {timeout, 60, fun grouped_prefix_uses_complete_group_planes/0}.
+
+phrase_does_not_cross_chunk_boundary_test_() ->
+    {timeout, 60, fun phrase_does_not_cross_chunk_boundary/0}.
+
+hpmor_bounded_multichunk_subset_test_() ->
+    {timeout, 60, fun hpmor_bounded_multichunk_subset/0}.
+
+ranked_group_total_and_ungrouped_retrieval() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-group-total">>))#{
+            identity_bookie => Identity
+        },
+        Document = <<"one-logical-group">>,
+        Tenant = <<"tenant">>,
+        lists:foreach(
+            fun({Key, Tf}) ->
+                Body = iolist_to_binary([
+                    binary:copy(<<"alpha ">>, Tf),
+                    binary:copy(<<"filler ">>, 50 - Tf)
+                ]),
+                ok = seam_put(Main, Schema, Key, Document, Tenant, Body)
+            end,
+            [{<<"chunk-1">>, 5}, {<<"chunk-2">>, 40}, {<<"chunk-3">>, 7}]
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        BaseOpts = #{
+            columns => [content],
+            limit => 20,
+            rank => bm25,
+            resolve_hits => false,
+            return_count => true
+        },
+        #{count := 1, hits := [Grouped]} = search(
+            Main, Schema, <<"alpha">>, BaseOpts
+        ),
+        ?assertEqual(52, maps:get(match_count, Grouped)),
+        #{count := 3, hits := Ungrouped} = search(
+            Main,
+            Schema,
+            <<"alpha">>,
+            BaseOpts#{grouping => ungrouped}
+        ),
+        ?assertEqual(3, length(Ungrouped)),
+        ?assertEqual(
+            [5, 7, 40],
+            lists:sort([maps:get(match_count, Hit) || Hit <- Ungrouped])
+        )
+    end).
+
+ranked_group_document_bm25() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-group-document-bm25">>))#{
+            identity_bookie => Identity
+        },
+        Tenant = <<"tenant">>,
+        %% The first logical document has 50 long chunks.  Every local tf=2
+        %% posting loses to the short competitor under the legacy chunk-grain
+        %% formula, while document-grain BM25 ranks the summed tf=100 first.
+        lists:foreach(
+            fun(Index) ->
+                Key = <<"multi-", Index:16/unsigned-big>>,
+                Tf = 2,
+                Tokens = 1000,
+                Body = iolist_to_binary([
+                    binary:copy(<<"alpha ">>, Tf),
+                    binary:copy(<<"filler ">>, Tokens - Tf)
+                ]),
+                ok = seam_put(
+                    Main, Schema, Key, <<"multi">>, Tenant, Body
+                )
+            end,
+            lists:seq(1, 50)
+        ),
+        ok = seam_put(
+            Main,
+            Schema,
+            <<"short-1">>,
+            <<"short">>,
+            Tenant,
+            binary:copy(<<"alpha ">>, 10)
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        #{count := 2, hits := [First, Second]} = search(
+            Main,
+            Schema,
+            <<"alpha">>,
+            #{
+                columns => [content],
+                limit => 20,
+                rank => bm25,
+                resolve_hits => false,
+                return_count => true
+            }
+        ),
+        ?assertEqual(100, maps:get(match_count, First)),
+        ?assertEqual(10, maps:get(match_count, Second)),
+        GroupCount = 2,
+        AverageLength = (50000 + 10) / GroupCount,
+        Idf = erlang:max(
+            math:log((GroupCount - 2 + 0.5) / (2 + 0.5)),
+            1.0e-6
+        ),
+        Expected = Idf * (100 * 2.2) /
+            (100 + 1.2 * (0.25 + 0.75 * (50000 / AverageLength))),
+        ?assert(abs(maps:get(score, First) - Expected) < 1.0e-12)
+    end).
+
+grouped_boolean_uses_document_candidates() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-group-boolean">>))#{
+            identity_bookie => Identity
+        },
+        Tenant = <<"tenant">>,
+        ok = seam_put(
+            Main, Schema, <<"both-a">>, <<"both">>, Tenant, <<"alpha">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"both-b">>, <<"both">>, Tenant, <<"beta">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"alpha-only">>, <<"alpha-only">>, Tenant,
+            <<"alpha">>
+        ),
+        #{count := 1, hits := [DirtyAnd]} = search(
+            Main,
+            Schema,
+            <<"alpha AND beta">>,
+            #{
+                columns => [content], limit => 20, rank => bm25,
+                resolve_hits => false, return_count => true
+            }
+        ),
+        ?assertEqual(2, maps:get(match_count, DirtyAnd)),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        Opts = #{
+            columns => [content], limit => 20, rank => bm25,
+            resolve_hits => false, return_count => true
+        },
+        #{count := 1, hits := [AndHit]} = search(
+            Main, Schema, <<"alpha AND beta">>, Opts
+        ),
+        ?assertEqual(2, maps:get(match_count, AndHit)),
+        #{count := 2} = search(Main, Schema, <<"alpha OR beta">>, Opts),
+        #{count := 1, hits := [NotHit]} = search(
+            Main, Schema, <<"alpha NOT beta">>, Opts
+        ),
+        ?assertEqual(1, maps:get(match_count, NotHit))
+    end).
+
+grouped_prefix_uses_complete_group_planes() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-group-prefix">>))#{
+            identity_bookie => Identity
+        },
+        Tenant = <<"tenant">>,
+        ok = seam_put(
+            Main, Schema, <<"a-1">>, <<"a">>, Tenant,
+            <<"hermione hermione">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"a-2">>, <<"a">>, Tenant,
+            <<"hermit hermit hermit">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"a-3">>, <<"a">>, Tenant,
+            <<"hermitage hermitages">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"b-1">>, <<"b">>, Tenant, <<"hermitage">>
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        #{count := 2, hits := Hits} = search(
+            Main,
+            Schema,
+            <<"hermi*">>,
+            #{
+                columns => [content], limit => 20, rank => bm25,
+                resolve_hits => false, return_count => true
+            }
+        ),
+        ?assertEqual([1, 7], lists:sort([
+            maps:get(match_count, Hit) || Hit <- Hits
+        ]))
+    end).
+
+phrase_does_not_cross_chunk_boundary() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-phrase-boundary">>))#{
+            identity_bookie => Identity
+        },
+        Tenant = <<"tenant">>,
+        ok = seam_put(
+            Main, Schema, <<"cross-1">>, <<"cross">>, Tenant,
+            <<"filler alpha">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"cross-2">>, <<"cross">>, Tenant,
+            <<"beta filler">>
+        ),
+        ok = seam_put(
+            Main, Schema, <<"within-1">>, <<"within">>, Tenant,
+            <<"filler alpha beta filler">>
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        #{count := 1, hits := [Hit]} = search(
+            Main,
+            Schema,
+            <<"\"alpha beta\"">>,
+            #{
+                columns => [content], limit => 20, rank => bm25,
+                resolve_hits => false, return_count => true
+            }
+        ),
+        ?assertEqual(1, maps:get(match_count, Hit))
+    end).
+
+hpmor_bounded_multichunk_subset() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-hpmor-bounded">>))#{
+            identity_bookie => Identity
+        },
+        Tenant = <<"tenant">>,
+        %% A bounded semantic stand-in for the 65-chunk HPMOR fixture: keep
+        %% enough repetitions to exercise multi-thousand document tf without
+        %% making the permanent suite ingest the full 3.7 MB novel.
+        lists:foreach(
+            fun(Index) ->
+                Key = <<"hpmor-", Index:16/unsigned-big>>,
+                Body = iolist_to_binary([
+                    binary:copy(<<"hermione ">>, 300),
+                    <<"harry potter">>
+                ]),
+                ok = seam_put(Main, Schema, Key, <<"hpmor">>, Tenant, Body)
+            end,
+            lists:seq(1, 8)
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        Opts = #{
+            columns => [content], limit => 20, rank => bm25,
+            resolve_hits => false, return_count => true
+        },
+        #{count := 1, hits := [Grouped]} = search(
+            Main, Schema, <<"hermione">>, Opts
+        ),
+        ?assertEqual(2400, maps:get(match_count, Grouped)),
+        #{count := 8, hits := Ungrouped} = search(
+            Main, Schema, <<"hermione">>, Opts#{grouping => ungrouped}
+        ),
+        ?assertEqual(2400, lists:sum([
+            maps:get(match_count, Hit) || Hit <- Ungrouped
+        ])),
+        #{count := 1, hits := [Phrase]} = search(
+            Main, Schema, <<"\"harry potter\"">>, Opts
+        ),
+        ?assertEqual(8, maps:get(match_count, Phrase))
+    end).
+
 ranked_page_ties_use_candidate_order() ->
     with_bookies(fun(Main, Identity) ->
         Schema = (schema(<<"fts2-ranked-ties">>))#{identity_bookie => Identity},
@@ -583,17 +851,21 @@ term_planes_are_separate_rows() ->
         {ok, Header} = leveled_bookie:book_headonly(
             Main, maps:get(index, Schema), TermKey, <<"h">>
         ),
-        <<2:8, _GroupDf:32/unsigned-big, _ChunkDf:32/unsigned-big,
+        <<4:8, _GroupDf:32/unsigned-big, _ChunkDf:32/unsigned-big,
             _CollectionFrequency:64/unsigned-big,
             _ChampionCount:32/unsigned-big, _ChampionBytes:32/unsigned-big,
             0:32/unsigned-big, 0:32/unsigned-big, _/binary>> = Header,
         {ok, BooleanPlane} = leveled_bookie:book_headonly(
             Main, maps:get(index, Schema), <<"f2:b:", TermRest/binary>>, <<"b">>
         ),
+        {ok, GroupPlane} = leveled_bookie:book_headonly(
+            Main, maps:get(index, Schema), <<"f2:b:", TermRest/binary>>, <<"g">>
+        ),
         {ok, PositionPlane} = leveled_bookie:book_headonly(
             Main, maps:get(index, Schema), <<"f2:p:", TermRest/binary>>, <<"p">>
         ),
         ?assertEqual(8, length(leveled_fts:fts2_codec_decode_plane(BooleanPlane))),
+        ?assertEqual(8, length(leveled_fts:fts2_codec_decode_plane(GroupPlane))),
         ?assertEqual(8, map_size(
             leveled_fts:fts2_codec_decode_positions(PositionPlane)
         )),
