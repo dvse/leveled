@@ -43,7 +43,14 @@
     fts2_codec_decode_positions/1,
     fts2_codec_encode_identity_page/1,
     fts2_codec_decode_identity_page/2,
-    fts2_phrase_fast/7
+    fts2_phrase_fast/7,
+    fts2_build_parallel_for_test/4,
+    fts2_build_parallel_for_test/5,
+    fts2_build_parallel_for_test/6,
+    fts2_outer_bound_for_test/3,
+    fts2_legacy_outer_assemble_for_test/2,
+    fts2_consolidate_with_heap_for_test/4,
+    fts2_consolidate_with_heap_for_test/5
 ]).
 -endif.
 
@@ -5478,6 +5485,70 @@ canonical_selector(Cols) ->
 -ifdef(TEST).
 fts2_available(Bookie, Schema) ->
     fts2_search_root(Bookie, Schema).
+
+fts2_consolidate_with_heap_for_test(Bookie, Schema, Opts, MaxHeapWords) ->
+    fts2_consolidate_with_heap_for_test(
+        Bookie, Schema, Opts, MaxHeapWords, undefined
+    ).
+
+fts2_consolidate_with_heap_for_test(
+    Bookie, Schema, Opts, MaxHeapWords, Observer
+) ->
+    Previous = put('$fts2_build_max_heap_words', MaxHeapWords),
+    PreviousObserver = put('$fts2_build_observer', Observer),
+    PreviousReportObserver = put('$fts2_build_report_observer', Observer),
+    try
+        case Observer of
+            Pid when is_pid(Pid) ->
+                Pid ! {fts2_build_outer, self()};
+            _ ->
+                ok
+        end,
+        consolidate(Bookie, Schema, Opts)
+    after
+        case Previous of
+            undefined -> erase('$fts2_build_max_heap_words');
+            _ -> put('$fts2_build_max_heap_words', Previous)
+        end,
+        case PreviousObserver of
+            undefined -> erase('$fts2_build_observer');
+            _ -> put('$fts2_build_observer', PreviousObserver)
+        end,
+        case PreviousReportObserver of
+            undefined -> erase('$fts2_build_report_observer');
+            _ -> put('$fts2_build_report_observer', PreviousReportObserver)
+        end
+    end.
+
+fts2_legacy_outer_assemble_for_test(Bookie, Schema) ->
+    Existing = case fts2_search_root(Bookie, Schema) of
+        {ok, Root} -> fts2_search_export_documents(Bookie, Schema, Root);
+        not_found -> #{}
+    end,
+    Documents = fts2_build_apply_deltas(
+        Existing, fts2_build_read_deltas(Bookie, Schema)
+    ),
+    {TokenDocs, CandidateRecords, HitRecords} =
+        fts2_build_document_maps(Documents),
+    SourceLengths = fts2_build_source_lengths(TokenDocs),
+    {SourceMap, Groups} = fts2_build_group_sources(
+        Schema, CandidateRecords, HitRecords, SourceLengths
+    ),
+    {TermRows, ByChunk} = fts2_build_build_term_rows(TokenDocs, SourceMap),
+    FrequentTerms = maps:from_list([
+        {Key, true}
+     || {Key, Row} <- maps:to_list(TermRows),
+        length(maps:get(entries, Row)) >= 64
+    ]),
+    {BigramRows, _BloomShards} = fts2_build_build_bigram_rows(
+        ByChunk, FrequentTerms
+    ),
+    #{
+        documents => map_size(Documents),
+        groups => length(Groups),
+        terms => map_size(TermRows),
+        bigrams => map_size(BigramRows)
+    }.
 -endif.
 
 fts2_lookup_documents(Bookie, Schema, SourceIds) ->
@@ -5520,104 +5591,18 @@ fts2_posting_read_dirty(Bookie, Schema, Root, AST, SourceIds, Opts) ->
 -define(HEAD_WINDOW, 256).
 -define(BIGRAM_MIN_CHUNKS, 256).
 -define(WRITE_SLICE, 192).
+-define(FTS2_MAX_BUILD_CONCURRENCY, 1).
+-define(FTS2_BUILD_SHARDS, 32).
+%% The 359,965-term gate (9,000 documents and one 3.10 MB document) measured a
+%% 3,800,194-word (29.00 MiB on a 64-bit VM) shard-worker peak. The 64 MiB
+%% ceiling is 2.21 times that peak and leaves 35.00 MiB of measured headroom.
+-define(FTS2_MAX_BUILD_HEAP_WORDS,
+    (64 * 1024 * 1024 div erlang:system_info(wordsize))
+).
 
-fts2_build_publish(
-    Bookie,
-    Schema,
-    TokenDocs,
-    CandidateRecords,
-    HitRecords,
-    CommitSpecs,
-    CommitConditions,
-    BuildConcurrency
-) ->
-    Bucket = maps:get(index, Schema),
-    Generation = fts2_build_generation_id(),
-    Previous = fts2_build_current_root(Bookie, Bucket),
-    SourceLengths = fts2_build_source_lengths(TokenDocs),
-    {SourceMap, Groups} = fts2_build_group_sources(
-        Schema, CandidateRecords, HitRecords, SourceLengths
-    ),
-    SelectedTotalLength = lists:sum([
-        maps:get(doc_length, Source)
-     || Source <- maps:values(SourceMap)
-    ]),
-    {TermRows, ByChunk} = fts2_build_build_term_rows(TokenDocs, SourceMap),
-    TermBloom = fts2_build_term_bloom(TermRows),
-    TermBloomShards = fts2_build_term_bloom_shards(TermRows),
-    FrequentTerms = maps:from_list([
-        {Key, true}
-     || {Key, Row} <- maps:to_list(TermRows),
-        length(maps:get(entries, Row)) >= 64
-    ]),
-    {AllBigramRows, BigramBloomShards} =
-        fts2_build_build_bigram_rows(ByChunk, FrequentTerms),
-    BigramRows = maps:filter(
-        fun(_Key, Chunks) -> map_size(Chunks) >= ?BIGRAM_MIN_CHUNKS end,
-        AllBigramRows
-    ),
-    ChunkCount = map_size(SourceMap),
-    IdentityRowCount = fts2_build_write_identities_parallel(
-        fts2_build_identity_bookie(Bookie, Schema), Bucket, Generation,
-        Groups, BuildConcurrency
-    ),
-    TermRowCount = fts2_build_write_terms_parallel(
-        Bookie, Bucket, Generation, TermRows, length(Groups),
-        SelectedTotalLength, BuildConcurrency
-    ),
-    BigramRowCount = fts2_build_write_bigrams_parallel(
-        Bookie, Bucket, Generation, BigramRows, TermRows, ChunkCount,
-        SelectedTotalLength, BuildConcurrency
-    ),
-    Root = #{
-        version => 1,
-        generation => Generation,
-        fingerprint => maps:get(fingerprint, Schema),
-        chunk_bits => ?CHUNK_BITS,
-        group_count => length(Groups),
-        chunk_count => map_size(SourceMap),
-        term_count => map_size(TermRows),
-        bigram_count => map_size(BigramRows),
-        identity_page_count => fts2_build_identity_page_count(
-            length(Groups), ?GENERATION_IDENTITY_PAGE_SHIFT
-        ),
-        identity_page_shift => ?GENERATION_IDENTITY_PAGE_SHIFT,
-        total_length => SelectedTotalLength,
-        phrase_strategy => bigram,
-        facet_domain => fts2_build_facet_domain(Schema, Groups),
-        term_bloom => 1,
-        term_bloom_shards => ?TERM_BLOOM_SHARDS,
-        bigram_bloom_shards => ?BIGRAM_BLOOM_SHARDS,
-        position_order => chunk,
-        group_order => native,
-        group_tie_fields => maps:get(candidate_group_fields, Schema, []),
-        previous_generation => fts2_build_previous_generation(Previous)
-    },
-    try
-        fts2_build_publish_root(
-            Bookie, Bucket, Previous, Root, TermBloom, TermBloomShards,
-            BigramBloomShards,
-            CommitSpecs, CommitConditions
-        )
-    catch
-        Class:Reason:Stacktrace ->
-            fts2_build_cleanup_generation(Bookie, Schema, Generation),
-            erlang:raise(Class, Reason, Stacktrace)
-    end,
-    case fts2_build_previous_generation(Previous) of
-        undefined -> ok;
-        PreviousGeneration ->
-            fts2_build_cleanup_generation(Bookie, Schema, PreviousGeneration)
-    end,
-    {ok, Root#{row_count =>
-        IdentityRowCount + TermRowCount + BigramRowCount}}.
-
-fts2_build_publish_documents(
-    Bookie, Schema, Documents, CommitSpecs, CommitConditions, BuildConcurrency
-) when
-    is_map(Documents)
-->
-    {TokenDocs, CandidateRecords, HitRecords} = maps:fold(
+-ifdef(TEST).
+fts2_build_document_maps(Documents) ->
+    maps:fold(
         fun(SourceId, Document, {Terms, Candidates, Hits}) ->
             Candidate = {
                 maps:get(doc_key, Document),
@@ -5657,53 +5642,70 @@ fts2_build_publish_documents(
         end,
         {#{}, #{}, #{}},
         Documents
-    ),
-    fts2_build_publish(
-        Bookie,
-        Schema,
-        TokenDocs,
-        CandidateRecords,
-        HitRecords,
-        CommitSpecs,
-        CommitConditions,
-        BuildConcurrency
     ).
+-endif.
 
 fts2_build_consolidate(Bookie, Schema, Hook, Opts) ->
     EpochConditions = fts2_build_epoch_conditions(Bookie, Schema),
-    Root = case fts2_search_root(Bookie, Schema) of
-        {ok, ExistingRoot} -> ExistingRoot;
-        not_found -> undefined
+    Previous = fts2_build_current_root(Bookie, maps:get(index, Schema)),
+    Root = case Previous of
+        absent -> undefined;
+        {_SQN, ExistingRoot} -> ExistingRoot
     end,
-    Existing = case Root of
-        undefined -> #{};
-        _ -> fts2_search_export_documents(Bookie, Schema, Root)
-    end,
-    Deltas = fts2_build_read_deltas(Bookie, Schema),
-    Documents = fts2_build_apply_deltas(Existing, Deltas),
-    case Hook of
+    DeltaRefs = fts2_build_read_delta_refs(Bookie, Schema),
+    Generation = fts2_build_generation_id(),
+    BuildConcurrency = client_option(concurrency, Opts, 1),
+    Result =
+        try
+            SelectedGroups = fts2_build_prepare_workspace(
+                Bookie, Schema, Root, DeltaRefs, Generation,
+                BuildConcurrency
+            ),
+            case Hook of
+                undefined -> ok;
+                Fun when is_function(Fun, 1) ->
+                    Fun({fts2, EpochConditions});
+                Fun when is_function(Fun, 0) ->
+                    Fun()
+            end,
+            TailPresenceCleanup = fts2_build_tail_presence_cleanup(
+                Bookie, Schema
+            ),
+            Published = fts2_build_publish_workspace(
+                Bookie,
+                Schema,
+                Root,
+                Previous,
+                Generation,
+                SelectedGroups,
+                [
+                    {remove, maps:get(index, Schema), <<"stats">>,
+                        <<"dirty">>, <<>>},
+                    {remove, maps:get(index, Schema), <<"record-tail">>,
+                        <<"dirty">>, <<>>}
+                ] ++ TailPresenceCleanup,
+                EpochConditions,
+                BuildConcurrency
+            ),
+            Published
+        catch
+            Class:Reason:Stacktrace ->
+                fts2_build_cleanup_generation(Bookie, Schema, Generation),
+                erlang:raise(Class, Reason, Stacktrace)
+        end,
+    %% The root now makes the new generation authoritative. Cleanup failures
+    %% after this point must never remove that published generation.
+    fts2_build_remove_workspace(Bookie, Schema, Generation),
+    case fts2_build_previous_generation(Previous) of
         undefined -> ok;
-        Fun when is_function(Fun, 1) -> Fun({fts2, EpochConditions});
-        Fun when is_function(Fun, 0) -> Fun()
+        CleanupGeneration ->
+            fts2_build_cleanup_generation(Bookie, Schema, CleanupGeneration)
     end,
-    TailPresenceCleanup = fts2_build_tail_presence_cleanup(Bookie, Schema),
-    Result = fts2_build_publish_documents(
-        Bookie,
-        Schema,
-        Documents,
-        [
-            {remove, maps:get(index, Schema), <<"stats">>, <<"dirty">>, <<>>},
-            {remove, maps:get(index, Schema), <<"record-tail">>, <<"dirty">>,
-                <<>>}
-        ] ++ TailPresenceCleanup,
-        EpochConditions,
-        client_option(concurrency, Opts, 1)
-    ),
     %% Seal the large immutable generation at its published root.  Delta
     %% tombstones are deliberately written to the next journal so retention
     %% of a few non-ledger tombstones cannot pin the complete build journal.
     fts2_build_trim_journals(Bookie, Schema),
-    fts2_build_remove_deltas(Bookie, maps:get(index, Schema), Deltas),
+    fts2_build_remove_deltas(Bookie, maps:get(index, Schema), DeltaRefs),
     {ok, PublishedRoot} = Result,
     case {
         client_option(reclaim, Opts, true),
@@ -5719,6 +5721,1259 @@ fts2_build_consolidate(Bookie, Schema, Hook, Opts) ->
     end,
     fts2_build_trim_journals(Bookie, Schema),
     Result.
+
+%% The coordinator retains only compact ordering descriptors and source ids.
+%% Full records and posting graphs pass through generation-qualified workspace
+%% rows. The rows are build spill, not a read cache: search never reads them,
+%% and success/failure cleanup removes the complete workspace.
+fts2_build_prepare_workspace(
+    Bookie, Schema, Root, DeltaRefs, Generation, BuildConcurrency
+) ->
+    {DeltaDescriptors, RetiredIds} = fts2_build_delta_descriptors(
+        Bookie, Schema, DeltaRefs, Generation, BuildConcurrency
+    ),
+    DeltaSources = maps:from_keys(
+        [SourceId || {SourceId, _SQN} <- DeltaRefs], true
+    ),
+    Retired = maps:from_keys(RetiredIds, true),
+    ExistingDescriptors = fts2_build_existing_descriptors(
+        Bookie,
+        Schema,
+        Root,
+        Generation,
+        DeltaSources,
+        Retired,
+        BuildConcurrency
+    ),
+    fts2_build_select_groups(DeltaDescriptors ++ ExistingDescriptors).
+
+fts2_build_delta_descriptors(
+    Bookie, Schema, DeltaRefs, Generation, _BuildConcurrency
+) ->
+    Bucket = maps:get(index, Schema),
+    Results = [
+        fts2_build_run_worker(
+            workspace_worker,
+            fun() ->
+                lists:map(
+                    fun({SourceId, _SQN}) ->
+                        Delta = fts2_build_read_delta(Bookie, Bucket, SourceId),
+                        Retired = maps:get(retired_ids, Delta, []),
+                        case maps:get(status, Delta) of
+                            live ->
+                                Metadata = maps:remove(posting, Delta),
+                                ok = fts2_build_workspace_write(
+                                    Bookie,
+                                    Bucket,
+                                    Generation,
+                                    SourceId,
+                                    <<"m">>,
+                                    Metadata
+                                ),
+                                {SourceId, live, Retired,
+                                    fts2_build_descriptor(
+                                        Schema, Metadata, delta, undefined
+                                    )};
+                            remove ->
+                                {SourceId, remove, Retired, undefined}
+                        end
+                    end,
+                    RefBatch
+                )
+            end
+        )
+     || RefBatch <- fts2_build_chunks(DeltaRefs, 8, [])
+    ],
+    {DescriptorMap, RetiredIds} = lists:foldl(
+        fun({SourceId, Status, Retired, Descriptor}, {Descriptors, RetiredAcc}) ->
+            WithoutRetired = maps:without(Retired, Descriptors),
+            NextDescriptors = case Status of
+                live -> WithoutRetired#{SourceId => Descriptor};
+                remove -> maps:remove(SourceId, WithoutRetired)
+            end,
+            {NextDescriptors, Retired ++ RetiredAcc}
+        end,
+        {#{}, []},
+        lists:append(Results)
+    ),
+    {maps:values(DescriptorMap), RetiredIds}.
+
+fts2_build_existing_descriptors(
+    _Bookie, _Schema, undefined, _Generation, _DeltaSources, _Retired,
+    _BuildConcurrency
+) ->
+    [];
+fts2_build_existing_descriptors(
+    Bookie, Schema, Root, Generation, DeltaSources, Retired,
+    _BuildConcurrency
+) ->
+    PageCount = maps:get(identity_page_count, Root),
+    lists:append([
+        fts2_build_run_worker(
+            workspace_worker,
+            fun() ->
+                fts2_build_existing_descriptor_page(
+                    Bookie,
+                    Schema,
+                    Root,
+                    Generation,
+                    PageNo,
+                    DeltaSources,
+                    Retired
+                )
+            end
+        )
+     || PageNo <- lists:seq(0, erlang:max(PageCount - 1, -1))
+    ]).
+
+fts2_build_existing_descriptor_page(
+    Bookie,
+    #{index := Bucket} = Schema,
+    Root,
+    Generation,
+    PageNo,
+    DeltaSources,
+    Retired
+) ->
+    IdentityBookie = fts2_build_identity_bookie(Bookie, Schema),
+    Key = fts2_codec_identity_key(maps:get(generation, Root)),
+    Shift = fts2_search_identity_page_shift(Root, Schema),
+    FirstGroupId = PageNo bsl Shift,
+    LastGroupId = erlang:min(
+        maps:get(group_count, Root) - 1,
+        FirstGroupId + (1 bsl Shift) - 1
+    ),
+    case leveled_bookie:book_headonly(
+        IdentityBookie,
+        Bucket,
+        Key,
+        fts2_codec_identity_subkey(PageNo)
+    ) of
+        not_found ->
+            [];
+        {ok, Value} ->
+            Groups = maps:values(fts2_search_groups_to_map(
+                fts2_codec_decode_identity_page(
+                    Value, lists:seq(FirstGroupId, LastGroupId)
+                )
+            )),
+            lists:foldl(
+                fun(Group, Acc) ->
+                    lists:foldl(
+                        fun(Chunk, Inner) ->
+                            SourceId = maps:get(source_id, Chunk),
+                            case maps:is_key(SourceId, DeltaSources) orelse
+                                maps:is_key(SourceId, Retired)
+                            of
+                                true ->
+                                    Inner;
+                                false ->
+                                    Metadata = (maps:with(
+                                        [
+                                            source_id,
+                                            doc_key,
+                                            doc_version,
+                                            doc_length,
+                                            candidate_record,
+                                            hit_record
+                                        ],
+                                        Chunk
+                                    ))#{status => live, retired_ids => []},
+                                    ok = fts2_build_workspace_write(
+                                        Bookie,
+                                        Bucket,
+                                        Generation,
+                                        SourceId,
+                                        <<"m">>,
+                                        Metadata
+                                    ),
+                                    [
+                                        fts2_build_descriptor(
+                                            Schema,
+                                            Metadata,
+                                            existing,
+                                            maps:get(chunk_id, Chunk)
+                                        )
+                                        | Inner
+                                    ]
+                            end
+                        end,
+                        Acc,
+                        maps:get(chunks, Group)
+                    )
+                end,
+                [],
+                Groups
+            )
+    end.
+
+%% {GroupKey, Version, DocKey, SourceId, Length, Origin, OldChunkId} is the
+%% complete coordinator state per candidate. It deliberately excludes posting,
+%% candidate, and hit records.
+fts2_build_descriptor(Schema, Metadata, Origin, OldChunkId) ->
+    SourceId = maps:get(source_id, Metadata),
+    Candidate = maps:get(candidate_record, Metadata),
+    {
+        fts2_build_group_key(
+            maps:get(candidate_group_fields, Schema, []),
+            SourceId,
+            Candidate
+        ),
+        fts2_build_group_version(
+            maps:get(candidate_version_field, Schema, undefined),
+            Candidate
+        ),
+        maps:get(doc_key, Metadata),
+        SourceId,
+        maps:get(doc_length, Metadata, 0),
+        Origin,
+        OldChunkId
+    }.
+
+fts2_build_select_groups(Descriptors) ->
+    Ordered = lists:sort(
+        fun(A, B) ->
+            {element(1, A), element(3, A), element(4, A)} =<
+                {element(1, B), element(3, B), element(4, B)}
+        end,
+        Descriptors
+    ),
+    fts2_build_select_groups(Ordered, []).
+
+fts2_build_select_groups([], Acc) ->
+    lists:reverse(Acc);
+fts2_build_select_groups([First | Rest], Acc) ->
+    GroupKey = element(1, First),
+    {SameGroup, Tail} = lists:splitwith(
+        fun(Descriptor) -> element(1, Descriptor) =:= GroupKey end,
+        [First | Rest]
+    ),
+    Version = lists:max([element(2, Descriptor) || Descriptor <- SameGroup]),
+    Rows = [
+        Descriptor
+     || Descriptor <- SameGroup,
+        element(2, Descriptor) =:= Version
+    ],
+    true = length(Rows) =< ?CHUNKS_PER_GROUP,
+    fts2_build_select_groups(Tail, [{GroupKey, Rows} | Acc]).
+
+fts2_build_publish_workspace(
+    Bookie,
+    Schema,
+    PreviousRoot,
+    Previous,
+    Generation,
+    SelectedGroups,
+    CommitSpecs,
+    CommitConditions,
+    BuildConcurrency
+) ->
+    Bucket = maps:get(index, Schema),
+    Identity = fts2_build_workspace_identities(
+        Bookie,
+        Schema,
+        Generation,
+        SelectedGroups,
+        BuildConcurrency
+    ),
+    Sources = maps:get(sources, Identity),
+    ok = fts2_build_workspace_postings(
+        Bookie,
+        Schema,
+        PreviousRoot,
+        Generation,
+        Sources,
+        BuildConcurrency
+    ),
+    TermState = fts2_build_workspace_terms(
+        Bookie,
+        Schema,
+        Generation,
+        Sources,
+        maps:get(group_count, Identity),
+        maps:get(total_length, Identity),
+        BuildConcurrency
+    ),
+    BigramState = fts2_build_workspace_bigrams(
+        Bookie,
+        Schema,
+        Generation,
+        Sources,
+        maps:get(frequent_terms, TermState),
+        maps:get(chunk_count, Identity),
+        maps:get(total_length, Identity),
+        BuildConcurrency
+    ),
+    Root = #{
+        version => 1,
+        generation => Generation,
+        fingerprint => maps:get(fingerprint, Schema),
+        chunk_bits => ?CHUNK_BITS,
+        group_count => maps:get(group_count, Identity),
+        chunk_count => maps:get(chunk_count, Identity),
+        term_count => maps:get(term_count, TermState),
+        bigram_count => maps:get(bigram_count, BigramState),
+        identity_page_count => fts2_build_identity_page_count(
+            maps:get(group_count, Identity),
+            ?GENERATION_IDENTITY_PAGE_SHIFT
+        ),
+        identity_page_shift => ?GENERATION_IDENTITY_PAGE_SHIFT,
+        total_length => maps:get(total_length, Identity),
+        phrase_strategy => bigram,
+        facet_domain => maps:get(facet_domain, Identity),
+        term_bloom => 1,
+        term_bloom_shards => ?TERM_BLOOM_SHARDS,
+        bigram_bloom_shards => ?BIGRAM_BLOOM_SHARDS,
+        position_order => chunk,
+        group_order => native,
+        group_tie_fields => maps:get(candidate_group_fields, Schema, []),
+        previous_generation => fts2_build_previous_generation(Previous)
+    },
+    fts2_build_publish_root(
+        Bookie,
+        Bucket,
+        Previous,
+        Root,
+        maps:get(term_bloom, TermState),
+        maps:get(term_bloom_shards, TermState),
+        maps:get(bigram_bloom_shards, BigramState),
+        CommitSpecs,
+        CommitConditions
+    ),
+    {ok, Root#{row_count =>
+        maps:get(row_count, Identity) +
+            maps:get(row_count, TermState) +
+            maps:get(row_count, BigramState)}}.
+
+fts2_build_workspace_identities(
+    Bookie, Schema, Generation, SelectedGroups, _BuildConcurrency
+) ->
+    fts2_build_workspace_identities(
+        Bookie,
+        Schema,
+        Generation,
+        SelectedGroups,
+        0,
+        0,
+        #{
+            sources => [],
+            group_count => 0,
+            chunk_count => 0,
+            total_length => 0,
+            facet_domain => #{},
+            row_count => 0
+        }
+    ).
+
+fts2_build_workspace_identities(
+    _Bookie, _Schema, _Generation, [], _GroupId, _DenseId, State
+) ->
+    State#{sources := lists:reverse(maps:get(sources, State))};
+fts2_build_workspace_identities(
+    Bookie,
+    Schema,
+    Generation,
+    Groups,
+    GroupId,
+    DenseId,
+    State
+) ->
+    Count = erlang:min(1 bsl ?GENERATION_IDENTITY_PAGE_SHIFT, length(Groups)),
+    {PageGroups, Rest} = lists:split(Count, Groups),
+    Page = fts2_build_run_worker(
+        identity_worker,
+        fun() ->
+            fts2_build_workspace_identity_page(
+                Bookie,
+                Schema,
+                Generation,
+                PageGroups,
+                GroupId,
+                DenseId
+            )
+        end
+    ),
+    NextState = State#{
+        sources := lists:reverse(maps:get(sources, Page)) ++
+            maps:get(sources, State),
+        group_count := maps:get(group_count, State) +
+            maps:get(group_count, Page),
+        chunk_count := maps:get(chunk_count, State) +
+            maps:get(chunk_count, Page),
+        total_length := maps:get(total_length, State) +
+            maps:get(total_length, Page),
+        facet_domain := fts2_build_merge_facet_domains(
+            maps:get(facet_domain, State),
+            maps:get(facet_domain, Page)
+        ),
+        row_count := maps:get(row_count, State) + maps:get(row_count, Page)
+    },
+    fts2_build_workspace_identities(
+        Bookie,
+        Schema,
+        Generation,
+        Rest,
+        GroupId + maps:get(group_count, Page),
+        maps:get(next_dense_id, Page),
+        NextState
+    ).
+
+fts2_build_workspace_identity_page(
+    Bookie,
+    #{index := Bucket} = Schema,
+    Generation,
+    PageGroups,
+    FirstGroupId,
+    FirstDenseId
+) ->
+    {Groups, Sources, NextDenseId, ChunkCount, TotalLength, FacetDomain} =
+        lists:foldl(
+            fun({GroupKey, Descriptors},
+                {GroupAcc, SourceAcc, DenseId0, ChunkAcc, LengthAcc,
+                    DomainAcc}) ->
+                GroupId = FirstGroupId + length(GroupAcc),
+                GroupLength = lists:sum([
+                    element(5, Descriptor) || Descriptor <- Descriptors
+                ]),
+                {Chunks, NextDenseId0, NextSources, NextDomain} =
+                    lists:foldl(
+                        fun(Descriptor,
+                            {ChunkRows, DenseId, Sources0, Domain0}) ->
+                            SourceId = element(4, Descriptor),
+                            Metadata = fts2_build_workspace_read(
+                                Bookie,
+                                Bucket,
+                                Generation,
+                                SourceId,
+                                <<"m">>
+                            ),
+                            Local = length(ChunkRows),
+                            ChunkId = (GroupId bsl ?CHUNK_BITS) bor Local,
+                            Chunk = Metadata#{
+                                chunk_id => ChunkId,
+                                group_id => GroupId,
+                                dense_id => DenseId,
+                                group_length => GroupLength
+                            },
+                            ok = fts2_build_workspace_write(
+                                Bookie,
+                                Bucket,
+                                Generation,
+                                SourceId,
+                                <<"m">>,
+                                {
+                                    ChunkId,
+                                    GroupId,
+                                    SourceId,
+                                    maps:get(doc_length, Metadata, 0),
+                                    DenseId,
+                                    GroupLength
+                                }
+                            ),
+                            {
+                                [Chunk | ChunkRows],
+                                DenseId + 1,
+                                [{SourceId, element(6, Descriptor),
+                                    element(7, Descriptor)} | Sources0],
+                                fts2_build_facet_add(
+                                    Schema,
+                                    maps:get(candidate_record, Metadata, #{}),
+                                    Domain0
+                                )
+                            }
+                        end,
+                        {[], DenseId0, SourceAcc, DomainAcc},
+                        Descriptors
+                    ),
+                Group = #{
+                    group_id => GroupId,
+                    group_key => GroupKey,
+                    chunks => lists:reverse(Chunks)
+                },
+                {
+                    [Group | GroupAcc],
+                    NextSources,
+                    NextDenseId0,
+                    ChunkAcc + length(Descriptors),
+                    LengthAcc + GroupLength,
+                    NextDomain
+                }
+            end,
+            {[], [], FirstDenseId, 0, 0, #{}},
+            PageGroups
+        ),
+    IdentityBookie = fts2_build_identity_bookie(Bookie, Schema),
+    Key = fts2_codec_identity_key(Generation),
+    PageNo = FirstGroupId bsr ?GENERATION_IDENTITY_PAGE_SHIFT,
+    ok = fts2_build_write_slices(
+        IdentityBookie,
+        [{add, Bucket, Key, fts2_codec_identity_subkey(PageNo),
+            fts2_codec_encode_identity_page(lists:reverse(Groups))}]
+    ),
+    #{
+        sources => Sources,
+        group_count => length(PageGroups),
+        chunk_count => ChunkCount,
+        total_length => TotalLength,
+        facet_domain => FacetDomain,
+        row_count => 1,
+        next_dense_id => NextDenseId
+    }.
+
+fts2_build_facet_add(Schema, Candidate, Domain0) ->
+    lists:foldl(
+        fun({Column, Field}, Domain) ->
+            Value = maps:get(Field, Candidate, undefined),
+            case maps:get(Column, Domain, unset) of
+                unset -> Domain#{Column => {uniform, Value}};
+                {uniform, Value} -> Domain;
+                _Other -> Domain#{Column => mixed}
+            end
+        end,
+        Domain0,
+        maps:get(candidate_filter_fields, Schema, [])
+    ).
+
+fts2_build_merge_facet_domains(Left, Right) ->
+    maps:fold(
+        fun(Column, Value, Acc) ->
+            case {maps:get(Column, Acc, unset), Value} of
+                {unset, _} -> Acc#{Column => Value};
+                {{uniform, Same}, {uniform, Same}} -> Acc;
+                _ -> Acc#{Column => mixed}
+            end
+        end,
+        Left,
+        Right
+    ).
+
+fts2_build_workspace_postings(
+    Bookie, Schema, PreviousRoot, Generation, Sources, _BuildConcurrency
+) ->
+    DeltaSources = [Source || Source = {_SourceId, delta, _Old} <- Sources],
+    ExistingSources = [
+        Source || Source = {_SourceId, existing, _Old} <- Sources
+    ],
+    lists:foreach(
+        fun(Batch) ->
+            _ = fts2_build_run_worker(
+                workspace_worker,
+                fun() ->
+                    lists:foreach(
+                        fun({SourceId, delta, _OldChunkId}) ->
+                            Delta = fts2_build_read_delta(
+                                Bookie, maps:get(index, Schema), SourceId
+                            ),
+                            fts2_build_write_document_fragments(
+                                Bookie,
+                                Schema,
+                                Generation,
+                                SourceId,
+                                maps:get(posting, Delta, #{})
+                            )
+                        end,
+                        Batch
+                    ),
+                    0
+                end
+            )
+        end,
+        fts2_build_chunks(DeltaSources, 1, [])
+    ),
+    lists:foreach(
+        fun(Batch) ->
+            _ = fts2_build_run_worker(
+                workspace_worker,
+                fun() ->
+                    fts2_build_reconstruct_existing_fragments(
+                        Bookie, Schema, PreviousRoot, Generation, Batch
+                    )
+                end
+            )
+        end,
+        fts2_build_chunks(ExistingSources, 128, [])
+    ),
+    ok.
+
+fts2_build_reconstruct_existing_fragments(
+    _Bookie, _Schema, undefined, _Generation, []
+) ->
+    0;
+fts2_build_reconstruct_existing_fragments(
+    Bookie, #{index := Bucket} = Schema, Root, Generation, Sources
+) ->
+    Wanted = maps:from_list([
+        {OldChunkId, SourceId}
+     || {SourceId, existing, OldChunkId} <- Sources
+    ]),
+    Documents0 = maps:from_keys(
+        [SourceId || {SourceId, existing, _OldChunkId} <- Sources], #{}
+    ),
+    OldGeneration = maps:get(generation, Root),
+    Fold = fun
+        (B, {Key, <<"b">>}, Value, Documents) when B =:= Bucket ->
+            case Key of
+                <<"f2:b:", OldGeneration:64/unsigned-big, Column:8,
+                    Token/binary>> ->
+                    lists:foldl(
+                        fun({ChunkId, _GroupId, _StoredSourceId, _Length,
+                                Tf, _DenseId}, Acc) ->
+                            SourceId = maps:get(ChunkId, Wanted),
+                            Posting = maps:get(SourceId, Acc),
+                            Tokens = maps:get(Column, Posting, #{}),
+                            Acc#{SourceId => Posting#{Column => Tokens#{
+                                Token => #{count => Tf, positions => []}
+                            }}}
+                        end,
+                        Documents,
+                        fts2_codec_decode_selected_plane(Value, Wanted)
+                    );
+                _ ->
+                    Documents
+            end;
+        (B, {Key, <<"p">>}, Value, Documents) when B =:= Bucket ->
+            case Key of
+                <<"f2:p:", OldGeneration:64/unsigned-big, Column:8,
+                    Token/binary>> ->
+                    Positions = fts2_codec_decode_positions(
+                        Value, maps:keys(Wanted)
+                    ),
+                    maps:fold(
+                        fun(ChunkId, ChunkPositions, Acc) ->
+                            SourceId = maps:get(ChunkId, Wanted),
+                            Posting = maps:get(SourceId, Acc),
+                            Tokens = maps:get(Column, Posting),
+                            Entry = maps:get(Token, Tokens),
+                            Acc#{SourceId => Posting#{Column => Tokens#{
+                                Token => Entry#{positions := ChunkPositions}
+                            }}}
+                        end,
+                        Documents,
+                        Positions
+                    );
+                _ ->
+                    Documents
+            end;
+        (_B, _Key, _Value, Documents) ->
+            Documents
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {
+            {<<"f2:b:">>, <<>>},
+            {<<"f2:u">>, <<255>>}
+        }},
+        {Fold, Documents0},
+        false,
+        true,
+        false
+    ),
+    maps:foreach(
+        fun(SourceId, Posting) ->
+            fts2_build_write_document_fragments(
+                Bookie, Schema, Generation, SourceId, Posting
+            )
+        end,
+        Runner()
+    ),
+    0.
+
+fts2_build_write_document_fragments(
+    Bookie, #{index := Bucket}, Generation, SourceId, Posting
+) ->
+    TermFragments = maps:fold(
+        fun(Column, Tokens, Acc0) ->
+            maps:fold(
+                fun(Token, Entry, Acc) ->
+                    Shard = fts2_build_shard({Column, Token}),
+                    Acc#{Shard => [
+                        {Column, Token, Entry} | maps:get(Shard, Acc, [])
+                    ]}
+                end,
+                Acc0,
+                Tokens
+            )
+        end,
+        #{},
+        Posting
+    ),
+    BigramFragments = fts2_build_document_bigram_fragments(Posting),
+    Key = fts2_build_workspace_key(Generation, SourceId),
+    TermSpecs = case map_size(TermFragments) of
+        0 -> [];
+        _ -> [{add, Bucket, Key, <<"t">>,
+            fts2_codec_encode(delta, TermFragments)}]
+    end,
+    BigramSpecs = case map_size(BigramFragments) of
+        0 -> [];
+        _ -> [{add, Bucket, Key, <<"g">>,
+            fts2_codec_encode(delta, BigramFragments)}]
+    end,
+    fts2_build_write_slices(Bookie, TermSpecs ++ BigramSpecs).
+
+fts2_build_document_bigram_fragments(Posting) ->
+    Rows = maps:fold(
+        fun(Column, Tokens, Acc0) ->
+            {Streams, _Ordinal} = maps:fold(
+                fun(Token, Entry, {Tree, Ordinal}) ->
+                    case maps:get(positions, Entry) of
+                        [] ->
+                            {Tree, Ordinal + 1};
+                        [Position | Rest] ->
+                            {
+                                gb_trees:enter(
+                                    {Position, Ordinal},
+                                    {Token, Entry, Rest},
+                                    Tree
+                                ),
+                                Ordinal + 1
+                            }
+                    end
+                end,
+                {gb_trees:empty(), 0},
+                Tokens
+            ),
+            fts2_build_document_bigram_stream(
+                Column, Streams, none, Acc0
+            )
+        end,
+        #{},
+        Posting
+    ),
+    maps:fold(
+        fun(Key, {FirstTf, SecondTf, Positions}, Acc) ->
+            Shard = fts2_build_shard(Key),
+            Acc#{Shard => [
+                {Key, FirstTf, SecondTf, Positions}
+                | maps:get(Shard, Acc, [])
+            ]}
+        end,
+        #{},
+        Rows
+    ).
+
+fts2_build_document_bigram_stream(Column, Streams, Previous, Acc) ->
+    case gb_trees:is_empty(Streams) of
+        true ->
+            Acc;
+        false ->
+            {{Position, Ordinal}, {Token, Entry, Rest}, NextStreams0} =
+                gb_trees:take_smallest(Streams),
+            NextStreams = case Rest of
+                [] -> NextStreams0;
+                [NextPosition | Tail] ->
+                    gb_trees:enter(
+                        {NextPosition, Ordinal},
+                        {Token, Entry, Tail},
+                        NextStreams0
+                    )
+            end,
+            NextAcc = case Previous of
+                {PreviousPosition, First, FirstEntry} when
+                    Position =:= PreviousPosition + 1
+                ->
+                    Key = {Column, First, Token},
+                    case maps:find(Key, Acc) of
+                        error ->
+                            Acc#{Key => {
+                                maps:get(count, FirstEntry),
+                                maps:get(count, Entry),
+                                [PreviousPosition]
+                            }};
+                        {ok, {FirstTf, SecondTf, Positions}} ->
+                            Acc#{Key => {
+                                FirstTf, SecondTf,
+                                [PreviousPosition | Positions]
+                            }}
+                    end;
+                _ ->
+                    Acc
+            end,
+            fts2_build_document_bigram_stream(
+                Column, NextStreams, {Position, Token, Entry}, NextAcc
+            )
+    end.
+
+fts2_build_workspace_terms(
+    Bookie, Schema, Generation, Sources, GroupCount, TotalLength,
+    _BuildConcurrency
+) ->
+    ZeroBloom = <<0:(?TERM_BLOOM_BITS)>>,
+    Initial = #{
+        term_count => 0,
+        row_count => 0,
+        frequent_terms => #{},
+        term_bloom => ZeroBloom,
+        term_bloom_shards => #{}
+    },
+    State = lists:foldl(
+        fun(Shard, Acc) ->
+            Result = fts2_build_run_worker(
+                term_shard_worker,
+                fun() ->
+                    fts2_build_workspace_term_shard(
+                        Bookie,
+                        Schema,
+                        Generation,
+                        Sources,
+                        Shard,
+                        GroupCount,
+                        TotalLength
+                    )
+                end
+            ),
+            Acc#{
+                term_count := maps:get(term_count, Acc) +
+                    maps:get(term_count, Result),
+                row_count := maps:get(row_count, Acc) +
+                    maps:get(row_count, Result),
+                frequent_terms := maps:merge(
+                    maps:get(frequent_terms, Acc),
+                    maps:get(frequent_terms, Result)
+                ),
+                term_bloom := fts2_build_binary_or(
+                    maps:get(term_bloom, Acc),
+                    maps:get(term_bloom, Result)
+                ),
+                term_bloom_shards := fts2_build_merge_bloom_shards(
+                    maps:get(term_bloom_shards, Acc),
+                    maps:get(term_bloom_shards, Result)
+                )
+            }
+        end,
+        Initial,
+        lists:seq(0, ?FTS2_BUILD_SHARDS - 1)
+    ),
+    State#{term_bloom_shards := fts2_build_complete_bloom_shards(
+        maps:get(term_bloom_shards, State),
+        ?TERM_BLOOM_SHARDS,
+        ?TERM_BLOOM_SHARD_BITS div 8
+    )}.
+
+fts2_build_workspace_term_shard(
+    Bookie,
+    #{index := Bucket},
+    Generation,
+    Sources,
+    Shard,
+    GroupCount,
+    TotalLength
+) ->
+    TermRows = fts2_build_workspace_fold_fragments(
+        Bookie,
+        Bucket,
+        Generation,
+        Sources,
+        {<<"t">>, Shard},
+        fun(Metadata, Entries, Acc0) ->
+            lists:foldl(
+                fun({Column, Token, Entry}, Acc) ->
+                    fts2_build_add_term_row_entry(
+                        Column, Token, Entry, Metadata, Acc
+                    )
+                end,
+                Acc0,
+                Entries
+            )
+        end,
+        #{}
+    ),
+    RowCount = fts2_build_write_term_rows(
+        Bookie,
+        Bucket,
+        Generation,
+        TermRows,
+        GroupCount,
+        TotalLength
+    ),
+    Frequent = maps:fold(
+        fun(Key, Row, Acc) ->
+            Df = length(maps:get(entries, Row)),
+            case Df >= 64 of
+                true -> Acc#{Key => Df};
+                false -> Acc
+            end
+        end,
+        #{},
+        TermRows
+    ),
+    #{
+        term_count => map_size(TermRows),
+        row_count => RowCount,
+        frequent_terms => Frequent,
+        term_bloom => fts2_build_term_bloom(TermRows),
+        term_bloom_shards => maps:from_list(
+            fts2_build_term_bloom_shards(TermRows)
+        )
+    }.
+
+fts2_build_add_term_row_entry(Column, Token, Entry, Metadata, Terms) ->
+    {ChunkId, GroupId, SourceId, Length, DenseId, GroupLength} = Metadata,
+    Tf = maps:get(count, Entry),
+    Positions = maps:get(positions, Entry),
+    PlaneEntry = {ChunkId, GroupId, SourceId, Length, Tf, DenseId},
+    Key = {Column, Token},
+    Row0 = maps:get(Key, Terms, #{entries => [], positions => []}),
+    Row = Row0#{
+        entries := [PlaneEntry | maps:get(entries, Row0)],
+        group_entries => [
+            {ChunkId, GroupId, SourceId, GroupLength, Tf, GroupId}
+            | maps:get(group_entries, Row0, [])
+        ],
+        positions := [{ChunkId, Positions} | maps:get(positions, Row0)]
+    },
+    Terms#{Key => Row}.
+
+fts2_build_write_term_rows(
+    Bookie, Bucket, Generation, TermRows, GroupCount, TotalLength
+) ->
+    {Batch, BatchSize, Count} = maps:fold(
+        fun({Column, Token}, Row, {Rows, Size, RowCount}) ->
+            Next = [{{Column, Token}, Row} | Rows],
+            case Size + 1 >= 48 of
+                true ->
+                    Written = fts2_build_write_term_batch(
+                        Bookie,
+                        Bucket,
+                        Generation,
+                        Next,
+                        GroupCount,
+                        TotalLength
+                    ),
+                    {[], 0, RowCount + Written};
+                false ->
+                    {Next, Size + 1, RowCount}
+            end
+        end,
+        {[], 0, 0},
+        TermRows
+    ),
+    Count + case BatchSize of
+        0 -> 0;
+        _ -> fts2_build_write_term_batch(
+            Bookie, Bucket, Generation, Batch, GroupCount, TotalLength
+        )
+    end.
+
+fts2_build_write_term_batch(
+    Bookie, Bucket, Generation, Rows, GroupCount, TotalLength
+) ->
+    Specs = lists:append([
+        fts2_build_term_row_specs(
+            Bucket, Generation, Column, Token, Row, GroupCount, TotalLength
+        )
+     || {{Column, Token}, Row} <- Rows
+    ]),
+    ok = fts2_build_write_slices(Bookie, Specs),
+    length(Specs).
+
+fts2_build_workspace_bigrams(
+    Bookie, Schema, Generation, Sources, FrequentTerms, ChunkCount,
+    TotalLength, _BuildConcurrency
+) ->
+    Initial = #{
+        bigram_count => 0,
+        row_count => 0,
+        bigram_bloom_shards => #{}
+    },
+    State = lists:foldl(
+        fun(Shard, Acc) ->
+            Result = fts2_build_run_worker(
+                bigram_shard_worker,
+                fun() ->
+                    fts2_build_workspace_bigram_shard(
+                        Bookie,
+                        Schema,
+                        Generation,
+                        Sources,
+                        Shard,
+                        FrequentTerms,
+                        ChunkCount,
+                        TotalLength
+                    )
+                end
+            ),
+            Acc#{
+                bigram_count := maps:get(bigram_count, Acc) +
+                    maps:get(bigram_count, Result),
+                row_count := maps:get(row_count, Acc) +
+                    maps:get(row_count, Result),
+                bigram_bloom_shards := fts2_build_merge_bloom_shards(
+                    maps:get(bigram_bloom_shards, Acc),
+                    maps:get(bigram_bloom_shards, Result)
+                )
+            }
+        end,
+        Initial,
+        lists:seq(0, ?FTS2_BUILD_SHARDS - 1)
+    ),
+    State#{bigram_bloom_shards := fts2_build_complete_bloom_shards(
+        maps:get(bigram_bloom_shards, State),
+        ?BIGRAM_BLOOM_SHARDS,
+        ?BIGRAM_BLOOM_SHARD_BITS div 8
+    )}.
+
+fts2_build_workspace_bigram_shard(
+    Bookie,
+    #{index := Bucket},
+    Generation,
+    Sources,
+    Shard,
+    FrequentTerms,
+    ChunkCount,
+    TotalLength
+) ->
+    {AllRows, BloomWords} = fts2_build_workspace_fold_fragments(
+        Bookie,
+        Bucket,
+        Generation,
+        Sources,
+        {<<"g">>, Shard},
+        fun(Metadata, Entries, {Rows0, Bloom0}) ->
+            lists:foldl(
+                fun({{Column, First, Second} = Key, FirstTf, SecondTf,
+                        Positions}, {Rows, Bloom}) ->
+                    NextBloom = fts2_build_bigram_bloom_add(
+                        Column, First, Second, Bloom
+                    ),
+                    case maps:is_key({Column, First}, FrequentTerms) andalso
+                        maps:is_key({Column, Second}, FrequentTerms)
+                    of
+                        true ->
+                            {ChunkId, GroupId, SourceId, Length,
+                                _DenseId, _GroupLength} = Metadata,
+                            PlaneEntry = {
+                                ChunkId, GroupId, SourceId, Length,
+                                FirstTf, 0
+                            },
+                            Row0 = maps:get(Key, Rows, #{}),
+                            {
+                                Rows#{Key => Row0#{ChunkId => {
+                                    PlaneEntry, SecondTf, Positions
+                                }}},
+                                NextBloom
+                            };
+                        false ->
+                            {Rows, NextBloom}
+                    end
+                end,
+                {Rows0, Bloom0},
+                Entries
+            )
+        end,
+        {#{}, #{}}
+    ),
+    BigramRows = maps:filter(
+        fun(_Key, Chunks) -> map_size(Chunks) >= ?BIGRAM_MIN_CHUNKS end,
+        AllRows
+    ),
+    RowCount = fts2_build_write_bigram_rows(
+        Bookie,
+        Bucket,
+        Generation,
+        BigramRows,
+        FrequentTerms,
+        ChunkCount,
+        TotalLength
+    ),
+    #{
+        bigram_count => map_size(BigramRows),
+        row_count => RowCount,
+        bigram_bloom_shards => maps:from_list([
+            {BloomShard, fts2_build_encode_bigram_bloom_shard(Words)}
+         || {BloomShard, Words} <- maps:to_list(BloomWords)
+        ])
+    }.
+
+fts2_build_write_bigram_rows(
+    Bookie, Bucket, Generation, BigramRows, FrequentTerms, ChunkCount,
+    TotalLength
+) ->
+    {Batch, BatchSize, Count} = maps:fold(
+        fun({Column, First, Second}, ByChunk, {Rows, Size, RowCount}) ->
+            Item = {
+                {Column, First, Second},
+                ByChunk,
+                maps:get({Column, First}, FrequentTerms),
+                maps:get({Column, Second}, FrequentTerms)
+            },
+            Next = [Item | Rows],
+            case Size + 1 >= 96 of
+                true ->
+                    Written = fts2_build_write_bigram_batch(
+                        Bookie,
+                        Bucket,
+                        Generation,
+                        Next,
+                        ChunkCount,
+                        TotalLength
+                    ),
+                    {[], 0, RowCount + Written};
+                false ->
+                    {Next, Size + 1, RowCount}
+            end
+        end,
+        {[], 0, 0},
+        BigramRows
+    ),
+    Count + case BatchSize of
+        0 -> 0;
+        _ -> fts2_build_write_bigram_batch(
+            Bookie, Bucket, Generation, Batch, ChunkCount, TotalLength
+        )
+    end.
+
+fts2_build_write_bigram_batch(
+    Bookie, Bucket, Generation, Rows, ChunkCount, TotalLength
+) ->
+    Specs = lists:append([
+        fts2_build_bigram_row_specs(
+            Bucket,
+            Generation,
+            Column,
+            First,
+            Second,
+            ByChunk,
+            FirstDf,
+            SecondDf,
+            ChunkCount,
+            TotalLength
+        )
+     || {{Column, First, Second}, ByChunk, FirstDf, SecondDf} <- Rows
+    ]),
+    ok = fts2_build_write_slices(Bookie, Specs),
+    length(Specs).
+
+fts2_build_workspace_fold_fragments(
+    Bookie, Bucket, Generation, Sources, {SubKey, Shard}, Fun, Acc0
+) ->
+    lists:foldl(
+        fun(SourceBatch, Acc) ->
+            Requests = lists:append([
+                [
+                    {fts2_build_workspace_key(Generation, SourceId), <<"m">>},
+                    {fts2_build_workspace_key(Generation, SourceId), SubKey}
+                ]
+             || {SourceId, _Origin, _OldChunkId} <- SourceBatch
+            ]),
+            Values = leveled_bookie:book_headonly_many(
+                Bookie, Bucket, Requests
+            ),
+            fts2_build_fold_workspace_values(Values, Shard, Fun, Acc)
+        end,
+        Acc0,
+        fts2_build_chunks(Sources, 64, [])
+    ).
+
+fts2_build_fold_workspace_values([], _Shard, _Fun, Acc) ->
+    Acc;
+fts2_build_fold_workspace_values(
+    [{ok, MetadataValue}, not_found | Rest], Shard, Fun, Acc
+) ->
+    _Metadata = fts2_codec_decode(delta, MetadataValue),
+    fts2_build_fold_workspace_values(Rest, Shard, Fun, Acc);
+fts2_build_fold_workspace_values(
+    [{ok, MetadataValue}, {ok, FragmentValue} | Rest], Shard, Fun, Acc
+) ->
+    Metadata = fts2_codec_decode(delta, MetadataValue),
+    Fragments = fts2_codec_decode(delta, FragmentValue),
+    Fragment = maps:get(Shard, Fragments, []),
+    fts2_build_fold_workspace_values(
+        Rest, Shard, Fun, Fun(Metadata, Fragment, Acc)
+    );
+fts2_build_fold_workspace_values(Bad, _Shard, _Fun, _Acc) ->
+    erlang:error({fts2_workspace_rows_invalid, Bad}).
+
+fts2_build_shard(Key) ->
+    erlang:phash2(Key, ?FTS2_BUILD_SHARDS).
+
+fts2_build_merge_bloom_shards(Acc, Next) ->
+    maps:fold(
+        fun(Shard, Bloom, Inner) ->
+            Inner#{Shard => case maps:find(Shard, Inner) of
+                error -> Bloom;
+                {ok, Existing} -> fts2_build_binary_or(Existing, Bloom)
+            end}
+        end,
+        Acc,
+        Next
+    ).
+
+fts2_build_complete_bloom_shards(Shards, Count, Bytes) ->
+    Zero = <<0:(Bytes * 8)>>,
+    [
+        {Shard, maps:get(Shard, Shards, Zero)}
+     || Shard <- lists:seq(0, Count - 1)
+    ].
+
+fts2_build_binary_or(Left, Right) when byte_size(Left) =:= byte_size(Right) ->
+    fts2_build_binary_or(Left, Right, []).
+
+fts2_build_binary_or(<<>>, <<>>, Acc) ->
+    iolist_to_binary(lists:reverse(Acc));
+fts2_build_binary_or(
+    <<Left:64/unsigned-little, LeftRest/binary>>,
+    <<Right:64/unsigned-little, RightRest/binary>>,
+    Acc
+) ->
+    fts2_build_binary_or(
+        LeftRest,
+        RightRest,
+        [<<(Left bor Right):64/unsigned-little>> | Acc]
+    ).
+
+fts2_build_workspace_key(Generation, SourceId) ->
+    <<"f2:w:", Generation:64/unsigned-big, SourceId:64/unsigned-big>>.
+
+fts2_build_workspace_write(
+    Bookie, Bucket, Generation, SourceId, SubKey, Value
+) ->
+    fts2_build_write_slices(
+        Bookie,
+        [{add, Bucket, fts2_build_workspace_key(Generation, SourceId),
+            SubKey, fts2_codec_encode(delta, Value)}]
+    ).
+
+fts2_build_workspace_read(
+    Bookie, Bucket, Generation, SourceId, SubKey
+) ->
+    case leveled_bookie:book_headonly(
+        Bookie,
+        Bucket,
+        fts2_build_workspace_key(Generation, SourceId),
+        SubKey
+    ) of
+        {ok, Value} -> fts2_codec_decode(delta, Value);
+        not_found -> erlang:error({fts2_workspace_row_missing, SourceId, SubKey})
+    end.
+
+fts2_build_read_delta(Bookie, Bucket, SourceId) ->
+    case leveled_bookie:book_headonly(
+        Bookie, Bucket, <<"f2:d">>, <<SourceId:64/unsigned-big>>
+    ) of
+        {ok, Value} -> fts2_codec_decode(delta, Value);
+        not_found -> erlang:error({fts2_delta_disappeared, SourceId})
+    end.
+
+fts2_build_run_worker(Role, Fun) ->
+    Parent = self(),
+    Ref = make_ref(),
+    0 = fts2_build_parallel(
+        Role,
+        [run],
+        1,
+        fun(run) ->
+            Result = Fun(),
+            Parent ! {fts2_build_worker_result, Ref, Result},
+            0
+        end
+    ),
+    receive
+        {fts2_build_worker_result, Ref, Result} -> Result
+    after 1000 ->
+        erlang:error({fts2_build_worker_result_missing, Role})
+    end.
 
 fts2_build_reclaim_ledgers(Bookies, Timeout) when
     is_integer(Timeout), Timeout > 0
@@ -5842,6 +7097,7 @@ fts2_build_epoch_conditions(Bookie, #{index := Bucket, shards := Shards}) ->
      || Shard <- lists:seq(0, Shards - 1)
     ].
 
+-ifdef(TEST).
 fts2_build_read_deltas(Bookie, #{index := Bucket}) ->
     Fold = fun
         (B, {<<"f2:d">>, <<SourceId:64/unsigned-big>>}, _Value, Acc) when
@@ -5885,7 +7141,45 @@ fts2_build_read_deltas(Bookie, #{index := Bucket}) ->
         end,
         lists:usort(Runner())
     ).
+-endif.
 
+fts2_build_read_delta_refs(Bookie, #{index := Bucket}) ->
+    Fold = fun
+        (B, {<<"f2:d">>, <<SourceId:64/unsigned-big>>}, _Value, Acc) when
+            B =:= Bucket
+        ->
+            [SourceId | Acc];
+        (_B, _Key, _Value, Acc) ->
+            Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {
+            {<<"f2:d">>, <<>>},
+            {<<"f2:d">>, <<16#FFFFFFFFFFFFFFFF:64/unsigned-big>>}
+        }},
+        {Fold, []},
+        false,
+        true,
+        false
+    ),
+    lists:filtermap(
+        fun(SourceId) ->
+            case leveled_bookie:book_sqn(
+                Bookie,
+                Bucket,
+                {<<"f2:d">>, <<SourceId:64/unsigned-big>>},
+                ?HEAD_TAG
+            ) of
+                {ok, SQN} -> {true, {SourceId, SQN}};
+                not_found -> false
+            end
+        end,
+        lists:usort(Runner())
+    ).
+
+-ifdef(TEST).
 fts2_build_apply_deltas(Existing, Deltas) ->
     lists:foldl(
         fun({_SourceId, _SQN, Delta}, Acc) ->
@@ -5901,6 +7195,7 @@ fts2_build_apply_deltas(Existing, Deltas) ->
         Existing,
         Deltas
     ).
+-endif.
 
 fts2_build_remove_deltas(_Bookie, _Bucket, []) ->
     ok;
@@ -5909,11 +7204,14 @@ fts2_build_remove_deltas(Bookie, Bucket, Deltas) ->
     {Batch, Rest} = lists:split(Count, Deltas),
     Specs = [
         {remove, Bucket, <<"f2:d">>, <<SourceId:64/unsigned-big>>, <<>>}
-     || {SourceId, _SQN, _Delta} <- Batch
+     || Delta <- Batch,
+        SourceId <- [element(1, Delta)]
     ],
     Conditions = [
         {Bucket, <<"f2:d">>, <<SourceId:64/unsigned-big>>, {sqn, SQN}}
-     || {SourceId, SQN, _Delta} <- Batch
+     || Delta <- Batch,
+        SourceId <- [element(1, Delta)],
+        SQN <- [element(2, Delta)]
     ],
     case leveled_bookie:book_casmput(Bookie, Specs, Conditions) of
         ok -> fts2_build_remove_deltas(Bookie, Bucket, Rest);
@@ -5924,6 +7222,7 @@ fts2_build_remove_deltas(Bookie, Bucket, Deltas) ->
             erlang:error({fts2_delta_cleanup_failed, Reason})
     end.
 
+-ifdef(TEST).
 fts2_build_source_lengths(TokenDocs) ->
     maps:fold(
         fun(_Token, Docs, Acc) ->
@@ -6019,6 +7318,7 @@ fts2_build_group_sources(Schema, CandidateRecords, HitRecords, SourceLengths) ->
         OrderedGroups
     ),
     {SourceMap, lists:reverse(Groups)}.
+-endif.
 
 fts2_build_group_key([], SourceId, _Candidate) ->
     {source, SourceId};
@@ -6028,6 +7328,7 @@ fts2_build_group_key(Fields, _SourceId, Candidate) ->
 fts2_build_group_version(undefined, _Candidate) -> 0;
 fts2_build_group_version(Field, Candidate) -> maps:get(Field, Candidate, 0).
 
+-ifdef(TEST).
 fts2_build_keep_group_version(Key, Version, Row, Acc) ->
     case maps:find(Key, Acc) of
         error ->
@@ -6039,7 +7340,9 @@ fts2_build_keep_group_version(Key, Version, Row, Acc) ->
         {ok, {_Newer, _Rows}} ->
             Acc
     end.
+-endif.
 
+-ifdef(TEST).
 fts2_build_build_term_rows(TokenDocs, SourceMap) ->
     maps:fold(
         fun(Token, Docs, {TermAcc, ChunkAcc}) ->
@@ -6077,6 +7380,7 @@ fts2_build_build_term_rows(TokenDocs, SourceMap) ->
         {#{}, #{}},
         TokenDocs
     ).
+-endif.
 
 %% Compact immutable vocabulary proof. It is fetched in the same Bookie call
 %% as the active state row, so an impossible exact term/phrase avoids all
@@ -6140,6 +7444,7 @@ fts2_term_bloom_add(Column, Token, Salt, Words) ->
         Words#{Word => maps:get(Word, Words, 0) bor Mask}
     ).
 
+-ifdef(TEST).
 fts2_build_add_term_entry(Column, Token, Entry, Chunk, Terms, Chunks) ->
     ChunkId = maps:get(chunk_id, Chunk),
     GroupId = maps:get(group_id, Chunk),
@@ -6229,6 +7534,7 @@ fts2_build_build_bigram_rows(ByChunk, FrequentTerms) ->
         BigramRows,
         fts2_build_encode_bigram_bloom_shards(BloomShardWords)
     }.
+-endif.
 
 fts2_build_bigram_bloom_add(Column, First, Second, ShardWords) ->
     Shard = fts2_bigram_bloom_shard(Column, First, Second),
@@ -6253,6 +7559,7 @@ fts2_bigram_bloom_shard_add(Column, First, Second, Salt, Words) ->
         Words#{Word => maps:get(Word, Words, 0) bor Mask}
     ).
 
+-ifdef(TEST).
 fts2_build_encode_bigram_bloom_shards(ShardWords) ->
     [
         {Shard, fts2_build_encode_bigram_bloom_shard(
@@ -6260,6 +7567,7 @@ fts2_build_encode_bigram_bloom_shards(ShardWords) ->
         )}
      || Shard <- lists:seq(0, ?BIGRAM_BLOOM_SHARDS - 1)
     ].
+-endif.
 
 fts2_build_encode_bigram_bloom_shard(Words) ->
     iolist_to_binary([
@@ -6267,6 +7575,7 @@ fts2_build_encode_bigram_bloom_shard(Words) ->
      || Word <- lists:seq(0, ?BIGRAM_BLOOM_SHARD_WORDS - 1)
     ]).
 
+-ifdef(TEST).
 fts2_build_add_bigram(
     Column, First, Second, Position, PlaneEntry, SecondPlaneEntry, Acc
 ) ->
@@ -6283,55 +7592,7 @@ fts2_build_add_bigram(
                 Existing, SecondTf, [Position | Positions]
             }}}
     end.
-
-fts2_build_write_identities_parallel(
-    Bookie, Bucket, Generation, Groups, Concurrency
-) ->
-    Pages = lists:foldl(
-        fun(Group, Acc) ->
-            PageNo = maps:get(group_id, Group) bsr
-                ?GENERATION_IDENTITY_PAGE_SHIFT,
-            Acc#{PageNo => [Group | maps:get(PageNo, Acc, [])]}
-        end,
-        #{},
-        Groups
-    ),
-    Key = fts2_codec_identity_key(Generation),
-    fts2_build_parallel(
-        fts2_build_chunks(maps:to_list(Pages), 1, []),
-        Concurrency,
-        fun(PageBatch) ->
-            Specs = [
-                {add, Bucket, Key, fts2_codec_identity_subkey(PageNo),
-                    fts2_codec_encode_identity_page(
-                        lists:reverse(PageGroups)
-                    )}
-             || {PageNo, PageGroups} <- PageBatch
-            ],
-            ok = fts2_build_write_slices(Bookie, Specs),
-            length(Specs)
-        end
-    ).
-
-fts2_build_write_terms_parallel(
-    Bookie, Bucket, Generation, TermRows, GroupCount, TotalLength,
-    Concurrency
-) ->
-    fts2_build_parallel(
-        fts2_build_chunks(maps:to_list(TermRows), 48, []),
-        Concurrency,
-        fun(RowBatch) ->
-            Specs = lists:append([
-                fts2_build_term_row_specs(
-                    Bucket, Generation, Column, Token, Row, GroupCount,
-                    TotalLength
-                )
-             || {{Column, Token}, Row} <- RowBatch
-            ]),
-            ok = fts2_build_write_slices(Bookie, Specs),
-            length(Specs)
-        end
-    ).
+-endif.
 
 fts2_build_term_row_specs(
     Bucket, Generation, Column, Token, Row, GroupCount, TotalLength
@@ -6366,64 +7627,221 @@ fts2_build_term_row_specs(
             fts2_codec_encode_plane(Anchor)}]
     end.
 
-fts2_build_write_bigrams_parallel(
-    Bookie, Bucket, Generation, BigramRows, TermRows, ChunkCount,
-    TotalLength, Concurrency
-) ->
-    Items = [
-        begin
-            FirstDf = length(maps:get(
-                entries, maps:get({Column, First}, TermRows)
-            )),
-            SecondDf = length(maps:get(
-                entries, maps:get({Column, Second}, TermRows)
-            )),
-            {{Column, First, Second}, ByChunk, FirstDf, SecondDf}
-        end
-     || {{Column, First, Second}, ByChunk} <- maps:to_list(BigramRows)
-    ],
-    fts2_build_parallel(
-        fts2_build_chunks(Items, 96, []),
-        Concurrency,
-        fun(RowBatch) ->
-            Specs = lists:append([
-                fts2_build_bigram_row_specs(
-                    Bucket, Generation, Column, First, Second, ByChunk,
-                    FirstDf, SecondDf, ChunkCount, TotalLength
-                )
-             || {{Column, First, Second}, ByChunk, FirstDf, SecondDf} <-
-                    RowBatch
-            ]),
-            ok = fts2_build_write_slices(Bookie, Specs),
-            length(Specs)
-        end
+fts2_build_parallel(_Role, [], _Concurrency, _Fun) ->
+    0;
+fts2_build_parallel(Role, Items, Concurrency0, Fun) ->
+    Concurrency =
+        case Concurrency0 of
+            N when is_integer(N), N > 0 ->
+                erlang:min(
+                    ?FTS2_MAX_BUILD_CONCURRENCY, erlang:min(N, length(Items))
+                );
+            _ ->
+                1
+        end,
+    fts2_build_parallel_with_limit(
+        Role, Items, Concurrency, Fun, fts2_build_max_heap_words()
     ).
 
-fts2_build_parallel([], _Concurrency, _Fun) ->
+-ifdef(TEST).
+fts2_build_parallel_for_test(Items, Concurrency0, Fun, MaxHeapWords) ->
+    fts2_build_parallel_for_test(
+        inner_worker, Items, Concurrency0, Fun, MaxHeapWords
+    ).
+
+fts2_build_parallel_for_test(
+    Role, Items, Concurrency0, Fun, MaxHeapWords
+) ->
+    Concurrency =
+        case Concurrency0 of
+            N when is_integer(N), N > 0 ->
+                erlang:min(N, erlang:max(length(Items), 1));
+            _ ->
+                1
+        end,
+    fts2_build_parallel_with_limit(
+        Role, Items, Concurrency, Fun, MaxHeapWords
+    ).
+
+fts2_build_parallel_for_test(
+    Role, Items, Concurrency0, Fun, MaxHeapWords, Observer
+) ->
+    PreviousObserver = put('$fts2_build_report_observer', Observer),
+    try
+        fts2_build_parallel_for_test(
+            Role, Items, Concurrency0, Fun, MaxHeapWords
+        )
+    after
+        case PreviousObserver of
+            undefined -> erase('$fts2_build_report_observer');
+            _ -> put('$fts2_build_report_observer', PreviousObserver)
+        end
+    end.
+
+fts2_outer_bound_for_test(Fun, MaxHeapWords, Observer) ->
+    PreviousObserver = put('$fts2_build_report_observer', Observer),
+    try
+        {Pid, Monitor} = spawn_opt(
+            fun() ->
+                Result =
+                    try Fun() of
+                        Value -> {fts2_outer_ok, Value}
+                    catch
+                        Class:Reason:Stacktrace ->
+                            {fts2_outer_error, Class, Reason, Stacktrace}
+                    end,
+                exit(Result)
+            end,
+            fts2_build_outer_options(MaxHeapWords)
+        ),
+        case Observer of
+            Sampler when is_pid(Sampler) ->
+                Sampler ! {fts2_build_outer, Pid};
+            _ ->
+                ok
+        end,
+        receive
+            {'DOWN', Monitor, process, Pid, {fts2_outer_ok, Value}} ->
+                Value;
+            {'DOWN', Monitor, process, Pid,
+                {fts2_outer_error, Class, Reason, Stacktrace}} ->
+                erlang:raise(Class, Reason, Stacktrace);
+            {'DOWN', Monitor, process, Pid, Reason} ->
+                fts2_build_report_bound(outer_build, Reason),
+                erlang:error({fts2_parallel_worker_lost, outer_build, Reason})
+        end
+    after
+        case PreviousObserver of
+            undefined -> erase('$fts2_build_report_observer');
+            _ -> put('$fts2_build_report_observer', PreviousObserver)
+        end
+    end.
+
+fts2_build_outer_options(infinity) ->
+    [monitor];
+fts2_build_outer_options(MaxHeapWords) ->
+    [
+        monitor,
+        {max_heap_size, #{
+            size => MaxHeapWords,
+            kill => true,
+            error_logger => false,
+            include_shared_binaries => true
+        }}
+    ].
+-endif.
+
+fts2_build_parallel_with_limit(
+    _Role, [], _Concurrency, _Fun, _MaxHeapWords
+) ->
     0;
-fts2_build_parallel(Items, Concurrency0, Fun) ->
-    Concurrency = case Concurrency0 of
-        N when is_integer(N), N > 0 -> erlang:min(N, length(Items));
-        _ -> 1
-    end,
-    ChunkSize = (length(Items) + Concurrency - 1) div Concurrency,
-    Chunks = fts2_build_chunks(Items, ChunkSize, []),
-    Monitors = [
-        begin
-            {_Pid, Monitor} = spawn_monitor(fun() ->
-                Result = try lists:sum([Fun(Item) || Item <- Chunk]) of
+fts2_build_parallel_with_limit(
+    Role, Items, Concurrency, Fun, MaxHeapWords
+) ->
+    PreviousTrapExit = process_flag(trap_exit, true),
+    try
+        {Pending, Monitors} = fts2_build_start_parallel(
+            Role, Items, Concurrency, Fun, MaxHeapWords, #{}
+        ),
+        fts2_build_collect_parallel(
+            {Role, Pending, Monitors, Fun, MaxHeapWords}, 0
+        )
+    after
+        process_flag(trap_exit, PreviousTrapExit)
+    end.
+
+fts2_build_start_parallel(
+    _Role, Items, 0, _Fun, _MaxHeapWords, Monitors
+) ->
+    {Items, Monitors};
+fts2_build_start_parallel(
+    _Role, [], _Slots, _Fun, _MaxHeapWords, Monitors
+) ->
+    {[], Monitors};
+fts2_build_start_parallel(
+    Role, [Item | Rest], Slots, Fun, MaxHeapWords, Monitors
+) ->
+    {Pid, Monitor} = spawn_opt(
+        fun() ->
+            Result =
+                try Fun(Item) of
                     Count -> {fts2_parallel_ok, Count}
                 catch
                     Class:Reason:Stacktrace ->
                         {fts2_parallel_error, Class, Reason, Stacktrace}
                 end,
-                exit(Result)
-            end),
-            Monitor
-        end
-     || Chunk <- Chunks
-    ],
-    fts2_build_collect_parallel(Monitors, 0).
+            exit(Result)
+        end,
+        [link | fts2_build_worker_options(MaxHeapWords)]
+    ),
+    fts2_build_observe_worker(Role, Pid),
+    fts2_build_start_parallel(
+        Role,
+        Rest,
+        Slots - 1,
+        Fun,
+        MaxHeapWords,
+        Monitors#{Monitor => {Pid, Role}}
+    ).
+
+fts2_build_worker_options(infinity) ->
+    [monitor];
+fts2_build_worker_options(MaxHeapWords) ->
+    [
+        monitor,
+        {max_heap_size, #{
+            size => MaxHeapWords,
+            kill => true,
+            %% The coordinator emits one typed report after the DOWN. Runtime
+            %% reporting is disabled so a heap breach cannot produce an
+            %% untyped duplicate.
+            error_logger => false,
+            include_shared_binaries => false
+        }}
+    ].
+
+-ifdef(TEST).
+fts2_build_max_heap_words() ->
+    case get('$fts2_build_max_heap_words') of
+        undefined -> ?FTS2_MAX_BUILD_HEAP_WORDS;
+        MaxHeapWords -> MaxHeapWords
+    end.
+
+fts2_build_observe_worker(Role, Pid) ->
+    case get('$fts2_build_observer') of
+        Observer when is_pid(Observer) ->
+            Observer ! {fts2_build_worker, Role, Pid},
+            ok;
+        _ ->
+            ok
+    end.
+
+fts2_build_report_bound(Role, Reason) ->
+    case get('$fts2_build_report_observer') of
+        Observer when is_pid(Observer) ->
+            Observer ! {fts2_bound_report, Role, Reason};
+        _ ->
+            ok
+    end,
+    error_logger:error_report([
+        {fts2_build_role, Role},
+        {reason, Reason},
+        {max_heap_size, breached}
+    ]).
+-else.
+fts2_build_max_heap_words() ->
+    ?FTS2_MAX_BUILD_HEAP_WORDS.
+
+fts2_build_observe_worker(_Role, _Pid) ->
+    ok.
+
+fts2_build_report_bound(Role, Reason) ->
+    error_logger:error_report([
+        {fts2_build_role, Role},
+        {reason, Reason},
+        {max_heap_size, breached}
+    ]).
+-endif.
 
 fts2_build_chunks([], _ChunkSize, Acc) ->
     lists:reverse(Acc);
@@ -6432,26 +7850,69 @@ fts2_build_chunks(Items, ChunkSize, Acc) ->
     {Chunk, Rest} = lists:split(Count, Items),
     fts2_build_chunks(Rest, ChunkSize, [Chunk | Acc]).
 
-fts2_build_collect_parallel([], Count) ->
+fts2_build_collect_parallel(
+    {_Role, [], Monitors, _Fun, _MaxHeapWords}, Count
+) when
+    map_size(Monitors) =:= 0
+->
     Count;
-fts2_build_collect_parallel(Monitors, Count) ->
+fts2_build_collect_parallel(
+    {Role, Pending, Monitors, Fun, MaxHeapWords}, Count
+) ->
     receive
-        {'DOWN', Monitor, process, _Pid, {fts2_parallel_ok, Rows}} ->
+        {'DOWN', Monitor, process, _Pid, {fts2_parallel_ok, Rows}} when
+            is_map_key(Monitor, Monitors)
+        ->
+            {Pid, Role} = maps:get(Monitor, Monitors),
+            fts2_build_drain_parallel_exit(Pid),
+            {NextPending, NextMonitors} = fts2_build_start_parallel(
+                Role,
+                Pending,
+                1,
+                Fun,
+                MaxHeapWords,
+                maps:remove(Monitor, Monitors)
+            ),
             fts2_build_collect_parallel(
-                lists:delete(Monitor, Monitors), Count + Rows
+                {Role, NextPending, NextMonitors, Fun, MaxHeapWords},
+                Count + Rows
             );
         {'DOWN', Monitor, process, _Pid,
-                {fts2_parallel_error, Class, Reason, Stacktrace}} ->
-            fts2_build_drain_parallel(lists:delete(Monitor, Monitors)),
-            erlang:raise(Class, Reason, Stacktrace)
+            {fts2_parallel_error, Class, Reason, Stacktrace}} when
+            is_map_key(Monitor, Monitors)
+        ->
+            {Pid, Role} = maps:get(Monitor, Monitors),
+            fts2_build_drain_parallel_exit(Pid),
+            fts2_build_drain_parallel(maps:remove(Monitor, Monitors)),
+            erlang:raise(Class, Reason, Stacktrace);
+        {'DOWN', Monitor, process, _Pid, Reason} when
+            is_map_key(Monitor, Monitors)
+        ->
+            {Pid, WorkerRole} = maps:get(Monitor, Monitors),
+            fts2_build_drain_parallel_exit(Pid),
+            %% A worker died without reporting a result tuple — e.g. killed
+            %% by its max_heap_size bound. Waiting would deadlock the build.
+            fts2_build_drain_parallel(maps:remove(Monitor, Monitors)),
+            fts2_build_report_bound(WorkerRole, Reason),
+            erlang:error({fts2_parallel_worker_lost, WorkerRole, Reason})
     end.
 
-fts2_build_drain_parallel([]) ->
+fts2_build_drain_parallel(Monitors) when map_size(Monitors) =:= 0 ->
     ok;
 fts2_build_drain_parallel(Monitors) ->
     receive
-        {'DOWN', Monitor, process, _Pid, _Reason} ->
-            fts2_build_drain_parallel(lists:delete(Monitor, Monitors))
+        {'DOWN', Monitor, process, Pid, _Reason} when
+            is_map_key(Monitor, Monitors)
+        ->
+            fts2_build_drain_parallel_exit(Pid),
+            fts2_build_drain_parallel(maps:remove(Monitor, Monitors))
+    end.
+
+fts2_build_drain_parallel_exit(Pid) ->
+    receive
+        {'EXIT', Pid, _Reason} -> ok
+    after 1000 ->
+        erlang:error({fts2_parallel_exit_signal_missing, Pid})
     end.
 
 fts2_build_bigram_row_specs(
@@ -6634,37 +8095,6 @@ fts2_build_identity_page_count(0, _Shift) ->
 fts2_build_identity_page_count(GroupCount, Shift) ->
     ((GroupCount - 1) div (1 bsl Shift)) + 1.
 
-%% A generation is immutable. Recording whether each declared filter column
-%% is uniform lets count-only serving discharge the common single-tenant facet
-%% without reading a posting plane or an identity page. Older roots decode
-%% without this key and conservatively behave as `mixed`.
-fts2_build_facet_domain(Schema, Groups) ->
-    lists:foldl(
-        fun(Group, Acc) ->
-            lists:foldl(
-                fun(Chunk, Inner) ->
-                    Candidate = maps:get(candidate_record, Chunk, #{}),
-                    lists:foldl(
-                        fun({Column, Field}, Domain) ->
-                            Value = maps:get(Field, Candidate, undefined),
-                            case maps:get(Column, Domain, unset) of
-                                unset -> Domain#{Column => {uniform, Value}};
-                                {uniform, Value} -> Domain;
-                                _Other -> Domain#{Column => mixed}
-                            end
-                        end,
-                        Inner,
-                        maps:get(candidate_filter_fields, Schema, [])
-                    )
-                end,
-                Acc,
-                maps:get(chunks, Group, [])
-            )
-        end,
-        #{},
-        Groups
-    ).
-
 fts2_build_write_slices(_Bookie, []) ->
     ok;
 fts2_build_write_slices(Bookie, Specs) ->
@@ -6681,24 +8111,39 @@ fts2_build_identity_bookie(Bookie, Schema) ->
 
 fts2_build_cleanup_generation(Bookie, Schema, Generation) ->
     Bucket = maps:get(index, Schema),
+    fts2_build_remove_workspace(Bookie, Schema, Generation),
     fts2_build_remove_generation_rows(Bookie, Bucket, term, Generation),
     fts2_build_remove_generation_rows(Bookie, Bucket, bigram, Generation),
     fts2_build_remove_generation_rows(
         fts2_build_identity_bookie(Bookie, Schema), Bucket, identity, Generation
     ).
 
+fts2_build_remove_workspace(Bookie, #{index := Bucket}, Generation) ->
+    fts2_build_remove_generation_rows(
+        Bookie, Bucket, workspace, Generation
+    ).
+
 fts2_build_remove_generation_rows(Bookie, Bucket, Kind, Generation) ->
     {Start, Finish} = case Kind of
         term -> {<<"f2:b:">>, <<"f2:u">>};
         bigram -> {<<"f2:g:">>, <<"f2:h">>};
+        workspace -> {<<"f2:w:">>, <<"f2:x">>};
         identity ->
             Key = fts2_codec_identity_key(Generation),
             {Key, Key}
     end,
-    Fold = fun(B, {Key, SubKey}, _Value, Acc) when B =:= Bucket ->
+    Fold = fun(B, {Key, SubKey}, _Value, {Specs, Size}) when B =:= Bucket ->
         case fts2_build_generation_key(Kind, Key, Generation) of
-            true -> [{remove, Bucket, Key, SubKey, <<>>} | Acc];
-            false -> Acc
+            true when Size + 1 >= ?WRITE_SLICE ->
+                ok = fts2_build_write_slices(
+                    Bookie,
+                    [{remove, Bucket, Key, SubKey, <<>>} | Specs]
+                ),
+                {[], 0};
+            true ->
+                {[{remove, Bucket, Key, SubKey, <<>>} | Specs], Size + 1};
+            false ->
+                {Specs, Size}
         end;
         (_B, _Key, _Value, Acc) -> Acc
     end,
@@ -6706,12 +8151,13 @@ fts2_build_remove_generation_rows(Bookie, Bucket, Kind, Generation) ->
         Bookie,
         ?HEAD_TAG,
         {range, Bucket, {{Start, <<>>}, {Finish, <<255, 255, 255, 255>>}}},
-        {Fold, []},
+        {Fold, {[], 0}},
         false,
         true,
         false
     ),
-    fts2_build_remove_specs(Bookie, Runner()).
+    {Remaining, _Size} = Runner(),
+    fts2_build_remove_specs(Bookie, Remaining).
 
 fts2_build_generation_key(term, <<"f2:t:", Generation:64/unsigned-big, _/binary>>,
     Generation) -> true;
@@ -6721,6 +8167,8 @@ fts2_build_generation_key(term, <<"f2:p:", Generation:64/unsigned-big, _/binary>
     Generation) -> true;
 fts2_build_generation_key(bigram, <<"f2:g:", Generation:64/unsigned-big, _/binary>>,
     Generation) -> true;
+fts2_build_generation_key(workspace,
+    <<"f2:w:", Generation:64/unsigned-big, _/binary>>, Generation) -> true;
 fts2_build_generation_key(identity, <<"f2:i:", Generation:64/unsigned-big>>, Generation) ->
     true;
 fts2_build_generation_key(_Kind, _Key, _Generation) -> false.
@@ -7196,6 +8644,30 @@ fts2_codec_decode_plane(<<?PLANE_VERSION:8, Count:32/unsigned-big, Payload/binar
     fts2_codec_decode_plane_entries(Payload, []);
 fts2_codec_decode_plane(Bad) ->
     erlang:error({invalid_fts2_plane, Bad}).
+
+fts2_codec_decode_selected_plane(
+    <<?PLANE_VERSION:8, Count:32/unsigned-big, Payload/binary>>, Wanted
+) when byte_size(Payload) =:= Count * 28, is_map(Wanted) ->
+    fts2_codec_decode_selected_plane_entries(Payload, Wanted, []);
+fts2_codec_decode_selected_plane(Bad, _Wanted) ->
+    erlang:error({invalid_fts2_plane, Bad}).
+
+fts2_codec_decode_selected_plane_entries(<<>>, _Wanted, Acc) ->
+    lists:reverse(Acc);
+fts2_codec_decode_selected_plane_entries(
+    <<ChunkId:32/unsigned-big, GroupId:32/unsigned-big,
+        SourceId:64/unsigned-big, DocLength:32/unsigned-big,
+        Tf:32/unsigned-big, DenseId:32/unsigned-big, Rest/binary>>,
+    Wanted,
+    Acc
+) ->
+    Next = case maps:is_key(ChunkId, Wanted) of
+        true -> [
+            {ChunkId, GroupId, SourceId, DocLength, Tf, DenseId} | Acc
+        ];
+        false -> Acc
+    end,
+    fts2_codec_decode_selected_plane_entries(Rest, Wanted, Next).
 
 fts2_codec_decode_plane_entries(<<>>, Acc) ->
     lists:reverse(Acc);
@@ -9908,11 +11380,28 @@ fts2_search_or_take_both(
 fts2_search_or_target_add(Candidate, none, GroupTf) ->
     {Candidate, GroupTf + element(5, Candidate)};
 fts2_search_or_target_add(Candidate, Winner, GroupTf) ->
-    NextWinner = case {-element(6, Candidate), element(3, Candidate)} <
-        {-element(6, Winner), element(3, Winner)} of
-        true -> Candidate;
-        false -> Winner
+    %% v4 term planes have one document-grain entry per term/group, but
+    %% different terms may choose different representative chunks.  The OR
+    %% score is the sum of both term contributions, never the best anchor.
+    {ChunkId, GroupId, SourceId, Length} = case
+        {element(1, Candidate), element(3, Candidate)} <
+            {element(1, Winner), element(3, Winner)}
+    of
+        true -> {
+            element(1, Candidate), element(2, Candidate),
+            element(3, Candidate), element(4, Candidate)
+        };
+        false -> {
+            element(1, Winner), element(2, Winner),
+            element(3, Winner), element(4, Winner)
+        }
     end,
+    NextWinner = {
+        ChunkId, GroupId, SourceId, Length,
+        element(5, Winner) + element(5, Candidate),
+        element(6, Winner) + element(6, Candidate),
+        element(7, Winner) bor element(7, Candidate)
+    },
     {NextWinner, GroupTf + element(5, Candidate)}.
 
 fts2_search_or_compact_score({{_ChunkId, _GroupId, _SourceId, _Length,
@@ -11173,17 +12662,18 @@ fts2_search_boolean_select_plane(
             Acc;
         true ->
             Stat = {{Column, Token}, Tf, base, Df},
-            case maps:find(ChunkId, Acc) of
+            case maps:find(GroupId, Acc) of
                 error ->
-                    Acc#{ChunkId => {
+                    Acc#{GroupId => {
                         ChunkId, GroupId, SourceId, Length, [Stat], Tf
                     }};
-                {ok, {ChunkId, GroupId, SourceId, Length, Stats, TotalTf}} ->
-                    Acc#{ChunkId => {
-                        ChunkId,
+                {ok, {StoredChunkId, GroupId, StoredSourceId, StoredLength,
+                        Stats, TotalTf}} ->
+                    Acc#{GroupId => {
+                        StoredChunkId,
                         GroupId,
-                        SourceId,
-                        Length,
+                        StoredSourceId,
+                        StoredLength,
                         [Stat | Stats],
                         TotalTf + Tf
                     }}
@@ -11204,15 +12694,16 @@ fts2_search_boolean_select_sparse(Plane, Result, Column, Token, Df, Acc) ->
                     RowAcc;
                 {ChunkId, GroupId, SourceId, Length, Tf, DenseId} ->
                     Stat = {{Column, Token}, Tf, base, Df},
-                    case maps:find(ChunkId, RowAcc) of
+                    case maps:find(GroupId, RowAcc) of
                         error ->
-                            RowAcc#{ChunkId => {
+                            RowAcc#{GroupId => {
                                 ChunkId, GroupId, SourceId, Length, [Stat], Tf
                             }};
-                        {ok, {ChunkId, GroupId, SourceId, Length,
-                                Stats, TotalTf}} ->
-                            RowAcc#{ChunkId => {
-                                ChunkId, GroupId, SourceId, Length,
+                        {ok, {StoredChunkId, GroupId, StoredSourceId,
+                                StoredLength, Stats, TotalTf}} ->
+                            RowAcc#{GroupId => {
+                                StoredChunkId, GroupId, StoredSourceId,
+                                StoredLength,
                                 [Stat | Stats], TotalTf + Tf
                             }}
                     end

@@ -1,7 +1,7 @@
 %% fts_sqlite_oracle_corpus.eterm
 %% Differential-oracle corpus: unicode61 tokenizer parity with SQLite FTS5.
 %% GENERATED FILE - do not edit; regenerate with test/regen_fts_sqlite_oracle.sh
-%% Oracle binary: sqlite3 3.43.2 2023-10-10 13:08:14 1b37c146ee9ebb7acd0160c0ab1fd11017a419fa8a3187386ed8cb32b709aapl (64-bit)
+%% Oracle binary: sqlite3 3.53.3 2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d78alt1 (64-bit)
 %%
 %% Read with file:consult/1 -> {ok, [Cases]} where Cases is this list.
 %% Case shape:
@@ -9,12 +9,13 @@
 %%     tokenizer_opts => #{remove_diacritics => 0|1|2,
 %%                         tokenchars => binary(), separators => binary()},
 %%     doc => binary(),        %% exact bytes indexed (may be invalid UTF-8)
-%%     queries => [#{q => binary(), match => boolean()}]}
+%%     queries => [#{q => binary(), hits => [{binary(), pos_integer()}]}]}
 %%
 %% Every doc was inserted as CAST(X'<hex>' AS TEXT) and byte-verified with
 %% SELECT hex(body). Every query ran as: body MATCH '"' || <bytes> || '"'
 %% (an FTS5 string/phrase, tokenized by the table's own tokenizer).
-%% Every match boolean is sqlite3's own answer (count(*) > 0).
+%% Hit identity/order comes from count(*); match_count is the number of
+%% FTS5 highlight start markers for the quoted phrase in that hit.
 [
  %% sd_eacute_rd0: doc=café rd=0; qs=[cafe, café, CAFÉ, cafè]
  #{id => sd_eacute_rd0,
@@ -24,10 +25,10 @@
          separators => <<>>},
    doc => <<99,97,102,195,169>>,
    queries =>
-       [#{q => <<99,97,102,101>>, match => false},
-        #{q => <<99,97,102,195,169>>, match => true},
-        #{q => <<67,65,70,195,137>>, match => true},
-        #{q => <<99,97,102,195,168>>, match => false}]}
+       [#{q => <<99,97,102,101>>, hits => []},
+        #{q => <<99,97,102,195,169>>, hits => [{<<"doc">>,1}]},
+        #{q => <<67,65,70,195,137>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102,195,168>>, hits => []}]}
  ,
  %% sd_eacute_rd1: doc=café rd=1; qs=[cafe, café, cafè, caf]
  #{id => sd_eacute_rd1,
@@ -37,10 +38,10 @@
          separators => <<>>},
    doc => <<99,97,102,195,169>>,
    queries =>
-       [#{q => <<99,97,102,101>>, match => true},
-        #{q => <<99,97,102,195,169>>, match => true},
-        #{q => <<99,97,102,195,168>>, match => true},
-        #{q => <<99,97,102>>, match => false}]}
+       [#{q => <<99,97,102,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102,195,169>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102,195,168>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102>>, hits => []}]}
  ,
  %% sd_eacute_rd2: doc=café rd=2; qs=[cafe, café]
  #{id => sd_eacute_rd2,
@@ -50,8 +51,8 @@
          separators => <<>>},
    doc => <<99,97,102,195,169>>,
    queries =>
-       [#{q => <<99,97,102,101>>, match => true},
-        #{q => <<99,97,102,195,169>>, match => true}]}
+       [#{q => <<99,97,102,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102,195,169>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_uuml_rd0: doc=über rd=0; qs=[uber, über]
  #{id => sd_uuml_rd0,
@@ -61,8 +62,8 @@
          separators => <<>>},
    doc => <<195,188,98,101,114>>,
    queries =>
-       [#{q => <<117,98,101,114>>, match => false},
-        #{q => <<195,188,98,101,114>>, match => true}]}
+       [#{q => <<117,98,101,114>>, hits => []},
+        #{q => <<195,188,98,101,114>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_uuml_rd1: doc=über rd=1; qs=[uber, über, Über, UBER]
  #{id => sd_uuml_rd1,
@@ -72,10 +73,10 @@
          separators => <<>>},
    doc => <<195,188,98,101,114>>,
    queries =>
-       [#{q => <<117,98,101,114>>, match => true},
-        #{q => <<195,188,98,101,114>>, match => true},
-        #{q => <<195,156,98,101,114>>, match => true},
-        #{q => <<85,66,69,82>>, match => true}]}
+       [#{q => <<117,98,101,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,188,98,101,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,156,98,101,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<85,66,69,82>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_uuml_rd2: doc=über rd=2; qs=[uber, über]
  #{id => sd_uuml_rd2,
@@ -85,8 +86,8 @@
          separators => <<>>},
    doc => <<195,188,98,101,114>>,
    queries =>
-       [#{q => <<117,98,101,114>>, match => true},
-        #{q => <<195,188,98,101,114>>, match => true}]}
+       [#{q => <<117,98,101,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,188,98,101,114>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_ntilde_rd0: doc=niño rd=0; qs=[nino, niño]
  #{id => sd_ntilde_rd0,
@@ -96,8 +97,8 @@
          separators => <<>>},
    doc => <<110,105,195,177,111>>,
    queries =>
-       [#{q => <<110,105,110,111>>, match => false},
-        #{q => <<110,105,195,177,111>>, match => true}]}
+       [#{q => <<110,105,110,111>>, hits => []},
+        #{q => <<110,105,195,177,111>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_ntilde_rd1: doc=niño rd=1; qs=[nino, niño]
  #{id => sd_ntilde_rd1,
@@ -107,8 +108,8 @@
          separators => <<>>},
    doc => <<110,105,195,177,111>>,
    queries =>
-       [#{q => <<110,105,110,111>>, match => true},
-        #{q => <<110,105,195,177,111>>, match => true}]}
+       [#{q => <<110,105,110,111>>, hits => [{<<"doc">>,1}]},
+        #{q => <<110,105,195,177,111>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_ntilde_rd2: doc=niño rd=2; qs=[nino]
  #{id => sd_ntilde_rd2,
@@ -118,7 +119,7 @@
          separators => <<>>},
    doc => <<110,105,195,177,111>>,
    queries =>
-       [#{q => <<110,105,110,111>>, match => true}]}
+       [#{q => <<110,105,110,111>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% sd_ccedil_rd1: doc=façade rd=1; qs=[facade, façade]
  #{id => sd_ccedil_rd1,
@@ -128,8 +129,8 @@
          separators => <<>>},
    doc => <<102,97,195,167,97,100,101>>,
    queries =>
-       [#{q => <<102,97,99,97,100,101>>, match => true},
-        #{q => <<102,97,195,167,97,100,101>>, match => true}]}
+       [#{q => <<102,97,99,97,100,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<102,97,195,167,97,100,101>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% md_viet_rd0: doc=một (o=U+1ED9, 2 diacritics) rd=0; qs=[mot, một, môt, mọt]
  #{id => md_viet_rd0,
@@ -139,10 +140,10 @@
          separators => <<>>},
    doc => <<109,225,187,153,116>>,
    queries =>
-       [#{q => <<109,111,116>>, match => false},
-        #{q => <<109,225,187,153,116>>, match => true},
-        #{q => <<109,195,180,116>>, match => false},
-        #{q => <<109,225,187,141,116>>, match => false}]}
+       [#{q => <<109,111,116>>, hits => []},
+        #{q => <<109,225,187,153,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,195,180,116>>, hits => []},
+        #{q => <<109,225,187,141,116>>, hits => []}]}
  ,
  %% md_viet_rd1: doc=một rd=1 (mode1 retains multi-diacritic codepoints); qs=[mot, một, môt, mọt]
  #{id => md_viet_rd1,
@@ -152,10 +153,10 @@
          separators => <<>>},
    doc => <<109,225,187,153,116>>,
    queries =>
-       [#{q => <<109,111,116>>, match => false},
-        #{q => <<109,225,187,153,116>>, match => true},
-        #{q => <<109,195,180,116>>, match => false},
-        #{q => <<109,225,187,141,116>>, match => false}]}
+       [#{q => <<109,111,116>>, hits => []},
+        #{q => <<109,225,187,153,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,195,180,116>>, hits => []},
+        #{q => <<109,225,187,141,116>>, hits => []}]}
  ,
  %% md_viet_rd2: doc=một rd=2 (mode2 folds); qs=[mot, một, môt, mọt]
  #{id => md_viet_rd2,
@@ -165,10 +166,10 @@
          separators => <<>>},
    doc => <<109,225,187,153,116>>,
    queries =>
-       [#{q => <<109,111,116>>, match => true},
-        #{q => <<109,225,187,153,116>>, match => true},
-        #{q => <<109,195,180,116>>, match => true},
-        #{q => <<109,225,187,141,116>>, match => true}]}
+       [#{q => <<109,111,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,225,187,153,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,195,180,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,225,187,141,116>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% md_cacute_rd1: doc=ḉa (U+1E09 c+cedilla+acute) rd=1; qs=[ca, ça, ḉa]
  #{id => md_cacute_rd1,
@@ -178,9 +179,9 @@
          separators => <<>>},
    doc => <<225,184,137,97>>,
    queries =>
-       [#{q => <<99,97>>, match => false},
-        #{q => <<195,167,97>>, match => false},
-        #{q => <<225,184,137,97>>, match => true}]}
+       [#{q => <<99,97>>, hits => []},
+        #{q => <<195,167,97>>, hits => []},
+        #{q => <<225,184,137,97>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% md_cacute_rd2: doc=ḉa rd=2; qs=[ca, ça, ḉa]
  #{id => md_cacute_rd2,
@@ -190,9 +191,9 @@
          separators => <<>>},
    doc => <<225,184,137,97>>,
    queries =>
-       [#{q => <<99,97>>, match => true},
-        #{q => <<195,167,97>>, match => true},
-        #{q => <<225,184,137,97>>, match => true}]}
+       [#{q => <<99,97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,167,97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<225,184,137,97>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% md_ecirc_rd1: doc=ệm (U+1EC7 e+circumflex+dot) rd=1; qs=[em, ệm, êm, ẹm]
  #{id => md_ecirc_rd1,
@@ -202,10 +203,10 @@
          separators => <<>>},
    doc => <<225,187,135,109>>,
    queries =>
-       [#{q => <<101,109>>, match => false},
-        #{q => <<225,187,135,109>>, match => true},
-        #{q => <<195,170,109>>, match => false},
-        #{q => <<225,186,185,109>>, match => false}]}
+       [#{q => <<101,109>>, hits => []},
+        #{q => <<225,187,135,109>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,170,109>>, hits => []},
+        #{q => <<225,186,185,109>>, hits => []}]}
  ,
  %% md_ecirc_rd2: doc=ệm rd=2; qs=[em, ệm]
  #{id => md_ecirc_rd2,
@@ -215,8 +216,8 @@
          separators => <<>>},
    doc => <<225,187,135,109>>,
    queries =>
-       [#{q => <<101,109>>, match => true},
-        #{q => <<225,187,135,109>>, match => true}]}
+       [#{q => <<101,109>>, hits => [{<<"doc">>,1}]},
+        #{q => <<225,187,135,109>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% gr_alpha_rd0: doc=άλφα (ά=U+03AC precomposed) rd=0; qs=[αλφα, άλφα]
  #{id => gr_alpha_rd0,
@@ -226,8 +227,8 @@
          separators => <<>>},
    doc => <<206,172,206,187,207,134,206,177>>,
    queries =>
-       [#{q => <<206,177,206,187,207,134,206,177>>, match => false},
-        #{q => <<206,172,206,187,207,134,206,177>>, match => true}]}
+       [#{q => <<206,177,206,187,207,134,206,177>>, hits => []},
+        #{q => <<206,172,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% gr_alpha_rd1: doc=άλφα rd=1; qs=[αλφα, άλφα, ΆΛΦΑ]
  #{id => gr_alpha_rd1,
@@ -237,9 +238,9 @@
          separators => <<>>},
    doc => <<206,172,206,187,207,134,206,177>>,
    queries =>
-       [#{q => <<206,177,206,187,207,134,206,177>>, match => false},
-        #{q => <<206,172,206,187,207,134,206,177>>, match => true},
-        #{q => <<206,134,206,155,206,166,206,145>>, match => true}]}
+       [#{q => <<206,177,206,187,207,134,206,177>>, hits => []},
+        #{q => <<206,172,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]},
+        #{q => <<206,134,206,155,206,166,206,145>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% gr_alpha_rd2: doc=άλφα rd=2; qs=[αλφα, άλφα]
  #{id => gr_alpha_rd2,
@@ -249,8 +250,8 @@
          separators => <<>>},
    doc => <<206,172,206,187,207,134,206,177>>,
    queries =>
-       [#{q => <<206,177,206,187,207,134,206,177>>, match => false},
-        #{q => <<206,172,206,187,207,134,206,177>>, match => true}]}
+       [#{q => <<206,177,206,187,207,134,206,177>>, hits => []},
+        #{q => <<206,172,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% gr_decomp_rd0: doc=α+U+0301(combining)+λφα rd=0; qs=[αλφα, άλφα, α<U+0301>λφα]
  #{id => gr_decomp_rd0,
@@ -260,9 +261,9 @@
          separators => <<>>},
    doc => <<206,177,204,129,206,187,207,134,206,177>>,
    queries =>
-       [#{q => <<206,177,206,187,207,134,206,177>>, match => false},
-        #{q => <<206,172,206,187,207,134,206,177>>, match => false},
-        #{q => <<206,177,204,129,206,187,207,134,206,177>>, match => true}]}
+       [#{q => <<206,177,206,187,207,134,206,177>>, hits => []},
+        #{q => <<206,172,206,187,207,134,206,177>>, hits => []},
+        #{q => <<206,177,204,129,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% gr_decomp_rd1: doc=α+U+0301+λφα rd=1; qs=[αλφα, άλφα, α<U+0301>λφα]
  #{id => gr_decomp_rd1,
@@ -272,9 +273,9 @@
          separators => <<>>},
    doc => <<206,177,204,129,206,187,207,134,206,177>>,
    queries =>
-       [#{q => <<206,177,206,187,207,134,206,177>>, match => true},
-        #{q => <<206,172,206,187,207,134,206,177>>, match => false},
-        #{q => <<206,177,204,129,206,187,207,134,206,177>>, match => true}]}
+       [#{q => <<206,177,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]},
+        #{q => <<206,172,206,187,207,134,206,177>>, hits => []},
+        #{q => <<206,177,204,129,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% gr_decomp_rd2: doc=α+U+0301+λφα rd=2; qs=[αλφα, άλφα]
  #{id => gr_decomp_rd2,
@@ -284,8 +285,8 @@
          separators => <<>>},
    doc => <<206,177,204,129,206,187,207,134,206,177>>,
    queries =>
-       [#{q => <<206,177,206,187,207,134,206,177>>, match => true},
-        #{q => <<206,172,206,187,207,134,206,177>>, match => false}]}
+       [#{q => <<206,177,206,187,207,134,206,177>>, hits => [{<<"doc">>,1}]},
+        #{q => <<206,172,206,187,207,134,206,177>>, hits => []}]}
  ,
  %% cy_shorti_rd1: doc=йод (й=U+0439 precomposed) rd=1; qs=[иод, йод]
  #{id => cy_shorti_rd1,
@@ -295,8 +296,8 @@
          separators => <<>>},
    doc => <<208,185,208,190,208,180>>,
    queries =>
-       [#{q => <<208,184,208,190,208,180>>, match => false},
-        #{q => <<208,185,208,190,208,180>>, match => true}]}
+       [#{q => <<208,184,208,190,208,180>>, hits => []},
+        #{q => <<208,185,208,190,208,180>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cy_shorti_rd2: doc=йод rd=2; qs=[иод, йод]
  #{id => cy_shorti_rd2,
@@ -306,8 +307,8 @@
          separators => <<>>},
    doc => <<208,185,208,190,208,180>>,
    queries =>
-       [#{q => <<208,184,208,190,208,180>>, match => false},
-        #{q => <<208,185,208,190,208,180>>, match => true}]}
+       [#{q => <<208,184,208,190,208,180>>, hits => []},
+        #{q => <<208,185,208,190,208,180>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cy_decomp_rd1: doc=и+U+0306(combining breve)+од rd=1; qs=[иод, йод, и<U+0306>од]
  #{id => cy_decomp_rd1,
@@ -317,9 +318,9 @@
          separators => <<>>},
    doc => <<208,184,204,134,208,190,208,180>>,
    queries =>
-       [#{q => <<208,184,208,190,208,180>>, match => true},
-        #{q => <<208,185,208,190,208,180>>, match => false},
-        #{q => <<208,184,204,134,208,190,208,180>>, match => true}]}
+       [#{q => <<208,184,208,190,208,180>>, hits => [{<<"doc">>,1}]},
+        #{q => <<208,185,208,190,208,180>>, hits => []},
+        #{q => <<208,184,204,134,208,190,208,180>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cy_yo_rd1: doc=ёж (ё=U+0451) rd=1; qs=[еж, ёж]
  #{id => cy_yo_rd1,
@@ -329,8 +330,8 @@
          separators => <<>>},
    doc => <<209,145,208,182>>,
    queries =>
-       [#{q => <<208,181,208,182>>, match => false},
-        #{q => <<209,145,208,182>>, match => true}]}
+       [#{q => <<208,181,208,182>>, hits => []},
+        #{q => <<209,145,208,182>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cy_yo_rd2: doc=ёж rd=2; qs=[еж, ёж]
  #{id => cy_yo_rd2,
@@ -340,8 +341,8 @@
          separators => <<>>},
    doc => <<209,145,208,182>>,
    queries =>
-       [#{q => <<208,181,208,182>>, match => false},
-        #{q => <<209,145,208,182>>, match => true}]}
+       [#{q => <<208,181,208,182>>, hits => []},
+        #{q => <<209,145,208,182>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% lat_decomp_rd0: doc=e+U+0301(combining acute)+f rd=0; qs=[ef, éf, e<U+0301>f]
  #{id => lat_decomp_rd0,
@@ -351,9 +352,9 @@
          separators => <<>>},
    doc => <<101,204,129,102>>,
    queries =>
-       [#{q => <<101,102>>, match => false},
-        #{q => <<195,169,102>>, match => false},
-        #{q => <<101,204,129,102>>, match => true}]}
+       [#{q => <<101,102>>, hits => []},
+        #{q => <<195,169,102>>, hits => []},
+        #{q => <<101,204,129,102>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% lat_decomp_rd1: doc=e+U+0301+f rd=1; qs=[ef, éf, e<U+0301>f]
  #{id => lat_decomp_rd1,
@@ -363,9 +364,9 @@
          separators => <<>>},
    doc => <<101,204,129,102>>,
    queries =>
-       [#{q => <<101,102>>, match => true},
-        #{q => <<195,169,102>>, match => true},
-        #{q => <<101,204,129,102>>, match => true}]}
+       [#{q => <<101,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,169,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<101,204,129,102>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% lat_decomp_rd2: doc=e+U+0301+f rd=2; qs=[ef, éf]
  #{id => lat_decomp_rd2,
@@ -375,8 +376,8 @@
          separators => <<>>},
    doc => <<101,204,129,102>>,
    queries =>
-       [#{q => <<101,102>>, match => true},
-        #{q => <<195,169,102>>, match => true}]}
+       [#{q => <<101,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,169,102>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% lat_2comb_rd1: doc=m,o,U+0302,U+0323,t (decomposed một) rd=1; qs=[mot, một, mo<U+0302><U+0323>t]
  #{id => lat_2comb_rd1,
@@ -386,9 +387,9 @@
          separators => <<>>},
    doc => <<109,111,204,130,204,163,116>>,
    queries =>
-       [#{q => <<109,111,116>>, match => true},
-        #{q => <<109,225,187,153,116>>, match => false},
-        #{q => <<109,111,204,130,204,163,116>>, match => true}]}
+       [#{q => <<109,111,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,225,187,153,116>>, hits => []},
+        #{q => <<109,111,204,130,204,163,116>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% lat_2comb_rd2: doc=decomposed một rd=2; qs=[mot, một]
  #{id => lat_2comb_rd2,
@@ -398,8 +399,8 @@
          separators => <<>>},
    doc => <<109,111,204,130,204,163,116>>,
    queries =>
-       [#{q => <<109,111,116>>, match => true},
-        #{q => <<109,225,187,153,116>>, match => true}]}
+       [#{q => <<109,111,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,225,187,153,116>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_ff_mid_rd1: doc=ab<FF>cd rd=1; qs=[ab, cd, abcd, "ab cd"]
  #{id => inv_ff_mid_rd1,
@@ -409,10 +410,10 @@
          separators => <<>>},
    doc => <<97,98,255,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,32,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_ff_mid_rd0: doc=ab<FF>cd rd=0; qs=[ab, cd, abcd]
  #{id => inv_ff_mid_rd0,
@@ -422,9 +423,9 @@
          separators => <<>>},
    doc => <<97,98,255,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []}]}
  ,
  %% inv_overlong_nul_rd1: doc=ab<C0 80>cd (overlong NUL) rd=1; qs=[ab, cd, abcd, "ab cd"]
  #{id => inv_overlong_nul_rd1,
@@ -434,10 +435,10 @@
          separators => <<>>},
    doc => <<97,98,192,128,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,32,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_trunc_euro_rd1: doc=ab<E2 82>cd (truncated 3-byte seq) rd=1; qs=[ab, cd, d, abcd]
  #{id => inv_trunc_euro_rd1,
@@ -447,10 +448,10 @@
          separators => <<>>},
    doc => <<97,98,226,130,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<100>>, match => false},
-        #{q => <<97,98,99,100>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<100>>, hits => []},
+        #{q => <<97,98,99,100>>, hits => []}]}
  ,
  %% inv_lone_cont_rd1: doc=ab<80>cd (lone continuation byte) rd=1; qs=[ab, cd, abcd]
  #{id => inv_lone_cont_rd1,
@@ -460,9 +461,9 @@
          separators => <<>>},
    doc => <<97,98,128,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []}]}
  ,
  %% inv_ff_start_rd1: doc=<FF>ab rd=1; qs=[ab, b]
  #{id => inv_ff_start_rd1,
@@ -472,8 +473,8 @@
          separators => <<>>},
    doc => <<255,97,98>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<98>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => []}]}
  ,
  %% inv_ff_end_rd1: doc=ab<FF> rd=1; qs=[ab, a]
  #{id => inv_ff_end_rd1,
@@ -483,8 +484,8 @@
          separators => <<>>},
    doc => <<97,98,255>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<97>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97>>, hits => []}]}
  ,
  %% inv_ff_ff_rd1: doc=ab<FF FF>cd rd=1; qs=[ab, cd, abcd, "ab cd"]
  #{id => inv_ff_ff_rd1,
@@ -494,10 +495,10 @@
          separators => <<>>},
    doc => <<97,98,255,255,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,32,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_c3_eats_rd1: doc=a<C3>bc (C3 expects continuation; b is not) rd=1; qs=[a, bc, c, abc]
  #{id => inv_c3_eats_rd1,
@@ -507,10 +508,10 @@
          separators => <<>>},
    doc => <<97,195,98,99>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98,99>>, match => true},
-        #{q => <<99>>, match => false},
-        #{q => <<97,98,99>>, match => false}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98,99>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99>>, hits => []},
+        #{q => <<97,98,99>>, hits => []}]}
  ,
  %% inv_f0_trunc_rd1: doc=ab<F0 9F 92>cd rd=1 (truncated 4-byte seq decodes to U+07D2, an NKO LETTER, fusing ab+cd into one token); qs=[ab, cd, d, abcd, ab<DF 92>cd]
  #{id => inv_f0_trunc_rd1,
@@ -520,11 +521,11 @@
          separators => <<>>},
    doc => <<97,98,240,159,146,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => false},
-        #{q => <<99,100>>, match => false},
-        #{q => <<100>>, match => false},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,223,146,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => []},
+        #{q => <<99,100>>, hits => []},
+        #{q => <<100>>, hits => []},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,223,146,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_f0_trunc_sep_rd1: doc=ab<F0 9F 92>SP cd rd=1 (phantom letter U+07D2 glues to left token only); qs=[ab, cd, ab<DF 92>]
  #{id => inv_f0_trunc_sep_rd1,
@@ -534,9 +535,9 @@
          separators => <<>>},
    doc => <<97,98,240,159,146,32,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => false},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,223,146>>, match => true}]}
+       [#{q => <<97,98>>, hits => []},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,223,146>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_surrogate_rd1: doc=ab<ED A0 80>cd (UTF-8-encoded surrogate D800) rd=1; qs=[ab, cd, abcd, "ab cd"]
  #{id => inv_surrogate_rd1,
@@ -546,10 +547,10 @@
          separators => <<>>},
    doc => <<97,98,237,160,128,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,32,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_nul_rd1: doc=ab<00>cd (embedded real NUL) rd=1; qs=[ab, cd, abcd, "ab cd"]
  #{id => inv_nul_rd1,
@@ -559,10 +560,10 @@
          separators => <<>>},
    doc => <<97,98,0,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,32,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% inv_overlong_slash_rd1: doc=ab<E0 80 AF>cd (overlong /) rd=1; qs=[ab, cd, abcd]
  #{id => inv_overlong_slash_rd1,
@@ -572,9 +573,9 @@
          separators => <<>>},
    doc => <<97,98,224,128,175,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []}]}
  ,
  %% inv_trunc_eof_rd1: doc=ab<E2 82> (truncated at EOF) rd=1; qs=[ab, a]
  #{id => inv_trunc_eof_rd1,
@@ -584,8 +585,8 @@
          separators => <<>>},
    doc => <<97,98,226,130>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<97>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97>>, hits => []}]}
  ,
  %% tc_underscore_rd1: doc="ab_cd ef" tokenchars=_ rd=1; qs=[ab_cd, ab, cd, ef]
  #{id => tc_underscore_rd1,
@@ -595,10 +596,10 @@
          separators => <<>>},
    doc => <<97,98,95,99,100,32,101,102>>,
    queries =>
-       [#{q => <<97,98,95,99,100>>, match => true},
-        #{q => <<97,98>>, match => false},
-        #{q => <<99,100>>, match => false},
-        #{q => <<101,102>>, match => true}]}
+       [#{q => <<97,98,95,99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98>>, hits => []},
+        #{q => <<99,100>>, hits => []},
+        #{q => <<101,102>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% tc_underscore_edges_rd1: doc="_ab cd_" tokenchars=_ rd=1; qs=[_ab, ab, cd_, cd]
  #{id => tc_underscore_edges_rd1,
@@ -608,10 +609,10 @@
          separators => <<>>},
    doc => <<95,97,98,32,99,100,95>>,
    queries =>
-       [#{q => <<95,97,98>>, match => true},
-        #{q => <<97,98>>, match => false},
-        #{q => <<99,100,95>>, match => true},
-        #{q => <<99,100>>, match => false}]}
+       [#{q => <<95,97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98>>, hits => []},
+        #{q => <<99,100,95>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => []}]}
  ,
  %% tc_dot_dash_rd1: doc="v1.2-rc3 x" tokenchars=-. rd=1; qs=[v1.2-rc3, v1, rc3, x]
  #{id => tc_dot_dash_rd1,
@@ -621,10 +622,10 @@
          separators => <<>>},
    doc => <<118,49,46,50,45,114,99,51,32,120>>,
    queries =>
-       [#{q => <<118,49,46,50,45,114,99,51>>, match => true},
-        #{q => <<118,49>>, match => false},
-        #{q => <<114,99,51>>, match => false},
-        #{q => <<120>>, match => true}]}
+       [#{q => <<118,49,46,50,45,114,99,51>>, hits => [{<<"doc">>,1}]},
+        #{q => <<118,49>>, hits => []},
+        #{q => <<114,99,51>>, hits => []},
+        #{q => <<120>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% tc_inv_left_rd1: doc=ab_<FF>cd tokenchars=_ rd=1; qs=[ab_, ab, cd, ab_cd]
  #{id => tc_inv_left_rd1,
@@ -634,10 +635,10 @@
          separators => <<>>},
    doc => <<97,98,95,255,99,100>>,
    queries =>
-       [#{q => <<97,98,95>>, match => true},
-        #{q => <<97,98>>, match => false},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,95,99,100>>, match => false}]}
+       [#{q => <<97,98,95>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98>>, hits => []},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,95,99,100>>, hits => []}]}
  ,
  %% tc_inv_right_rd1: doc=ab<FF>_cd tokenchars=_ rd=1; qs=[ab, _cd, cd, ab_cd]
  #{id => tc_inv_right_rd1,
@@ -647,10 +648,10 @@
          separators => <<>>},
    doc => <<97,98,255,95,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<95,99,100>>, match => true},
-        #{q => <<99,100>>, match => false},
-        #{q => <<97,98,95,99,100>>, match => false}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<95,99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => []},
+        #{q => <<97,98,95,99,100>>, hits => []}]}
  ,
  %% sep_x_rd1: doc=axb separators=x rd=1; qs=[a, b, axb, ab] (query axb tokenizes to phrase "a b")
  #{id => sep_x_rd1,
@@ -660,10 +661,10 @@
          separators => <<"x">>},
    doc => <<97,120,98>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<97,120,98>>, match => true},
-        #{q => <<97,98>>, match => false}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,120,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98>>, hits => []}]}
  ,
  %% sep_x_inv_rd1: doc=a<FF>xb separators=x rd=1; qs=[a, b, axb, ab]
  #{id => sep_x_inv_rd1,
@@ -673,10 +674,10 @@
          separators => <<"x">>},
    doc => <<97,255,120,98>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<97,120,98>>, match => true},
-        #{q => <<97,98>>, match => false}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,120,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98>>, hits => []}]}
  ,
  %% sep_digit_rd1: doc="a0b 102" separators=0 (default token char made separator) rd=1; qs=[a, b, a0b, 102, 12, 1]
  #{id => sep_digit_rd1,
@@ -686,12 +687,12 @@
          separators => <<"0">>},
    doc => <<97,48,98,32,49,48,50>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<97,48,98>>, match => true},
-        #{q => <<49,48,50>>, match => true},
-        #{q => <<49,50>>, match => false},
-        #{q => <<49>>, match => true}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,48,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<49,48,50>>, hits => [{<<"doc">>,1}]},
+        #{q => <<49,50>>, hits => []},
+        #{q => <<49>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% tc_sep_combo_rd1: doc=a_bxc_d tokenchars=_ separators=x rd=1; qs=[a_b, c_d, a_bxc_d, "a_b c_d"]
  #{id => tc_sep_combo_rd1,
@@ -701,10 +702,10 @@
          separators => <<"x">>},
    doc => <<97,95,98,120,99,95,100>>,
    queries =>
-       [#{q => <<97,95,98>>, match => true},
-        #{q => <<99,95,100>>, match => true},
-        #{q => <<97,95,98,120,99,95,100>>, match => true},
-        #{q => <<97,95,98,32,99,95,100>>, match => true}]}
+       [#{q => <<97,95,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,95,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,95,98,120,99,95,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,95,98,32,99,95,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% tc_dot_num_rd1: doc="3.14 15" tokenchars=. rd=1; qs=[3.14, 3, 14, 15]
  #{id => tc_dot_num_rd1,
@@ -714,10 +715,10 @@
          separators => <<>>},
    doc => <<51,46,49,52,32,49,53>>,
    queries =>
-       [#{q => <<51,46,49,52>>, match => true},
-        #{q => <<51>>, match => false},
-        #{q => <<49,52>>, match => false},
-        #{q => <<49,53>>, match => true}]}
+       [#{q => <<51,46,49,52>>, hits => [{<<"doc">>,1}]},
+        #{q => <<51>>, hits => []},
+        #{q => <<49,52>>, hits => []},
+        #{q => <<49,53>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% tc_dash_diac_rd2: doc=cafés-bar tokenchars=- rd=2; qs=[cafes-bar, cafés-bar, cafes, bar]
  #{id => tc_dash_diac_rd2,
@@ -727,10 +728,10 @@
          separators => <<>>},
    doc => <<99,97,102,195,169,115,45,98,97,114>>,
    queries =>
-       [#{q => <<99,97,102,101,115,45,98,97,114>>, match => true},
-        #{q => <<99,97,102,195,169,115,45,98,97,114>>, match => true},
-        #{q => <<99,97,102,101,115>>, match => false},
-        #{q => <<98,97,114>>, match => false}]}
+       [#{q => <<99,97,102,101,115,45,98,97,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102,195,169,115,45,98,97,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,97,102,101,115>>, hits => []},
+        #{q => <<98,97,114>>, hits => []}]}
  ,
  %% tc_dash_diac_rd0: doc=cafés-bar tokenchars=- rd=0; qs=[cafes-bar, cafés-bar]
  #{id => tc_dash_diac_rd0,
@@ -740,8 +741,8 @@
          separators => <<>>},
    doc => <<99,97,102,195,169,115,45,98,97,114>>,
    queries =>
-       [#{q => <<99,97,102,101,115,45,98,97,114>>, match => false},
-        #{q => <<99,97,102,195,169,115,45,98,97,114>>, match => true}]}
+       [#{q => <<99,97,102,101,115,45,98,97,114>>, hits => []},
+        #{q => <<99,97,102,195,169,115,45,98,97,114>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% case_ete_rd0: doc=ÉTÉ rd=0; qs=[été, ete, ÉTÉ, Été]
  #{id => case_ete_rd0,
@@ -751,10 +752,10 @@
          separators => <<>>},
    doc => <<195,137,84,195,137>>,
    queries =>
-       [#{q => <<195,169,116,195,169>>, match => true},
-        #{q => <<101,116,101>>, match => false},
-        #{q => <<195,137,84,195,137>>, match => true},
-        #{q => <<195,137,116,195,169>>, match => true}]}
+       [#{q => <<195,169,116,195,169>>, hits => [{<<"doc">>,1}]},
+        #{q => <<101,116,101>>, hits => []},
+        #{q => <<195,137,84,195,137>>, hits => [{<<"doc">>,1}]},
+        #{q => <<195,137,116,195,169>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% case_ete_rd1: doc=ÉTÉ rd=1; qs=[été, ete, ETE]
  #{id => case_ete_rd1,
@@ -764,9 +765,9 @@
          separators => <<>>},
    doc => <<195,137,84,195,137>>,
    queries =>
-       [#{q => <<195,169,116,195,169>>, match => true},
-        #{q => <<101,116,101>>, match => true},
-        #{q => <<69,84,69>>, match => true}]}
+       [#{q => <<195,169,116,195,169>>, hits => [{<<"doc">>,1}]},
+        #{q => <<101,116,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<69,84,69>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% case_mot_upper_rd1: doc=MỘT (Ộ=U+1ED8) rd=1; qs=[một, mot, MOT]
  #{id => case_mot_upper_rd1,
@@ -776,9 +777,9 @@
          separators => <<>>},
    doc => <<77,225,187,152,84>>,
    queries =>
-       [#{q => <<109,225,187,153,116>>, match => true},
-        #{q => <<109,111,116>>, match => false},
-        #{q => <<77,79,84>>, match => false}]}
+       [#{q => <<109,225,187,153,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,111,116>>, hits => []},
+        #{q => <<77,79,84>>, hits => []}]}
  ,
  %% case_mot_upper_rd2: doc=MỘT rd=2; qs=[một, mot]
  #{id => case_mot_upper_rd2,
@@ -788,8 +789,8 @@
          separators => <<>>},
    doc => <<77,225,187,152,84>>,
    queries =>
-       [#{q => <<109,225,187,153,116>>, match => true},
-        #{q => <<109,111,116>>, match => true}]}
+       [#{q => <<109,225,187,153,116>>, hits => [{<<"doc">>,1}]},
+        #{q => <<109,111,116>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% case_sharps_rd1: doc=straße (ß=U+00DF) rd=1; qs=[straße, strasse, STRASSE]
  #{id => case_sharps_rd1,
@@ -799,9 +800,9 @@
          separators => <<>>},
    doc => <<115,116,114,97,195,159,101>>,
    queries =>
-       [#{q => <<115,116,114,97,195,159,101>>, match => true},
-        #{q => <<115,116,114,97,115,115,101>>, match => false},
-        #{q => <<83,84,82,65,83,83,69>>, match => false}]}
+       [#{q => <<115,116,114,97,195,159,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<115,116,114,97,115,115,101>>, hits => []},
+        #{q => <<83,84,82,65,83,83,69>>, hits => []}]}
  ,
  %% case_cap_sharps_rd1: doc=STRAẞE (ẞ=U+1E9E capital sharp s) rd=1; qs=[straße, strasse, STRAẞE]
  #{id => case_cap_sharps_rd1,
@@ -811,9 +812,9 @@
          separators => <<>>},
    doc => <<83,84,82,65,225,186,158,69>>,
    queries =>
-       [#{q => <<115,116,114,97,195,159,101>>, match => true},
-        #{q => <<115,116,114,97,115,115,101>>, match => false},
-        #{q => <<83,84,82,65,225,186,158,69>>, match => true}]}
+       [#{q => <<115,116,114,97,195,159,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<115,116,114,97,115,115,101>>, hits => []},
+        #{q => <<83,84,82,65,225,186,158,69>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% case_turkish_dotted_rd1: doc=İzmir (İ=U+0130) rd=1; qs=[izmir, İzmir, Izmir]
  #{id => case_turkish_dotted_rd1,
@@ -823,9 +824,9 @@
          separators => <<>>},
    doc => <<196,176,122,109,105,114>>,
    queries =>
-       [#{q => <<105,122,109,105,114>>, match => true},
-        #{q => <<196,176,122,109,105,114>>, match => true},
-        #{q => <<73,122,109,105,114>>, match => true}]}
+       [#{q => <<105,122,109,105,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<196,176,122,109,105,114>>, hits => [{<<"doc">>,1}]},
+        #{q => <<73,122,109,105,114>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% case_greek_sigma_rd1: doc=ΟΔΟΣ rd=1; qs=[οδος(final sigma), οδοσ, ΟΔΟΣ]
  #{id => case_greek_sigma_rd1,
@@ -835,9 +836,9 @@
          separators => <<>>},
    doc => <<206,159,206,148,206,159,206,163>>,
    queries =>
-       [#{q => <<206,191,206,180,206,191,207,130>>, match => true},
-        #{q => <<206,191,206,180,206,191,207,131>>, match => true},
-        #{q => <<206,159,206,148,206,159,206,163>>, match => true}]}
+       [#{q => <<206,191,206,180,206,191,207,130>>, hits => [{<<"doc">>,1}]},
+        #{q => <<206,191,206,180,206,191,207,131>>, hits => [{<<"doc">>,1}]},
+        #{q => <<206,159,206,148,206,159,206,163>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% phrase_basic_rd1: doc="one two three" rd=1; qs=["one two", "two three", "one three", "three two", "one two three"]
  #{id => phrase_basic_rd1,
@@ -847,11 +848,11 @@
          separators => <<>>},
    doc => <<111,110,101,32,116,119,111,32,116,104,114,101,101>>,
    queries =>
-       [#{q => <<111,110,101,32,116,119,111>>, match => true},
-        #{q => <<116,119,111,32,116,104,114,101,101>>, match => true},
-        #{q => <<111,110,101,32,116,104,114,101,101>>, match => false},
-        #{q => <<116,104,114,101,101,32,116,119,111>>, match => false},
-        #{q => <<111,110,101,32,116,119,111,32,116,104,114,101,101>>, match => true}]}
+       [#{q => <<111,110,101,32,116,119,111>>, hits => [{<<"doc">>,1}]},
+        #{q => <<116,119,111,32,116,104,114,101,101>>, hits => [{<<"doc">>,1}]},
+        #{q => <<111,110,101,32,116,104,114,101,101>>, hits => []},
+        #{q => <<116,104,114,101,101,32,116,119,111>>, hits => []},
+        #{q => <<111,110,101,32,116,119,111,32,116,104,114,101,101>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% phrase_tc_rd1: doc="ab cd-ef gh" tokenchars=- rd=1; qs=[cd-ef, "ab cd-ef", "ab cd", "cd-ef gh"]
  #{id => phrase_tc_rd1,
@@ -861,10 +862,10 @@
          separators => <<>>},
    doc => <<97,98,32,99,100,45,101,102,32,103,104>>,
    queries =>
-       [#{q => <<99,100,45,101,102>>, match => true},
-        #{q => <<97,98,32,99,100,45,101,102>>, match => true},
-        #{q => <<97,98,32,99,100>>, match => false},
-        #{q => <<99,100,45,101,102,32,103,104>>, match => true}]}
+       [#{q => <<99,100,45,101,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,32,99,100,45,101,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,32,99,100>>, hits => []},
+        #{q => <<99,100,45,101,102,32,103,104>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% phrase_inv_rd1: doc=ab<FF>cd ef rd=1; qs=["ab cd", "cd ef", "ab cd ef", "ab ef"]
  #{id => phrase_inv_rd1,
@@ -874,10 +875,10 @@
          separators => <<>>},
    doc => <<97,98,255,99,100,32,101,102>>,
    queries =>
-       [#{q => <<97,98,32,99,100>>, match => true},
-        #{q => <<99,100,32,101,102>>, match => true},
-        #{q => <<97,98,32,99,100,32,101,102>>, match => true},
-        #{q => <<97,98,32,101,102>>, match => false}]}
+       [#{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100,32,101,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,32,99,100,32,101,102>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,32,101,102>>, hits => []}]}
  ,
  %% cat_digits_rd1: doc="abc 123 a1b" rd=1; qs=[123, a1b, abc]
  #{id => cat_digits_rd1,
@@ -887,9 +888,9 @@
          separators => <<>>},
    doc => <<97,98,99,32,49,50,51,32,97,49,98>>,
    queries =>
-       [#{q => <<49,50,51>>, match => true},
-        #{q => <<97,49,98>>, match => true},
-        #{q => <<97,98,99>>, match => true}]}
+       [#{q => <<49,50,51>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,49,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_arabic_digits_rd1: doc=١٢٣ (Arabic-Indic digits, Nd) abc rd=1; qs=[١٢٣, 123, abc]
  #{id => cat_arabic_digits_rd1,
@@ -899,9 +900,9 @@
          separators => <<>>},
    doc => <<217,161,217,162,217,163,32,97,98,99>>,
    queries =>
-       [#{q => <<217,161,217,162,217,163>>, match => true},
-        #{q => <<49,50,51>>, match => false},
-        #{q => <<97,98,99>>, match => true}]}
+       [#{q => <<217,161,217,162,217,163>>, hits => [{<<"doc">>,1}]},
+        #{q => <<49,50,51>>, hits => []},
+        #{q => <<97,98,99>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_superscript_rd1: doc=x²y (²=U+00B2 category No) rd=1; qs=[x², x2, x, y]
  #{id => cat_superscript_rd1,
@@ -911,10 +912,10 @@
          separators => <<>>},
    doc => <<120,194,178,32,121>>,
    queries =>
-       [#{q => <<120,194,178>>, match => true},
-        #{q => <<120,50>>, match => false},
-        #{q => <<120>>, match => false},
-        #{q => <<121>>, match => true}]}
+       [#{q => <<120,194,178>>, hits => [{<<"doc">>,1}]},
+        #{q => <<120,50>>, hits => []},
+        #{q => <<120>>, hits => []},
+        #{q => <<121>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_roman_rd1: doc=Ⅻ (U+216B Nl) abc rd=1; qs=[Ⅻ, ⅻ, abc]
  #{id => cat_roman_rd1,
@@ -924,9 +925,9 @@
          separators => <<>>},
    doc => <<226,133,171,32,97,98,99>>,
    queries =>
-       [#{q => <<226,133,171>>, match => true},
-        #{q => <<226,133,187>>, match => true},
-        #{q => <<97,98,99>>, match => true}]}
+       [#{q => <<226,133,171>>, hits => [{<<"doc">>,1}]},
+        #{q => <<226,133,187>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_symbols_rd1: doc="a+b ©c €d" (+ © € are separators?) rd=1; qs=[a, b, c, d, a+b]
  #{id => cat_symbols_rd1,
@@ -936,11 +937,11 @@
          separators => <<>>},
    doc => <<97,43,98,32,194,169,99,32,226,130,172,100>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<99>>, match => true},
-        #{q => <<100>>, match => true},
-        #{q => <<97,43,98>>, match => true}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99>>, hits => [{<<"doc">>,1}]},
+        #{q => <<100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,43,98>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_cjk_rd1: doc=你好 世界 rd=1; qs=[你好, 你, 好世, 世界, "你好 世界"]
  #{id => cat_cjk_rd1,
@@ -950,11 +951,11 @@
          separators => <<>>},
    doc => <<228,189,160,229,165,189,32,228,184,150,231,149,140>>,
    queries =>
-       [#{q => <<228,189,160,229,165,189>>, match => true},
-        #{q => <<228,189,160>>, match => false},
-        #{q => <<229,165,189,228,184,150>>, match => false},
-        #{q => <<228,184,150,231,149,140>>, match => true},
-        #{q => <<228,189,160,229,165,189,32,228,184,150,231,149,140>>, match => true}]}
+       [#{q => <<228,189,160,229,165,189>>, hits => [{<<"doc">>,1}]},
+        #{q => <<228,189,160>>, hits => []},
+        #{q => <<229,165,189,228,184,150>>, hits => []},
+        #{q => <<228,184,150,231,149,140>>, hits => [{<<"doc">>,1}]},
+        #{q => <<228,189,160,229,165,189,32,228,184,150,231,149,140>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_lone_comb_rd1: doc=a SP U+0300 SP b (lone combining mark) rd=1; qs=[a, b, "a b", <U+0300>]
  #{id => cat_lone_comb_rd1,
@@ -964,10 +965,10 @@
          separators => <<>>},
    doc => <<97,32,204,128,32,98>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<97,32,98>>, match => true},
-        #{q => <<204,128>>, match => false}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,32,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<204,128>>, hits => []}]}
  ,
  %% cat_lone_comb_rd0: doc=a SP U+0300 SP b rd=0; qs=[a, b, "a b", <U+0300>]
  #{id => cat_lone_comb_rd0,
@@ -977,10 +978,10 @@
          separators => <<>>},
    doc => <<97,32,204,128,32,98>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<97,32,98>>, match => true},
-        #{q => <<204,128>>, match => false}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,32,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<204,128>>, hits => []}]}
  ,
  %% cat_zwsp_rd1: doc=ab<U+200B zero-width space, Cf>cd rd=1; qs=[ab, cd, abcd, "ab cd"]
  #{id => cat_zwsp_rd1,
@@ -990,10 +991,10 @@
          separators => <<>>},
    doc => <<97,98,226,128,139,99,100>>,
    queries =>
-       [#{q => <<97,98>>, match => true},
-        #{q => <<99,100>>, match => true},
-        #{q => <<97,98,99,100>>, match => false},
-        #{q => <<97,98,32,99,100>>, match => true}]}
+       [#{q => <<97,98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<99,100>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98,99,100>>, hits => []},
+        #{q => <<97,98,32,99,100>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_middot_rd1: doc="l·l x" (·=U+00B7 Po) rd=1; qs=[l, ll, l·l, x]
  #{id => cat_middot_rd1,
@@ -1003,10 +1004,10 @@
          separators => <<>>},
    doc => <<108,194,183,108,32,120>>,
    queries =>
-       [#{q => <<108>>, match => true},
-        #{q => <<108,108>>, match => false},
-        #{q => <<108,194,183,108>>, match => true},
-        #{q => <<120>>, match => true}]}
+       [#{q => <<108>>, hits => [{<<"doc">>,2}]},
+        #{q => <<108,108>>, hits => []},
+        #{q => <<108,194,183,108>>, hits => [{<<"doc">>,1}]},
+        #{q => <<120>>, hits => [{<<"doc">>,1}]}]}
  ,
  %% cat_emoji_rd1: doc=a<U+1F600 emoji, So>b rd=1; qs=[a, b, ab, "a b"]
  #{id => cat_emoji_rd1,
@@ -1016,8 +1017,8 @@
          separators => <<>>},
    doc => <<97,240,159,152,128,98>>,
    queries =>
-       [#{q => <<97>>, match => true},
-        #{q => <<98>>, match => true},
-        #{q => <<97,98>>, match => false},
-        #{q => <<97,32,98>>, match => true}]}
+       [#{q => <<97>>, hits => [{<<"doc">>,1}]},
+        #{q => <<98>>, hits => [{<<"doc">>,1}]},
+        #{q => <<97,98>>, hits => []},
+        #{q => <<97,32,98>>, hits => [{<<"doc">>,1}]}]}
 ].

@@ -2,13 +2,13 @@
 
 `fts_sqlite_oracle_corpus.eterm` is a machine-generated oracle corpus for testing
 parity between our Erlang FTS engine's tokenizer and SQLite FTS5's `unicode61`
-tokenizer. **Every `match` boolean in the corpus is the literal answer a real
-sqlite3 process gave** — none was written by hand or inferred from documentation.
+tokenizer. **Every ordered hit identity and per-hit occurrence count is derived
+from a real sqlite3 process** — none was copied from the Erlang engine.
 
 - Corpus: `test/fts_sqlite_oracle_corpus.eterm` (82 cases, 267 queries)
 - Regeneration script: `test/regen_fts_sqlite_oracle.sh`
 - Oracle binary used: `/usr/bin/sqlite3`, version
-  `3.43.2 2023-10-10 13:08:14 1b37c146ee9ebb7acd0160c0ab1fd11017a419fa8a3187386ed8cb32b709aapl (64-bit)` (macOS system build, FTS5 enabled)
+  `3.53.3 2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d78alt1 (64-bit)` (FTS5 enabled)
 
 ## File format
 
@@ -20,7 +20,8 @@ Read with `file:consult/1`, which yields `{ok, [Cases]}`:
                       tokenchars => binary(),     %% <<>> when unset
                       separators => binary()},    %% <<>> when unset
   doc => binary(),                                %% exact indexed bytes; MAY be invalid UTF-8
-  queries => [#{q => binary(), match => boolean()}]}
+  queries => [#{q => binary(),
+                hits => [{binary(), pos_integer()}]}]}
 ```
 
 `doc` and `q` are emitted as decimal byte lists (`<<97,98,255,99,100>>`) because
@@ -37,7 +38,7 @@ CREATE VIRTUAL TABLE t USING fts5(body,
     tokenize="unicode61 remove_diacritics R [tokenchars '..'] [separators '..']");
 INSERT INTO t(body) VALUES (CAST(X'<dochex>' AS TEXT));
 SELECT 'DOC:' || hex(body) FROM t;   -- byte-exact round-trip check
-SELECT 'Q:' || count(*) FROM t
+SELECT count(*), highlight(t, 0, X'01', X'02') FROM t
   WHERE body MATCH ('"' || CAST(X'<qhex>' AS TEXT) || '"');
 ```
 
@@ -54,9 +55,10 @@ Notes on the mechanism:
   query. Query bytes are also injected via `CAST(X'..' AS TEXT)` so no shell or
   SQL escaping ever touches them.
 - A query that tokenizes to zero tokens (e.g. a lone combining mark) does not
-  error in this form; it simply matches nothing. Such cases are included and
-  recorded as `match => false`.
-- `match => true` means `count(*) > 0` for the single-row table.
+  error in this form; it simply returns `hits => []`.
+- The fixture has one document named `<<"doc">>`. SQLite `count(*)` supplies
+  the exact hit list/order, and the number of FTS5 highlight start markers
+  supplies that hit's quoted-term/phrase occurrence count.
 
 Determinism: the full corpus was generated twice (byte-identical output), and
 seven representative cases (`inv_nul_rd1`, `md_viet_rd1`, `md_viet_rd2`,
@@ -148,7 +150,7 @@ OUT=/Users/dvse/projects/agents/leveled/test/fts_sqlite_oracle_corpus.eterm \
 The script aborts (non-zero exit) if the sqlite3 binary lacks FTS5, if any doc
 fails the byte round-trip check, or if any query fails to execute. Output is
 deterministic for a given sqlite3 build; regenerating with a *different* SQLite
-version may legitimately change `match` values — the header comment of the
+version may legitimately change `hits` values — the header comment of the
 `.eterm` records the exact oracle version used.
 
 Validate the generated file parses:

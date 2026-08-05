@@ -10,7 +10,12 @@
     cross_shard_version_skew/1,
     consolidation_restart_equivalence/1,
     consolidation_write_race/1,
-    sqlite_oracle_corpus/1
+    sqlite_oracle_corpus/1,
+    parallel_heap_kill_no_hang/1,
+    outer_heap_kill_reports_role/1,
+    parallel_worker_crash_surfaces/1,
+    parallel_drain_clears_down_messages/1,
+    full_store_build_memory_equivalence/1
 ]).
 
 all() ->
@@ -21,7 +26,12 @@ all() ->
         cross_shard_version_skew,
         consolidation_restart_equivalence,
         consolidation_write_race,
-        sqlite_oracle_corpus
+        sqlite_oracle_corpus,
+        parallel_heap_kill_no_hang,
+        outer_heap_kill_reports_role,
+        parallel_worker_crash_surfaces,
+        parallel_drain_clears_down_messages,
+        full_store_build_memory_equivalence
     ].
 
 init_per_suite(Config) ->
@@ -40,16 +50,24 @@ search_shapes(_Config) ->
             #{title => <<"Beta">>, body => <<"quick blue hare">>}),
         ok = put_doc(Bookie, Schema, <<"3">>,
             #{title => <<"Gamma">>, body => <<"slow brown bear">>}),
-        [<<"1">>, <<"2">>] = keys(search(Bookie, Schema, <<"quick">>, #{})),
-        [<<"1">>] = keys(search(Bookie, Schema, <<"quick AND fox">>, #{})),
-        [<<"1">>, <<"2">>, <<"3">>] =
-            keys(search(Bookie, Schema, <<"quick OR bear">>, #{})),
-        [<<"1">>] = keys(search(Bookie, Schema, <<"quick NOT blue">>, #{})),
-        [<<"1">>] = keys(search(Bookie, Schema, <<"\"quick brown\"">>, #{})),
-        [<<"1">>, <<"2">>] = keys(search(Bookie, Schema, <<"qui*">>, #{})),
-        [<<"1">>] = keys(search(Bookie, Schema, <<"NEAR(quick fox, 2)">>, #{})),
-        [<<"2">>] = keys(search(Bookie, Schema, <<"title:beta">>, #{})),
-        [] = keys(search(Bookie, Schema, <<"title:quick">>, #{})),
+        [{<<"1">>, 1}, {<<"2">>, 1}] =
+            exact_hits(search(Bookie, Schema, <<"quick">>, #{})),
+        [{<<"1">>, 2}] =
+            exact_hits(search(Bookie, Schema, <<"quick AND fox">>, #{})),
+        [{<<"1">>, 1}, {<<"2">>, 1}, {<<"3">>, 1}] =
+            exact_hits(search(Bookie, Schema, <<"quick OR bear">>, #{})),
+        [{<<"1">>, 1}] =
+            exact_hits(search(Bookie, Schema, <<"quick NOT blue">>, #{})),
+        [{<<"1">>, 1}] =
+            exact_hits(search(Bookie, Schema, <<"\"quick brown\"">>, #{})),
+        [{<<"1">>, 1}, {<<"2">>, 1}] =
+            exact_hits(search(Bookie, Schema, <<"qui*">>, #{})),
+        [{<<"1">>, 1}] = exact_hits(
+            search(Bookie, Schema, <<"NEAR(quick fox, 2)">>, #{})
+        ),
+        [{<<"2">>, 1}] =
+            exact_hits(search(Bookie, Schema, <<"title:beta">>, #{})),
+        [] = exact_hits(search(Bookie, Schema, <<"title:quick">>, #{})),
         [Hit] = search(Bookie, Schema, <<"quick">>, #{return_positions => true,
             limit => 1}),
         true = maps:is_key(positions, Hit)
@@ -66,16 +84,18 @@ update_delete_visibility(_Config) ->
             Schema, <<"1">>, #{body => <<"blue green">>}, Manifest1
         ),
         ok = leveled_bookie:book_mput(Bookie, UpdateSpecs),
-        [] = keys(search(Bookie, Schema, <<"red">>, #{})),
-        [<<"1">>] = keys(search(Bookie, Schema, <<"blue">>, #{})),
+        [] = exact_hits(search(Bookie, Schema, <<"red">>, #{})),
+        [{<<"1">>, 1}] = exact_hits(
+            search(Bookie, Schema, <<"blue">>, #{})
+        ),
         {ok, Manifest2} = leveled_bookie:book_headonly(
             Bookie, <<"updates">>, <<"doc">>, <<"1">>
         ),
         ok = leveled_bookie:book_mput(
             Bookie, leveled_fts:remove(Schema, <<"1">>, Manifest2)
         ),
-        [] = keys(search(Bookie, Schema, <<"blue">>, #{})),
-        [] = keys(search(Bookie, Schema, all_docs, #{}))
+        [] = exact_hits(search(Bookie, Schema, <<"blue">>, #{})),
+        [] = exact_hits(search(Bookie, Schema, all_docs, #{}))
     end).
 
 tail_fold_interleaving(_Config) ->
@@ -89,11 +109,14 @@ tail_fold_interleaving(_Config) ->
                 1 -> ok
             end
         end,
-        [<<"seed">>] = keys(search(Bookie, Schema, <<"common">>,
-            #{tail_fold_hook => Hook})),
+        [{<<"seed">>, 1}] = exact_hits(search(
+            Bookie, Schema, <<"common">>, #{tail_fold_hook => Hook}
+        )),
         %% The forced interleaving returns the exact pre-write snapshot; the
         %% next store-direct query sees the committed tail.
-        [<<"racer">>, <<"seed">>] = keys(search(Bookie, Schema, <<"common">>, #{}))
+        [{<<"racer">>, 1}, {<<"seed">>, 1}] = exact_hits(
+            search(Bookie, Schema, <<"common">>, #{})
+        )
     end).
 
 cross_shard_version_skew(_Config) ->
@@ -121,11 +144,13 @@ cross_shard_version_skew(_Config) ->
                     ok
             end
         end,
-        [] = keys(search(Bookie, Schema, <<"aa AND zz">>,
+        [] = exact_hits(search(Bookie, Schema, <<"aa AND zz">>,
             #{tail_fold_hook => Hook})),
         %% post-update state is v2 exactly: zz matches, aa does not
-        [<<"1">>] = keys(search(Bookie, Schema, <<"zz">>, #{})),
-        [] = keys(search(Bookie, Schema, <<"aa">>, #{}))
+        [{<<"1">>, 1}] = exact_hits(
+            search(Bookie, Schema, <<"zz">>, #{})
+        ),
+        [] = exact_hits(search(Bookie, Schema, <<"aa">>, #{}))
     end).
 
 consolidation_restart_equivalence(_Config) ->
@@ -137,6 +162,7 @@ consolidation_restart_equivalence(_Config) ->
     ok = put_doc(Bookie1, Schema, <<"2">>, #{body => <<"alpha beta beta">>}),
     Before = search(Bookie1, Schema, <<"alpha OR beta">>, #{rank => bm25,
         return_positions => true}),
+    [{<<"1">>, 3}, {<<"2">>, 3}] = exact_hits(Before),
     {ok, #{skipped := []}} = leveled_fts:consolidate(Bookie1, Schema, #{}),
     Before = search(Bookie1, Schema, <<"alpha OR beta">>, #{rank => bm25,
         return_positions => true}),
@@ -144,6 +170,20 @@ consolidation_restart_equivalence(_Config) ->
     {ok, Bookie2} = leveled_bookie:book_start(Opts),
     Before = search(Bookie2, Schema, <<"alpha OR beta">>, #{rank => bm25,
         return_positions => true}),
+    {ok, Manifest} = leveled_bookie:book_headonly(
+        Bookie2, <<"consolidate">>, <<"doc">>, <<"1">>
+    ),
+    {ok, UpdateSpecs} = leveled_fts:update(
+        Schema, <<"1">>, #{body => <<"gamma beta beta">>}, Manifest
+    ),
+    ok = leveled_bookie:book_mput(Bookie2, UpdateSpecs),
+    Updated = search(Bookie2, Schema, <<"gamma OR beta">>, #{
+        rank => bm25, return_positions => true
+    }),
+    {ok, #{skipped := []}} = leveled_fts:consolidate(Bookie2, Schema, #{}),
+    Updated = search(Bookie2, Schema, <<"gamma OR beta">>, #{
+        rank => bm25, return_positions => true
+    }),
     ok = leveled_bookie:book_destroy(Bookie2).
 
 consolidation_write_race(_Config) ->
@@ -161,7 +201,9 @@ consolidation_write_race(_Config) ->
             leveled_fts:consolidate(Bookie, Schema,
                 #{before_consolidate_commit => Hook}),
         true = Skipped =:= lists:seq(0, maps:get(shards, Schema) - 1),
-        [<<"late">>, <<"seed">>] = keys(search(Bookie, Schema, <<"alpha OR apple">>, #{}))
+        [{<<"late">>, 1}, {<<"seed">>, 1}] = exact_hits(
+            search(Bookie, Schema, <<"alpha OR apple">>, #{})
+        )
     end).
 
 sqlite_oracle_corpus(_Config) ->
@@ -174,14 +216,466 @@ sqlite_oracle_corpus(_Config) ->
         lists:foreach(fun(Case) -> oracle_case(Bookie, Case) end, Cases)
     end).
 
+parallel_heap_kill_no_hang(_Config) ->
+    Parent = self(),
+    {Pid, Monitor} = spawn_monitor(fun() ->
+        try
+            leveled_fts:fts2_build_parallel_for_test(
+                inner_worker,
+                [allocate],
+                1,
+                fun(_Item) ->
+                    Allocation = lists:seq(1, 1000000),
+                    length(Allocation)
+                end,
+                16384,
+                Parent
+            )
+        of
+            Result -> exit({unexpected_parallel_result, Result})
+        catch
+            error:{fts2_parallel_worker_lost, inner_worker, killed} ->
+                exit(heap_kill_surfaced);
+            Class:Reason ->
+                exit({unexpected_parallel_error, Class, Reason})
+        end
+    end),
+    receive
+        {'DOWN', Monitor, process, Pid, heap_kill_surfaced} ->
+            ok;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            ct:fail({unexpected_heap_kill_result, Reason})
+    after 5000 ->
+        exit(Pid, kill),
+        ct:fail(parallel_heap_kill_timed_out)
+    end,
+    receive
+        {fts2_bound_report, inner_worker, killed} -> ok
+    after 1000 ->
+        ct:fail(inner_worker_bound_report_missing)
+    end,
+    receive
+        {fts2_bound_report, inner_worker, killed} ->
+            ct:fail(duplicate_inner_worker_bound_report)
+    after 0 ->
+        ok
+    end.
+
+outer_heap_kill_reports_role(_Config) ->
+    try
+        leveled_fts:fts2_outer_bound_for_test(
+            fun() ->
+                Allocation = lists:seq(1, 1000000),
+                length(Allocation)
+            end,
+            16384,
+            self()
+        )
+    of
+        Result -> ct:fail({unexpected_outer_result, Result})
+    catch
+        error:{fts2_parallel_worker_lost, outer_build, killed} -> ok;
+        Class:Reason -> ct:fail({unexpected_outer_error, Class, Reason})
+    end,
+    receive
+        {fts2_build_outer, _Pid} -> ok
+    after 1000 ->
+        ct:fail(outer_build_observation_missing)
+    end,
+    receive
+        {fts2_bound_report, outer_build, killed} -> ok
+    after 1000 ->
+        ct:fail(outer_build_bound_report_missing)
+    end,
+    receive
+        {fts2_bound_report, outer_build, killed} ->
+            ct:fail(duplicate_outer_build_bound_report)
+    after 0 ->
+        ok
+    end.
+
+parallel_worker_crash_surfaces(_Config) ->
+    try
+        leveled_fts:fts2_build_parallel_for_test(
+            [crash],
+            1,
+            fun(_Item) -> erlang:error(synthetic_parallel_crash) end,
+            infinity
+        )
+    of
+        Result -> ct:fail({unexpected_parallel_result, Result})
+    catch
+        error:synthetic_parallel_crash -> ok;
+        Class:Reason -> ct:fail({unexpected_parallel_error, Class, Reason})
+    end.
+
+parallel_drain_clears_down_messages(_Config) ->
+    {Pid, Monitor} = spawn_monitor(fun() ->
+        Outcome =
+            try
+                leveled_fts:fts2_build_parallel_for_test(
+                    [crash, slow_a, slow_b],
+                    3,
+                    fun
+                        (crash) ->
+                            erlang:error(synthetic_parallel_crash);
+                        (_Slow) ->
+                            timer:sleep(50),
+                            1
+                    end,
+                    infinity
+                )
+            of
+                Result -> {unexpected_parallel_result, Result}
+            catch
+                error:synthetic_parallel_crash -> crash_surfaced;
+                Class:Reason -> {unexpected_parallel_error, Class, Reason}
+            end,
+        Stray =
+            receive
+                {'DOWN', _Ref, process, _Worker, _Reason} = Down -> Down
+            after 0 ->
+                none
+            end,
+        exit({Outcome, Stray})
+    end),
+    receive
+        {'DOWN', Monitor, process, Pid, {crash_surfaced, none}} ->
+            ok;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            ct:fail({parallel_drain_failed, Reason})
+    after 5000 ->
+        exit(Pid, kill),
+        ct:fail(parallel_drain_timed_out)
+    end.
+
+full_store_build_memory_equivalence(_Config) ->
+    ct:timetrap({minutes, 30}),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    BoundedRoot = testutil:reset_filestructure(
+        "test/test_fts_build_memory_bounded_" ++ Suffix
+    ),
+    UnboundedRoot = testutil:reset_filestructure(
+        "test/test_fts_build_memory_unbounded_" ++ Suffix
+    ),
+    {ok, Bounded} = leveled_bookie:book_start(start_opts(BoundedRoot)),
+    {ok, Unbounded} = leveled_bookie:book_start(start_opts(UnboundedRoot)),
+    Schema = schema(<<"full-store-build-memory">>, [body], #{}),
+    Sampler = spawn(fun() -> fts_build_sampler(#{}, #{}, []) end),
+    try
+        LargeBody = binary:copy(
+            <<"alpha beta gamma delta epsilon ">>, 100000
+        ),
+        full_store_put_corpus(Bounded, Unbounded, Schema, LargeBody),
+        WordSize = erlang:system_info(wordsize),
+        LegacyBoundWords = 1024 * 1024 * 1024 div WordSize,
+        try
+            leveled_fts:fts2_outer_bound_for_test(
+                fun() ->
+                    leveled_fts:fts2_legacy_outer_assemble_for_test(
+                        Bounded, Schema
+                    )
+                end,
+                LegacyBoundWords,
+                Sampler
+            )
+        of
+            LegacyResult -> ct:fail({legacy_outer_did_not_reproduce, LegacyResult})
+        catch
+            error:{fts2_parallel_worker_lost, outer_build, killed} -> ok
+        end,
+        Sampler ! {reports, self()},
+        receive
+            {fts_build_reports, [{outer_build, killed}]} -> ok;
+            {fts_build_reports, LegacyReports} ->
+                ct:fail({legacy_outer_report_mismatch, LegacyReports})
+        after 5000 ->
+            ct:fail(legacy_outer_report_timed_out)
+        end,
+        Sampler ! reset,
+        InnerBoundWords = 64 * 1024 * 1024 div WordSize,
+        OuterBoundWords = 64 * 1024 * 1024 div WordSize,
+        {ok, #{skipped := []}} = leveled_fts:fts2_outer_bound_for_test(
+            fun() ->
+                leveled_fts:fts2_consolidate_with_heap_for_test(
+                    Bounded,
+                    Schema,
+                    #{reclaim => false},
+                    InnerBoundWords,
+                    Sampler
+                )
+            end,
+            OuterBoundWords,
+            Sampler
+        ),
+        Sampler ! {snapshot, self()},
+        BoundedPeaks =
+            receive
+                {fts_build_peaks, BoundedPeaksMessage} ->
+                    BoundedPeaksMessage
+            after 5000 ->
+                ct:fail(fts_build_sampler_timed_out)
+            end,
+        {BoundedOuterHeapWords, BoundedOuterMemoryBytes} =
+            maps:get(outer_build, BoundedPeaks),
+        {BoundedInnerRole, BoundedInnerHeapWords, BoundedInnerMemoryBytes} =
+            fts_build_inner_peak(BoundedPeaks),
+        true = BoundedOuterHeapWords < OuterBoundWords,
+        true = BoundedInnerHeapWords < InnerBoundWords,
+        ct:pal(
+            "bounded FTS outer peak: ~B heap words (~B heap bytes), "
+            "~B process bytes; inner peak role ~p: ~B words (~B bytes), "
+            "~B process bytes",
+            [
+                BoundedOuterHeapWords,
+                BoundedOuterHeapWords * WordSize,
+                BoundedOuterMemoryBytes,
+                BoundedInnerRole,
+                BoundedInnerHeapWords,
+                BoundedInnerHeapWords * WordSize,
+                BoundedInnerMemoryBytes
+            ]
+        ),
+        Sampler ! reset,
+        {ok, #{skipped := []}} = leveled_fts:fts2_outer_bound_for_test(
+            fun() ->
+                leveled_fts:fts2_consolidate_with_heap_for_test(
+                    Unbounded,
+                    Schema,
+                    #{reclaim => false},
+                    infinity,
+                    Sampler
+                )
+            end,
+            infinity,
+            Sampler
+        ),
+        Sampler ! {snapshot, self()},
+        UnboundedPeaks =
+            receive
+                {fts_build_peaks, UnboundedPeaksMessage} ->
+                    UnboundedPeaksMessage
+            after 5000 ->
+                ct:fail(fts_build_sampler_timed_out)
+            end,
+        {UnboundedOuterHeapWords, UnboundedOuterMemoryBytes} =
+            maps:get(outer_build, UnboundedPeaks),
+        {UnboundedInnerRole, UnboundedInnerHeapWords,
+            UnboundedInnerMemoryBytes} = fts_build_inner_peak(UnboundedPeaks),
+        ct:pal(
+            "unbounded FTS outer peak: ~B heap words (~B heap bytes), "
+            "~B process bytes; inner peak role ~p: ~B words (~B bytes), "
+            "~B process bytes",
+            [
+                UnboundedOuterHeapWords,
+                UnboundedOuterHeapWords * WordSize,
+                UnboundedOuterMemoryBytes,
+                UnboundedInnerRole,
+                UnboundedInnerHeapWords,
+                UnboundedInnerHeapWords * WordSize,
+                UnboundedInnerMemoryBytes
+            ]
+        ),
+        {ok, BoundedIndex} = leveled_fts:fts2_available(Bounded, Schema),
+        {ok, UnboundedIndex} = leveled_fts:fts2_available(Unbounded, Schema),
+        RootFields = [
+            group_count,
+            chunk_count,
+            term_count,
+            bigram_count,
+            total_length
+        ],
+        true =
+            maps:with(RootFields, BoundedIndex) =:=
+                maps:with(RootFields, UnboundedIndex),
+        ct:pal(
+            "full-store FTS fixture: ~B documents, ~B terms, ~B bigrams, "
+            "~B indexed tokens, ~B-byte largest document",
+            [
+                maps:get(chunk_count, BoundedIndex),
+                maps:get(term_count, BoundedIndex),
+                maps:get(bigram_count, BoundedIndex),
+                maps:get(total_length, BoundedIndex),
+                byte_size(LargeBody)
+            ]
+        ),
+        ProbeOpts = #{
+            limit => 40,
+            rank => bm25,
+            resolve_hits => false,
+            return_count => true
+        },
+        lists:foreach(
+            fun(Query) ->
+                BoundedResult = search(Bounded, Schema, Query, ProbeOpts),
+                BoundedResult = search(Unbounded, Schema, Query, ProbeOpts)
+            end,
+            [
+                <<"alpha">>,
+                <<"term17p17">>,
+                <<"alpha AND term17p17">>,
+                <<"term17p17 OR term8191p31">>,
+                <<"\"alpha beta\"">>,
+                <<"NEAR(alpha beta, 2)">>
+            ]
+        )
+    after
+        Sampler ! stop,
+        try
+            leveled_bookie:book_destroy(Bounded)
+        catch
+            _:_ -> ok
+        end,
+        try
+            leveled_bookie:book_destroy(Unbounded)
+        catch
+            _:_ -> ok
+        end
+    end.
+
+fts_build_sampler(Active, Peaks, Reports) ->
+    receive
+        {fts2_build_outer, Pid} ->
+            fts_build_sampler_add(Pid, outer_build, Active, Peaks, Reports);
+        {fts2_build_worker, Role, Pid} ->
+            fts_build_sampler_add(Pid, Role, Active, Peaks, Reports);
+        {fts2_bound_report, Role, Reason} ->
+            fts_build_sampler(Active, Peaks, [{Role, Reason} | Reports]);
+        {'DOWN', Monitor, process, Pid, _Reason} ->
+            case maps:find(Pid, Active) of
+                {ok, {Monitor, _Role}} ->
+                    fts_build_sampler(
+                        maps:remove(Pid, Active),
+                        Peaks,
+                        Reports
+                    );
+                _ ->
+                    fts_build_sampler(Active, Peaks, Reports)
+            end;
+        {snapshot, From} ->
+            NextPeaks = fts_build_sample_workers(Active, Peaks),
+            From ! {fts_build_peaks, NextPeaks},
+            fts_build_sampler(Active, NextPeaks, Reports);
+        {reports, From} ->
+            From ! {fts_build_reports, lists:reverse(Reports)},
+            fts_build_sampler(Active, Peaks, Reports);
+        reset ->
+            fts_build_sampler(Active, #{}, []);
+        stop ->
+            ok
+    after 1 ->
+        fts_build_sampler(
+            Active, fts_build_sample_workers(Active, Peaks), Reports
+        )
+    end.
+
+fts_build_sampler_add(Pid, Role, Active, Peaks, Reports) ->
+    case maps:is_key(Pid, Active) of
+        true ->
+            fts_build_sampler(Active, Peaks, Reports);
+        false ->
+            Monitor = erlang:monitor(process, Pid),
+            fts_build_sampler(
+                Active#{Pid => {Monitor, Role}}, Peaks, Reports
+            )
+    end.
+
+fts_build_sample_workers(Active, Peaks) ->
+    maps:fold(
+        fun(Pid, {_Monitor, Role}, Acc) ->
+            case process_info(Pid, [total_heap_size, memory]) of
+                undefined ->
+                    Acc;
+                Info ->
+                    {HeapPeak, MemoryPeak} = maps:get(Role, Acc, {0, 0}),
+                    Acc#{Role => {
+                        erlang:max(
+                            proplists:get_value(total_heap_size, Info), HeapPeak
+                        ),
+                        erlang:max(
+                            proplists:get_value(memory, Info), MemoryPeak
+                        )
+                    }}
+            end
+        end,
+        Peaks,
+        Active
+    ).
+
+fts_build_inner_peak(Peaks) ->
+    lists:foldl(
+        fun({Role, {HeapWords, MemoryBytes}}, {_BestRole, BestHeap, _BestMemory}
+            = Best) ->
+            case Role =/= outer_build andalso HeapWords > BestHeap of
+                true -> {Role, HeapWords, MemoryBytes};
+                false -> Best
+            end
+        end,
+        {none, 0, 0},
+        maps:to_list(Peaks)
+    ).
+
+full_store_put_corpus(Bounded, Unbounded, Schema, LargeBody) ->
+    lists:foreach(
+        fun(DocumentNumbers) ->
+            Specs = lists:append([
+                begin
+                    Body =
+                        case DocumentNumber of
+                            1 -> LargeBody;
+                            _ -> full_store_document_body(DocumentNumber)
+                        end,
+                    Key = <<"doc-", DocumentNumber:32/unsigned-big>>,
+                    {ok, DocumentSpecs} = leveled_fts:derive(
+                        Schema, Key, #{body => Body}
+                    ),
+                    DocumentSpecs
+                end
+             || DocumentNumber <- DocumentNumbers
+            ]),
+            full_store_mput(Bounded, Specs),
+            full_store_mput(Unbounded, Specs)
+        end,
+        chunked(lists:seq(1, 9000), 32, [])
+    ).
+
+full_store_document_body(DocumentNumber) ->
+    Terms = [
+        <<"term",
+            (integer_to_binary(DocumentNumber))/binary,
+            "p",
+            (integer_to_binary(Position))/binary>>
+     || Position <- lists:seq(1, 40)
+    ],
+    iolist_to_binary([<<"alpha beta ">>, lists:join(<<" ">>, Terms)]).
+
+full_store_mput(Bookie, Specs) ->
+    case leveled_bookie:book_mput(Bookie, Specs) of
+        ok -> ok;
+        pause -> timer:sleep(1)
+    end.
+
+chunked([], _Size, Acc) ->
+    lists:reverse(Acc);
+chunked(Items, Size, Acc) ->
+    Count = erlang:min(Size, length(Items)),
+    {Chunk, Rest} = lists:split(Count, Items),
+    chunked(Rest, Size, [Chunk | Acc]).
+
 oracle_case(Bookie, #{id := Id, tokenizer_opts := TokOpts,
         doc := Doc, queries := Queries}) ->
     Index = atom_to_binary(Id, utf8),
     Schema = schema(Index, [body], TokOpts),
     ok = put_doc(Bookie, Schema, <<"doc">>, #{body => Doc}),
-    lists:foreach(fun(#{q := Query, match := Expected}) ->
+    lists:foreach(fun(#{q := Query, hits := Expected}) ->
         Quoted = <<"\"", Query/binary, "\"">>,
-        Actual = search(Bookie, Schema, Quoted, #{}) =/= [],
+        {ok, #{hits := Hits}} = leveled_fts:search(
+            Bookie, Schema, Quoted, #{return_count => true}
+        ),
+        Actual = [
+            {maps:get(key, Hit), maps:get(match_count, Hit)}
+         || Hit <- Hits
+        ],
         case Actual =:= Expected of
             true -> ok;
             false -> ct:fail({sqlite_oracle_mismatch, Id, Query, Expected, Actual})
@@ -200,7 +694,8 @@ search(Bookie, Schema, Query, Opts) ->
     {ok, Hits} = leveled_fts:search(Bookie, Schema, Query, Opts),
     Hits.
 
-keys(Hits) -> [maps:get(key, Hit) || Hit <- Hits].
+exact_hits(Hits) ->
+    [{maps:get(key, Hit), maps:get(match_count, Hit)} || Hit <- Hits].
 
 with_bookie(Fun) ->
     Root = testutil:reset_filestructure(),

@@ -348,6 +348,7 @@ ranked_group_total_and_ungrouped_retrieval() ->
         #{count := 1, hits := [Grouped]} = search(
             Main, Schema, <<"alpha">>, BaseOpts
         ),
+        ?assertEqual(Document, seam_hit_udi(Grouped)),
         ?assertEqual(52, maps:get(match_count, Grouped)),
         #{count := 3, hits := Ungrouped} = search(
             Main,
@@ -357,8 +358,12 @@ ranked_group_total_and_ungrouped_retrieval() ->
         ),
         ?assertEqual(3, length(Ungrouped)),
         ?assertEqual(
-            [5, 7, 40],
-            lists:sort([maps:get(match_count, Hit) || Hit <- Ungrouped])
+            [{<<"chunk-1">>, 5}, {<<"chunk-2">>, 40}, {<<"chunk-3">>, 7}],
+            lists:sort([
+                {maps:get(chunk_key, maps:get(candidate_record, Hit)),
+                    maps:get(match_count, Hit)}
+             || Hit <- Ungrouped
+            ])
         )
     end).
 
@@ -409,6 +414,9 @@ ranked_group_document_bm25() ->
         ),
         ?assertEqual(100, maps:get(match_count, First)),
         ?assertEqual(10, maps:get(match_count, Second)),
+        ?assertEqual([<<"multi">>, <<"short">>], [
+            seam_hit_udi(First), seam_hit_udi(Second)
+        ]),
         GroupCount = 2,
         AverageLength = (50000 + 10) / GroupCount,
         Idf = erlang:max(
@@ -455,7 +463,13 @@ grouped_boolean_uses_document_candidates() ->
             Main, Schema, <<"alpha AND beta">>, Opts
         ),
         ?assertEqual(2, maps:get(match_count, AndHit)),
-        #{count := 2} = search(Main, Schema, <<"alpha OR beta">>, Opts),
+        #{count := 2, hits := OrHits} = search(
+            Main, Schema, <<"alpha OR beta">>, Opts
+        ),
+        ?assertEqual(
+            [{<<"both">>, 2}, {<<"alpha-only">>, 1}],
+            [{seam_hit_udi(Hit), maps:get(match_count, Hit)} || Hit <- OrHits]
+        ),
         #{count := 1, hits := [NotHit]} = search(
             Main, Schema, <<"alpha NOT beta">>, Opts
         ),
@@ -493,6 +507,23 @@ grouped_prefix_uses_complete_group_planes() ->
                 resolve_hits => false, return_count => true
             }
         ),
+        ?assertEqual([<<"a">>, <<"b">>], [
+            seam_hit_udi(Hit) || Hit <- Hits
+        ]),
+        [AHit, _BHit] = Hits,
+        Idf = 1.0e-6,
+        %% Document length covers all indexed columns.  The three chunks in
+        %% group a therefore contribute seven content tokens plus three
+        %% verbatim tenant tokens; group b contributes two tokens.
+        GroupLength = 10,
+        AverageLength = 6.0,
+        ExpectedScore = lists:sum([
+            Idf * (Tf * 2.2) /
+                (Tf + 1.2 * (0.25 + 0.75 *
+                    (GroupLength / AverageLength)))
+         || Tf <- [2, 3, 1, 1]
+        ]),
+        ?assert(abs(maps:get(score, AHit) - ExpectedScore) < 1.0e-12),
         ?assertEqual([1, 7], lists:sort([
             maps:get(match_count, Hit) || Hit <- Hits
         ]))
@@ -526,6 +557,7 @@ phrase_does_not_cross_chunk_boundary() ->
                 resolve_hits => false, return_count => true
             }
         ),
+        ?assertEqual(<<"within">>, seam_hit_udi(Hit)),
         ?assertEqual(1, maps:get(match_count, Hit))
     end).
 
@@ -557,17 +589,31 @@ hpmor_bounded_multichunk_subset() ->
         #{count := 1, hits := [Grouped]} = search(
             Main, Schema, <<"hermione">>, Opts
         ),
-        ?assertEqual(2400, maps:get(match_count, Grouped)),
+        ?assertEqual(
+            {<<"hpmor">>, 2400},
+            {seam_hit_udi(Grouped), maps:get(match_count, Grouped)}
+        ),
         #{count := 8, hits := Ungrouped} = search(
             Main, Schema, <<"hermione">>, Opts#{grouping => ungrouped}
         ),
-        ?assertEqual(2400, lists:sum([
-            maps:get(match_count, Hit) || Hit <- Ungrouped
-        ])),
+        ?assertEqual(
+            [
+                {<<"hpmor-", Index:16/unsigned-big>>, 300}
+             || Index <- lists:seq(1, 8)
+            ],
+            [
+                {maps:get(chunk_key, maps:get(candidate_record, Hit)),
+                    maps:get(match_count, Hit)}
+             || Hit <- Ungrouped
+            ]
+        ),
         #{count := 1, hits := [Phrase]} = search(
             Main, Schema, <<"\"harry potter\"">>, Opts
         ),
-        ?assertEqual(8, maps:get(match_count, Phrase))
+        ?assertEqual(
+            {<<"hpmor">>, 8},
+            {seam_hit_udi(Phrase), maps:get(match_count, Phrase)}
+        )
     end).
 
 ranked_page_ties_use_candidate_order() ->
@@ -584,7 +630,10 @@ ranked_page_ties_use_candidate_order() ->
             <<"equal">>,
             #{return_count => true, rank => bm25, limit => 2}
         ),
-        ?assertEqual([<<"a">>, <<"b">>], [maps:get(key, Hit) || Hit <- Hits])
+        ?assertEqual(
+            [{<<"a">>, 1}, {<<"b">>, 1}],
+            [{maps:get(key, Hit), maps:get(match_count, Hit)} || Hit <- Hits]
+        )
     end).
 
 bounded_or_page_matches_full_ranking_test_() ->
@@ -643,6 +692,17 @@ bounded_or_page_matches_full_ranking() ->
             lists:sublist(maps:get(hits, Full), 20),
             maps:get(hits, Fast)
         ),
+        ?assertEqual(
+            [
+                {list_to_binary(io_lib:format("~4..0B", [I])), 8}
+             || I <- lists:seq(1, 20)
+            ],
+            [
+                {maps:get(title, maps:get(candidate_record, Hit)),
+                    maps:get(match_count, Hit)}
+             || Hit <- maps:get(hits, Fast)
+            ]
+        ),
         ?assertEqual(1, maps:get(
             {leveled_fts, fts2_search_fast_or_bounded, 5}, Counts
         ))
@@ -684,7 +744,10 @@ ranked_tie_fields_prepage_before_identity() ->
                 limit => 2
             }
         ),
-        ?assertEqual(2, length(Hits))
+        ?assertEqual(
+            [{<<"0000">>, 3}, {<<"0001">>, 2}],
+            [{maps:get(key, Hit), maps:get(match_count, Hit)} || Hit <- Hits]
+        )
     end).
 
 production_page_only_contract_test_() ->
@@ -735,6 +798,23 @@ production_page_only_contract() ->
             ),
         ?assertEqual(4, length(Hits)),
         ?assertEqual(4, map_size(Hydrated)),
+        ?assertEqual(
+            [
+                {list_to_binary(io_lib:format("~4..0B", [I])), 1}
+             || I <- [16, 32, 48, 64]
+            ],
+            [
+                begin
+                    Row = maps:get(
+                        {maps:get(group_id, Hit), maps:get(chunk_id, Hit)},
+                        Hydrated
+                    ),
+                    Candidate = maps:get(candidate_record, Row),
+                    {maps:get(chunk_key, Candidate), maps:get(match_count, Hit)}
+                end
+             || Hit <- Hits
+            ]
+        ),
         ?assert(lists:all(
             fun(Hit) ->
                 maps:is_key(group_id, Hit) andalso
@@ -1359,8 +1439,8 @@ seam_schema(Index) ->
             #{name => tenant, path => [tenant], mode => verbatim}
         ],
         text_field => [content],
-        hit_fields => [udi, path, ipath_vec, tenant, content_version],
-        candidate_fields => [udi, path, ipath_vec, tenant, content_version],
+        hit_fields => [udi, path, ipath_vec, tenant, content_version, chunk_key],
+        candidate_fields => [udi, path, ipath_vec, tenant, content_version, chunk_key],
         candidate_filter_fields => [#{column => tenant, field => tenant}],
         candidate_group_fields => [udi, path, ipath_vec, content_version],
         candidate_version_field => content_version
@@ -1374,9 +1454,13 @@ seam_put(Bookie, Schema, Key, Document, Tenant, Body) ->
         udi => Document,
         path => <<"/", Document/binary>>,
         ipath_vec => [<<"root">>, Document],
-        content_version => 1
+        content_version => 1,
+        chunk_key => Key
     }),
     leveled_bookie:book_mput(Bookie, Specs).
+
+seam_hit_udi(Hit) ->
+    maps:get(udi, maps:get(candidate_record, Hit)).
 
 trace_call_counts(Fun, MFAs) ->
     lists:foreach(

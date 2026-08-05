@@ -324,16 +324,26 @@ get_topandtail(Block, {2, PressMethod}) ->
             Last = get_row(
                 binary:part(Rows, LastOffset, LastLength), PressMethod
             ),
-            {
-                element(1, First),
-                element(1, Last),
-                fun(_) ->
-                    [
-                        get_row(binary:part(Rows, Offset, Length), PressMethod)
-                     || {Offset, Length} <- Directory
-                    ]
-                end
-            };
+            case {First, Last} of
+                {not_present, _} ->
+                    {not_present, not_present, fun(_) -> [] end};
+                {_, not_present} ->
+                    {not_present, not_present, fun(_) -> [] end};
+                _ ->
+                    {
+                        element(1, First),
+                        element(1, Last),
+                        fun(_) ->
+                            [
+                                get_row(
+                                    binary:part(Rows, Offset, Length),
+                                    PressMethod
+                                )
+                             || {Offset, Length} <- Directory
+                            ]
+                        end
+                    }
+            end;
         _ ->
             {not_present, not_present, fun(_) -> [] end}
     end.
@@ -894,6 +904,21 @@ v2_row_crc_isolation_test() ->
             Suffix/binary>>,
     ?assertEqual(hd(Rows), get_nth(1, Corrupt, {2, native})),
     ?assertEqual(not_present, get_nth(3, Corrupt, {2, native})).
+
+v2_topandtail_unreadable_row_test() ->
+    Rows = [{{row, 1}, <<"first">>}, {{row, 2}, <<"last">>}],
+    Block = serialise_block(no_lookup, {2, native}, Rows),
+    {ok, FirstStart, FirstLength} = row_location(Block, 1),
+    <<Prefix:FirstStart/binary, FirstRow:FirstLength/binary, Suffix/binary>> = Block,
+    FirstPayloadSize = FirstLength - 1,
+    <<FirstPrefix:FirstPayloadSize/binary, FirstByte:8/integer>> = FirstRow,
+    Corrupt =
+        <<Prefix/binary, FirstPrefix/binary, (FirstByte bxor 16#FF):8/integer,
+            Suffix/binary>>,
+    {Top, Tail, AllFun} = get_topandtail(Corrupt, {2, native}),
+    ?assertEqual(not_present, Top),
+    ?assertEqual(not_present, Tail),
+    ?assertEqual([], AllFun(all)).
 
 v1_bigblock_test() ->
     BigBlob = crypto:strong_rand_bytes(16384),

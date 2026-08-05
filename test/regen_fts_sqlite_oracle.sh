@@ -6,8 +6,8 @@
 #
 # The corpus is a differential oracle for an Erlang FTS engine whose
 # correctness contract is parity with SQLite FTS5's unicode61 tokenizer.
-# Every `match` boolean in the output file is the answer sqlite3 itself
-# gave; nothing is inferred.
+# Every ordered hit identity and occurrence count in the output file comes
+# from sqlite3 itself; nothing is inferred from this engine's results.
 #
 # Usage:
 #   test/regen_fts_sqlite_oracle.sh
@@ -19,7 +19,8 @@
 #   CREATE VIRTUAL TABLE t USING fts5(body, tokenize="unicode61 remove_diacritics R [tokenchars '..'] [separators '..']");
 #   INSERT INTO t(body) VALUES (CAST(X'<dochex>' AS TEXT));   -- X'' blob cast: exact bytes, incl. invalid UTF-8/NUL
 #   SELECT 'DOC:' || hex(body) FROM t;                        -- verify the bytes actually reached the table
-#   SELECT 'Q:' || count(*) FROM t WHERE body MATCH ('"' || CAST(X'<qhex>' AS TEXT) || '"');
+#   SELECT row count plus a separately labelled highlight() result for each
+#   quoted MATCH query (FTS5 auxiliary functions cannot run under aggregate).
 # The query is always wrapped in double quotes, i.e. it is an FTS5 string/phrase
 # (tokenized by the table's own tokenizer), never bareword syntax.
 
@@ -162,8 +163,11 @@ while IFS='|' read -r id rd tc sep dochex qhexes comment; do
         echo "CREATE VIRTUAL TABLE t USING fts5(body, tokenize=\"$TOK\");"
         echo "INSERT INTO t(body) VALUES (CAST(X'$dochex' AS TEXT));"
         echo "SELECT 'DOC:' || hex(body) FROM t;"
+        qi=0
         for q in $qhexes; do
+            qi=$((qi + 1))
             echo "SELECT 'Q:' || count(*) FROM t WHERE body MATCH ('\"' || CAST(X'$q' AS TEXT) || '\"');"
+            echo "SELECT 'H:$qi:' || hex(highlight(t, 0, X'011B1C1D', X'021B1C1D')) FROM t WHERE body MATCH ('\"' || CAST(X'$q' AS TEXT) || '\"');"
         done
     } > "$WORK/case.sql"
 
@@ -209,10 +213,22 @@ while IFS='|' read -r id rd tc sep dochex qhexes comment; do
         for q in $qhexes; do
             i=$((i + 1))
             n=$(grep '^Q:' "$WORK/case.out" | sed -n "${i}s/^Q://p")
-            if [ "$n" -gt 0 ]; then m=true; else m=false; fi
+            if [ "$n" -gt 0 ]; then
+                marked=$(sed -n "s/^H:$i://p" "$WORK/case.out")
+                count=$(printf '%s' "$marked" | awk '{
+                    s = $0; n = 0
+                    while (match(s, /011B1C1D/)) {
+                        n++; s = substr(s, RSTART + RLENGTH)
+                    }
+                    print n
+                }')
+                hits="[{<<\"doc\">>,$count}]"
+            else
+                hits="[]"
+            fi
             if [ "$i" -eq 1 ]; then pre="       [#{"; else pre="        #{"; fi
             if [ "$i" -eq "$nq" ]; then post="}]}"; else post="},"; fi
-            echo "${pre}q => <<$(hex_to_bytes "$q")>>, match => $m$post"
+            echo "${pre}q => <<$(hex_to_bytes "$q")>>, hits => $hits$post"
         done
     } >> "$WORK/body.eterm"
     total=$((total + 1))
@@ -231,12 +247,13 @@ done < "$WORK/cases.txt"
     echo "%%     tokenizer_opts => #{remove_diacritics => 0|1|2,"
     echo "%%                         tokenchars => binary(), separators => binary()},"
     echo "%%     doc => binary(),        %% exact bytes indexed (may be invalid UTF-8)"
-    echo "%%     queries => [#{q => binary(), match => boolean()}]}"
+    echo "%%     queries => [#{q => binary(), hits => [{binary(), pos_integer()}]}]}"
     echo "%%"
     echo "%% Every doc was inserted as CAST(X'<hex>' AS TEXT) and byte-verified with"
     echo "%% SELECT hex(body). Every query ran as: body MATCH '\"' || <bytes> || '\"'"
     echo "%% (an FTS5 string/phrase, tokenized by the table's own tokenizer)."
-    echo "%% Every match boolean is sqlite3's own answer (count(*) > 0)."
+    echo "%% Hit identity/order comes from count(*); match_count is the number of"
+    echo "%% FTS5 highlight start markers for the quoted phrase in that hit."
     echo "["
     cat "$WORK/body.eterm"
     echo "]."

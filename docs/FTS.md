@@ -164,7 +164,7 @@ the tail is the only part of a query that is not a point read.
   `remove_diacritics` modes 0/1/2 follow SQLite unicode61 semantics.
 - The standing differential gate is the generated SQLite FTS5 oracle
   corpus (test/fts_sqlite_oracle_corpus.eterm — 82 cases / 267
-  oracle-verified queries incl. the surprising behaviours: truncated
+  oracle-verified exact ordered-hit and match-count queries incl. the surprising behaviours: truncated
   4-byte sequences fusing tokens, NUL as separator, script-dependent
   diacritic folding) run as a CT suite.
 
