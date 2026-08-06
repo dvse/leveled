@@ -25,6 +25,7 @@
     text_blocks_batch/3,
     text_blocks_with_offsets_batch/3,
     document_text/3,
+    document_text_batch/3,
     record_fetch/4,
     candidate_fetch/4,
     hydrate_page/3,
@@ -50,7 +51,8 @@
     fts2_outer_bound_for_test/3,
     fts2_legacy_outer_assemble_for_test/2,
     fts2_consolidate_with_heap_for_test/4,
-    fts2_consolidate_with_heap_for_test/5
+    fts2_consolidate_with_heap_for_test/5,
+    fts2_consolidate_with_shards_for_test/6
 ]).
 -endif.
 
@@ -1092,7 +1094,13 @@ text_blocks(_Bookie, _Schema, _DocId, _FirstBlock, _LastBlock) ->
 text_blocks_batch(Bookie, #{index := _Bucket} = Schema, Requests) when
     is_pid(Bookie), is_list(Requests)
 ->
-    case text_blocks_with_offsets_batch(Bookie, Schema, Requests) of
+    TextOnlyRequests = [
+        {DocId, FirstBlock, LastBlock, []}
+     || Request <- Requests,
+        {DocId, FirstBlock, LastBlock} <-
+            [client_text_block_request_range(Request)]
+    ],
+    case text_blocks_with_offsets_batch(Bookie, Schema, TextOnlyRequests) of
         {ok, Blocks} ->
             {ok, maps:map(fun(_Key, {Text, _Offsets}) -> Text end, Blocks)};
         Error ->
@@ -1435,6 +1443,62 @@ document_text(Bookie, #{index := Bucket} = Schema, DocKey) when
     end;
 document_text(_Bookie, _Schema, _DocKey) ->
     {error, invalid_fts_document_text_request}.
+
+-spec document_text_batch(pid(), map(), [binary()]) ->
+    {ok, #{binary() => binary()}} | {error, term()}.
+document_text_batch(Bookie, #{index := Bucket} = Schema, DocKeys0) when
+    is_pid(Bookie), is_list(DocKeys0)
+->
+    try
+        DocKeys = lists:usort(DocKeys0),
+        ManifestValues = leveled_bookie:book_headonly_many(
+            Bookie,
+            Bucket,
+            [{<<"doc">>, DocKey} || DocKey <- DocKeys]
+        ),
+        Manifests = lists:foldl(
+            fun
+                ({DocKey, {ok, Manifest0}}, Acc) ->
+                    Acc#{DocKey => client_decode_manifest_value(Manifest0)};
+                ({_DocKey, not_found}, Acc) ->
+                    Acc
+            end,
+            #{},
+            lists:zip(DocKeys, ManifestValues)
+        ),
+        Requests = maps:fold(
+            fun(_DocKey, Manifest, Acc) ->
+                case maps:get(block_count, Manifest, 0) of
+                    0 -> Acc;
+                    BlockCount ->
+                        [{maps:get(doc_id, Manifest), 0, BlockCount - 1} | Acc]
+                end
+            end,
+            [],
+            Manifests
+        ),
+        case text_blocks_batch(Bookie, Schema, Requests) of
+            {ok, Blocks} ->
+                Texts = maps:map(
+                    fun(_DocKey, Manifest) ->
+                        DocId = maps:get(doc_id, Manifest),
+                        BlockCount = maps:get(block_count, Manifest, 0),
+                        iolist_to_binary([
+                            maps:get({DocId, BlockNo}, Blocks)
+                         || BlockNo <- lists:seq(0, BlockCount - 1)
+                        ])
+                    end,
+                    Manifests
+                ),
+                {ok, Texts};
+            Error ->
+                Error
+        end
+    catch
+        error:CaughtReason -> {error, CaughtReason}
+    end;
+document_text_batch(_Bookie, _Schema, _DocKeys) ->
+    {error, invalid_fts_document_text_batch_request}.
 
 -spec record_fetch(pid(), map(), [non_neg_integer()], fold | points) ->
     {ok, map()} | {error, term()}.
@@ -5520,6 +5584,21 @@ fts2_consolidate_with_heap_for_test(
         end
     end.
 
+fts2_consolidate_with_shards_for_test(
+    Bookie, Schema, Opts, MaxHeapWords, Shards, Observer
+) ->
+    Previous = put('$fts2_build_shards', Shards),
+    try
+        fts2_consolidate_with_heap_for_test(
+            Bookie, Schema, Opts, MaxHeapWords, Observer
+        )
+    after
+        case Previous of
+            undefined -> erase('$fts2_build_shards');
+            _ -> put('$fts2_build_shards', Previous)
+        end
+    end.
+
 fts2_legacy_outer_assemble_for_test(Bookie, Schema) ->
     Existing = case fts2_search_root(Bookie, Schema) of
         {ok, Root} -> fts2_search_export_documents(Bookie, Schema, Root);
@@ -5592,12 +5671,33 @@ fts2_posting_read_dirty(Bookie, Schema, Root, AST, SourceIds, Opts) ->
 -define(BIGRAM_MIN_CHUNKS, 256).
 -define(WRITE_SLICE, 192).
 -define(FTS2_MAX_BUILD_CONCURRENCY, 1).
--define(FTS2_BUILD_SHARDS, 32).
-%% The 359,965-term gate (9,000 documents and one 3.10 MB document) measured a
-%% 3,800,194-word (29.00 MiB on a 64-bit VM) shard-worker peak. The 64 MiB
-%% ceiling is 2.21 times that peak and leaves 35.00 MiB of measured headroom.
+%% Term and bigram rows are assembled one shard at a time. A shard's document
+%% fragments are stored SHARD-MAJOR, so a shard worker reads only its own data
+%% in one range fold. Its heap is therefore proportional to its share of the
+%% generation. The share must stay small on a Zipfian corpus, where a few hot
+%% terms carry most of the positions, so the term space is cut finely.
+%% Bigram workers additionally carry the generation's frequent-term map, which
+%% is copied once per worker, so the bigram space is cut less finely.
+%% Fragment rounds are flushed once their accumulated position weight
+%% reaches this many positions, so a workspace worker's fragment buffer is
+%% bounded independently of the document's size.
+-define(FRAGMENT_FLUSH_WEIGHT, 65536).
+-define(FTS2_BUILD_TERM_SHARDS, 1024).
+-define(FTS2_BUILD_BIGRAM_SHARDS, 256).
+%% Anti-runaway backstop, not a tuning knob. Every build role now streams:
+%% the outer holds ordering descriptors, a term shard holds its own shard
+%% (whose floor is the single hottest term's row), and a workspace worker
+%% holds one document -- the atomic delta grain -- with its fragments flushed
+%% in bounded rounds. On the 360,473-term Zipfian gate (9,000 documents, one
+%% 1.96 MB document) the measured live peaks are 10.66 MiB for a term shard,
+%% 7.86 MiB for a bigram shard, 26.70 MiB for a workspace worker and 39.28 MiB
+%% for the outer. max_heap_size counts allocated heap BLOCKS, which run about
+%% 3.4 times live data across a copying collection, so the workspace worker's
+%% document-grain floor already needs roughly 106 MiB of block budget here and
+%% scales with the largest single document. 512 MiB covers a document several
+%% times larger than the live store's while still stopping a runaway loudly.
 -define(FTS2_MAX_BUILD_HEAP_WORDS,
-    (64 * 1024 * 1024 div erlang:system_info(wordsize))
+    (512 * 1024 * 1024 div erlang:system_info(wordsize))
 ).
 
 -ifdef(TEST).
@@ -5989,7 +6089,6 @@ fts2_build_publish_workspace(
         Bookie,
         Schema,
         Generation,
-        Sources,
         maps:get(group_count, Identity),
         maps:get(total_length, Identity),
         BuildConcurrency
@@ -5998,7 +6097,6 @@ fts2_build_publish_workspace(
         Bookie,
         Schema,
         Generation,
-        Sources,
         maps:get(frequent_terms, TermState),
         maps:get(chunk_count, Identity),
         maps:get(total_length, Identity),
@@ -6269,6 +6367,13 @@ fts2_build_workspace_postings(
                                 Schema,
                                 Generation,
                                 SourceId,
+                                fts2_build_workspace_read(
+                                    Bookie,
+                                    maps:get(index, Schema),
+                                    Generation,
+                                    SourceId,
+                                    <<"m">>
+                                ),
                                 maps:get(posting, Delta, #{})
                             )
                         end,
@@ -6372,49 +6477,92 @@ fts2_build_reconstruct_existing_fragments(
     maps:foreach(
         fun(SourceId, Posting) ->
             fts2_build_write_document_fragments(
-                Bookie, Schema, Generation, SourceId, Posting
+                Bookie,
+                Schema,
+                Generation,
+                SourceId,
+                fts2_build_workspace_read(
+                    Bookie, Bucket, Generation, SourceId, <<"m">>
+                ),
+                Posting
             )
         end,
         Runner()
     ),
     0.
 
+%% One row per (kind, shard, source). The row carries the source's chunk
+%% metadata, so a shard worker needs no per-source lookup and no source list.
+%% A shard worker therefore reads exactly its own shard once, instead of every
+%% source's complete fragment map once per shard.
+%% Streamed. A document's posting is the atomic delta grain, so the worker
+%% must hold it; it must not hold a second reshaped copy of it, a third
+%% encoded copy of it, and the bigram graph all at once. Fragments are
+%% therefore emitted in bounded rounds: entries accumulate until their
+%% position weight reaches the flush threshold, the round is written, and the
+%% round is released before the next one starts. Terms are written and freed
+%% before the bigram graph is built. Rounds are separate rows under the same
+%% shard key, which the shard-major range fold reads as one stream.
 fts2_build_write_document_fragments(
-    Bookie, #{index := Bucket}, Generation, SourceId, Posting
+    Bookie, #{index := Bucket}, Generation, SourceId, Metadata, Posting
 ) ->
-    TermFragments = maps:fold(
+    ok = fts2_build_stream_term_fragments(
+        Bookie, Bucket, Generation, SourceId, Metadata, Posting
+    ),
+    fts2_build_stream_bigram_fragments(
+        Bookie, Bucket, Generation, SourceId, Metadata, Posting
+    ).
+
+fts2_build_stream_term_fragments(
+    Bookie, Bucket, Generation, SourceId, Metadata, Posting
+) ->
+    {Buckets, Weight, Round} = maps:fold(
         fun(Column, Tokens, Acc0) ->
             maps:fold(
-                fun(Token, Entry, Acc) ->
-                    Shard = fts2_build_shard({Column, Token}),
-                    Acc#{Shard => [
-                        {Column, Token, Entry} | maps:get(Shard, Acc, [])
-                    ]}
+                fun(Token, Entry, {Buckets0, Weight0, Round0}) ->
+                    Shard = fts2_build_term_shard({Column, Token}),
+                    Buckets1 = Buckets0#{Shard => [
+                        {Column, Token, Entry} | maps:get(Shard, Buckets0, [])
+                    ]},
+                    Weight1 = Weight0 + 1 + maps:get(count, Entry, 0),
+                    case Weight1 >= ?FRAGMENT_FLUSH_WEIGHT of
+                        true ->
+                            ok = fts2_build_flush_fragments(
+                                Bookie, Bucket, Generation, $t, SourceId,
+                                Round0, Metadata, Buckets1
+                            ),
+                            {#{}, 0, Round0 + 1};
+                        false ->
+                            {Buckets1, Weight1, Round0}
+                    end
                 end,
                 Acc0,
                 Tokens
             )
         end,
-        #{},
+        {#{}, 0, 0},
         Posting
     ),
-    BigramFragments = fts2_build_document_bigram_fragments(Posting),
-    Key = fts2_build_workspace_key(Generation, SourceId),
-    TermSpecs = case map_size(TermFragments) of
-        0 -> [];
-        _ -> [{add, Bucket, Key, <<"t">>,
-            fts2_codec_encode(delta, TermFragments)}]
-    end,
-    BigramSpecs = case map_size(BigramFragments) of
-        0 -> [];
-        _ -> [{add, Bucket, Key, <<"g">>,
-            fts2_codec_encode(delta, BigramFragments)}]
-    end,
-    fts2_build_write_slices(Bookie, TermSpecs ++ BigramSpecs).
+    case Weight of
+        0 -> ok;
+        _ ->
+            fts2_build_flush_fragments(
+                Bookie, Bucket, Generation, $t, SourceId, Round, Metadata,
+                Buckets
+            )
+    end.
 
-fts2_build_document_bigram_fragments(Posting) ->
-    Rows = maps:fold(
-        fun(Column, Tokens, Acc0) ->
+fts2_build_stream_bigram_fragments(
+    Bookie, Bucket, Generation, SourceId, Metadata, Posting
+) ->
+    %% The document's bigram graph is produced in position order and flushed
+    %% in bounded rounds, so the worker never holds the whole graph. A bigram
+    %% key may therefore appear in more than one round; the shard worker
+    %% merges rounds, and its position lists are sorted and counted there, so
+    %% the merge is exact.
+    Context = {Bookie, Bucket, Generation, SourceId, Metadata},
+    {Rows, Weight, Round} = maps:fold(
+        fun(Column, Tokens, State0) ->
             {Streams, _Ordinal} = maps:fold(
                 fun(Token, Entry, {Tree, Ordinal}) ->
                     case maps:get(positions, Entry) of
@@ -6435,28 +6583,56 @@ fts2_build_document_bigram_fragments(Posting) ->
                 Tokens
             ),
             fts2_build_document_bigram_stream(
-                Column, Streams, none, Acc0
+                Context, Column, Streams, none, State0
             )
         end,
-        #{},
+        {#{}, 0, 0},
         Posting
     ),
-    maps:fold(
+    case Weight of
+        0 -> ok;
+        _ -> fts2_build_flush_bigram_round(Context, Round, Rows)
+    end.
+
+fts2_build_flush_bigram_round(
+    {Bookie, Bucket, Generation, SourceId, Metadata}, Round, Rows
+) ->
+    Buckets = maps:fold(
         fun(Key, {FirstTf, SecondTf, Positions}, Acc) ->
-            Shard = fts2_build_shard(Key),
+            Shard = fts2_build_bigram_shard(Key),
             Acc#{Shard => [
-                {Key, FirstTf, SecondTf, Positions}
-                | maps:get(Shard, Acc, [])
+                {Key, FirstTf, SecondTf, Positions} | maps:get(Shard, Acc, [])
             ]}
         end,
         #{},
         Rows
+    ),
+    fts2_build_flush_fragments(
+        Bookie, Bucket, Generation, $g, SourceId, Round, Metadata, Buckets
     ).
 
-fts2_build_document_bigram_stream(Column, Streams, Previous, Acc) ->
+fts2_build_flush_fragments(
+    Bookie, Bucket, Generation, Kind, SourceId, Round, Metadata, Buckets
+) ->
+    SubKey = <<SourceId:64/unsigned-big, Round:16/unsigned-big>>,
+    fts2_build_write_slices(
+        Bookie,
+        [
+            {add, Bucket, fts2_build_fragment_key(Generation, Kind, Shard),
+                SubKey, fts2_codec_encode(delta, {Metadata, Entries})}
+         || {Shard, Entries} <- maps:to_list(Buckets)
+        ]
+    ).
+
+%% Shares the workspace key prefix so generation cleanup removes it unchanged.
+%% The 11-byte suffix cannot collide with a 16-byte source workspace key.
+fts2_build_fragment_key(Generation, Kind, Shard) ->
+    <<"f2:w:", Generation:64/unsigned-big, Kind:8, Shard:16/unsigned-big>>.
+
+fts2_build_document_bigram_stream(Context, Column, Streams, Previous, State) ->
     case gb_trees:is_empty(Streams) of
         true ->
-            Acc;
+            State;
         false ->
             {{Position, Ordinal}, {Token, Entry, Rest}, NextStreams0} =
                 gb_trees:take_smallest(Streams),
@@ -6469,43 +6645,58 @@ fts2_build_document_bigram_stream(Column, Streams, Previous, Acc) ->
                         NextStreams0
                     )
             end,
-            NextAcc = case Previous of
+            NextState = case Previous of
                 {PreviousPosition, First, FirstEntry} when
                     Position =:= PreviousPosition + 1
                 ->
-                    Key = {Column, First, Token},
-                    case maps:find(Key, Acc) of
-                        error ->
-                            Acc#{Key => {
-                                maps:get(count, FirstEntry),
-                                maps:get(count, Entry),
-                                [PreviousPosition]
-                            }};
-                        {ok, {FirstTf, SecondTf, Positions}} ->
-                            Acc#{Key => {
-                                FirstTf, SecondTf,
-                                [PreviousPosition | Positions]
-                            }}
-                    end;
+                    fts2_build_note_bigram(
+                        Context,
+                        {Column, First, Token},
+                        maps:get(count, FirstEntry),
+                        maps:get(count, Entry),
+                        PreviousPosition,
+                        State
+                    );
                 _ ->
-                    Acc
+                    State
             end,
             fts2_build_document_bigram_stream(
-                Column, NextStreams, {Position, Token, Entry}, NextAcc
+                Context, Column, NextStreams, {Position, Token, Entry},
+                NextState
             )
     end.
 
-fts2_build_workspace_terms(
-    Bookie, Schema, Generation, Sources, GroupCount, TotalLength,
-    _BuildConcurrency
+fts2_build_note_bigram(
+    Context, Key, FirstTf, SecondTf, Position, {Rows0, Weight0, Round}
 ) ->
-    ZeroBloom = <<0:(?TERM_BLOOM_BITS)>>,
+    Rows = case maps:find(Key, Rows0) of
+        error ->
+            Rows0#{Key => {FirstTf, SecondTf, [Position]}};
+        {ok, {ExistingFirstTf, ExistingSecondTf, Positions}} ->
+            Rows0#{Key => {
+                ExistingFirstTf, ExistingSecondTf, [Position | Positions]
+            }}
+    end,
+    Weight = Weight0 + 1,
+    case Weight >= ?FRAGMENT_FLUSH_WEIGHT of
+        true ->
+            ok = fts2_build_flush_bigram_round(Context, Round, Rows),
+            {#{}, 0, Round + 1};
+        false ->
+            {Rows, Weight, Round}
+    end.
+
+fts2_build_workspace_terms(
+    Bookie, Schema, Generation, GroupCount, TotalLength, _BuildConcurrency
+) ->
+    %% Bloom bits travel as sparse word maps and are encoded once, here. A
+    %% per-shard binary OR would cost the full bloom width on every shard.
     Initial = #{
         term_count => 0,
         row_count => 0,
         frequent_terms => #{},
-        term_bloom => ZeroBloom,
-        term_bloom_shards => #{}
+        bloom_words => #{},
+        bloom_shard_words => #{}
     },
     State = lists:foldl(
         fun(Shard, Acc) ->
@@ -6516,7 +6707,6 @@ fts2_build_workspace_terms(
                         Bookie,
                         Schema,
                         Generation,
-                        Sources,
                         Shard,
                         GroupCount,
                         TotalLength
@@ -6532,30 +6722,68 @@ fts2_build_workspace_terms(
                     maps:get(frequent_terms, Acc),
                     maps:get(frequent_terms, Result)
                 ),
-                term_bloom := fts2_build_binary_or(
-                    maps:get(term_bloom, Acc),
-                    maps:get(term_bloom, Result)
+                bloom_words := fts2_build_merge_bloom_words(
+                    maps:get(bloom_words, Acc),
+                    maps:get(bloom_words, Result)
                 ),
-                term_bloom_shards := fts2_build_merge_bloom_shards(
-                    maps:get(term_bloom_shards, Acc),
-                    maps:get(term_bloom_shards, Result)
+                bloom_shard_words := fts2_build_merge_bloom_shard_words(
+                    maps:get(bloom_shard_words, Acc),
+                    maps:get(bloom_shard_words, Result)
                 )
             }
         end,
         Initial,
-        lists:seq(0, ?FTS2_BUILD_SHARDS - 1)
+        lists:seq(0, fts2_build_term_shards() - 1)
     ),
-    State#{term_bloom_shards := fts2_build_complete_bloom_shards(
-        maps:get(term_bloom_shards, State),
-        ?TERM_BLOOM_SHARDS,
-        ?TERM_BLOOM_SHARD_BITS div 8
-    )}.
+    State#{
+        term_bloom => fts2_build_encode_bloom_words(
+            maps:get(bloom_words, State), ?TERM_BLOOM_WORDS
+        ),
+        term_bloom_shards => fts2_build_encode_bloom_shard_words(
+            maps:get(bloom_shard_words, State),
+            ?TERM_BLOOM_SHARDS,
+            ?TERM_BLOOM_SHARD_WORDS
+        )
+    }.
+
+fts2_build_merge_bloom_words(Left, Right) ->
+    maps:fold(
+        fun(Word, Mask, Acc) ->
+            Acc#{Word => maps:get(Word, Acc, 0) bor Mask}
+        end,
+        Left,
+        Right
+    ).
+
+fts2_build_merge_bloom_shard_words(Left, Right) ->
+    maps:fold(
+        fun(Shard, Words, Acc) ->
+            Acc#{Shard => fts2_build_merge_bloom_words(
+                maps:get(Shard, Acc, #{}), Words
+            )}
+        end,
+        Left,
+        Right
+    ).
+
+fts2_build_encode_bloom_words(Words, WordCount) ->
+    iolist_to_binary([
+        <<(maps:get(Word, Words, 0)):64/unsigned-little>>
+     || Word <- lists:seq(0, WordCount - 1)
+    ]).
+
+fts2_build_encode_bloom_shard_words(ShardWords, ShardCount, WordCount) ->
+    [
+        {Shard, fts2_build_encode_bloom_words(
+            maps:get(Shard, ShardWords, #{}), WordCount
+        )}
+     || Shard <- lists:seq(0, ShardCount - 1)
+    ].
 
 fts2_build_workspace_term_shard(
     Bookie,
     #{index := Bucket},
     Generation,
-    Sources,
     Shard,
     GroupCount,
     TotalLength
@@ -6564,8 +6792,8 @@ fts2_build_workspace_term_shard(
         Bookie,
         Bucket,
         Generation,
-        Sources,
-        {<<"t">>, Shard},
+        $t,
+        Shard,
         fun(Metadata, Entries, Acc0) ->
             lists:foldl(
                 fun({Column, Token, Entry}, Acc) ->
@@ -6579,33 +6807,100 @@ fts2_build_workspace_term_shard(
         end,
         #{}
     ),
-    RowCount = fts2_build_write_term_rows(
+    TermCount = map_size(TermRows),
+    %% The map is not referenced past this point. Each row is released once its
+    %% batch is written, so the write phase never holds the whole shard and its
+    %% encoded rows at the same time. Bloom bits and frequent-term keys are
+    %% collected on the same single pass rather than by re-walking the shard.
+    State = fts2_build_stream_term_rows(
         Bookie,
         Bucket,
         Generation,
-        TermRows,
+        maps:to_list(TermRows),
         GroupCount,
-        TotalLength
+        TotalLength,
+        [],
+        0,
+        #{
+            row_count => 0,
+            frequent_terms => #{},
+            bloom_words => #{},
+            bloom_shard_words => #{}
+        }
     ),
-    Frequent = maps:fold(
-        fun(Key, Row, Acc) ->
-            Df = length(maps:get(entries, Row)),
-            case Df >= 64 of
-                true -> Acc#{Key => Df};
-                false -> Acc
-            end
-        end,
-        #{},
-        TermRows
+    State#{term_count => TermCount}.
+
+fts2_build_stream_term_rows(
+    _Bookie, _Bucket, _Generation, [], _GroupCount, _TotalLength, [], _Size,
+    State
+) ->
+    State;
+fts2_build_stream_term_rows(
+    Bookie, Bucket, Generation, [], GroupCount, TotalLength, Batch, _Size,
+    State
+) ->
+    Written = fts2_build_write_term_batch(
+        Bookie, Bucket, Generation, Batch, GroupCount, TotalLength
     ),
-    #{
-        term_count => map_size(TermRows),
-        row_count => RowCount,
-        frequent_terms => Frequent,
-        term_bloom => fts2_build_term_bloom(TermRows),
-        term_bloom_shards => maps:from_list(
-            fts2_build_term_bloom_shards(TermRows)
-        )
+    State#{row_count := maps:get(row_count, State) + Written};
+fts2_build_stream_term_rows(
+    Bookie, Bucket, Generation, [{Key, Row} | Rest], GroupCount, TotalLength,
+    Batch, Size, State0
+) ->
+    State = fts2_build_note_term_row(Key, Row, State0),
+    case Size + 1 >= 48 of
+        true ->
+            Written = fts2_build_write_term_batch(
+                Bookie,
+                Bucket,
+                Generation,
+                [{Key, Row} | Batch],
+                GroupCount,
+                TotalLength
+            ),
+            fts2_build_stream_term_rows(
+                Bookie,
+                Bucket,
+                Generation,
+                Rest,
+                GroupCount,
+                TotalLength,
+                [],
+                0,
+                State#{row_count := maps:get(row_count, State) + Written}
+            );
+        false ->
+            fts2_build_stream_term_rows(
+                Bookie,
+                Bucket,
+                Generation,
+                Rest,
+                GroupCount,
+                TotalLength,
+                [{Key, Row} | Batch],
+                Size + 1,
+                State
+            )
+    end.
+
+fts2_build_note_term_row({Column, Token}, Row, State) ->
+    Df = length(maps:get(entries, Row)),
+    Frequent = case Df >= 64 of
+        true -> (maps:get(frequent_terms, State))#{{Column, Token} => Df};
+        false -> maps:get(frequent_terms, State)
+    end,
+    BloomShard = fts2_term_bloom_shard(Column, Token),
+    ShardWords = maps:get(bloom_shard_words, State),
+    State#{
+        frequent_terms := Frequent,
+        bloom_words := fts2_term_bloom_add(
+            Column, Token, 0, maps:get(bloom_words, State)
+        ),
+        bloom_shard_words := ShardWords#{
+            BloomShard => fts2_term_bloom_shard_add(
+                Column, Token, 0, maps:get(BloomShard, ShardWords, #{})
+            )
+        }
     }.
 
 fts2_build_add_term_row_entry(Column, Token, Entry, Metadata, Terms) ->
@@ -6625,37 +6920,6 @@ fts2_build_add_term_row_entry(Column, Token, Entry, Metadata, Terms) ->
     },
     Terms#{Key => Row}.
 
-fts2_build_write_term_rows(
-    Bookie, Bucket, Generation, TermRows, GroupCount, TotalLength
-) ->
-    {Batch, BatchSize, Count} = maps:fold(
-        fun({Column, Token}, Row, {Rows, Size, RowCount}) ->
-            Next = [{{Column, Token}, Row} | Rows],
-            case Size + 1 >= 48 of
-                true ->
-                    Written = fts2_build_write_term_batch(
-                        Bookie,
-                        Bucket,
-                        Generation,
-                        Next,
-                        GroupCount,
-                        TotalLength
-                    ),
-                    {[], 0, RowCount + Written};
-                false ->
-                    {Next, Size + 1, RowCount}
-            end
-        end,
-        {[], 0, 0},
-        TermRows
-    ),
-    Count + case BatchSize of
-        0 -> 0;
-        _ -> fts2_build_write_term_batch(
-            Bookie, Bucket, Generation, Batch, GroupCount, TotalLength
-        )
-    end.
-
 fts2_build_write_term_batch(
     Bookie, Bucket, Generation, Rows, GroupCount, TotalLength
 ) ->
@@ -6669,13 +6933,13 @@ fts2_build_write_term_batch(
     length(Specs).
 
 fts2_build_workspace_bigrams(
-    Bookie, Schema, Generation, Sources, FrequentTerms, ChunkCount,
-    TotalLength, _BuildConcurrency
+    Bookie, Schema, Generation, FrequentTerms, ChunkCount, TotalLength,
+    _BuildConcurrency
 ) ->
     Initial = #{
         bigram_count => 0,
         row_count => 0,
-        bigram_bloom_shards => #{}
+        bloom_shard_words => #{}
     },
     State = lists:foldl(
         fun(Shard, Acc) ->
@@ -6686,7 +6950,6 @@ fts2_build_workspace_bigrams(
                         Bookie,
                         Schema,
                         Generation,
-                        Sources,
                         Shard,
                         FrequentTerms,
                         ChunkCount,
@@ -6699,26 +6962,25 @@ fts2_build_workspace_bigrams(
                     maps:get(bigram_count, Result),
                 row_count := maps:get(row_count, Acc) +
                     maps:get(row_count, Result),
-                bigram_bloom_shards := fts2_build_merge_bloom_shards(
-                    maps:get(bigram_bloom_shards, Acc),
-                    maps:get(bigram_bloom_shards, Result)
+                bloom_shard_words := fts2_build_merge_bloom_shard_words(
+                    maps:get(bloom_shard_words, Acc),
+                    maps:get(bloom_shard_words, Result)
                 )
             }
         end,
         Initial,
-        lists:seq(0, ?FTS2_BUILD_SHARDS - 1)
+        lists:seq(0, fts2_build_bigram_shards() - 1)
     ),
-    State#{bigram_bloom_shards := fts2_build_complete_bloom_shards(
-        maps:get(bigram_bloom_shards, State),
+    State#{bigram_bloom_shards => fts2_build_encode_bloom_shard_words(
+        maps:get(bloom_shard_words, State),
         ?BIGRAM_BLOOM_SHARDS,
-        ?BIGRAM_BLOOM_SHARD_BITS div 8
+        ?BIGRAM_BLOOM_SHARD_WORDS
     )}.
 
 fts2_build_workspace_bigram_shard(
     Bookie,
     #{index := Bucket},
     Generation,
-    Sources,
     Shard,
     FrequentTerms,
     ChunkCount,
@@ -6728,8 +6990,8 @@ fts2_build_workspace_bigram_shard(
         Bookie,
         Bucket,
         Generation,
-        Sources,
-        {<<"g">>, Shard},
+        $g,
+        Shard,
         fun(Metadata, Entries, {Rows0, Bloom0}) ->
             lists:foldl(
                 fun({{Column, First, Second} = Key, FirstTf, SecondTf,
@@ -6748,10 +7010,19 @@ fts2_build_workspace_bigram_shard(
                                 FirstTf, 0
                             },
                             Row0 = maps:get(Key, Rows, #{}),
+                            %% A document emits its bigram graph in bounded
+                            %% rounds, so one key can arrive more than once
+                            %% for the same chunk. Positions concatenate; the
+                            %% row encoder sorts and counts them.
+                            Merged = case maps:find(ChunkId, Row0) of
+                                error ->
+                                    {PlaneEntry, SecondTf, Positions};
+                                {ok, {Existing, ExistingSecondTf, Prior}} ->
+                                    {Existing, ExistingSecondTf,
+                                        Positions ++ Prior}
+                            end,
                             {
-                                Rows#{Key => Row0#{ChunkId => {
-                                    PlaneEntry, SecondTf, Positions
-                                }}},
+                                Rows#{Key => Row0#{ChunkId => Merged}},
                                 NextBloom
                             };
                         false ->
@@ -6768,30 +7039,30 @@ fts2_build_workspace_bigram_shard(
         fun(_Key, Chunks) -> map_size(Chunks) >= ?BIGRAM_MIN_CHUNKS end,
         AllRows
     ),
+    BigramCount = map_size(BigramRows),
+    %% As for terms: the surviving rows are consumed as a list, so a written
+    %% batch is released before the next one is encoded.
     RowCount = fts2_build_write_bigram_rows(
         Bookie,
         Bucket,
         Generation,
-        BigramRows,
+        maps:to_list(BigramRows),
         FrequentTerms,
         ChunkCount,
         TotalLength
     ),
     #{
-        bigram_count => map_size(BigramRows),
+        bigram_count => BigramCount,
         row_count => RowCount,
-        bigram_bloom_shards => maps:from_list([
-            {BloomShard, fts2_build_encode_bigram_bloom_shard(Words)}
-         || {BloomShard, Words} <- maps:to_list(BloomWords)
-        ])
+        bloom_shard_words => BloomWords
     }.
 
 fts2_build_write_bigram_rows(
     Bookie, Bucket, Generation, BigramRows, FrequentTerms, ChunkCount,
     TotalLength
 ) ->
-    {Batch, BatchSize, Count} = maps:fold(
-        fun({Column, First, Second}, ByChunk, {Rows, Size, RowCount}) ->
+    {Batch, BatchSize, Count} = lists:foldl(
+        fun({{Column, First, Second}, ByChunk}, {Rows, Size, RowCount}) ->
             Item = {
                 {Column, First, Second},
                 ByChunk,
@@ -6845,83 +7116,38 @@ fts2_build_write_bigram_batch(
     ok = fts2_build_write_slices(Bookie, Specs),
     length(Specs).
 
+%% One range fold over the shard's own key. Nothing outside the shard is read
+%% and nothing outside the shard is decoded.
 fts2_build_workspace_fold_fragments(
-    Bookie, Bucket, Generation, Sources, {SubKey, Shard}, Fun, Acc0
+    Bookie, Bucket, Generation, Kind, Shard, Fun, Acc0
 ) ->
-    lists:foldl(
-        fun(SourceBatch, Acc) ->
-            Requests = lists:append([
-                [
-                    {fts2_build_workspace_key(Generation, SourceId), <<"m">>},
-                    {fts2_build_workspace_key(Generation, SourceId), SubKey}
-                ]
-             || {SourceId, _Origin, _OldChunkId} <- SourceBatch
-            ]),
-            Values = leveled_bookie:book_headonly_many(
-                Bookie, Bucket, Requests
-            ),
-            fts2_build_fold_workspace_values(Values, Shard, Fun, Acc)
-        end,
-        Acc0,
-        fts2_build_chunks(Sources, 64, [])
-    ).
+    Key = fts2_build_fragment_key(Generation, Kind, Shard),
+    Fold = fun
+        (B, {K, _SubKey}, Value, Acc) when B =:= Bucket, K =:= Key ->
+            {Metadata, Entries} = fts2_codec_decode(delta, Value),
+            Fun(Metadata, Entries, Acc);
+        (_B, _Key, _Value, Acc) ->
+            Acc
+    end,
+    {async, Runner} = leveled_bookie:book_headfold(
+        Bookie,
+        ?HEAD_TAG,
+        {range, Bucket, {
+            {Key, <<>>},
+            {Key, <<255, 255, 255, 255, 255, 255, 255, 255, 255, 255>>}
+        }},
+        {Fold, Acc0},
+        false,
+        true,
+        false
+    ),
+    Runner().
 
-fts2_build_fold_workspace_values([], _Shard, _Fun, Acc) ->
-    Acc;
-fts2_build_fold_workspace_values(
-    [{ok, MetadataValue}, not_found | Rest], Shard, Fun, Acc
-) ->
-    _Metadata = fts2_codec_decode(delta, MetadataValue),
-    fts2_build_fold_workspace_values(Rest, Shard, Fun, Acc);
-fts2_build_fold_workspace_values(
-    [{ok, MetadataValue}, {ok, FragmentValue} | Rest], Shard, Fun, Acc
-) ->
-    Metadata = fts2_codec_decode(delta, MetadataValue),
-    Fragments = fts2_codec_decode(delta, FragmentValue),
-    Fragment = maps:get(Shard, Fragments, []),
-    fts2_build_fold_workspace_values(
-        Rest, Shard, Fun, Fun(Metadata, Fragment, Acc)
-    );
-fts2_build_fold_workspace_values(Bad, _Shard, _Fun, _Acc) ->
-    erlang:error({fts2_workspace_rows_invalid, Bad}).
+fts2_build_term_shard(Key) ->
+    erlang:phash2(Key, fts2_build_term_shards()).
 
-fts2_build_shard(Key) ->
-    erlang:phash2(Key, ?FTS2_BUILD_SHARDS).
-
-fts2_build_merge_bloom_shards(Acc, Next) ->
-    maps:fold(
-        fun(Shard, Bloom, Inner) ->
-            Inner#{Shard => case maps:find(Shard, Inner) of
-                error -> Bloom;
-                {ok, Existing} -> fts2_build_binary_or(Existing, Bloom)
-            end}
-        end,
-        Acc,
-        Next
-    ).
-
-fts2_build_complete_bloom_shards(Shards, Count, Bytes) ->
-    Zero = <<0:(Bytes * 8)>>,
-    [
-        {Shard, maps:get(Shard, Shards, Zero)}
-     || Shard <- lists:seq(0, Count - 1)
-    ].
-
-fts2_build_binary_or(Left, Right) when byte_size(Left) =:= byte_size(Right) ->
-    fts2_build_binary_or(Left, Right, []).
-
-fts2_build_binary_or(<<>>, <<>>, Acc) ->
-    iolist_to_binary(lists:reverse(Acc));
-fts2_build_binary_or(
-    <<Left:64/unsigned-little, LeftRest/binary>>,
-    <<Right:64/unsigned-little, RightRest/binary>>,
-    Acc
-) ->
-    fts2_build_binary_or(
-        LeftRest,
-        RightRest,
-        [<<(Left bor Right):64/unsigned-little>> | Acc]
-    ).
+fts2_build_bigram_shard(Key) ->
+    erlang:phash2(Key, fts2_build_bigram_shards()).
 
 fts2_build_workspace_key(Generation, SourceId) ->
     <<"f2:w:", Generation:64/unsigned-big, SourceId:64/unsigned-big>>.
@@ -7386,40 +7612,6 @@ fts2_build_build_term_rows(TokenDocs, SourceMap) ->
 %% as the active state row, so an impossible exact term/phrase avoids all
 %% generation-qualified header reads. False positives only select the normal
 %% path; the bitset can never create a false negative.
-fts2_build_term_bloom(TermRows) ->
-    Words = maps:fold(
-        fun({Column, Token}, _Row, Acc) ->
-            fts2_term_bloom_add(Column, Token, 0, Acc)
-        end,
-        #{},
-        TermRows
-    ),
-    iolist_to_binary([
-        <<(maps:get(Word, Words, 0)):64/unsigned-little>>
-     || Word <- lists:seq(0, ?TERM_BLOOM_WORDS - 1)
-    ]).
-
-fts2_build_term_bloom_shards(TermRows) ->
-    ShardWords = maps:fold(
-        fun({Column, Token}, _Row, Acc) ->
-            Shard = fts2_term_bloom_shard(Column, Token),
-            Words0 = maps:get(Shard, Acc, #{}),
-            Acc#{Shard => fts2_term_bloom_shard_add(
-                Column, Token, 0, Words0
-            )}
-        end,
-        #{},
-        TermRows
-    ),
-    [
-        {Shard, iolist_to_binary([
-            <<(maps:get(Word, maps:get(Shard, ShardWords, #{}), 0)):
-                64/unsigned-little>>
-         || Word <- lists:seq(0, ?TERM_BLOOM_SHARD_WORDS - 1)
-        ])}
-     || Shard <- lists:seq(0, ?TERM_BLOOM_SHARDS - 1)
-    ].
-
 fts2_term_bloom_shard_add(_Column, _Token, 4, Words) ->
     Words;
 fts2_term_bloom_shard_add(Column, Token, Salt, Words) ->
@@ -7561,19 +7753,10 @@ fts2_bigram_bloom_shard_add(Column, First, Second, Salt, Words) ->
 
 -ifdef(TEST).
 fts2_build_encode_bigram_bloom_shards(ShardWords) ->
-    [
-        {Shard, fts2_build_encode_bigram_bloom_shard(
-            maps:get(Shard, ShardWords, #{})
-        )}
-     || Shard <- lists:seq(0, ?BIGRAM_BLOOM_SHARDS - 1)
-    ].
+    fts2_build_encode_bloom_shard_words(
+        ShardWords, ?BIGRAM_BLOOM_SHARDS, ?BIGRAM_BLOOM_SHARD_WORDS
+    ).
 -endif.
-
-fts2_build_encode_bigram_bloom_shard(Words) ->
-    iolist_to_binary([
-        <<(maps:get(Word, Words, 0)):64/unsigned-little>>
-     || Word <- lists:seq(0, ?BIGRAM_BLOOM_SHARD_WORDS - 1)
-    ]).
 
 -ifdef(TEST).
 fts2_build_add_bigram(
@@ -7725,7 +7908,9 @@ fts2_build_outer_options(MaxHeapWords) ->
         {max_heap_size, #{
             size => MaxHeapWords,
             kill => true,
-            error_logger => false,
+            %% Mirrors the production outer bound owned by the supervised
+            %% build task, including its runtime report.
+            error_logger => true,
             include_shared_binaries => true
         }}
     ].
@@ -7761,8 +7946,10 @@ fts2_build_start_parallel(
 fts2_build_start_parallel(
     Role, [Item | Rest], Slots, Fun, MaxHeapWords, Monitors
 ) ->
+    Context = fts2_build_worker_context(),
     {Pid, Monitor} = spawn_opt(
         fun() ->
+            fts2_build_apply_worker_context(Context),
             Result =
                 try Fun(Item) of
                     Count -> {fts2_parallel_ok, Count}
@@ -7792,10 +7979,11 @@ fts2_build_worker_options(MaxHeapWords) ->
         {max_heap_size, #{
             size => MaxHeapWords,
             kill => true,
-            %% The coordinator emits one typed report after the DOWN. Runtime
-            %% reporting is disabled so a heap breach cannot produce an
-            %% untyped duplicate.
-            error_logger => false,
+            %% The runtime report carries the heap sizes and the stack at the
+            %% breach. That evidence localised the live build defect and is
+            %% kept. It does not name a role, so the coordinator adds exactly
+            %% one role-attributed report after the DOWN.
+            error_logger => true,
             include_shared_binaries => false
         }}
     ].
@@ -7806,6 +7994,30 @@ fts2_build_max_heap_words() ->
         undefined -> ?FTS2_MAX_BUILD_HEAP_WORDS;
         MaxHeapWords -> MaxHeapWords
     end.
+
+%% The gate builds the same corpus at the superseded shard counts to show the
+%% coarse partition breaching a bound the fine partition clears. Shard counts
+%% are read inside build workers too, so the override travels with the worker.
+fts2_build_term_shards() ->
+    case get('$fts2_build_shards') of
+        undefined -> ?FTS2_BUILD_TERM_SHARDS;
+        Shards -> Shards
+    end.
+
+fts2_build_bigram_shards() ->
+    case get('$fts2_build_shards') of
+        undefined -> ?FTS2_BUILD_BIGRAM_SHARDS;
+        Shards -> Shards
+    end.
+
+fts2_build_worker_context() ->
+    get('$fts2_build_shards').
+
+fts2_build_apply_worker_context(undefined) ->
+    ok;
+fts2_build_apply_worker_context(Shards) ->
+    _ = put('$fts2_build_shards', Shards),
+    ok.
 
 fts2_build_observe_worker(Role, Pid) ->
     case get('$fts2_build_observer') of
@@ -7826,20 +8038,36 @@ fts2_build_report_bound(Role, Reason) ->
     error_logger:error_report([
         {fts2_build_role, Role},
         {reason, Reason},
-        {max_heap_size, breached}
+        {outcome, worker_lost}
     ]).
 -else.
 fts2_build_max_heap_words() ->
     ?FTS2_MAX_BUILD_HEAP_WORDS.
 
+fts2_build_term_shards() ->
+    ?FTS2_BUILD_TERM_SHARDS.
+
+fts2_build_bigram_shards() ->
+    ?FTS2_BUILD_BIGRAM_SHARDS.
+
+fts2_build_worker_context() ->
+    undefined.
+
+fts2_build_apply_worker_context(_Context) ->
+    ok.
+
 fts2_build_observe_worker(_Role, _Pid) ->
     ok.
 
+%% One report per lost worker, naming the role. A worker killed by its own
+%% max_heap_size is also reported by the runtime with heap sizes and a stack.
+%% A worker killed by a propagated signal has no runtime report, so this is
+%% the only record of it; the reason is therefore stated, not assumed.
 fts2_build_report_bound(Role, Reason) ->
     error_logger:error_report([
         {fts2_build_role, Role},
         {reason, Reason},
-        {max_heap_size, breached}
+        {outcome, worker_lost}
     ]).
 -endif.
 

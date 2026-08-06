@@ -2,6 +2,11 @@
 
 -include("leveled.hrl").
 
+-define(ZIPF_POOL, 512).
+-define(COARSE_SHARDS, 1).
+-define(COARSE_SHARD_BOUND_BYTES, (128 * 1024 * 1024)).
+-define(FINE_SHARD_BOUND_BYTES, (128 * 1024 * 1024)).
+
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([
     search_shapes/1,
@@ -13,6 +18,8 @@
     sqlite_oracle_corpus/1,
     parallel_heap_kill_no_hang/1,
     outer_heap_kill_reports_role/1,
+    propagated_kill_reports_inner_role/1,
+    coarse_shard_partition_reproduces/1,
     parallel_worker_crash_surfaces/1,
     parallel_drain_clears_down_messages/1,
     full_store_build_memory_equivalence/1
@@ -29,6 +36,8 @@ all() ->
         sqlite_oracle_corpus,
         parallel_heap_kill_no_hang,
         outer_heap_kill_reports_role,
+        propagated_kill_reports_inner_role,
+        coarse_shard_partition_reproduces,
         parallel_worker_crash_surfaces,
         parallel_drain_clears_down_messages,
         full_store_build_memory_equivalence
@@ -294,6 +303,52 @@ outer_heap_kill_reports_role(_Config) ->
         ok
     end.
 
+%% A worker killed by a propagated signal never breaches its own bound, so the
+%% runtime emits no report for it. This is the live silent-kill signature: an
+%% outer bound breach kills the linked inner workers. The collector must still
+%% raise a role-attributed error and emit exactly one role-attributed report.
+propagated_kill_reports_inner_role(_Config) ->
+    Parent = self(),
+    {Pid, Monitor} = spawn_monitor(fun() ->
+        try
+            leveled_fts:fts2_build_parallel_for_test(
+                inner_worker,
+                [propagate],
+                1,
+                fun(_Item) -> exit(self(), kill) end,
+                infinity,
+                Parent
+            )
+        of
+            Result -> exit({unexpected_parallel_result, Result})
+        catch
+            error:{fts2_parallel_worker_lost, inner_worker, killed} ->
+                exit(propagated_kill_surfaced);
+            Class:Reason ->
+                exit({unexpected_parallel_error, Class, Reason})
+        end
+    end),
+    receive
+        {'DOWN', Monitor, process, Pid, propagated_kill_surfaced} ->
+            ok;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            ct:fail({unexpected_propagated_kill_result, Reason})
+    after 5000 ->
+        exit(Pid, kill),
+        ct:fail(propagated_kill_timed_out)
+    end,
+    receive
+        {fts2_bound_report, inner_worker, killed} -> ok
+    after 1000 ->
+        ct:fail(propagated_kill_report_missing)
+    end,
+    receive
+        {fts2_bound_report, inner_worker, killed} ->
+            ct:fail(duplicate_propagated_kill_report)
+    after 0 ->
+        ok
+    end.
+
 parallel_worker_crash_surfaces(_Config) ->
     try
         leveled_fts:fts2_build_parallel_for_test(
@@ -349,6 +404,124 @@ parallel_drain_clears_down_messages(_Config) ->
         ct:fail(parallel_drain_timed_out)
     end.
 
+%% A term's postings cannot be split across build shards, so a Zipfian corpus
+%% concentrates most positions in a few terms and therefore in a few shards.
+%% The superseded coarse partition breaches its bound on this corpus. The
+%% production partition builds the same corpus well inside the same bound.
+coarse_shard_partition_reproduces(_Config) ->
+    ct:timetrap({minutes, 60}),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    CoarseRoot = testutil:reset_filestructure(
+        "test/test_fts_shard_coarse_" ++ Suffix
+    ),
+    FineRoot = testutil:reset_filestructure(
+        "test/test_fts_shard_fine_" ++ Suffix
+    ),
+    {ok, Coarse} = leveled_bookie:book_start(start_opts(CoarseRoot)),
+    {ok, Fine} = leveled_bookie:book_start(start_opts(FineRoot)),
+    Schema = schema(<<"shard-partition">>, [body], #{}),
+    Sampler = spawn(fun() -> fts_build_sampler(#{}, #{}, []) end),
+    try
+        LargeBody = iolist_to_binary([
+            <<"alpha beta ">>, zipfian_tokens(large_document, 400000)
+        ]),
+        full_store_put_corpus([Coarse, Fine], Schema, LargeBody),
+        WordSize = erlang:system_info(wordsize),
+        CoarseBoundWords = ?COARSE_SHARD_BOUND_BYTES div WordSize,
+        Outcome =
+            case leveled_fts:fts2_consolidate_with_shards_for_test(
+                Coarse,
+                Schema,
+                #{reclaim => false},
+                CoarseBoundWords,
+                ?COARSE_SHARDS,
+                Sampler
+            ) of
+                {error, {fts2_parallel_worker_lost, LostRole, killed}} ->
+                    {killed, LostRole};
+                Result ->
+                    {completed, Result}
+            end,
+        Sampler ! {snapshot, self()},
+        CoarsePeaks = fts_build_await_peaks(),
+        ct:pal(
+            "unpartitioned (~B-shard) build: ~p against a ~B-byte bound; "
+            "peaks ~p",
+            [
+                ?COARSE_SHARDS,
+                Outcome,
+                ?COARSE_SHARD_BOUND_BYTES,
+                fts_build_peak_report(CoarsePeaks, WordSize)
+            ]
+        ),
+        Sampler ! reset,
+        FineBoundWords = ?FINE_SHARD_BOUND_BYTES div WordSize,
+        {ok, #{skipped := []}} = leveled_fts:fts2_consolidate_with_heap_for_test(
+            Fine, Schema, #{reclaim => false}, FineBoundWords, Sampler
+        ),
+        Sampler ! {snapshot, self()},
+        FinePeaks = fts_build_await_peaks(),
+        ct:pal(
+            "production-partition build against a ~B-byte bound; peaks ~p",
+            [?FINE_SHARD_BOUND_BYTES, fts_build_peak_report(FinePeaks, WordSize)]
+        ),
+        {ok, Index} = leveled_fts:fts2_available(Fine, Schema),
+        ct:pal(
+            "shard-partition fixture: ~B documents, ~B terms, ~B bigrams, "
+            "~B indexed tokens, ~B-byte largest document",
+            [
+                maps:get(chunk_count, Index),
+                maps:get(term_count, Index),
+                maps:get(bigram_count, Index),
+                maps:get(total_length, Index),
+                byte_size(LargeBody)
+            ]
+        ),
+        {_FineRole, FineHeapWords, _FineMemory} = fts_build_inner_peak(FinePeaks),
+        true = FineHeapWords < FineBoundWords,
+        case Outcome of
+            {killed, term_shard_worker} ->
+                ok;
+            _ ->
+                ct:fail({
+                    unpartitioned_build_did_not_reproduce,
+                    Outcome,
+                    coarse_term_shard_words(CoarsePeaks)
+                })
+        end
+    after
+        Sampler ! stop,
+        lists:foreach(
+            fun(Bookie) ->
+                try
+                    leveled_bookie:book_destroy(Bookie)
+                catch
+                    _:_ -> ok
+                end
+            end,
+            [Coarse, Fine]
+        )
+    end.
+
+coarse_term_shard_words(Peaks) ->
+    case maps:find(term_shard_worker, Peaks) of
+        {ok, {HeapWords, _Memory}} -> HeapWords;
+        error -> 0
+    end.
+
+fts_build_await_peaks() ->
+    receive
+        {fts_build_peaks, Peaks} -> Peaks
+    after 5000 ->
+        ct:fail(fts_build_sampler_timed_out)
+    end.
+
+fts_build_peak_report(Peaks, WordSize) ->
+    lists:sort([
+        {Role, HeapWords, HeapWords * WordSize, MemoryBytes}
+     || {Role, {HeapWords, MemoryBytes}} <- maps:to_list(Peaks)
+    ]).
+
 full_store_build_memory_equivalence(_Config) ->
     ct:timetrap({minutes, 30}),
     Suffix = integer_to_list(erlang:unique_integer([positive])),
@@ -363,10 +536,13 @@ full_store_build_memory_equivalence(_Config) ->
     Schema = schema(<<"full-store-build-memory">>, [body], #{}),
     Sampler = spawn(fun() -> fts_build_sampler(#{}, #{}, []) end),
     try
-        LargeBody = binary:copy(
-            <<"alpha beta gamma delta epsilon ">>, 100000
-        ),
-        full_store_put_corpus(Bounded, Unbounded, Schema, LargeBody),
+        %% One dense multi-megabyte document over the same shared pool, so the
+        %% hottest terms hold both a high document frequency and a very long
+        %% position list inside a single chunk.
+        LargeBody = iolist_to_binary([
+            <<"alpha beta ">>, zipfian_tokens(large_document, 400000)
+        ]),
+        full_store_put_corpus([Bounded, Unbounded], Schema, LargeBody),
         WordSize = erlang:system_info(wordsize),
         LegacyBoundWords = 1024 * 1024 * 1024 div WordSize,
         try
@@ -393,8 +569,8 @@ full_store_build_memory_equivalence(_Config) ->
             ct:fail(legacy_outer_report_timed_out)
         end,
         Sampler ! reset,
-        InnerBoundWords = 64 * 1024 * 1024 div WordSize,
-        OuterBoundWords = 64 * 1024 * 1024 div WordSize,
+        InnerBoundWords = 128 * 1024 * 1024 div WordSize,
+        OuterBoundWords = 128 * 1024 * 1024 div WordSize,
         {ok, #{skipped := []}} = leveled_fts:fts2_outer_bound_for_test(
             fun() ->
                 leveled_fts:fts2_consolidate_with_heap_for_test(
@@ -615,7 +791,7 @@ fts_build_inner_peak(Peaks) ->
         maps:to_list(Peaks)
     ).
 
-full_store_put_corpus(Bounded, Unbounded, Schema, LargeBody) ->
+full_store_put_corpus(Bookies, Schema, LargeBody) ->
     lists:foreach(
         fun(DocumentNumbers) ->
             Specs = lists:append([
@@ -633,12 +809,18 @@ full_store_put_corpus(Bounded, Unbounded, Schema, LargeBody) ->
                 end
              || DocumentNumber <- DocumentNumbers
             ]),
-            full_store_mput(Bounded, Specs),
-            full_store_mput(Unbounded, Specs)
+            lists:foreach(
+                fun(Bookie) -> full_store_mput(Bookie, Specs) end, Bookies
+            )
         end,
         chunked(lists:seq(1, 9000), 32, [])
     ).
 
+%% Each document carries 40 terms that occur nowhere else, for cardinality,
+%% plus 40 tokens drawn from a shared 512-word pool with a Zipfian rank
+%% distribution, for hot terms. The hot terms are what a real English corpus
+%% adds: a few terms hold most of the positions, and a term cannot be split
+%% across build shards, so they concentrate in one shard worker.
 full_store_document_body(DocumentNumber) ->
     Terms = [
         <<"term",
@@ -647,7 +829,20 @@ full_store_document_body(DocumentNumber) ->
             (integer_to_binary(Position))/binary>>
      || Position <- lists:seq(1, 40)
     ],
-    iolist_to_binary([<<"alpha beta ">>, lists:join(<<" ">>, Terms)]).
+    iolist_to_binary([
+        <<"alpha beta ">>,
+        lists:join(<<" ">>, Terms),
+        <<" ">>,
+        zipfian_tokens(DocumentNumber, 40)
+    ]).
+
+zipfian_tokens(Seed, Count) ->
+    lists:join(<<" ">>, [zipfian_token(Seed, Index) || Index <- lists:seq(1, Count)]).
+
+zipfian_token(Seed, Index) ->
+    Uniform = erlang:phash2({Seed, Index}, 1000000) / 1000000,
+    Rank = trunc(math:pow(?ZIPF_POOL, Uniform)),
+    <<"zw", (integer_to_binary(Rank))/binary>>.
 
 full_store_mput(Bookie, Specs) ->
     case leveled_bookie:book_mput(Bookie, Specs) of
