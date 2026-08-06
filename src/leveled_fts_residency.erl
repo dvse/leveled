@@ -22,19 +22,24 @@
 -define(ROW_OVERHEAD_BYTES, 64).
 
 prepare(Bookie, #{index := Bucket, fingerprint := Fingerprint} = Schema) ->
-    case current_descriptor(Bookie, Bucket) of
-        #{fingerprint := Fingerprint} ->
+    case prepare_status(Bookie, Bucket, Fingerprint) of
+        ok ->
             ok;
-        _ ->
+        {error, _Reason} = Error ->
+            Error;
+        load ->
             case leveled_bookie:book_fts_residency_budget(Bookie) of
                 Budget when is_integer(Budget), Budget > 0 ->
                     Lock = {{?MODULE, Bookie, Bucket}, self()},
-                    _ = global:trans(
+                    case global:trans(
                         Lock,
                         fun() -> prepare_locked(Bookie, Schema, Budget) end,
                         [node()]
-                    ),
-                    ok;
+                    ) of
+                        ok -> ok;
+                        {error, _Reason} = LoadError -> LoadError;
+                        aborted -> {error, fts_residency_lock_aborted}
+                    end;
                 _ ->
                     ok
             end
@@ -42,10 +47,12 @@ prepare(Bookie, #{index := Bucket, fingerprint := Fingerprint} = Schema) ->
 
 prepare_locked(Bookie, #{index := Bucket, fingerprint := Fingerprint} = Schema,
         Budget) ->
-    case current_descriptor(Bookie, Bucket) of
-        #{fingerprint := Fingerprint} ->
+    case prepare_status(Bookie, Bucket, Fingerprint) of
+        ok ->
             ok;
-        _ ->
+        {error, _Reason} = Error ->
+            Error;
+        load ->
             case leveled_bookie:book_headonly(
                 Bookie, Bucket, <<"f2:state">>, <<"current">>
             ) of
@@ -61,6 +68,17 @@ prepare_locked(Bookie, #{index := Bucket, fingerprint := Fingerprint} = Schema,
             end
     end.
 
+prepare_status(Bookie, Bucket, Fingerprint) ->
+    case current_descriptor(Bookie, Bucket) of
+        #{fingerprint := Fingerprint, generation := Generation,
+            load_error := Reason} ->
+            {error, {fts_residency_load_failed, Generation, Reason}};
+        #{fingerprint := Fingerprint} ->
+            ok;
+        _ ->
+            load
+    end.
+
 start_owner(Bookie, Schema, Root, RootValue, Budget) ->
     Caller = self(),
     Ref = make_ref(),
@@ -69,12 +87,14 @@ start_owner(Bookie, Schema, Root, RootValue, Budget) ->
     end),
     receive
         {Ref, ready, _Descriptor} -> ok;
-        {Ref, error, _Reason} -> ok
+        {Ref, error, Generation, Reason} ->
+            {error, {fts_residency_load_failed, Generation, Reason}}
     end.
 
 owner_load(Caller, Ref, Bookie, #{index := Bucket} = Schema, Root, RootValue,
         Budget) ->
     IdentityBookie = maps:get(identity_bookie, Schema, Bookie),
+    Generation = maps:get(generation, Root),
     MainMonitor = erlang:monitor(process, Bookie),
     IdentityMonitor = case IdentityBookie =:= Bookie of
         true -> MainMonitor;
@@ -82,7 +102,6 @@ owner_load(Caller, Ref, Bookie, #{index := Bucket} = Schema, Root, RootValue,
     end,
     Table = ets:new(?MODULE, [ordered_set, public, {read_concurrency, true}]),
     try
-        Generation = maps:get(generation, Root),
         Initial = #{
             table => Table,
             budget => Budget,
@@ -133,9 +152,26 @@ owner_load(Caller, Ref, Bookie, #{index := Bucket} = Schema, Root, RootValue,
         Caller ! {Ref, ready, Descriptor},
         owner_loop(Descriptor, MainMonitor, IdentityMonitor)
     catch
-        Class:Reason:Stacktrace ->
+        Class:Reason:_Stacktrace ->
             true = ets:delete(Table),
-            Caller ! {Ref, error, {Class, Reason, Stacktrace}}
+            Failure = #{
+                owner => self(),
+                bookie => Bookie,
+                identity_bookie => IdentityBookie,
+                bucket => Bucket,
+                generation => Generation,
+                fingerprint => maps:get(fingerprint, Root),
+                budget_bytes => Budget,
+                load_error => {Class, Reason}
+            },
+            persistent_term:put(generation_key(Generation), Failure),
+            persistent_term:put(current_key(Bookie, Bucket), Generation),
+            persistent_term:put(
+                current_key(IdentityBookie, Bucket), Generation
+            ),
+            persistent_term:put(status_key(Bookie), failure_status_map(Failure)),
+            Caller ! {Ref, error, Generation, {Class, Reason}},
+            owner_loop(Failure, MainMonitor, IdentityMonitor)
     end.
 
 owner_loop(Descriptor, MainMonitor, IdentityMonitor) ->
@@ -148,13 +184,18 @@ owner_loop(Descriptor, MainMonitor, IdentityMonitor) ->
             cleanup(Descriptor)
     end.
 
-cleanup(#{generation := Generation, bookie := Bookie,
-        identity_bookie := IdentityBookie, bucket := Bucket, table := Table}) ->
+cleanup(#{owner := Owner, generation := Generation, bookie := Bookie,
+        identity_bookie := IdentityBookie, bucket := Bucket} = Descriptor) ->
     erase_if(current_key(Bookie, Bucket), Generation),
     erase_if(current_key(IdentityBookie, Bucket), Generation),
     erase_if(status_key(Bookie), Generation, generation),
-    persistent_term:erase(generation_key(Generation)),
-    try ets:delete(Table) catch error:badarg -> true end,
+    erase_if(generation_key(Generation), Owner, owner),
+    case maps:find(table, Descriptor) of
+        {ok, Table} ->
+            try ets:delete(Table) catch error:badarg -> true end;
+        error ->
+            ok
+    end,
     ok.
 
 invalidate_specs(Bookie, Specs) when is_list(Specs) ->
@@ -172,7 +213,7 @@ invalidate(Bookie, Bucket) ->
                 #{owner := Owner, identity_bookie := IdentityBookie} ->
                     persistent_term:erase(current_key(Bookie, Bucket)),
                     persistent_term:erase(current_key(IdentityBookie, Bucket)),
-                    persistent_term:erase(generation_key(Generation)),
+                    erase_if(generation_key(Generation), Owner, owner),
                     erase_if(status_key(Bookie), Generation, generation),
                     Owner ! stop;
                 _ ->
@@ -275,6 +316,19 @@ status_map(Descriptor) ->
         fts_resident_ets_table_bytes => maps:get(ets_table_bytes, Descriptor),
         fts_resident_rows => maps:get(row_count, Descriptor),
         fts_resident_complete => maps:get(complete, Descriptor)
+    }.
+
+failure_status_map(Descriptor) ->
+    #{
+        generation => maps:get(generation, Descriptor),
+        fts_residency_budget_bytes => maps:get(budget_bytes, Descriptor),
+        fts_resident_generation => undefined,
+        fts_resident_bytes => 0,
+        fts_resident_payload_bytes => 0,
+        fts_resident_ets_table_bytes => 0,
+        fts_resident_rows => 0,
+        fts_resident_complete => #{},
+        fts_residency_load_error => maps:get(load_error, Descriptor)
     }.
 
 resident_result(Bookie, Bucket, Key, SubKey) ->

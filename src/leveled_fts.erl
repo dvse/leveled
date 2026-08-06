@@ -1574,30 +1574,35 @@ hydrate_page(Bookie, #{fingerprint := _} = Schema, Addresses) when
     is_pid(Bookie), is_list(Addresses)
 ->
     try
-        ok = leveled_fts_residency:prepare(Bookie, Schema),
-        case fts2_search_root(Bookie, Schema) of
-            {ok, Root} ->
-                Requests = lists:usort(Addresses),
-                Rows = fts2_search_read_identity_rows(
-                    Bookie, Schema, Root, Requests
-                ),
-                {ok, lists:foldl(
-                    fun
-                        (undefined, Acc) ->
-                            Acc;
-                        ({GroupId, _GroupKey, ChunkId, SourceId, DocKey,
-                            DocVersion, DocLength, Candidate, HitRecord}, Acc) ->
-                            Acc#{{GroupId, ChunkId} =>
-                                fts2_search_page_row(
-                                    SourceId, DocKey, DocVersion, DocLength,
-                                    Candidate, HitRecord
-                                )}
-                    end,
-                    #{},
-                    Rows
-                )};
-            not_found ->
-                {ok, #{}}
+        case leveled_fts_residency:prepare(Bookie, Schema) of
+            ok ->
+                case fts2_search_root(Bookie, Schema) of
+                    {ok, Root} ->
+                        Requests = lists:usort(Addresses),
+                        Rows = fts2_search_read_identity_rows(
+                            Bookie, Schema, Root, Requests
+                        ),
+                        {ok, lists:foldl(
+                            fun
+                                (undefined, Acc) ->
+                                    Acc;
+                                ({GroupId, _GroupKey, ChunkId, SourceId,
+                                    DocKey, DocVersion, DocLength, Candidate,
+                                    HitRecord}, Acc) ->
+                                    Acc#{{GroupId, ChunkId} =>
+                                        fts2_search_page_row(
+                                            SourceId, DocKey, DocVersion,
+                                            DocLength, Candidate, HitRecord
+                                        )}
+                            end,
+                            #{},
+                            Rows
+                        )};
+                    not_found ->
+                        {ok, #{}}
+                end;
+            {error, PrepareReason} ->
+                {error, PrepareReason}
         end
     catch
         error:Reason -> {error, Reason};
@@ -2150,14 +2155,30 @@ client_fts2_legacy_state(Bookie, Bucket, Schema) ->
     {State, Root}.
 
 client_search(Bookie, Schema, AST, Opts, Hook) ->
-    ok = leveled_fts_residency:prepare(Bookie, Schema),
-    case client_fts2_state_for_ast(Bookie, Schema, AST) of
-        {clean_absent, _Root} ->
-            client_empty_search_result(Opts);
-        {clean, Root} when is_map(Root) ->
-            fts2_search(Bookie, Schema, Root, AST, Opts);
-        {_State, Root} ->
-            fts2_search_dirty(Bookie, Schema, Root, AST, Opts, Hook)
+    case leveled_fts_residency:prepare(Bookie, Schema) of
+        ok ->
+            case client_fts2_state_for_ast(Bookie, Schema, AST) of
+                {clean_absent, _Root} ->
+                    client_empty_search_result(Opts);
+                {clean, Root} when is_map(Root) ->
+                    fts2_search(Bookie, Schema, Root, AST, Opts);
+                {dirty, Root} when is_map(Root) ->
+                    case {maps:get(grouping, Opts, grouped),
+                        maps:get(candidate_group_fields, Schema, [])} of
+                        {grouped, [_ | _]} ->
+                            {error, {fts_index_dirty,
+                                grouped_search_requires_consolidation,
+                                maps:get(generation, Root)}};
+                        _ExactDirtyMode ->
+                            fts2_search_dirty(
+                                Bookie, Schema, Root, AST, Opts, Hook
+                            )
+                    end;
+                {_State, Root} ->
+                    fts2_search_dirty(Bookie, Schema, Root, AST, Opts, Hook)
+            end;
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 client_empty_search_result(Opts) ->
@@ -5634,7 +5655,17 @@ fts2_lookup_documents(Bookie, Schema, SourceIds) ->
     fts2_search_lookup_documents(Bookie, Schema, SourceIds).
 
 fts2_consolidate(Bookie, Schema, Hook, Opts) ->
-    fts2_build_consolidate(Bookie, Schema, Hook, Opts).
+    Pressure = spawn_link(fun() -> fts2_build_pressure_loop(#{}) end),
+    PreviousPressure = put('$fts2_build_pressure', Pressure),
+    try
+        fts2_build_consolidate(Bookie, Schema, Hook, Opts)
+    after
+        Pressure ! stop,
+        case PreviousPressure of
+            undefined -> erase('$fts2_build_pressure');
+            _ -> put('$fts2_build_pressure', PreviousPressure)
+        end
+    end.
 
 fts2_search(Bookie, Schema, Root, AST, Opts) ->
     fts2_search_search(Bookie, Schema, Root, AST, Opts).
@@ -5670,6 +5701,7 @@ fts2_posting_read_dirty(Bookie, Schema, Root, AST, SourceIds, Opts) ->
 -define(HEAD_WINDOW, 256).
 -define(BIGRAM_MIN_CHUNKS, 256).
 -define(WRITE_SLICE, 192).
+-define(WRITE_BARRIER_SLICES, 128).
 -define(FTS2_MAX_BUILD_CONCURRENCY, 1).
 %% Term and bigram rows are assembled one shard at a time. A shard's document
 %% fragments are stored SHARD-MAJOR, so a shard worker reads only its own data
@@ -7300,9 +7332,9 @@ fts2_build_publish_root(
         )
     of
         ok ->
-            ok;
+            fts2_build_after_write(Bookie, false);
         pause ->
-            ok;
+            fts2_build_after_write(Bookie, true);
         {error, {precondition_failed, _}} ->
             erlang:error(fts2_generation_raced);
         {error, Reason} ->
@@ -7440,8 +7472,12 @@ fts2_build_remove_deltas(Bookie, Bucket, Deltas) ->
         SQN <- [element(2, Delta)]
     ],
     case leveled_bookie:book_casmput(Bookie, Specs, Conditions) of
-        ok -> fts2_build_remove_deltas(Bookie, Bucket, Rest);
-        pause -> fts2_build_remove_deltas(Bookie, Bucket, Rest);
+        ok ->
+            fts2_build_after_write(Bookie, false),
+            fts2_build_remove_deltas(Bookie, Bucket, Rest);
+        pause ->
+            fts2_build_after_write(Bookie, true),
+            fts2_build_remove_deltas(Bookie, Bucket, Rest);
         {error, {precondition_failed, _}} ->
             fts2_build_remove_deltas(Bookie, Bucket, Rest);
         {error, Reason} ->
@@ -8011,12 +8047,17 @@ fts2_build_bigram_shards() ->
     end.
 
 fts2_build_worker_context() ->
-    get('$fts2_build_shards').
+    {get('$fts2_build_shards'), get('$fts2_build_pressure')}.
 
-fts2_build_apply_worker_context(undefined) ->
-    ok;
-fts2_build_apply_worker_context(Shards) ->
-    _ = put('$fts2_build_shards', Shards),
+fts2_build_apply_worker_context({Shards, Pressure}) ->
+    case Shards of
+        undefined -> ok;
+        _ -> _ = put('$fts2_build_shards', Shards)
+    end,
+    case Pressure of
+        undefined -> ok;
+        _ -> _ = put('$fts2_build_pressure', Pressure)
+    end,
     ok.
 
 fts2_build_observe_worker(Role, Pid) ->
@@ -8051,9 +8092,12 @@ fts2_build_bigram_shards() ->
     ?FTS2_BUILD_BIGRAM_SHARDS.
 
 fts2_build_worker_context() ->
-    undefined.
+    get('$fts2_build_pressure').
 
-fts2_build_apply_worker_context(_Context) ->
+fts2_build_apply_worker_context(undefined) ->
+    ok;
+fts2_build_apply_worker_context(Pressure) ->
+    _ = put('$fts2_build_pressure', Pressure),
     ok.
 
 fts2_build_observe_worker(_Role, _Pid) ->
@@ -8329,8 +8373,12 @@ fts2_build_write_slices(Bookie, Specs) ->
     Count = erlang:min(?WRITE_SLICE, length(Specs)),
     {Batch, Rest} = lists:split(Count, Specs),
     case leveled_bookie:book_mput(Bookie, Batch) of
-        ok -> fts2_build_write_slices(Bookie, Rest);
-        pause -> fts2_build_write_slices(Bookie, Rest);
+        ok ->
+            fts2_build_after_write(Bookie, false),
+            fts2_build_write_slices(Bookie, Rest);
+        pause ->
+            fts2_build_after_write(Bookie, true),
+            fts2_build_write_slices(Bookie, Rest);
         {error, Reason} -> erlang:error({fts2_generation_write_failed, Reason})
     end.
 
@@ -8360,32 +8408,45 @@ fts2_build_remove_generation_rows(Bookie, Bucket, Kind, Generation) ->
             Key = fts2_codec_identity_key(Generation),
             {Key, Key}
     end,
-    Fold = fun(B, {Key, SubKey}, _Value, {Specs, Size}) when B =:= Bucket ->
-        case fts2_build_generation_key(Kind, Key, Generation) of
-            true when Size + 1 >= ?WRITE_SLICE ->
-                ok = fts2_build_write_slices(
-                    Bookie,
-                    [{remove, Bucket, Key, SubKey, <<>>} | Specs]
-                ),
-                {[], 0};
-            true ->
-                {[{remove, Bucket, Key, SubKey, <<>>} | Specs], Size + 1};
-            false ->
-                {Specs, Size}
-        end;
+    fts2_build_remove_generation_page(
+        Bookie, Bucket, Kind, Generation, {Start, <<>>},
+        {Finish, <<255, 255, 255, 255>>}
+    ).
+
+fts2_build_remove_generation_page(
+    Bookie, Bucket, Kind, Generation, Start, Finish
+) ->
+    Fold = fun(B, {Key, SubKey} = FullKey, _Value, {Specs, _LastKey}) when
+        B =:= Bucket
+    ->
+        NextSpecs = case fts2_build_generation_key(Kind, Key, Generation) of
+            true -> [{remove, Bucket, Key, SubKey, <<>>} | Specs];
+            false -> Specs
+        end,
+        {NextSpecs, FullKey};
         (_B, _Key, _Value, Acc) -> Acc
     end,
     {async, Runner} = leveled_bookie:book_headfold(
         Bookie,
         ?HEAD_TAG,
-        {range, Bucket, {{Start, <<>>}, {Finish, <<255, 255, 255, 255>>}}},
-        {Fold, {[], 0}},
+        {range, Bucket, {Start, Finish}},
+        {Fold, {[], undefined}},
         false,
         true,
-        false
+        false,
+        false,
+        ?WRITE_SLICE
     ),
-    {Remaining, _Size} = Runner(),
-    fts2_build_remove_specs(Bookie, Remaining).
+    {RemainingCount, {Specs, LastKey}} = Runner(),
+    fts2_build_remove_specs(Bookie, lists:reverse(Specs)),
+    case {RemainingCount, LastKey} of
+        {0, NextStart} when NextStart =/= undefined ->
+            fts2_build_remove_generation_page(
+                Bookie, Bucket, Kind, Generation, NextStart, Finish
+            );
+        _Exhausted ->
+            ok
+    end.
 
 fts2_build_generation_key(term, <<"f2:t:", Generation:64/unsigned-big, _/binary>>,
     Generation) -> true;
@@ -8406,9 +8467,60 @@ fts2_build_remove_specs(Bookie, Specs) ->
     Count = erlang:min(?WRITE_SLICE, length(Specs)),
     {Batch, Rest} = lists:split(Count, Specs),
     case leveled_bookie:book_mput(Bookie, Batch) of
-        ok -> fts2_build_remove_specs(Bookie, Rest);
-        pause -> fts2_build_remove_specs(Bookie, Rest);
+        ok ->
+            fts2_build_after_write(Bookie, false),
+            fts2_build_remove_specs(Bookie, Rest);
+        pause ->
+            fts2_build_after_write(Bookie, true),
+            fts2_build_remove_specs(Bookie, Rest);
         {error, Reason} -> erlang:error({fts2_generation_cleanup_failed, Reason})
+    end.
+
+%% Every committed slice consumes a permit shared by all build workers for
+%% this bookie. The fixed barrier makes admission deterministic even though a
+%% bookie's pause replies are intentionally jittered.
+fts2_build_after_write(Bookie, ForceBarrier) ->
+    Action = case get('$fts2_build_pressure') of
+        Pressure when is_pid(Pressure) ->
+            Ref = make_ref(),
+            Pressure ! {write_slice, self(), Ref, Bookie, ForceBarrier},
+            receive
+                {write_slice, Ref, NextAction} -> NextAction
+            after 5000 ->
+                erlang:error(fts2_backpressure_coordinator_timeout)
+            end;
+        undefined when ForceBarrier ->
+            barrier;
+        undefined ->
+            continue
+    end,
+    case Action of
+        continue -> ok;
+        barrier ->
+            case leveled_bookie:book_reclaimledger(Bookie, 300000) of
+                ok -> ok;
+                {error, Reason} ->
+                    erlang:error({fts2_backpressure_failed, Reason})
+            end
+    end.
+
+fts2_build_pressure_loop(Counts) ->
+    receive
+        {write_slice, From, Ref, Bookie, true} ->
+            From ! {write_slice, Ref, barrier},
+            fts2_build_pressure_loop(Counts#{Bookie => 0});
+        {write_slice, From, Ref, Bookie, false} ->
+            Count = maps:get(Bookie, Counts, 0) + 1,
+            case Count >= ?WRITE_BARRIER_SLICES of
+                true ->
+                    From ! {write_slice, Ref, barrier},
+                    fts2_build_pressure_loop(Counts#{Bookie => 0});
+                false ->
+                    From ! {write_slice, Ref, continue},
+                    fts2_build_pressure_loop(Counts#{Bookie => Count})
+            end;
+        stop ->
+            ok
     end.
 
 fts2_build_trim_journals(Bookie, Schema) ->

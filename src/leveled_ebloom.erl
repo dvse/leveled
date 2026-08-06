@@ -18,8 +18,13 @@
 
 -export([
     create_bloom/1,
+    create_bloom/2,
     check_hash/2
 ]).
+
+-ifdef(TEST).
+-export([set_test_observer/1]).
+-endif.
 
 -define(BLOOM_SLOTSIZE_BYTES, 512).
 -define(INTEGER_SLICE_SIZE, 64).
@@ -47,20 +52,32 @@
 %% a single 32-bit hash (the second element of the tuple is actually used in
 %% the building of the bloom filter
 create_bloom(HashList) ->
+    create_bloom([HashList], length(HashList)).
+
+-spec create_bloom(
+    [list(leveled_codec:segment_hash())], non_neg_integer()
+) -> bloom().
+%% @doc
+%% Create a bloom from bounded batches of hashes. The caller supplies the
+%% total count because the bloom's fixed slot width depends on it. Bloom bits
+%% are accumulated directly into a fixed atomics array capped at 128 * 64
+%% words; no generation-sized flat hash list or per-slot hash lists are
+%% constructed.
+create_bloom(HashLists, HashCount) ->
+    observe_build(HashCount),
     SlotCount =
-        case length(HashList) of
+        case HashCount of
             0 ->
                 0;
             L ->
                 min(128, max(2, (L - 1) div 512))
         end,
-    SlotHashes =
-        map_hashes(
-            HashList,
-            list_to_tuple(lists:duplicate(SlotCount, [])),
-            SlotCount
-        ),
-    build_bloom(SlotHashes, SlotCount).
+    BloomWords = lists:foldl(
+        fun(HashList, Acc) -> map_hashes(HashList, Acc, SlotCount) end,
+        new_bloom_words(SlotCount),
+        HashLists
+    ),
+    build_bloom(BloomWords, SlotCount).
 
 -spec check_hash(leveled_codec:segment_hash(), bloom()) -> boolean().
 %% @doc
@@ -88,18 +105,33 @@ check_hash({_SegHash, Hash}, BloomBin) when is_binary(BloomBin) ->
 -type external_hash() :: 0..16#FFFFFFFF.
 
 -spec map_hashes(
-    list(leveled_codec:segment_hash()), tuple(), slot_count()
-) -> tuple().
-map_hashes([], HashListTuple, _SlotCount) ->
-    HashListTuple;
-map_hashes([{_SH, EH} | Rest], HashListTuple, SlotCount) ->
+    list(leveled_codec:segment_hash()), reference() | undefined, slot_count()
+) -> reference() | undefined.
+map_hashes([], BloomWords, _SlotCount) ->
+    BloomWords;
+map_hashes([{_SH, EH} | Rest], BloomWords, SlotCount) ->
     {Slot, [H0, H1]} = split_hash(EH, SlotCount),
-    SlotHL = element(Slot + 1, HashListTuple),
+    WithH0 = add_hash_word(Slot, H0, BloomWords),
     map_hashes(
         Rest,
-        setelement(Slot + 1, HashListTuple, [H0, H1 | SlotHL]),
+        add_hash_word(Slot, H1, WithH0),
         SlotCount
     ).
+
+-spec add_hash_word(
+    non_neg_integer(), bloom_hash(), reference()
+) -> reference().
+add_hash_word(Slot, Hash, BloomWords) ->
+    Word = Slot * ?INTEGER_SLICES + (Hash bsr ?MASK_BSR) + 1,
+    Mask = 1 bsl (Hash band ?MASK_BAND),
+    atomics:put(BloomWords, Word, atomics:get(BloomWords, Word) bor Mask),
+    BloomWords.
+
+-spec new_bloom_words(slot_count()) -> reference() | undefined.
+new_bloom_words(0) ->
+    undefined;
+new_bloom_words(SlotCount) ->
+    atomics:new(SlotCount * ?INTEGER_SLICES, [{signed, false}]).
 
 -spec split_hash(external_hash(), slot_count()) ->
     {non_neg_integer(), [bloom_hash()]}.
@@ -114,55 +146,32 @@ match_hash(BloomBin, Pos, Hash) ->
     <<_Pre:Pos/binary, CheckInt:8/integer, _Rest/binary>> = BloomBin,
     (CheckInt bsr Hash) band 1 == 1.
 
--spec build_bloom(tuple(), slot_count()) -> bloom().
-build_bloom(_SlotHashes, 0) ->
+-spec build_bloom(reference() | undefined, slot_count()) -> bloom().
+build_bloom(_BloomWords, 0) ->
     <<>>;
-build_bloom(SlotHashes, SlotCount) when SlotCount > 0 ->
-    lists:foldr(
-        fun(I, AccBin) ->
-            HashList = element(I, SlotHashes),
-            SlotBin =
-                add_hashlist(
-                    lists:usort(HashList), 0, 1, ?INTEGER_SLICES, <<>>
-                ),
-            <<SlotBin/binary, AccBin/binary>>
-        end,
-        <<>>,
-        lists:seq(1, SlotCount)
-    ).
+build_bloom(BloomWords, SlotCount) when SlotCount > 0 ->
+    iolist_to_binary([
+        <<(atomics:get(
+            BloomWords,
+            Slot * ?INTEGER_SLICES + Slice + 1
+        )):?INTEGER_SLICE_SIZE/unsigned-big>>
+     || Slot <- lists:seq(0, SlotCount - 1),
+        Slice <- lists:seq(?INTEGER_SLICES - 1, 0, -1)
+    ]).
 
--spec add_hashlist(
-    list(bloom_hash()),
-    non_neg_integer(),
-    non_neg_integer(),
-    0..?INTEGER_SLICES,
-    binary()
-) -> bloom().
-add_hashlist([], ThisSlice, SliceCount, SliceCount, AccBin) ->
-    <<ThisSlice:?INTEGER_SLICE_SIZE/integer, AccBin/binary>>;
-add_hashlist([], ThisSlice, SliceNumber, SliceCount, AccBin) ->
-    add_hashlist(
-        [],
-        0,
-        SliceNumber + 1,
-        SliceCount,
-        <<ThisSlice:?INTEGER_SLICE_SIZE/integer, AccBin/binary>>
-    );
-add_hashlist([H0 | Rest], ThisSlice, SliceNumber, SliceCount, AccBin) when
-    ((H0 bsr ?MASK_BSR) + 1) == SliceNumber
-->
-    Mask0 = 1 bsl (H0 band (?MASK_BAND)),
-    add_hashlist(
-        Rest, ThisSlice bor Mask0, SliceNumber, SliceCount, AccBin
-    );
-add_hashlist(Rest, ThisSlice, SliceNumber, SliceCount, AccBin) ->
-    add_hashlist(
-        Rest,
-        0,
-        SliceNumber + 1,
-        SliceCount,
-        <<ThisSlice:?INTEGER_SLICE_SIZE/integer, AccBin/binary>>
-    ).
+-ifdef(TEST).
+observe_build(HashCount) ->
+    case persistent_term:get({?MODULE, test_observer}, undefined) of
+        Pid when is_pid(Pid) ->
+            Pid ! {fts2_build_worker, {ebloom_worker, HashCount}, self()},
+            ok;
+        undefined ->
+            ok
+    end.
+-else.
+observe_build(_HashCount) ->
+    ok.
+-endif.
 
 %%%============================================================================
 %%% Test
@@ -171,6 +180,13 @@ add_hashlist(Rest, ThisSlice, SliceNumber, SliceCount, AccBin) ->
 -ifdef(TEST).
 
 -include_lib("eunit/include/eunit.hrl").
+
+set_test_observer(undefined) ->
+    persistent_term:erase({?MODULE, test_observer}),
+    ok;
+set_test_observer(Pid) when is_pid(Pid) ->
+    persistent_term:put({?MODULE, test_observer}, Pid),
+    ok.
 
 generate_orderedkeys(Seqn, Count, BucketRangeLow, BucketRangeHigh) ->
     generate_orderedkeys(Seqn, Count, [], BucketRangeLow, BucketRangeHigh).
@@ -227,6 +243,14 @@ empty_bloom_test() ->
     ?assertMatch(
         {0, 4}, check_neg_hashes(BloomBin0, [0, 10, 100, 100000], {0, 0})
     ).
+
+chunked_bloom_equivalence_test() ->
+    HashList = get_hashlist(20000),
+    {First, Rest} = lists:split(7311, HashList),
+    {Second, Third} = lists:split(4227, Rest),
+    Flat = create_bloom(HashList),
+    Flat = create_bloom([First, Second, Third], length(HashList)),
+    check_all_hashes(Flat, HashList).
 
 bloom_test_() ->
     {timeout, 120, fun bloom_test_ranges/0}.
@@ -320,14 +344,14 @@ split_builder_speed_tester() ->
         lists:map(
             fun(HashList) ->
                 SlotCount = min(128, max(2, (length(HashList) - 1) div 512)),
-                InitTuple = list_to_tuple(lists:duplicate(SlotCount, [])),
-                {MTC, SlotHashes} =
+                {MTC, BloomWords} =
                     timer:tc(
-                        fun map_hashes/3, [HashList, InitTuple, SlotCount]
+                        fun map_hashes/3,
+                        [HashList, new_bloom_words(SlotCount), SlotCount]
                     ),
                 {BTC, _Bloom} =
                     timer:tc(
-                        fun build_bloom/2, [SlotHashes, SlotCount]
+                        fun build_bloom/2, [BloomWords, SlotCount]
                     ),
                 {MTC, BTC}
             end,

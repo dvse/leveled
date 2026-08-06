@@ -692,7 +692,8 @@ starting(
         [
             {reply, From,
                 {ok, {Summary#summary.first_key, Summary#summary.last_key},
-                    Bloom}}
+                    Bloom}},
+            hibernate
         ]};
 starting(
     {call, From},
@@ -798,10 +799,13 @@ starting(cast, complete_l0startup, State) ->
             ),
             ok
     end,
-    {next_state, reader, UpdState#state{
-        high_modified_date = HighModDate,
-        monitor = Monitor
-    }};
+    {next_state,
+        reader,
+        UpdState#state{
+            high_modified_date = HighModDate,
+            monitor = Monitor
+        },
+        [hibernate]};
 starting(cast, {sst_returnslot, FetchedSlot, FetchFun, SlotCount}, State) ->
     FetchedSlots =
         case {FetchedSlot, State#state.new_slots} of
@@ -2143,11 +2147,11 @@ read_table_summary(BinWithCheck, TombCount) ->
 
 build_all_slots(SlotList) ->
     SlotCount = length(SlotList),
-    {SlotIndex, BlockIndex, SlotsBin, HashLists} =
+    {SlotIndex, BlockIndex, SlotsBin, HashLists, HashCount} =
         build_all_slots(
-            SlotList, 9, 1, [], [], <<>>, []
+            SlotList, 9, 1, [], [], <<>>, [], 0
         ),
-    Bloom = leveled_ebloom:create_bloom(HashLists),
+    Bloom = leveled_ebloom:create_bloom(HashLists, HashCount),
     {SlotCount, SlotIndex, BlockIndex, SlotsBin, Bloom}.
 
 build_all_slots(
@@ -2157,9 +2161,10 @@ build_all_slots(
     SlotIdxAcc,
     BlockIdxAcc,
     SlotBinAcc,
-    HashLists
+    HashLists,
+    HashCount
 ) ->
-    {SlotIdxAcc, BlockIdxAcc, SlotBinAcc, HashLists};
+    {SlotIdxAcc, BlockIdxAcc, SlotBinAcc, HashLists, HashCount};
 build_all_slots(
     [SlotD | Rest],
     Pos,
@@ -2167,7 +2172,8 @@ build_all_slots(
     SlotIdxAcc,
     BlockIdxAcc,
     SlotBinAcc,
-    HashLists
+    HashLists,
+    HashCount
 ) ->
     {BlockIdx, SlotBin, HashList, LastKey} = SlotD,
     Length = byte_size(SlotBin),
@@ -2182,7 +2188,8 @@ build_all_slots(
         [{LastKey, SlotIndexV} | SlotIdxAcc],
         [{SlotID, BlockIdx} | BlockIdxAcc],
         <<SlotBinAcc/binary, SlotBin/binary>>,
-        lists:append(HashList, HashLists)
+        [HashList | HashLists],
+        HashCount + length(HashList)
     ).
 
 generate_filenames(RootFilename) ->

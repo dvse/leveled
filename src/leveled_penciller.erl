@@ -846,7 +846,7 @@ handle_call(
                 )
             of
                 empty_push ->
-                    {reply, ok, State};
+                    {reply, ok, State, hibernate};
                 {UpdMaxSQN, NewL0Size, UpdL0Cache} ->
                     UpdL0Index =
                         leveled_pmem:add_to_index(
@@ -860,12 +860,19 @@ handle_call(
                     ),
                     Subs = [NewL0Size, true, true, MinSQN, MaxSQN],
                     ?RND_LOG(p0031, Subs, SW, 0.1),
-                    {reply, ok, State#state{
-                        levelzero_cache = UpdL0Cache,
-                        levelzero_size = NewL0Size,
-                        levelzero_index = UpdL0Index,
-                        ledger_sqn = UpdMaxSQN
-                    }}
+                    {reply, ok,
+                        State#state{
+                            levelzero_cache = UpdL0Cache,
+                            levelzero_size = NewL0Size,
+                            levelzero_index = UpdL0Index,
+                            ledger_sqn = UpdMaxSQN
+                        },
+                        %% ets:tab2list/1 and tree construction temporarily
+                        %% retain both representations of the pushed cache.
+                        %% Compact immediately after the immutable tree is in
+                        %% state so high-water garbage cannot accumulate
+                        %% across generation-write batches.
+                        hibernate}
             end
     end;
 handle_call(
@@ -1434,15 +1441,21 @@ handle_cast(
         leveled_pmanifest:insert_manifest_entry(Man, ManifestSQN, 0, ManEntry),
     % Prompt clerk to ask about work - do this for every L0 roll
     ok = leveled_pclerk:clerk_prompt(Clerk),
-    {noreply, State#state{
-        levelzero_cache = [],
-        levelzero_index = [],
-        levelzero_pending = false,
-        levelzero_constructor = undefined,
-        levelzero_size = 0,
-        manifest = UpdMan,
-        persisted_sqn = State#state.ledger_sqn
-    }};
+    {noreply,
+        State#state{
+            levelzero_cache = [],
+            levelzero_index = [],
+            levelzero_pending = false,
+            levelzero_constructor = undefined,
+            levelzero_size = 0,
+            manifest = UpdMan,
+            persisted_sqn = State#state.ledger_sqn
+        },
+        %% A large immutable-generation build can drive thousands of L0
+        %% cycles through this long-lived process. The completed cache is no
+        %% longer reachable from state; hibernate now so its temporary merge
+        %% and fetch heaps cannot accumulate across the whole generation.
+        hibernate};
 handle_cast(
     work_for_clerk,
     State = #state{

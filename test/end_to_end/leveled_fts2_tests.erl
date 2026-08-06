@@ -147,6 +147,242 @@ generation_and_identity_bookie_test_() ->
 generation_residency_budget_fallback_test_() ->
     {timeout, 60, fun generation_residency_budget_fallback/0}.
 
+cold_reopen_result_parity_test_() ->
+    {timeout, 180, fun cold_reopen_result_parity/0}.
+
+residency_failure_is_sticky_test_() ->
+    {timeout, 60, fun residency_failure_is_sticky/0}.
+
+cold_reopen_result_parity() ->
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    MainRoot = testutil:reset_filestructure(
+        "test/test_fts2_cold_reopen_main_" ++ Suffix
+    ),
+    IdentityRoot = testutil:reset_filestructure(
+        "test/test_fts2_cold_reopen_identity_" ++ Suffix
+    ),
+    {ok, Main0} = leveled_bookie:book_plainstart(start_opts(MainRoot)),
+    {ok, Identity0} = leveled_bookie:book_plainstart(start_opts(IdentityRoot)),
+    Schema0 = (seam_schema(<<"fts2-cold-reopen">>))#{
+        identity_bookie => Identity0
+    },
+    try
+        lists:foreach(
+            fun(Group) ->
+                Document = <<"file-", Group:16/unsigned-big>>,
+                lists:foreach(
+                    fun(Chunk) ->
+                        Key = <<Group:16/unsigned-big, Chunk:16/unsigned-big>>,
+                        Body = iolist_to_binary([
+                            binary:copy(<<"spitfire ">>, 1 + Group rem 7),
+                            binary:copy(<<"filler ">>, Chunk + Group rem 5)
+                        ]),
+                        ok = seam_put(
+                            Main0, Schema0, Key, Document, <<"default">>, Body
+                        )
+                    end,
+                    lists:seq(1, 1 + Group rem 4)
+                )
+            end,
+            lists:seq(1, 32)
+        ),
+        Opts = #{
+            columns => [content],
+            limit => 20,
+            rank => bm25,
+            resolve_hits => false,
+            return_count => true
+        },
+        Dirty = search(Main0, Schema0, <<"spitfire">>, Opts),
+        {ok, _} = leveled_fts:consolidate(Main0, Schema0, #{}),
+        Clean = search(Main0, Schema0, <<"spitfire">>, Opts),
+        ?assertEqual(
+            cold_reopen_result_projection(Dirty),
+            cold_reopen_result_projection(Clean)
+        ),
+        lists:foreach(
+            fun(Group) ->
+                Document = <<"file-", Group:16/unsigned-big>>,
+                lists:foreach(
+                    fun(Chunk) ->
+                        Key = <<Group:16/unsigned-big, Chunk:16/unsigned-big>>,
+                        {ok, Manifest} = leveled_bookie:book_headonly(
+                            Main0, maps:get(index, Schema0), <<"doc">>, Key
+                        ),
+                        {ok, Specs} = leveled_fts:update(
+                            Schema0,
+                            Key,
+                            #{
+                                content => <<"renamed filler">>,
+                                tenant => <<"default">>,
+                                udi => Document,
+                                path => <<"/", Document/binary>>,
+                                ipath_vec => [<<"root">>, Document],
+                                content_version => 2,
+                                chunk_key => Key
+                            },
+                            Manifest
+                        ),
+                        ok = leveled_bookie:book_mput(Main0, Specs)
+                    end,
+                    lists:seq(1, 1 + Group rem 4)
+                )
+            end,
+            lists:seq(1, 12)
+        ),
+        lists:foreach(
+            fun(Group) ->
+                Document = <<"file-", Group:16/unsigned-big>>,
+                Key = <<Group:16/unsigned-big, 1:16/unsigned-big>>,
+                ok = seam_put(
+                    Main0,
+                    Schema0,
+                    Key,
+                    Document,
+                    <<"default">>,
+                    <<"spitfire spitfire">>
+                )
+            end,
+            lists:seq(33, 44)
+        ),
+        {DirtyErrorUs, DirtyError} = timer:tc(
+            leveled_fts,
+            search,
+            [Main0, Schema0, <<"spitfire">>, Opts]
+        ),
+        ?assertMatch(
+            {error, {fts_index_dirty,
+                grouped_search_requires_consolidation, _}},
+            DirtyError
+        ),
+        ?assert(DirtyErrorUs < 50000),
+        {ok, _} = leveled_fts:consolidate(Main0, Schema0, #{}),
+        CleanOverlay = search(Main0, Schema0, <<"spitfire">>, Opts),
+        exit(Main0, kill),
+        exit(Identity0, kill),
+        {ok, Main1} = leveled_bookie:book_start(start_opts(MainRoot)),
+        {ok, Identity1} = leveled_bookie:book_start(start_opts(IdentityRoot)),
+        Schema1 = Schema0#{identity_bookie := Identity1},
+        try
+            {FirstUs, First} = timer:tc(
+                fun() -> search(Main1, Schema1, <<"spitfire">>, Opts) end
+            ),
+            {SecondUs, Second} = timer:tc(
+                fun() -> search(Main1, Schema1, <<"spitfire">>, Opts) end
+            ),
+            WarmSamples = [
+                timer:tc(
+                    fun() ->
+                        search(Main1, Schema1, <<"spitfire">>, Opts)
+                    end
+                )
+             || _ <- lists:seq(1, 5)
+            ],
+            {WarmTimes, Warms} = lists:unzip(WarmSamples),
+            WarmUs = lists:nth(3, lists:sort(WarmTimes)),
+            Projection = cold_reopen_result_projection(CleanOverlay),
+            ?assertEqual(Projection, cold_reopen_result_projection(First)),
+            ?assertEqual(Projection, cold_reopen_result_projection(Second)),
+            lists:foreach(
+                fun(Warm) ->
+                    ?assertEqual(
+                        Projection, cold_reopen_result_projection(Warm)
+                    )
+                end,
+                Warms
+            ),
+            ?assert(SecondUs =< 5 * erlang:max(WarmUs, 1)),
+            Status = leveled_bookie:book_status(Main1),
+            ?assert(is_integer(maps:get(fts_resident_generation, Status))),
+            ?assert(maps:get(fts_resident_rows, Status) > 0),
+            io:format(
+                user,
+                "coldnames dirty_error_us=~p first_us=~p second_us=~p "
+                "warm_median_us=~p~n",
+                [DirtyErrorUs, FirstUs, SecondUs, WarmUs]
+            )
+        after
+            try leveled_bookie:book_destroy(Main1) catch _:_ -> ok end,
+            try leveled_bookie:book_destroy(Identity1) catch _:_ -> ok end
+        end
+    catch
+        Class:Reason:Stacktrace ->
+            try leveled_bookie:book_destroy(Main0) catch _:_ -> ok end,
+            try leveled_bookie:book_destroy(Identity0) catch _:_ -> ok end,
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+residency_failure_is_sticky() ->
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    MainRoot = testutil:reset_filestructure(
+        "test/test_fts2_resident_failure_main_" ++ Suffix
+    ),
+    IdentityRoot = testutil:reset_filestructure(
+        "test/test_fts2_resident_failure_identity_" ++ Suffix
+    ),
+    {ok, Main0} = leveled_bookie:book_start(start_opts(MainRoot)),
+    {ok, Identity0} = leveled_bookie:book_start(start_opts(IdentityRoot)),
+    Schema0 = (schema(<<"fts2-resident-failure">>))#{
+        identity_bookie => Identity0
+    },
+    try
+        ok = put_doc(Main0, Schema0, <<"a">>, <<"alpha">>),
+        {ok, _} = leveled_fts:consolidate(Main0, Schema0, #{}),
+        {ok, Root} = leveled_fts:fts2_available(Main0, Schema0),
+        Generation = maps:get(generation, Root),
+        ok = leveled_bookie:book_mput(Main0, [{
+            add,
+            maps:get(index, Schema0),
+            <<"f2:bloom">>,
+            <<"current">>,
+            <<"corrupt-residency-fixture">>
+        }]),
+        ok = leveled_bookie:book_close(Main0),
+        ok = leveled_bookie:book_close(Identity0),
+        {ok, Main1} = leveled_bookie:book_start(start_opts(MainRoot)),
+        {ok, Identity1} = leveled_bookie:book_start(start_opts(IdentityRoot)),
+        Schema1 = Schema0#{identity_bookie := Identity1},
+        try
+            {Results, Counts} = trace_call_counts(
+                fun() ->
+                    [
+                        leveled_fts:search(
+                            Main1, Schema1, <<"alpha">>, #{rank => bm25}
+                        )
+                     || _ <- lists:seq(1, 2)
+                    ]
+                end,
+                [{leveled_fts_residency, owner_load, 7}]
+            ),
+            Expected = {error, {fts_residency_load_failed,
+                Generation, {error, function_clause}}},
+            ?assertEqual([Expected, Expected], Results),
+            ?assertEqual(
+                1,
+                maps:get({leveled_fts_residency, owner_load, 7}, Counts)
+            ),
+            Status = leveled_bookie:book_status(Main1),
+            ?assertEqual(
+                {error, function_clause},
+                maps:get(fts_residency_load_error, Status)
+            )
+        after
+            try leveled_bookie:book_destroy(Main1) catch _:_ -> ok end,
+            try leveled_bookie:book_destroy(Identity1) catch _:_ -> ok end
+        end
+    catch
+        Class:Reason:Stacktrace ->
+            try leveled_bookie:book_destroy(Main0) catch _:_ -> ok end,
+            try leveled_bookie:book_destroy(Identity0) catch _:_ -> ok end,
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+cold_reopen_result_projection(#{count := Count, hits := Hits}) ->
+    {Count, [
+        {seam_hit_udi(Hit), maps:get(match_count, Hit)}
+     || Hit <- Hits
+    ]}.
+
 generation_residency_budget_fallback() ->
     Suffix = integer_to_list(erlang:unique_integer([positive])),
     MainRoot = testutil:reset_filestructure(

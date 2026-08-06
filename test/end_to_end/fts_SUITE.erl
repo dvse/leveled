@@ -14,6 +14,7 @@
     tail_fold_interleaving/1,
     cross_shard_version_skew/1,
     consolidation_restart_equivalence/1,
+    consolidation_kill_restart_recovery/1,
     consolidation_write_race/1,
     sqlite_oracle_corpus/1,
     parallel_heap_kill_no_hang/1,
@@ -22,7 +23,8 @@
     coarse_shard_partition_reproduces/1,
     parallel_worker_crash_surfaces/1,
     parallel_drain_clears_down_messages/1,
-    full_store_build_memory_equivalence/1
+    full_store_build_memory_equivalence/1,
+    live_mail_member_build_memory/1
 ]).
 
 all() ->
@@ -32,6 +34,7 @@ all() ->
         tail_fold_interleaving,
         cross_shard_version_skew,
         consolidation_restart_equivalence,
+        consolidation_kill_restart_recovery,
         consolidation_write_race,
         sqlite_oracle_corpus,
         parallel_heap_kill_no_hang,
@@ -40,7 +43,8 @@ all() ->
         coarse_shard_partition_reproduces,
         parallel_worker_crash_surfaces,
         parallel_drain_clears_down_messages,
-        full_store_build_memory_equivalence
+        full_store_build_memory_equivalence,
+        live_mail_member_build_memory
     ].
 
 init_per_suite(Config) ->
@@ -194,6 +198,75 @@ consolidation_restart_equivalence(_Config) ->
         rank => bm25, return_positions => true
     }),
     ok = leveled_bookie:book_destroy(Bookie2).
+
+consolidation_kill_restart_recovery(_Config) ->
+    Root = testutil:reset_filestructure(
+        "test/test_fts_kill_restart_" ++
+            integer_to_list(erlang:unique_integer([positive]))
+    ),
+    Opts = start_opts(Root),
+    {ok, Bookie1} = leveled_bookie:book_start(Opts),
+    Schema = schema(<<"kill-restart">>, [body], #{}),
+    lists:foreach(
+        fun(Number) ->
+            Key = <<"mail-", Number:32/unsigned-big>>,
+            Body = iolist_to_binary([
+                <<"alpha beta durable mail member ">>,
+                integer_to_binary(Number),
+                <<" ">>,
+                zipfian_tokens({kill_restart, Number}, 80)
+            ]),
+            ok = put_doc(Bookie1, Schema, Key, #{body => Body})
+        end,
+        lists:seq(1, 256)
+    ),
+    Expected = search(Bookie1, Schema, <<"alpha OR beta">>, #{
+        rank => bm25, return_positions => true
+    }),
+    Parent = self(),
+    {Builder, Monitor} = spawn_monitor(fun() ->
+        leveled_fts:consolidate(
+            Bookie1,
+            Schema,
+            #{
+                reclaim => false,
+                before_consolidate_commit => fun(_EpochConditions) ->
+                    Parent ! {consolidation_precommit, self()},
+                    receive continue -> ok end
+                end
+            }
+        )
+    end),
+    receive
+        {consolidation_precommit, Builder} -> ok
+    after 30000 ->
+        exit(Builder, kill),
+        ct:fail(consolidation_precommit_not_reached)
+    end,
+    exit(Builder, kill),
+    receive
+        {'DOWN', Monitor, process, Builder, killed} -> ok
+    after 5000 ->
+        ct:fail(consolidation_kill_not_observed)
+    end,
+    Expected = search(Bookie1, Schema, <<"alpha OR beta">>, #{
+        rank => bm25, return_positions => true
+    }),
+    ok = leveled_bookie:book_close(Bookie1),
+    {ok, Bookie2} = leveled_bookie:book_start(Opts),
+    try
+        Expected = search(Bookie2, Schema, <<"alpha OR beta">>, #{
+            rank => bm25, return_positions => true
+        }),
+        {ok, #{skipped := []}} = leveled_fts:consolidate(
+            Bookie2, Schema, #{reclaim => false}
+        ),
+        Expected = search(Bookie2, Schema, <<"alpha OR beta">>, #{
+            rank => bm25, return_positions => true
+        })
+    after
+        ok = leveled_bookie:book_destroy(Bookie2)
+    end.
 
 consolidation_write_race(_Config) ->
     with_bookie(fun(Bookie, _Root) ->
@@ -505,7 +578,7 @@ coarse_shard_partition_reproduces(_Config) ->
 
 coarse_term_shard_words(Peaks) ->
     case maps:find(term_shard_worker, Peaks) of
-        {ok, {HeapWords, _Memory}} -> HeapWords;
+        {ok, {HeapWords, _Memory, _Function}} -> HeapWords;
         error -> 0
     end.
 
@@ -517,9 +590,26 @@ fts_build_await_peaks() ->
     end.
 
 fts_build_peak_report(Peaks, WordSize) ->
+    RolePeaks = maps:fold(
+        fun(Role0, Peak = {HeapWords, _MemoryBytes, _Function}, Acc) ->
+            Role = case Role0 of
+                {ebloom_worker, _HashCount} -> ebloom_worker;
+                _ -> Role0
+            end,
+            case maps:get(Role, Acc, {0, 0, undefined}) of
+                {ExistingHeap, _ExistingMemory, _ExistingFunction}
+                    when ExistingHeap >= HeapWords ->
+                    Acc;
+                _ ->
+                    Acc#{Role => Peak}
+            end
+        end,
+        #{},
+        Peaks
+    ),
     lists:sort([
-        {Role, HeapWords, HeapWords * WordSize, MemoryBytes}
-     || {Role, {HeapWords, MemoryBytes}} <- maps:to_list(Peaks)
+        {Role, HeapWords, HeapWords * WordSize, MemoryBytes, Function}
+     || {Role, {HeapWords, MemoryBytes, Function}} <- maps:to_list(RolePeaks)
     ]).
 
 full_store_build_memory_equivalence(_Config) ->
@@ -592,7 +682,7 @@ full_store_build_memory_equivalence(_Config) ->
             after 5000 ->
                 ct:fail(fts_build_sampler_timed_out)
             end,
-        {BoundedOuterHeapWords, BoundedOuterMemoryBytes} =
+        {BoundedOuterHeapWords, BoundedOuterMemoryBytes, _BoundedOuterFunction} =
             maps:get(outer_build, BoundedPeaks),
         {BoundedInnerRole, BoundedInnerHeapWords, BoundedInnerMemoryBytes} =
             fts_build_inner_peak(BoundedPeaks),
@@ -634,7 +724,8 @@ full_store_build_memory_equivalence(_Config) ->
             after 5000 ->
                 ct:fail(fts_build_sampler_timed_out)
             end,
-        {UnboundedOuterHeapWords, UnboundedOuterMemoryBytes} =
+        {UnboundedOuterHeapWords, UnboundedOuterMemoryBytes,
+            _UnboundedOuterFunction} =
             maps:get(outer_build, UnboundedPeaks),
         {UnboundedInnerRole, UnboundedInnerHeapWords,
             UnboundedInnerMemoryBytes} = fts_build_inner_peak(UnboundedPeaks),
@@ -709,6 +800,115 @@ full_store_build_memory_equivalence(_Config) ->
         end
     end.
 
+%% Live PST members are many ordinary messages, a long tail of larger quoted
+%% threads/MIME bodies, and a small number of multi-megabyte members. This gate
+%% keeps that shape while using a deterministic shared mail vocabulary: 15,000
+%% documents, 3,072 tokens in the common case, 6,144 every fifth message,
+%% 12,288 every fiftieth, and one roughly 2 MiB member. Unique envelope terms
+%% keep cardinality proportional to document count while the shared vocabulary
+%% exercises the hot posting rows that dominate a real mailbox generation.
+live_mail_member_build_memory(_Config) ->
+    ct:timetrap({minutes, 120}),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    Root = testutil:reset_filestructure(
+        "test/test_fts_live_mail_member_memory_" ++ Suffix
+    ),
+    %% Match the live VFS content store rather than Leveled's standalone
+    %% throughput defaults. The small penciller cache is itself part of the
+    %% production memory contract for large FTS row values.
+    LiveOpts = [
+        {cache_size, 1000},
+        {max_pencillercachesize, 401},
+        {compression_method, lz4},
+        {ledger_compression, as_store}
+        | start_opts(Root)
+    ],
+    {ok, Bookie} = leveled_bookie:book_start(LiveOpts),
+    Schema = schema(<<"live-mail-member-memory">>, [body], #{}),
+    Sampler = spawn(fun() -> fts_build_sampler(#{}, #{}, []) end),
+    try
+        MailNoise = iolist_to_binary([
+            zipfian_tokens(mail_member_noise, 3072)
+        ]),
+        live_mail_member_put_corpus(Bookie, Schema, MailNoise),
+        {ok, _Inker, Penciller} = leveled_bookie:book_returnactors(Bookie),
+        Clerk = leveled_penciller:pcl_getclerkpid(Penciller),
+        Sampler ! {fts2_build_worker, bookie, Bookie},
+        Sampler ! {fts2_build_worker, penciller, Penciller},
+        Sampler ! {fts2_build_worker, clerk, Clerk},
+        ok = leveled_ebloom:set_test_observer(Sampler),
+        WordSize = erlang:system_info(wordsize),
+        BoundWords = 512 * 1024 * 1024 div WordSize,
+        {ok, #{skipped := []}} = leveled_fts:fts2_outer_bound_for_test(
+            fun() ->
+                leveled_fts:fts2_consolidate_with_heap_for_test(
+                    Bookie,
+                    Schema,
+                    #{reclaim => false},
+                    BoundWords,
+                    Sampler
+                )
+            end,
+            BoundWords,
+            Sampler
+        ),
+        Sampler ! {snapshot, self()},
+        Peaks = fts_build_await_peaks(),
+        PeakReport = fts_build_peak_report(Peaks, WordSize),
+        ct:pal("live mail-member build peaks ~p", [PeakReport]),
+        lists:foreach(
+            fun({Role, HeapWords, _HeapBytes, _MemoryBytes, _Function}) ->
+                case HeapWords < BoundWords of
+                    true -> ok;
+                    false -> ct:fail({live_mail_member_role_over_bound,
+                        Role, HeapWords, BoundWords})
+                end
+            end,
+            PeakReport
+        ),
+        lists:foreach(
+            fun(Role) ->
+                true = maps:is_key(Role, Peaks)
+            end,
+            [outer_build, workspace_worker, identity_worker,
+                term_shard_worker, bigram_shard_worker, bookie, penciller,
+                clerk]
+        ),
+        true = lists:any(
+            fun
+                ({ebloom_worker, _HashCount}) -> true;
+                (_Role) -> false
+            end,
+            maps:keys(Peaks)
+        ),
+        {ok, Index} = leveled_fts:fts2_available(Bookie, Schema),
+        15000 = maps:get(chunk_count, Index),
+        ct:pal(
+            "live mail-member fixture: ~B documents, ~B terms, ~B bigrams, "
+            "~B indexed tokens, ~B-byte base mail body",
+            [
+                maps:get(chunk_count, Index),
+                maps:get(term_count, Index),
+                maps:get(bigram_count, Index),
+                maps:get(total_length, Index),
+                byte_size(MailNoise)
+            ]
+        ),
+        {ok, #{hits := Hits, count := 15000}} = leveled_fts:search(
+            Bookie,
+            Schema,
+            <<"received AND subject">>,
+            #{limit => 10, rank => bm25, return_count => true}
+        ),
+        10 = length(Hits)
+    after
+        ok = leveled_ebloom:set_test_observer(undefined),
+        Sampler ! stop,
+        try leveled_bookie:book_destroy(Bookie)
+        catch _:_ -> ok
+        end
+    end.
+
 fts_build_sampler(Active, Peaks, Reports) ->
     receive
         {fts2_build_outer, Pid} ->
@@ -759,18 +959,23 @@ fts_build_sampler_add(Pid, Role, Active, Peaks, Reports) ->
 fts_build_sample_workers(Active, Peaks) ->
     maps:fold(
         fun(Pid, {_Monitor, Role}, Acc) ->
-            case process_info(Pid, [total_heap_size, memory]) of
+            case process_info(Pid, [total_heap_size, memory, current_function]) of
                 undefined ->
                     Acc;
                 Info ->
-                    {HeapPeak, MemoryPeak} = maps:get(Role, Acc, {0, 0}),
+                    {HeapPeak, MemoryPeak, PeakFunction} = maps:get(
+                        Role, Acc, {0, 0, undefined}
+                    ),
+                    Heap = proplists:get_value(total_heap_size, Info),
+                    Memory = proplists:get_value(memory, Info),
+                    Function = proplists:get_value(current_function, Info),
                     Acc#{Role => {
-                        erlang:max(
-                            proplists:get_value(total_heap_size, Info), HeapPeak
-                        ),
-                        erlang:max(
-                            proplists:get_value(memory, Info), MemoryPeak
-                        )
+                        erlang:max(Heap, HeapPeak),
+                        erlang:max(Memory, MemoryPeak),
+                        case Heap > HeapPeak of
+                            true -> Function;
+                            false -> PeakFunction
+                        end
                     }}
             end
         end,
@@ -780,7 +985,8 @@ fts_build_sample_workers(Active, Peaks) ->
 
 fts_build_inner_peak(Peaks) ->
     lists:foldl(
-        fun({Role, {HeapWords, MemoryBytes}}, {_BestRole, BestHeap, _BestMemory}
+        fun({Role, {HeapWords, MemoryBytes, _Function}},
+            {_BestRole, BestHeap, _BestMemory}
             = Best) ->
             case Role =/= outer_build andalso HeapWords > BestHeap of
                 true -> {Role, HeapWords, MemoryBytes};
@@ -815,6 +1021,53 @@ full_store_put_corpus(Bookies, Schema, LargeBody) ->
         end,
         chunked(lists:seq(1, 9000), 32, [])
     ).
+
+live_mail_member_put_corpus(Bookie, Schema, MailNoise) ->
+    lists:foreach(
+        fun(DocumentNumbers) ->
+            Specs = lists:append([
+                begin
+                    Key = <<"mail-", DocumentNumber:32/unsigned-big>>,
+                    {ok, DocumentSpecs} = leveled_fts:derive(
+                        Schema,
+                        Key,
+                        #{body => live_mail_member_body(
+                            DocumentNumber, MailNoise
+                        )}
+                    ),
+                    DocumentSpecs
+                end
+             || DocumentNumber <- DocumentNumbers
+            ]),
+            full_store_mput(Bookie, Specs)
+        end,
+        chunked(lists:seq(1, 15000), 8, [])
+    ).
+
+live_mail_member_body(DocumentNumber, MailNoise) ->
+    NoiseCopies = case DocumentNumber of
+        1 -> 128;
+        _ when DocumentNumber rem 50 =:= 0 -> 4;
+        _ when DocumentNumber rem 5 =:= 0 -> 2;
+        _ -> 1
+    end,
+    EnvelopeTerms = [
+        <<"message", (integer_to_binary(DocumentNumber))/binary,
+            "field", (integer_to_binary(Position))/binary>>
+     || Position <- lists:seq(1, 24)
+    ],
+    iolist_to_binary([
+        <<"Received: from mail.example.test by outlook.example.test\r\n",
+            "Subject: RE project settlement review ">>,
+        integer_to_binary(DocumentNumber),
+        <<"\r\nMessage-ID: member-">>,
+        integer_to_binary(DocumentNumber),
+        <<"@example.test\r\nContent-Type: message/rfc822\r\n\r\n">>,
+        lists:join(<<" ">>, EnvelopeTerms),
+        <<"\r\nPlease review the attached correspondence and prior quoted "
+            "thread. Regards accounts legal property trust.\r\n">>,
+        lists:duplicate(NoiseCopies, [<<" ">>, MailNoise])
+    ]).
 
 %% Each document carries 40 terms that occur nowhere else, for cardinality,
 %% plus 40 tokens drawn from a shared 512-word pool with a Zipfian rank
