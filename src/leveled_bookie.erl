@@ -70,6 +70,7 @@
     book_compactjournal/2,
     book_islastcompactionpending/1,
     book_trimjournal/1,
+    book_persistledger/2,
     book_reclaimledger/2,
     book_hotbackup/1,
     book_close/1,
@@ -1297,6 +1298,15 @@ book_snapshot(Pid, SnapType, Query, LongRunning) ->
 -spec book_compactjournal(pid(), integer()) -> ok | busy.
 -spec book_islastcompactionpending(pid()) -> boolean().
 -spec book_trimjournal(pid()) -> ok.
+-spec book_persistledger(pid(), pos_integer()) -> ok | {error, timeout}.
+
+%% @doc Persist the complete live ledger without waiting for superseded SSTs
+%% protected by readers to be deleted. This is the bounded write-admission
+%% barrier for bulk writers that must coexist with long-lived snapshots.
+book_persistledger(Pid, Timeout) when is_integer(Timeout), Timeout > 0 ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    book_driveledger_loop(Pid, Deadline, persist_ledger).
+
 -spec book_reclaimledger(pid(), pos_integer()) -> ok | {error, timeout}.
 
 %% @doc Call for compaction of the Journal
@@ -1326,11 +1336,11 @@ book_trimjournal(Pid) ->
 %% barrier; it never bypasses manifest snapshot protection.
 book_reclaimledger(Pid, Timeout) when is_integer(Timeout), Timeout > 0 ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
-    book_reclaimledger_loop(Pid, Deadline).
+    book_driveledger_loop(Pid, Deadline, reclaim_ledger).
 
-book_reclaimledger_loop(Pid, Deadline) ->
+book_driveledger_loop(Pid, Deadline, Operation) ->
     Result = case gen_server:call(Pid, flush_ledger, infinity) of
-        ok -> gen_server:call(Pid, reclaim_ledger, infinity);
+        ok -> gen_server:call(Pid, Operation, infinity);
         busy -> busy
     end,
     case Result of
@@ -1340,7 +1350,7 @@ book_reclaimledger_loop(Pid, Deadline) ->
             case erlang:monotonic_time(millisecond) < Deadline of
                 true ->
                     timer:sleep(10),
-                    book_reclaimledger_loop(Pid, Deadline);
+                    book_driveledger_loop(Pid, Deadline, Operation);
                 false ->
                     {error, timeout}
             end
@@ -1927,6 +1937,8 @@ handle_call(flush_ledger, _From, State) ->
                     {reply, busy, State#state{slow_offer = true}}
             end
     end;
+handle_call(persist_ledger, _From, State) ->
+    {reply, leveled_penciller:pcl_persist(State#state.penciller), State};
 handle_call(reclaim_ledger, _From, State) ->
     {reply, leveled_penciller:pcl_reclaim(State#state.penciller), State};
 handle_call(hot_backup, _From, State) when State#state.head_only == false ->

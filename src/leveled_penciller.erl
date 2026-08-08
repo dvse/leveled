@@ -194,6 +194,7 @@
     pcl_getstartupsequencenumber/1,
     pcl_checkbloomtest/2,
     pcl_checkforwork/1,
+    pcl_persist/1,
     pcl_reclaim/1,
     pcl_retentionstatus/1,
     pcl_persistedsqn/1,
@@ -686,6 +687,12 @@ pcl_checkbloomtest(Pid, Key) ->
 %% Used in test only to confim compaction work complete before closing
 pcl_checkforwork(Pid) ->
     gen_server:call(Pid, check_for_work, 2000).
+
+-spec pcl_persist(pid()) -> idle | busy.
+%% @doc Force current memory/L0 state through the manifest and clerk machinery,
+%% without waiting for snapshot-protected superseded files to be deleted.
+pcl_persist(Pid) ->
+    gen_server:call(Pid, persist, infinity).
 
 -spec pcl_reclaim(pid()) -> idle | busy.
 %% @doc Force the current memory/L0 state through the normal manifest and
@@ -1253,9 +1260,30 @@ handle_call(
 ->
     {_WL, WC} = leveled_pmanifest:check_for_work(Manifest),
     {reply, WC > 0, State};
+handle_call(persist, _From, State) ->
+    drive_ledger_persistence(persist, State);
+handle_call(reclaim, _From, State) ->
+    drive_ledger_persistence(reclaim, State);
+handle_call(persisted_sqn, _From, State) ->
+    {reply, State#state.persisted_sqn, State};
 handle_call(
-    reclaim,
-    _From,
+    retention_status, _From, State = #state{manifest = Manifest}
+) when ?IS_DEF(Manifest) ->
+    Manifest0 = leveled_pmanifest:expire_snapshots(Manifest),
+    {reply,
+        leveled_pmanifest:retention_status(Manifest0),
+        State#state{manifest = Manifest0}};
+handle_call(
+    get_sstpids, _From, State = #state{manifest = Manifest}
+) when
+    ?IS_DEF(Manifest)
+->
+    {reply, leveled_pmanifest:get_sstpids(Manifest), State};
+handle_call(get_clerkpid, _From, State) ->
+    {reply, State#state.clerk, State}.
+
+drive_ledger_persistence(
+    Mode,
     State = #state{
         manifest = Manifest,
         clerk = Clerk,
@@ -1268,25 +1296,26 @@ handle_call(
     {_WorkLevels, WorkCount} = leveled_pmanifest:check_for_work(Manifest0),
     Snapshots = leveled_pmanifest:snapshot_pids(Manifest0),
     PendingDeleteCount = leveled_pmanifest:pending_delete_count(Manifest0),
-    case {Snapshots, PendingDeleteCount} of
-        {[], Count} when Count > 0 ->
+    case {Mode, Snapshots, PendingDeleteCount} of
+        {reclaim, [], Count} when Count > 0 ->
             lists:foreach(
                 fun({Filename, FilePid}) ->
                     pcl_confirmdelete(self(), Filename, FilePid)
                 end,
                 leveled_pmanifest:pending_delete_requests(Manifest0)
             );
-        _ProtectedOrClear ->
+        _NotReclaimable ->
             ok
     end,
     Protected = Snapshots =/= [] orelse PendingDeleteCount > 0,
+    RetentionBusy = Mode =:= reclaim andalso Protected,
     case {
         State0#state.levelzero_pending,
         State0#state.work_ongoing,
         L0Present,
         State0#state.levelzero_size,
         WorkCount,
-        Protected
+        RetentionBusy
     } of
         {false, false, false, 0, 0, false} ->
             {reply, idle, State0};
@@ -1309,24 +1338,7 @@ handle_call(
         _Busy ->
             ok = leveled_pclerk:clerk_prompt(Clerk),
             {reply, busy, State0}
-    end;
-handle_call(persisted_sqn, _From, State) ->
-    {reply, State#state.persisted_sqn, State};
-handle_call(
-    retention_status, _From, State = #state{manifest = Manifest}
-) when ?IS_DEF(Manifest) ->
-    Manifest0 = leveled_pmanifest:expire_snapshots(Manifest),
-    {reply,
-        leveled_pmanifest:retention_status(Manifest0),
-        State#state{manifest = Manifest0}};
-handle_call(
-    get_sstpids, _From, State = #state{manifest = Manifest}
-) when
-    ?IS_DEF(Manifest)
-->
-    {reply, leveled_pmanifest:get_sstpids(Manifest), State};
-handle_call(get_clerkpid, _From, State) ->
-    {reply, State#state.clerk, State}.
+    end.
 
 handle_cast(
     {manifest_change, Manifest},

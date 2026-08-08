@@ -10,24 +10,42 @@ delta_write_shape_test() ->
     ),
     Keys = [{Key, SubKey} || {add, _Bucket, Key, SubKey, _Value} <- Specs],
     ?assert(lists:member({<<"doc">>, <<"doc">>}, Keys)),
-    ?assert(lists:any(fun({<<"f2:d">>, <<_:64>>}) -> true;
-        (_) -> false end, Keys)),
-    ?assertNot(lists:any(fun({<<"r">>, _}) -> true;
-        ({<<"c">>, _}) -> true;
-        ({<<_Shard:16>>, <<"d:", _/binary>>}) -> true;
-        (_) -> false end, Keys)).
+    ?assert(
+        lists:any(
+            fun
+                ({<<"f2:d">>, <<_:64>>}) -> true;
+                (_) -> false
+            end,
+            Keys
+        )
+    ),
+    ?assertNot(
+        lists:any(
+            fun
+                ({<<"r">>, _}) -> true;
+                ({<<"c">>, _}) -> true;
+                ({<<_Shard:16>>, <<"d:", _/binary>>}) -> true;
+                (_) -> false
+            end,
+            Keys
+        )
+    ).
 
 codec_roundtrip_test() ->
     Plane = [{1, 2, 3, 4, 5, 0}, {9, 10, 11, 12, 13, 1}],
     Positions = [{1, [0, 3, 21]}, {9, [2, 8]}],
-    ?assertEqual(Plane,
+    ?assertEqual(
+        Plane,
         leveled_fts:fts2_codec_decode_plane(
             leveled_fts:fts2_codec_encode_plane(Plane)
-        )),
-    ?assertEqual(maps:from_list(Positions),
+        )
+    ),
+    ?assertEqual(
+        maps:from_list(Positions),
         leveled_fts:fts2_codec_decode_positions(
             leveled_fts:fts2_codec_encode_positions(Positions)
-        )).
+        )
+    ).
 
 packed_identity_page_selective_roundtrip_test() ->
     First = identity_group(
@@ -46,10 +64,14 @@ packed_identity_page_selective_roundtrip_test() ->
     ),
     Encoded = leveled_fts:fts2_codec_encode_identity_page([First, Second]),
     ?assertMatch(<<4, _/binary>>, Encoded),
-    [{1, {group, [<<"second">>, [8], nil]}, 1, 8, <<"second">>,
-        <<8:64/unsigned-big>>, 12, Candidate, Hit}] =
+    [
+        {1, {group, [<<"second">>, [8], nil]}, 1, 8, <<"second">>,
+            <<8:64/unsigned-big>>, 12, Candidate, Hit}
+    ] =
         leveled_fts:fts2_codec_decode_identity_page(Encoded, [{1, 1}]),
-    ?assertEqual(maps:get(candidate_record, hd(maps:get(chunks, Second))), Candidate),
+    ?assertEqual(
+        maps:get(candidate_record, hd(maps:get(chunks, Second))), Candidate
+    ),
     ?assertEqual(maps:get(hit_record, hd(maps:get(chunks, Second))), Hit).
 
 packed_identity_serving_row_roundtrip_test() ->
@@ -70,22 +92,23 @@ packed_identity_serving_row_roundtrip_test() ->
     Group = #{
         group_id => 7,
         group_key => {group, [<<"document-identity">>]},
-        chunks => [#{
-            chunk_id => 11,
-            group_id => 7,
-            source_id => 99,
-            doc_key => Key,
-            doc_version => <<42:64/unsigned-big>>,
-            doc_length => 512,
-            candidate_record => Candidate,
-            hit_record => Hit
-        }]
+        chunks => [
+            #{
+                chunk_id => 11,
+                group_id => 7,
+                source_id => 99,
+                doc_key => Key,
+                doc_version => <<42:64/unsigned-big>>,
+                doc_length => 512,
+                candidate_record => Candidate,
+                hit_record => Hit
+            }
+        ]
     },
     Encoded = leveled_fts:fts2_codec_encode_identity_page([Group]),
-    [{7, undefined, 11, 99, Key, <<42:64/unsigned-big>>, 512,
-        Candidate, Hit}] = leveled_fts:fts2_codec_decode_identity_page(
-            Encoded, [{serve, 7, 11}]
-        ).
+    [{7, undefined, 11, 99, Key, <<42:64/unsigned-big>>, 512, Candidate, Hit}] = leveled_fts:fts2_codec_decode_identity_page(
+        Encoded, [{serve, 7, 11}]
+    ).
 
 tokenizer_scanner_parity_test() ->
     Inputs = tokenizer_parity_inputs(),
@@ -251,8 +274,8 @@ cold_reopen_result_parity() ->
             [Main0, Schema0, <<"spitfire">>, Opts]
         ),
         ?assertMatch(
-            {error, {fts_index_dirty,
-                grouped_search_requires_consolidation, _}},
+            {error,
+                {fts_index_dirty, grouped_search_requires_consolidation, _}},
             DirtyError
         ),
         ?assert(DirtyErrorUs < 50000),
@@ -302,13 +325,29 @@ cold_reopen_result_parity() ->
                 [DirtyErrorUs, FirstUs, SecondUs, WarmUs]
             )
         after
-            try leveled_bookie:book_destroy(Main1) catch _:_ -> ok end,
-            try leveled_bookie:book_destroy(Identity1) catch _:_ -> ok end
+            try
+                leveled_bookie:book_destroy(Main1)
+            catch
+                _:_ -> ok
+            end,
+            try
+                leveled_bookie:book_destroy(Identity1)
+            catch
+                _:_ -> ok
+            end
         end
     catch
         Class:Reason:Stacktrace ->
-            try leveled_bookie:book_destroy(Main0) catch _:_ -> ok end,
-            try leveled_bookie:book_destroy(Identity0) catch _:_ -> ok end,
+            try
+                leveled_bookie:book_destroy(Main0)
+            catch
+                _:_ -> ok
+            end,
+            try
+                leveled_bookie:book_destroy(Identity0)
+            catch
+                _:_ -> ok
+            end,
             erlang:raise(Class, Reason, Stacktrace)
     end.
 
@@ -330,13 +369,15 @@ residency_failure_is_sticky() ->
         {ok, _} = leveled_fts:consolidate(Main0, Schema0, #{}),
         {ok, Root} = leveled_fts:fts2_available(Main0, Schema0),
         Generation = maps:get(generation, Root),
-        ok = leveled_bookie:book_mput(Main0, [{
-            add,
-            maps:get(index, Schema0),
-            <<"f2:bloom">>,
-            <<"current">>,
-            <<"corrupt-residency-fixture">>
-        }]),
+        ok = leveled_bookie:book_mput(Main0, [
+            {
+                add,
+                maps:get(index, Schema0),
+                <<"f2:bloom">>,
+                <<"current">>,
+                <<"corrupt-residency-fixture">>
+            }
+        ]),
         ok = leveled_bookie:book_close(Main0),
         ok = leveled_bookie:book_close(Identity0),
         {ok, Main1} = leveled_bookie:book_start(start_opts(MainRoot)),
@@ -354,8 +395,10 @@ residency_failure_is_sticky() ->
                 end,
                 [{leveled_fts_residency, owner_load, 7}]
             ),
-            Expected = {error, {fts_residency_load_failed,
-                Generation, {error, function_clause}}},
+            Expected =
+                {error,
+                    {fts_residency_load_failed, Generation,
+                        {error, function_clause}}},
             ?assertEqual([Expected, Expected], Results),
             ?assertEqual(
                 1,
@@ -367,13 +410,29 @@ residency_failure_is_sticky() ->
                 maps:get(fts_residency_load_error, Status)
             )
         after
-            try leveled_bookie:book_destroy(Main1) catch _:_ -> ok end,
-            try leveled_bookie:book_destroy(Identity1) catch _:_ -> ok end
+            try
+                leveled_bookie:book_destroy(Main1)
+            catch
+                _:_ -> ok
+            end,
+            try
+                leveled_bookie:book_destroy(Identity1)
+            catch
+                _:_ -> ok
+            end
         end
     catch
         Class:Reason:Stacktrace ->
-            try leveled_bookie:book_destroy(Main0) catch _:_ -> ok end,
-            try leveled_bookie:book_destroy(Identity0) catch _:_ -> ok end,
+            try
+                leveled_bookie:book_destroy(Main0)
+            catch
+                _:_ -> ok
+            end,
+            try
+                leveled_bookie:book_destroy(Identity0)
+            catch
+                _:_ -> ok
+            end,
             erlang:raise(Class, Reason, Stacktrace)
     end.
 
@@ -415,8 +474,16 @@ generation_residency_budget_fallback() ->
             )
         )
     after
-        try leveled_bookie:book_destroy(Main) catch _:_ -> ok end,
-        try leveled_bookie:book_destroy(Identity) catch _:_ -> ok end
+        try
+            leveled_bookie:book_destroy(Main)
+        catch
+            _:_ -> ok
+        end,
+        try
+            leveled_bookie:book_destroy(Identity)
+        catch
+            _:_ -> ok
+        end
     end.
 
 generation_and_identity_bookie() ->
@@ -440,7 +507,9 @@ generation_and_identity_bookie() ->
         {ok, _} = leveled_bookie:book_headonly(
             Identity, maps:get(index, Schema), IdentityKey1, <<0:32>>
         ),
-        #{count := 2} = search(Main, Schema, <<"alpha">>, #{return_count => true}),
+        #{count := 2} = search(Main, Schema, <<"alpha">>, #{
+            return_count => true
+        }),
         Resident1 = leveled_bookie:book_status(Main),
         ?assertEqual(
             Generation1, maps:get(fts_resident_generation, Resident1)
@@ -463,15 +532,24 @@ generation_and_identity_bookie() ->
         ],
         [#{count := 1}, #{count := 1}] = PhraseResults,
         [FirstPhrase | OtherPhrases] = PhraseResults,
-        FirstPhraseKeys = [maps:get(candidate_key, Hit) || Hit <-
-            maps:get(hits, FirstPhrase)],
-        ?assert(lists:all(
-            fun(Result) ->
-                FirstPhraseKeys =:= [maps:get(candidate_key, Hit) || Hit <-
-                    maps:get(hits, Result)]
-            end,
-            OtherPhrases
-        )),
+        FirstPhraseKeys = [
+            maps:get(candidate_key, Hit)
+         || Hit <-
+                maps:get(hits, FirstPhrase)
+        ],
+        ?assert(
+            lists:all(
+                fun(Result) ->
+                    FirstPhraseKeys =:=
+                        [
+                            maps:get(candidate_key, Hit)
+                         || Hit <-
+                                maps:get(hits, Result)
+                        ]
+                end,
+                OtherPhrases
+            )
+        ),
         #{count := 1} = search(
             Main,
             Schema,
@@ -491,7 +569,9 @@ generation_and_identity_bookie() ->
             maps:get(fts_resident_generation, DirtyResident)
         ),
         ?assertEqual(0, maps:get(fts_resident_bytes, DirtyResident)),
-        #{count := 1} = search(Main, Schema, <<"alpha">>, #{return_count => true}),
+        #{count := 1} = search(Main, Schema, <<"alpha">>, #{
+            return_count => true
+        }),
         DirtyWindow = search(
             Main,
             Schema,
@@ -510,7 +590,9 @@ generation_and_identity_bookie() ->
         not_found = leveled_bookie:book_headonly(
             Identity, maps:get(index, Schema), IdentityKey1, <<0:32>>
         ),
-        #{count := 1} = search(Main, Schema, <<"gamma">>, #{return_count => true}),
+        #{count := 1} = search(Main, Schema, <<"gamma">>, #{
+            return_count => true
+        }),
         Resident2 = leveled_bookie:book_status(Main),
         ?assertEqual(
             maps:get(generation, Root2),
@@ -522,7 +604,9 @@ generation_and_identity_bookie() ->
             <<"alpha OR gamma">>,
             #{return_count => true, rank => bm25, resolve_hits => false}
         ),
-        ?assertEqual(maps:get(count, DirtyWindow), maps:get(count, CleanWindow)),
+        ?assertEqual(
+            maps:get(count, DirtyWindow), maps:get(count, CleanWindow)
+        ),
         ?assertEqual(
             lists:sort([
                 maps:get(candidate_key, Hit)
@@ -552,6 +636,9 @@ grouped_prefix_uses_complete_group_planes_test_() ->
 
 phrase_does_not_cross_chunk_boundary_test_() ->
     {timeout, 60, fun phrase_does_not_cross_chunk_boundary/0}.
+
+hot_token_phrase_uses_rare_driver_test_() ->
+    {timeout, 120, fun hot_token_phrase_uses_rare_driver/0}.
 
 hpmor_bounded_multichunk_subset_test_() ->
     {timeout, 60, fun hpmor_bounded_multichunk_subset/0}.
@@ -596,8 +683,10 @@ ranked_group_total_and_ungrouped_retrieval() ->
         ?assertEqual(
             [{<<"chunk-1">>, 5}, {<<"chunk-2">>, 40}, {<<"chunk-3">>, 7}],
             lists:sort([
-                {maps:get(chunk_key, maps:get(candidate_record, Hit)),
-                    maps:get(match_count, Hit)}
+                {
+                    maps:get(chunk_key, maps:get(candidate_record, Hit)),
+                    maps:get(match_count, Hit)
+                }
              || Hit <- Ungrouped
             ])
         )
@@ -659,8 +748,9 @@ ranked_group_document_bm25() ->
             math:log((GroupCount - 2 + 0.5) / (2 + 0.5)),
             1.0e-6
         ),
-        Expected = Idf * (100 * 2.2) /
-            (100 + 1.2 * (0.25 + 0.75 * (50000 / AverageLength))),
+        Expected =
+            Idf * (100 * 2.2) /
+                (100 + 1.2 * (0.25 + 0.75 * (50000 / AverageLength))),
         ?assert(abs(maps:get(score, First) - Expected) < 1.0e-12)
     end).
 
@@ -677,7 +767,11 @@ grouped_boolean_uses_document_candidates() ->
             Main, Schema, <<"both-b">>, <<"both">>, Tenant, <<"beta">>
         ),
         ok = seam_put(
-            Main, Schema, <<"alpha-only">>, <<"alpha-only">>, Tenant,
+            Main,
+            Schema,
+            <<"alpha-only">>,
+            <<"alpha-only">>,
+            Tenant,
             <<"alpha">>
         ),
         #{count := 1, hits := [DirtyAnd]} = search(
@@ -685,15 +779,21 @@ grouped_boolean_uses_document_candidates() ->
             Schema,
             <<"alpha AND beta">>,
             #{
-                columns => [content], limit => 20, rank => bm25,
-                resolve_hits => false, return_count => true
+                columns => [content],
+                limit => 20,
+                rank => bm25,
+                resolve_hits => false,
+                return_count => true
             }
         ),
         ?assertEqual(2, maps:get(match_count, DirtyAnd)),
         {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
         Opts = #{
-            columns => [content], limit => 20, rank => bm25,
-            resolve_hits => false, return_count => true
+            columns => [content],
+            limit => 20,
+            rank => bm25,
+            resolve_hits => false,
+            return_count => true
         },
         #{count := 1, hits := [AndHit]} = search(
             Main, Schema, <<"alpha AND beta">>, Opts
@@ -719,15 +819,27 @@ grouped_prefix_uses_complete_group_planes() ->
         },
         Tenant = <<"tenant">>,
         ok = seam_put(
-            Main, Schema, <<"a-1">>, <<"a">>, Tenant,
+            Main,
+            Schema,
+            <<"a-1">>,
+            <<"a">>,
+            Tenant,
             <<"hermione hermione">>
         ),
         ok = seam_put(
-            Main, Schema, <<"a-2">>, <<"a">>, Tenant,
+            Main,
+            Schema,
+            <<"a-2">>,
+            <<"a">>,
+            Tenant,
             <<"hermit hermit hermit">>
         ),
         ok = seam_put(
-            Main, Schema, <<"a-3">>, <<"a">>, Tenant,
+            Main,
+            Schema,
+            <<"a-3">>,
+            <<"a">>,
+            Tenant,
             <<"hermitage hermitages">>
         ),
         ok = seam_put(
@@ -739,13 +851,14 @@ grouped_prefix_uses_complete_group_planes() ->
             Schema,
             <<"hermi*">>,
             #{
-                columns => [content], limit => 20, rank => bm25,
-                resolve_hits => false, return_count => true
+                columns => [content],
+                limit => 20,
+                rank => bm25,
+                resolve_hits => false,
+                return_count => true
             }
         ),
-        ?assertEqual([<<"a">>, <<"b">>], [
-            seam_hit_udi(Hit) || Hit <- Hits
-        ]),
+        ?assertEqual([<<"a">>, <<"b">>], [seam_hit_udi(Hit) || Hit <- Hits]),
         [AHit, _BHit] = Hits,
         Idf = 1.0e-6,
         %% Document length covers all indexed columns.  The three chunks in
@@ -755,14 +868,17 @@ grouped_prefix_uses_complete_group_planes() ->
         AverageLength = 6.0,
         ExpectedScore = lists:sum([
             Idf * (Tf * 2.2) /
-                (Tf + 1.2 * (0.25 + 0.75 *
-                    (GroupLength / AverageLength)))
+                (Tf +
+                    1.2 *
+                        (0.25 +
+                            0.75 *
+                                (GroupLength / AverageLength)))
          || Tf <- [2, 3, 1, 1]
         ]),
         ?assert(abs(maps:get(score, AHit) - ExpectedScore) < 1.0e-12),
-        ?assertEqual([1, 7], lists:sort([
-            maps:get(match_count, Hit) || Hit <- Hits
-        ]))
+        ?assertEqual(
+            [1, 7], lists:sort([maps:get(match_count, Hit) || Hit <- Hits])
+        )
     end).
 
 phrase_does_not_cross_chunk_boundary() ->
@@ -772,15 +888,27 @@ phrase_does_not_cross_chunk_boundary() ->
         },
         Tenant = <<"tenant">>,
         ok = seam_put(
-            Main, Schema, <<"cross-1">>, <<"cross">>, Tenant,
+            Main,
+            Schema,
+            <<"cross-1">>,
+            <<"cross">>,
+            Tenant,
             <<"filler alpha">>
         ),
         ok = seam_put(
-            Main, Schema, <<"cross-2">>, <<"cross">>, Tenant,
+            Main,
+            Schema,
+            <<"cross-2">>,
+            <<"cross">>,
+            Tenant,
             <<"beta filler">>
         ),
         ok = seam_put(
-            Main, Schema, <<"within-1">>, <<"within">>, Tenant,
+            Main,
+            Schema,
+            <<"within-1">>,
+            <<"within">>,
+            Tenant,
             <<"filler alpha beta filler">>
         ),
         {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
@@ -789,12 +917,160 @@ phrase_does_not_cross_chunk_boundary() ->
             Schema,
             <<"\"alpha beta\"">>,
             #{
-                columns => [content], limit => 20, rank => bm25,
-                resolve_hits => false, return_count => true
+                columns => [content],
+                limit => 20,
+                rank => bm25,
+                resolve_hits => false,
+                return_count => true
             }
         ),
         ?assertEqual(<<"within">>, seam_hit_udi(Hit)),
         ?assertEqual(1, maps:get(match_count, Hit))
+    end).
+
+hot_token_phrase_uses_rare_driver() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (schema(<<"fts2-hot-token-phrase">>))#{
+            identity_bookie => Identity
+        },
+        lists:foreach(
+            fun(Index) ->
+                Key = <<"hot-", Index:32/unsigned-big>>,
+                Body =
+                    case Index =< 300 of
+                        true ->
+                            <<"hot common filler andrew potentiacap com">>;
+                        false ->
+                            <<"hot common filler andrew separated com">>
+                    end,
+                ok = put_doc(Main, Schema, Key, Body)
+            end,
+            lists:seq(1, 1024)
+        ),
+        ok = put_doc(
+            Main,
+            Schema,
+            <<"needle">>,
+            <<"hot rare suffix hot common filler rare">>
+        ),
+        ok = put_doc(
+            Main,
+            Schema,
+            <<"legal-match">>,
+            <<"Deed of Accession valuation cap settlement one two Calderbank">>
+        ),
+        ok = put_doc(
+            Main,
+            Schema,
+            <<"legal-nonmatch">>,
+            <<"Deed separated of Accession valuation separated cap ",
+                "settlement one two three four Calderbank">>
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        Opts = #{
+            rank => bm25,
+            resolve_hits => false,
+            return_count => true,
+            return_positions => true
+        },
+        erlang:put({leveled_fts, term_run_folds}, #{}),
+        #{count := 1, hits := [Exact]} = search(
+            Main, Schema#{phrase_strategy => skip}, <<"\"hot rare\"">>, Opts
+        ),
+        ?assertEqual(<<"needle">>, maps:get(candidate_key, Exact)),
+        ExactReads = erlang:get({leveled_fts, term_run_folds}),
+        ?assertEqual(1, maps:get(<<"rare">>, ExactReads)),
+        ?assertEqual(0, maps:get(<<"hot">>, ExactReads, 0)),
+        erlang:put({leveled_fts, term_run_folds}, #{}),
+        #{count := 1, hits := [Prefix]} = search(
+            Main, Schema, <<"\"hot rar\"*">>, Opts
+        ),
+        ?assertEqual(<<"needle">>, maps:get(candidate_key, Prefix)),
+        PrefixReads = erlang:get({leveled_fts, term_run_folds}),
+        ?assertEqual(1, maps:get(<<"rare">>, PrefixReads)),
+        ?assertEqual(0, maps:get(<<"hot">>, PrefixReads, 0)),
+        erlang:put({leveled_fts, term_run_folds}, #{}),
+        {#{count := 1, hits := [LongPhrase]}, LongPhraseCalls} =
+            trace_call_counts(
+                fun() ->
+                    search(
+                        Main,
+                        Schema,
+                        <<"\"hot common filler rare\"">>,
+                        Opts
+                    )
+                end,
+                [{leveled_fts, fts2_phrase_read_bundle, 6}]
+            ),
+        ?assertEqual(<<"needle">>, maps:get(candidate_key, LongPhrase)),
+        LongPhraseReads = erlang:get({leveled_fts, term_run_folds}),
+        ?assertEqual(1, maps:get(<<"rare">>, LongPhraseReads)),
+        ?assertEqual(0, maps:get(<<"hot">>, LongPhraseReads, 0)),
+        ?assertEqual(
+            0,
+            maps:get(
+                {leveled_fts, fts2_phrase_read_bundle, 6},
+                LongPhraseCalls
+            )
+        ),
+        erlang:put({leveled_fts, term_run_folds}, #{}),
+        QuotedEmail = search(
+            Main, Schema, <<"\"andrew@potentiacap.com\"">>, Opts
+        ),
+        BareEmail = search(
+            Main, Schema, <<"andrew@potentiacap.com">>, Opts
+        ),
+        ?assertEqual(300, maps:get(count, QuotedEmail)),
+        ?assertEqual(
+            lists:sort([
+                maps:get(candidate_key, Hit)
+             || Hit <- maps:get(hits, QuotedEmail)
+            ]),
+            lists:sort([
+                maps:get(candidate_key, Hit)
+             || Hit <- maps:get(hits, BareEmail)
+            ])
+        ),
+        ?assertEqual(#{}, erlang:get({leveled_fts, term_run_folds})),
+        LegacySchema = Schema#{
+            text_path => [legacy_fallback], phrase_strategy => skip
+        },
+        LegacyEmail = search(
+            Main, LegacySchema, <<"\"andrew@potentiacap.com\"">>, Opts
+        ),
+        ?assertEqual(
+            lists:sort([
+                maps:get(candidate_key, Hit)
+             || Hit <- maps:get(hits, LegacyEmail)
+            ]),
+            lists:sort([
+                maps:get(candidate_key, Hit)
+             || Hit <- maps:get(hits, QuotedEmail)
+            ])
+        ),
+        lists:foreach(
+            fun(Query) ->
+                Current = search(Main, Schema, Query, Opts),
+                Legacy = search(Main, LegacySchema, Query, Opts),
+                ?assertEqual(maps:get(count, Legacy), maps:get(count, Current)),
+                ?assertEqual(
+                    lists:sort([
+                        maps:get(candidate_key, Hit)
+                     || Hit <- maps:get(hits, Legacy)
+                    ]),
+                    lists:sort([
+                        maps:get(candidate_key, Hit)
+                     || Hit <- maps:get(hits, Current)
+                    ])
+                )
+            end,
+            [
+                <<"\"Deed of Accession\"">>,
+                <<"\"valuation cap\"">>,
+                <<"settlement NEAR,3 Calderbank">>
+            ]
+        ),
+        erlang:erase({leveled_fts, term_run_folds})
     end).
 
 hpmor_bounded_multichunk_subset() ->
@@ -819,8 +1095,11 @@ hpmor_bounded_multichunk_subset() ->
         ),
         {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
         Opts = #{
-            columns => [content], limit => 20, rank => bm25,
-            resolve_hits => false, return_count => true
+            columns => [content],
+            limit => 20,
+            rank => bm25,
+            resolve_hits => false,
+            return_count => true
         },
         #{count := 1, hits := [Grouped]} = search(
             Main, Schema, <<"hermione">>, Opts
@@ -838,8 +1117,10 @@ hpmor_bounded_multichunk_subset() ->
              || Index <- lists:seq(1, 8)
             ],
             [
-                {maps:get(chunk_key, maps:get(candidate_record, Hit)),
-                    maps:get(match_count, Hit)}
+                {
+                    maps:get(chunk_key, maps:get(candidate_record, Hit)),
+                    maps:get(match_count, Hit)
+                }
              || Hit <- Ungrouped
             ]
         ),
@@ -883,20 +1164,22 @@ bounded_or_page_matches_full_ranking() ->
         lists:foreach(
             fun(I) ->
                 Key = list_to_binary(io_lib:format("~4..0B", [I])),
-                Body = case I =< 24 of
-                    true ->
-                        <<"alpha alpha alpha alpha beta beta beta beta ",
-                            Key/binary>>;
-                    false ->
-                        Term = case I rem 2 of
-                            0 -> <<"alpha ">>;
-                            1 -> <<"beta ">>
-                        end,
-                        Filler = binary:copy(
-                            <<"filler ">>, 1 + (I rem 300)
-                        ),
-                        <<Term/binary, Filler/binary, Key/binary>>
-                end,
+                Body =
+                    case I =< 24 of
+                        true ->
+                            <<"alpha alpha alpha alpha beta beta beta beta ",
+                                Key/binary>>;
+                        false ->
+                            Term =
+                                case I rem 2 of
+                                    0 -> <<"alpha ">>;
+                                    1 -> <<"beta ">>
+                                end,
+                            Filler = binary:copy(
+                                <<"filler ">>, 1 + (I rem 300)
+                            ),
+                            <<Term/binary, Filler/binary, Key/binary>>
+                    end,
                 case put_doc(Main, Schema, Key, Body) of
                     ok -> ok;
                     pause -> timer:sleep(1)
@@ -913,7 +1196,9 @@ bounded_or_page_matches_full_ranking() ->
         {Fast, Counts} = trace_call_counts(
             fun() ->
                 search(
-                    Main, Schema, <<"alpha OR beta">>,
+                    Main,
+                    Schema,
+                    <<"alpha OR beta">>,
                     BaseOpts#{limit => 20}
                 )
             end,
@@ -934,14 +1219,19 @@ bounded_or_page_matches_full_ranking() ->
              || I <- lists:seq(1, 20)
             ],
             [
-                {maps:get(title, maps:get(candidate_record, Hit)),
-                    maps:get(match_count, Hit)}
+                {
+                    maps:get(title, maps:get(candidate_record, Hit)),
+                    maps:get(match_count, Hit)
+                }
              || Hit <- maps:get(hits, Fast)
             ]
         ),
-        ?assertEqual(1, maps:get(
-            {leveled_fts, fts2_search_fast_or_bounded, 5}, Counts
-        ))
+        ?assertEqual(
+            1,
+            maps:get(
+                {leveled_fts, fts2_search_fast_or_bounded, 5}, Counts
+            )
+        )
     end).
 
 ranked_tie_fields_prepage_before_identity_test_() ->
@@ -1000,11 +1290,40 @@ production_page_only_contract() ->
                 Document = list_to_binary(io_lib:format("~4..0B", [I])),
                 Filler = binary:copy(<<"filler ">>, 1 + (I rem 16)),
                 ok = seam_put(
-                    Main, Schema, Document, Document, <<"default">>,
+                    Main,
+                    Schema,
+                    Document,
+                    Document,
+                    <<"default">>,
                     <<"alpha ", Filler/binary, Document/binary>>
                 )
             end,
             lists:seq(1, Total)
+        ),
+        TailCandidateOpts = (production_page_only_opts(4))#{
+            page_order => candidate,
+            rank_tie_fields => [ipath_vec, udi]
+        },
+        #{count := Total, hits := TailCandidateHits} = search(
+            Main, Schema, <<"alpha">>, TailCandidateOpts
+        ),
+        ?assertEqual(
+            [
+                list_to_binary(io_lib:format("~4..0B", [I]))
+             || I <- lists:seq(1, 4)
+            ],
+            [
+                maps:get(chunk_key, maps:get(candidate_record, Hit))
+             || Hit <- TailCandidateHits
+            ]
+        ),
+        ?assert(
+            lists:all(
+                fun(#{key := Key, candidate_key := Key, doc_id := Id}) ->
+                    is_binary(Key) andalso is_integer(Id)
+                end,
+                TailCandidateHits
+            )
         ),
         {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
         {ok, Root} = leveled_fts:fts2_available(Main, Schema),
@@ -1051,28 +1370,82 @@ production_page_only_contract() ->
              || Hit <- Hits
             ]
         ),
-        ?assert(lists:all(
-            fun(Hit) ->
-                maps:is_key(group_id, Hit) andalso
-                    maps:is_key(chunk_id, Hit) andalso
-                    not maps:is_key(candidate_record, Hit)
-            end,
-            Hits
-        )),
+        ?assert(
+            lists:all(
+                fun(Hit) ->
+                    maps:is_key(group_id, Hit) andalso
+                        maps:is_key(chunk_id, Hit) andalso
+                        not maps:is_key(candidate_record, Hit)
+                end,
+                Hits
+            )
+        ),
         %% Phase one never materialises a full hit. Phase two decodes exactly
         %% the requested v4 rows, and never enters the generic map-pair codec.
         %% Native group-key order also means only phase two reads an identity
         %% page; the phase-one tie order is already the group-id order.
-        ?assertEqual(1, maps:get(
-            {leveled_fts, fts2_search_identity_page_handles, 4}, Counts
-        )),
-        ?assertEqual(0, maps:get({leveled_fts, fts2_search_hydrate_hit, 3}, Counts)),
-        ?assertEqual(4, maps:get(
-            {leveled_fts, fts2_codec_decode_identity_chunk, 5}, Counts
-        )),
-        ?assertEqual(0, maps:get(
-            {leveled_fts, fts2_codec_decode_identity_pairs, 3}, Counts
-        ))
+        ?assertEqual(
+            1,
+            maps:get(
+                {leveled_fts, fts2_search_identity_page_handles, 4}, Counts
+            )
+        ),
+        ?assertEqual(
+            0, maps:get({leveled_fts, fts2_search_hydrate_hit, 3}, Counts)
+        ),
+        ?assertEqual(
+            4,
+            maps:get(
+                {leveled_fts, fts2_codec_decode_identity_chunk, 5}, Counts
+            )
+        ),
+        ?assertEqual(
+            0,
+            maps:get(
+                {leveled_fts, fts2_codec_decode_identity_pairs, 3}, Counts
+            )
+        ),
+        CandidateOpts = Opts#{
+            page_order => candidate,
+            rank_tie_fields => [ipath_vec, udi]
+        },
+        #{count := Total, hits := CandidateHits} = search(
+            Main, Schema, <<"alpha">>, CandidateOpts
+        ),
+        ?assert(
+            lists:all(
+                fun(#{key := Key, candidate_key := Key, doc_id := Id}) ->
+                    is_binary(Key) andalso is_integer(Id)
+                end,
+                CandidateHits
+            )
+        ),
+        CandidateAddresses = [
+            {maps:get(group_id, Hit), maps:get(chunk_id, Hit)}
+         || Hit <- CandidateHits
+        ],
+        {ok, CandidateRows} = leveled_fts:hydrate_page(
+            Main, Schema, CandidateAddresses
+        ),
+        ?assertEqual(
+            [
+                list_to_binary(io_lib:format("~4..0B", [I]))
+             || I <- lists:seq(1, 4)
+            ],
+            [
+                maps:get(
+                    chunk_key,
+                    maps:get(
+                        candidate_record,
+                        maps:get(
+                            {maps:get(group_id, Hit), maps:get(chunk_id, Hit)},
+                            CandidateRows
+                        )
+                    )
+                )
+             || Hit <- CandidateHits
+            ]
+        )
     end).
 
 production_selective_count_contract_test_() ->
@@ -1088,27 +1461,40 @@ production_selective_count_contract() ->
         lists:foreach(
             fun(I) ->
                 DocumentNo = (I + 1) div 2,
-                Document = list_to_binary(io_lib:format("~4..0B", [DocumentNo])),
-                Chunk = list_to_binary(io_lib:format("~4..0B-~B", [DocumentNo, I rem 2])),
-                Tenant = case DocumentNo rem 2 of
-                    0 -> <<"default">>;
-                    1 -> <<"other">>
-                end,
+                Document = list_to_binary(
+                    io_lib:format("~4..0B", [DocumentNo])
+                ),
+                Chunk = list_to_binary(
+                    io_lib:format("~4..0B-~B", [DocumentNo, I rem 2])
+                ),
+                Tenant =
+                    case DocumentNo rem 2 of
+                        0 -> <<"default">>;
+                        1 -> <<"other">>
+                    end,
                 ok = seam_put(
-                    Main, Schema, Chunk, Document, Tenant,
+                    Main,
+                    Schema,
+                    Chunk,
+                    Document,
+                    Tenant,
                     <<"alpha filler ", Chunk/binary>>
                 )
             end,
             lists:seq(1, 128)
         ),
         {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
-        #{hits := [], count := 32, count_kind := grouped,
-            facet_universal := false} = search(
-                Main,
-                Schema,
-                <<"alpha">>,
-                production_count_only_opts(<<"default">>)
-            )
+        #{
+            hits := [],
+            count := 32,
+            count_kind := grouped,
+            facet_universal := false
+        } = search(
+            Main,
+            Schema,
+            <<"alpha">>,
+            production_count_only_opts(<<"default">>)
+        )
     end).
 
 term_planes_are_separate_rows_test_() ->
@@ -1123,7 +1509,11 @@ term_planes_are_separate_rows() ->
             fun(I) ->
                 Document = integer_to_binary(I),
                 ok = seam_put(
-                    Main, Schema, Document, Document, <<"default">>,
+                    Main,
+                    Schema,
+                    Document,
+                    Document,
+                    <<"default">>,
                     <<"alpha beta ", Document/binary>>
                 )
             end,
@@ -1133,7 +1523,8 @@ term_planes_are_separate_rows() ->
         {ok, RootValue} = leveled_bookie:book_headonly(
             Main, maps:get(index, Schema), <<"f2:root">>, <<"manifest">>
         ),
-        <<1:8, RootBytes:32/unsigned-big, RootRaw:RootBytes/binary>> = RootValue,
+        <<1:8, RootBytes:32/unsigned-big, RootRaw:RootBytes/binary>> =
+            RootValue,
         Root = binary_to_term(RootRaw, [safe]),
         ?assertEqual(1, maps:get(term_bloom, Root)),
         ?assertEqual(256, maps:get(term_bloom_shards, Root)),
@@ -1147,8 +1538,10 @@ term_planes_are_separate_rows() ->
         AlphaShard = erlang:phash2({0, <<"alpha">>}, 256),
         {ok, <<1, Generation:64/unsigned-big, AlphaBloom/binary>>} =
             leveled_bookie:book_headonly(
-                Main, maps:get(index, Schema),
-                <<"f2:bloom">>, <<"s", AlphaShard:8>>
+                Main,
+                maps:get(index, Schema),
+                <<"f2:bloom">>,
+                <<"s", AlphaShard:8>>
             ),
         ?assertEqual((1 bsl 13) div 8, byte_size(AlphaBloom)),
         ReverseBigramShard = erlang:phash2(
@@ -1156,8 +1549,10 @@ term_planes_are_separate_rows() ->
         ),
         {ok, <<1, Generation:64/unsigned-big, BigramBloom/binary>>} =
             leveled_bookie:book_headonly(
-                Main, maps:get(index, Schema),
-                <<"f2:bloom">>, <<"g", ReverseBigramShard:8>>
+                Main,
+                maps:get(index, Schema),
+                <<"f2:bloom">>,
+                <<"g", ReverseBigramShard:8>>
             ),
         ?assertEqual((1 bsl 16) div 8, byte_size(BigramBloom)),
         {TermKey, _} = leveled_fts:fts2_codec_term_key(
@@ -1180,11 +1575,18 @@ term_planes_are_separate_rows() ->
         {ok, PositionPlane} = leveled_bookie:book_headonly(
             Main, maps:get(index, Schema), <<"f2:p:", TermRest/binary>>, <<"p">>
         ),
-        ?assertEqual(8, length(leveled_fts:fts2_codec_decode_plane(BooleanPlane))),
-        ?assertEqual(8, length(leveled_fts:fts2_codec_decode_plane(GroupPlane))),
-        ?assertEqual(8, map_size(
-            leveled_fts:fts2_codec_decode_positions(PositionPlane)
-        )),
+        ?assertEqual(
+            8, length(leveled_fts:fts2_codec_decode_plane(BooleanPlane))
+        ),
+        ?assertEqual(
+            8, length(leveled_fts:fts2_codec_decode_plane(GroupPlane))
+        ),
+        ?assertEqual(
+            8,
+            map_size(
+                leveled_fts:fts2_codec_decode_positions(PositionPlane)
+            )
+        ),
         {#{count := 0, hits := []}, MissCounts} = trace_call_counts(
             fun() ->
                 search(Main, Schema, <<"impossiblevocabularyterm">>, #{
@@ -1196,9 +1598,31 @@ term_planes_are_separate_rows() ->
             end,
             [{leveled_fts, fts2_search_fast_single_term, 7}]
         ),
-        ?assertEqual(0, maps:get(
-            {leveled_fts, fts2_search_fast_single_term, 7}, MissCounts
-        )),
+        ?assertEqual(
+            0,
+            maps:get(
+                {leveled_fts, fts2_search_fast_single_term, 7}, MissCounts
+            )
+        ),
+        {#{count := 0, hits := []}, BooleanMissCounts} = trace_call_counts(
+            fun() ->
+                search(
+                    Main, Schema, <<"alpha AND impossiblevocabularyterm">>, #{
+                        rank => bm25,
+                        limit => 20,
+                        return_count => true,
+                        resolve_hits => false
+                    }
+                )
+            end,
+            [{leveled_fts, fts2_search_fast_boolean, 5}]
+        ),
+        ?assertEqual(
+            0,
+            maps:get(
+                {leveled_fts, fts2_search_fast_boolean, 5}, BooleanMissCounts
+            )
+        ),
         {#{count := 0, hits := []}, PhraseMissCounts} = trace_call_counts(
             fun() ->
                 search(Main, Schema, <<"\"beta alpha\"">>, #{
@@ -1210,18 +1634,27 @@ term_planes_are_separate_rows() ->
             end,
             [{leveled_fts, fts2_phrase_fast, 7}]
         ),
-        ?assertEqual(0, maps:get(
-            {leveled_fts, fts2_phrase_fast, 7}, PhraseMissCounts
-        )),
+        ?assertEqual(
+            0,
+            maps:get(
+                {leveled_fts, fts2_phrase_fast, 7}, PhraseMissCounts
+            )
+        ),
         ok = seam_put(
-            Main, Schema, <<"dirty">>, <<"dirty">>, <<"default">>,
+            Main,
+            Schema,
+            <<"dirty">>,
+            <<"dirty">>,
+            <<"default">>,
             <<"alpha dirty">>
         ),
         ?assertEqual(
             {ok, <<0>>},
             leveled_bookie:book_headonly(
-                Main, maps:get(index, Schema),
-                <<"f2:state">>, <<"current">>
+                Main,
+                maps:get(index, Schema),
+                <<"f2:state">>,
+                <<"current">>
             )
         )
     end).
@@ -1296,8 +1729,10 @@ fetches_cover_dirty_and_clean() ->
     with_bookies(fun(Main, Identity) ->
         Schema = (schema(<<"fts2-fetch">>))#{identity_bookie => Identity},
         ok = put_doc(Main, Schema, <<"a">>, <<"alpha">>),
-        [DirtyHit] = maps:get(hits,
-            search(Main, Schema, <<"alpha">>, #{return_count => true})),
+        [DirtyHit] = maps:get(
+            hits,
+            search(Main, Schema, <<"alpha">>, #{return_count => true})
+        ),
         DocId = maps:get(doc_id, DirtyHit),
         {ok, #{DocId := {<<"a">>, _Version, _Record}}} =
             leveled_fts:record_fetch(Main, Schema, [DocId], points),
@@ -1316,7 +1751,9 @@ dirty_tail_presence_skips_impossible_fold_test_() ->
 
 dirty_tail_presence_skips_impossible_fold() ->
     with_bookies(fun(Main, Identity) ->
-        Schema = (schema(<<"fts2-tail-presence">>))#{identity_bookie => Identity},
+        Schema = (schema(<<"fts2-tail-presence">>))#{
+            identity_bookie => Identity
+        },
         ok = put_doc(Main, Schema, <<"base">>, <<"alpha">>),
         {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
         ok = put_doc(Main, Schema, <<"tail">>, <<"beta">>),
@@ -1328,14 +1765,20 @@ dirty_tail_presence_skips_impossible_fold() ->
             <<"gamma">>,
             #{return_count => true, tail_fold_hook => Hook}
         ),
-        receive {tail_rows, 0} -> ok after 1000 -> ?assert(false) end,
+        receive
+            {tail_rows, 0} -> ok
+        after 1000 -> ?assert(false)
+        end,
         #{count := 1} = search(
             Main,
             Schema,
             <<"beta">>,
             #{return_count => true, tail_fold_hook => Hook}
         ),
-        receive {tail_rows, 1} -> ok after 1000 -> ?assert(false) end
+        receive
+            {tail_rows, 1} -> ok
+        after 1000 -> ?assert(false)
+        end
     end).
 
 live_generation_reclaim_without_close_test_() ->
@@ -1343,7 +1786,9 @@ live_generation_reclaim_without_close_test_() ->
 
 live_generation_reclaim_without_close() ->
     Suffix = integer_to_list(erlang:unique_integer([positive])),
-    MainRoot = testutil:reset_filestructure("test/test_fts2_reclaim_main_" ++ Suffix),
+    MainRoot = testutil:reset_filestructure(
+        "test/test_fts2_reclaim_main_" ++ Suffix
+    ),
     IdentityRoot = testutil:reset_filestructure(
         "test/test_fts2_reclaim_identity_" ++ Suffix
     ),
@@ -1354,8 +1799,9 @@ live_generation_reclaim_without_close() ->
         lists:foreach(
             fun(I) ->
                 Key = <<I:32/unsigned-big>>,
-                Body = <<"alpha ", (integer_to_binary(I))/binary, " ",
-                    (binary:copy(<<(I band 255)>>, 256))/binary>>,
+                Body =
+                    <<"alpha ", (integer_to_binary(I))/binary, " ",
+                        (binary:copy(<<(I band 255)>>, 256))/binary>>,
                 case put_doc(Main, Schema, Key, Body) of
                     ok -> ok;
                     pause -> timer:sleep(1)
@@ -1376,8 +1822,9 @@ live_generation_reclaim_without_close() ->
                     Schema,
                     Key,
                     #{
-                        body => <<"alpha revision ",
-                            (integer_to_binary(Revision))/binary>>,
+                        body =>
+                            <<"alpha revision ",
+                                (integer_to_binary(Revision))/binary>>,
                         title => Key
                     },
                     Manifest
@@ -1398,22 +1845,39 @@ live_generation_reclaim_without_close() ->
         ),
         lists:foreach(
             fun({MainStatus, IdentityStatus}) ->
-                ?assertEqual(0, maps:get(
-                    ledger_delete_pending_files, MainStatus
-                )),
-                ?assertEqual(0, maps:get(
-                    ledger_delete_pending_files, IdentityStatus
-                )),
+                ?assertEqual(
+                    0,
+                    maps:get(
+                        ledger_delete_pending_files, MainStatus
+                    )
+                ),
+                ?assertEqual(
+                    0,
+                    maps:get(
+                        ledger_delete_pending_files, IdentityStatus
+                    )
+                ),
                 ?assertEqual(0, maps:get(ledger_snapshot_count, MainStatus)),
-                ?assertEqual(0, maps:get(
-                    ledger_snapshot_count, IdentityStatus
-                ))
+                ?assertEqual(
+                    0,
+                    maps:get(
+                        ledger_snapshot_count, IdentityStatus
+                    )
+                )
             end,
             Samples
         )
     after
-        try leveled_bookie:book_destroy(Main) catch _:_ -> ok end,
-        try leveled_bookie:book_destroy(Identity) catch _:_ -> ok end
+        try
+            leveled_bookie:book_destroy(Main)
+        catch
+            _:_ -> ok
+        end,
+        try
+            leveled_bookie:book_destroy(Identity)
+        catch
+            _:_ -> ok
+        end
     end.
 
 snapshot_protects_superseded_generation_until_release_test_() ->
@@ -1428,15 +1892,18 @@ snapshot_protects_superseded_generation_until_release() ->
     lists:foreach(
         fun(I) ->
             Key = <<I:32/unsigned-big>>,
-            Body = <<"alpha snapshot ", (integer_to_binary(I))/binary, " ",
-                (binary:copy(<<(I band 255)>>, 512))/binary>>,
+            Body =
+                <<"alpha snapshot ", (integer_to_binary(I))/binary, " ",
+                    (binary:copy(<<(I band 255)>>, 512))/binary>>,
             ok = put_doc(Main, Schema, Key, Body)
         end,
         lists:seq(1, 80)
     ),
     {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
     ok = leveled_bookie:book_reclaimledger(Main, 30000),
-    OldFiles = filelib:wildcard(filename:join([Root, "ledger", "ledger_files", "*.sst"])),
+    OldFiles = filelib:wildcard(
+        filename:join([Root, "ledger", "ledger_files", "*.sst"])
+    ),
     ?assert(OldFiles =/= []),
     {ok, SnapshotPenciller, SnapshotInker} =
         leveled_bookie:book_snapshot(Main, store, undefined, true),
@@ -1462,27 +1929,37 @@ snapshot_protects_superseded_generation_until_release() ->
         ok = leveled_penciller:pcl_close(SnapshotPenciller),
         ok = leveled_inker:ink_close(SnapshotInker),
         ok = leveled_bookie:book_reclaimledger(Main, 30000),
-        ?assert(lists:any(
-            fun(Path) -> not filelib:is_regular(Path) end, OldFiles
-        ))
+        ?assert(
+            lists:any(
+                fun(Path) -> not filelib:is_regular(Path) end, OldFiles
+            )
+        )
     after
         case is_process_alive(SnapshotPenciller) of
             true ->
-                try leveled_penciller:pcl_close(SnapshotPenciller)
+                try
+                    leveled_penciller:pcl_close(SnapshotPenciller)
                 catch
                     _:_ -> ok
                 end;
-            false -> ok
+            false ->
+                ok
         end,
         case is_process_alive(SnapshotInker) of
             true ->
-                try leveled_inker:ink_close(SnapshotInker)
+                try
+                    leveled_inker:ink_close(SnapshotInker)
                 catch
                     _:_ -> ok
                 end;
-            false -> ok
+            false ->
+                ok
         end,
-        try leveled_bookie:book_destroy(Main) catch _:_ -> ok end,
+        try
+            leveled_bookie:book_destroy(Main)
+        catch
+            _:_ -> ok
+        end,
         _ = testutil:reset_filestructure(RelativeRoot)
     end.
 
@@ -1525,9 +2002,13 @@ expired_snapshot_releases_superseded_ssts() ->
         Status0 = leveled_bookie:book_status(Main),
         ?assertEqual(1, maps:get(ledger_snapshot_count, Status0)),
         ?assert(maps:get(ledger_delete_pending_files, Status0) > 0),
-        ?assert(is_integer(maps:get(
-            ledger_oldest_snapshot_age_seconds, Status0
-        ))),
+        ?assert(
+            is_integer(
+                maps:get(
+                    ledger_oldest_snapshot_age_seconds, Status0
+                )
+            )
+        ),
         ?assert(lists:all(fun filelib:is_regular/1, OldFiles)),
 
         timer:sleep(2100),
@@ -1547,15 +2028,20 @@ expired_snapshot_releases_superseded_ssts() ->
             end,
             lists:seq(2, 4)
         ),
-        ?assert(lists:any(
-            fun(Path) -> not filelib:is_regular(Path) end, OldFiles
-        )),
+        ?assert(
+            lists:any(
+                fun(Path) -> not filelib:is_regular(Path) end, OldFiles
+            )
+        ),
         Status1 = leveled_bookie:book_status(Main),
         ?assertEqual(0, maps:get(ledger_delete_pending_files, Status1)),
         ?assertEqual(0, maps:get(ledger_snapshot_count, Status1)),
-        ?assertEqual(undefined, maps:get(
-            ledger_oldest_snapshot_age_seconds, Status1
-        )),
+        ?assertEqual(
+            undefined,
+            maps:get(
+                ledger_oldest_snapshot_age_seconds, Status1
+            )
+        ),
 
         {ok, FreshSnapshot} = leveled_bookie:book_start([
             {snapshot_bookie, Main}
@@ -1573,13 +2059,19 @@ expired_snapshot_releases_superseded_ssts() ->
     after
         case is_process_alive(Snapshot) of
             true ->
-                try leveled_bookie:book_close(Snapshot)
+                try
+                    leveled_bookie:book_close(Snapshot)
                 catch
                     _:_ -> ok
                 end;
-            false -> ok
+            false ->
+                ok
         end,
-        try leveled_bookie:book_destroy(Main) catch _:_ -> ok end,
+        try
+            leveled_bookie:book_destroy(Main)
+        catch
+            _:_ -> ok
+        end,
         _ = testutil:reset_filestructure(RelativeRoot)
     end.
 
@@ -1592,8 +2084,9 @@ update_snapshot_fixture(Main, Schema, Revision) ->
         Schema,
         Key,
         #{
-            body => <<"alpha lease revision ",
-                (integer_to_binary(Revision))/binary>>,
+            body =>
+                <<"alpha lease revision ",
+                    (integer_to_binary(Revision))/binary>>,
             title => Key
         },
         Manifest
@@ -1622,21 +2115,23 @@ identity_group(GroupId, ChunkId, SourceId, Key, Candidate) ->
     #{
         group_id => GroupId,
         group_key => {group, [Key, [SourceId], nil]},
-        chunks => [#{
-            chunk_id => ChunkId,
-            group_id => GroupId,
-            source_id => SourceId,
-            doc_key => Key,
-            doc_version => <<SourceId:64/unsigned-big>>,
-            doc_length => 12,
-            candidate_record => Candidate,
-            hit_record => #{
+        chunks => [
+            #{
+                chunk_id => ChunkId,
+                group_id => GroupId,
+                source_id => SourceId,
                 doc_key => Key,
-                record => #{title => maps:get(title, Candidate)},
-                text_blocks => [{0, 0, 0}],
-                text_bytes => 12
+                doc_version => <<SourceId:64/unsigned-big>>,
+                doc_length => 12,
+                candidate_record => Candidate,
+                hit_record => #{
+                    doc_key => Key,
+                    record => #{title => maps:get(title, Candidate)},
+                    text_blocks => [{0, 0, 0}],
+                    text_bytes => 12
+                }
             }
-        }]
+        ]
     }.
 
 production_page_only_opts(Limit) ->
@@ -1675,8 +2170,12 @@ seam_schema(Index) ->
             #{name => tenant, path => [tenant], mode => verbatim}
         ],
         text_field => [content],
-        hit_fields => [udi, path, ipath_vec, tenant, content_version, chunk_key],
-        candidate_fields => [udi, path, ipath_vec, tenant, content_version, chunk_key],
+        hit_fields => [
+            udi, path, ipath_vec, tenant, content_version, chunk_key
+        ],
+        candidate_fields => [
+            udi, path, ipath_vec, tenant, content_version, chunk_key
+        ],
         candidate_filter_fields => [#{column => tenant, field => tenant}],
         candidate_group_fields => [udi, path, ipath_vec, content_version],
         candidate_version_field => content_version
@@ -1718,7 +2217,9 @@ trace_call_counts(Fun, MFAs) ->
         {Result, Counts}
     after
         lists:foreach(
-            fun(MFA) -> erlang:trace_pattern(MFA, false, [local, call_count]) end,
+            fun(MFA) ->
+                erlang:trace_pattern(MFA, false, [local, call_count])
+            end,
             MFAs
         )
     end.
@@ -1741,7 +2242,10 @@ tokenizer_parity_inputs() ->
 tree_bytes(Path) ->
     case file:list_dir(Path) of
         {ok, Entries} ->
-            lists:sum([tree_bytes(filename:join(Path, Entry)) || Entry <- Entries]);
+            lists:sum([
+                tree_bytes(filename:join(Path, Entry))
+             || Entry <- Entries
+            ]);
         {error, enotdir} ->
             filelib:file_size(Path)
     end.
@@ -1758,10 +2262,19 @@ with_bookies(Fun) ->
     ),
     {ok, Main} = leveled_bookie:book_start(start_opts(MainRoot)),
     {ok, Identity} = leveled_bookie:book_start(start_opts(IdentityRoot)),
-    try Fun(Main, Identity)
+    try
+        Fun(Main, Identity)
     after
-        try leveled_bookie:book_destroy(Main) catch _:_ -> ok end,
-        try leveled_bookie:book_destroy(Identity) catch _:_ -> ok end
+        try
+            leveled_bookie:book_destroy(Main)
+        catch
+            _:_ -> ok
+        end,
+        try
+            leveled_bookie:book_destroy(Identity)
+        catch
+            _:_ -> ok
+        end
     end.
 
 start_opts(Root) ->

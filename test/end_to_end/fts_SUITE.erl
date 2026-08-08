@@ -804,14 +804,20 @@ full_store_build_memory_equivalence(_Config) ->
 %% threads/MIME bodies, and a small number of multi-megabyte members. This gate
 %% keeps that shape while using a deterministic shared mail vocabulary: 15,000
 %% documents, 3,072 tokens in the common case, 6,144 every fifth message,
-%% 12,288 every fiftieth, and one roughly 2 MiB member. Unique envelope terms
-%% keep cardinality proportional to document count while the shared vocabulary
-%% exercises the hot posting rows that dominate a real mailbox generation.
+%% 12,288 every fiftieth, and one roughly 2 MiB member. A small set of unique
+%% envelope terms per message keeps cardinality proportional to document count
+%% without turning a realistic RFC822 envelope into a synthetic term-cardinality
+%% stress test. The shared vocabulary exercises the hot posting rows that
+%% dominate a real mailbox generation.
 live_mail_member_build_memory(_Config) ->
     ct:timetrap({minutes, 120}),
     Suffix = integer_to_list(erlang:unique_integer([positive])),
+    ScratchRoot = case os:getenv("TMPDIR") of
+        false -> "/tmp";
+        Path -> Path
+    end,
     Root = testutil:reset_filestructure(
-        "test/test_fts_live_mail_member_memory_" ++ Suffix
+        filename:join(ScratchRoot, "test_fts_live_mail_member_memory_" ++ Suffix)
     ),
     %% Match the live VFS content store rather than Leveled's standalone
     %% throughput defaults. The small penciller cache is itself part of the
@@ -1054,7 +1060,7 @@ live_mail_member_body(DocumentNumber, MailNoise) ->
     EnvelopeTerms = [
         <<"message", (integer_to_binary(DocumentNumber))/binary,
             "field", (integer_to_binary(Position))/binary>>
-     || Position <- lists:seq(1, 24)
+     || Position <- lists:seq(1, 8)
     ],
     iolist_to_binary([
         <<"Received: from mail.example.test by outlook.example.test\r\n",
