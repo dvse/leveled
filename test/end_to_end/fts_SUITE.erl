@@ -18,6 +18,7 @@
     consolidation_write_race/1,
     sqlite_oracle_corpus/1,
     parallel_heap_kill_no_hang/1,
+    parallel_worker_timeout_releases_collector/1,
     outer_heap_kill_reports_role/1,
     propagated_kill_reports_inner_role/1,
     coarse_shard_partition_reproduces/1,
@@ -38,6 +39,7 @@ all() ->
         consolidation_write_race,
         sqlite_oracle_corpus,
         parallel_heap_kill_no_hang,
+        parallel_worker_timeout_releases_collector,
         outer_heap_kill_reports_role,
         propagated_kill_reports_inner_role,
         coarse_shard_partition_reproduces,
@@ -57,12 +59,24 @@ end_per_suite(Config) ->
 search_shapes(_Config) ->
     with_bookie(fun(Bookie, _Root) ->
         Schema = schema(<<"shapes">>, [title, body], #{}),
-        ok = put_doc(Bookie, Schema, <<"1">>,
-            #{title => <<"Alpha">>, body => <<"quick brown fox">>}),
-        ok = put_doc(Bookie, Schema, <<"2">>,
-            #{title => <<"Beta">>, body => <<"quick blue hare">>}),
-        ok = put_doc(Bookie, Schema, <<"3">>,
-            #{title => <<"Gamma">>, body => <<"slow brown bear">>}),
+        ok = put_doc(
+            Bookie,
+            Schema,
+            <<"1">>,
+            #{title => <<"Alpha">>, body => <<"quick brown fox">>}
+        ),
+        ok = put_doc(
+            Bookie,
+            Schema,
+            <<"2">>,
+            #{title => <<"Beta">>, body => <<"quick blue hare">>}
+        ),
+        ok = put_doc(
+            Bookie,
+            Schema,
+            <<"3">>,
+            #{title => <<"Gamma">>, body => <<"slow brown bear">>}
+        ),
         [{<<"1">>, 1}, {<<"2">>, 1}] =
             exact_hits(search(Bookie, Schema, <<"quick">>, #{})),
         [{<<"1">>, 2}] =
@@ -81,8 +95,10 @@ search_shapes(_Config) ->
         [{<<"2">>, 1}] =
             exact_hits(search(Bookie, Schema, <<"title:beta">>, #{})),
         [] = exact_hits(search(Bookie, Schema, <<"title:quick">>, #{})),
-        [Hit] = search(Bookie, Schema, <<"quick">>, #{return_positions => true,
-            limit => 1}),
+        [Hit] = search(Bookie, Schema, <<"quick">>, #{
+            return_positions => true,
+            limit => 1
+        }),
         true = maps:is_key(positions, Hit)
     end).
 
@@ -118,13 +134,17 @@ tail_fold_interleaving(_Config) ->
         Gate = atomics:new(1, []),
         Hook = fun({_Shard, _Tail}) ->
             case atomics:exchange(Gate, 1, 1) of
-                0 -> put_doc(Bookie, Schema, <<"racer">>, #{body => <<"common">>});
-                1 -> ok
+                0 ->
+                    put_doc(Bookie, Schema, <<"racer">>, #{body => <<"common">>});
+                1 ->
+                    ok
             end
         end,
-        [{<<"seed">>, 1}] = exact_hits(search(
-            Bookie, Schema, <<"common">>, #{tail_fold_hook => Hook}
-        )),
+        [{<<"seed">>, 1}] = exact_hits(
+            search(
+                Bookie, Schema, <<"common">>, #{tail_fold_hook => Hook}
+            )
+        ),
         %% The forced interleaving returns the exact pre-write snapshot; the
         %% next store-direct query sees the committed tail.
         [{<<"racer">>, 1}, {<<"seed">>, 1}] = exact_hits(
@@ -157,8 +177,14 @@ cross_shard_version_skew(_Config) ->
                     ok
             end
         end,
-        [] = exact_hits(search(Bookie, Schema, <<"aa AND zz">>,
-            #{tail_fold_hook => Hook})),
+        [] = exact_hits(
+            search(
+                Bookie,
+                Schema,
+                <<"aa AND zz">>,
+                #{tail_fold_hook => Hook}
+            )
+        ),
         %% post-update state is v2 exactly: zz matches, aa does not
         [{<<"1">>, 1}] = exact_hits(
             search(Bookie, Schema, <<"zz">>, #{})
@@ -173,16 +199,27 @@ consolidation_restart_equivalence(_Config) ->
     Schema = schema(<<"consolidate">>, [body], #{}),
     ok = put_doc(Bookie1, Schema, <<"1">>, #{body => <<"alpha alpha beta">>}),
     ok = put_doc(Bookie1, Schema, <<"2">>, #{body => <<"alpha beta beta">>}),
-    Before = search(Bookie1, Schema, <<"alpha OR beta">>, #{rank => bm25,
-        return_positions => true}),
+    Before = search(Bookie1, Schema, <<"alpha OR beta">>, #{
+        rank => bm25,
+        return_positions => true
+    }),
+    BeforeProjection = search_projection(Before),
     [{<<"1">>, 3}, {<<"2">>, 3}] = exact_hits(Before),
     {ok, #{skipped := []}} = leveled_fts:consolidate(Bookie1, Schema, #{}),
-    Before = search(Bookie1, Schema, <<"alpha OR beta">>, #{rank => bm25,
-        return_positions => true}),
+    BeforeProjection = search_projection(
+        search(Bookie1, Schema, <<"alpha OR beta">>, #{
+            rank => bm25,
+            return_positions => true
+        })
+    ),
     ok = leveled_bookie:book_close(Bookie1),
     {ok, Bookie2} = leveled_bookie:book_start(Opts),
-    Before = search(Bookie2, Schema, <<"alpha OR beta">>, #{rank => bm25,
-        return_positions => true}),
+    BeforeProjection = search_projection(
+        search(Bookie2, Schema, <<"alpha OR beta">>, #{
+            rank => bm25,
+            return_positions => true
+        })
+    ),
     {ok, Manifest} = leveled_bookie:book_headonly(
         Bookie2, <<"consolidate">>, <<"doc">>, <<"1">>
     ),
@@ -193,10 +230,13 @@ consolidation_restart_equivalence(_Config) ->
     Updated = search(Bookie2, Schema, <<"gamma OR beta">>, #{
         rank => bm25, return_positions => true
     }),
+    UpdatedProjection = search_projection(Updated),
     {ok, #{skipped := []}} = leveled_fts:consolidate(Bookie2, Schema, #{}),
-    Updated = search(Bookie2, Schema, <<"gamma OR beta">>, #{
-        rank => bm25, return_positions => true
-    }),
+    UpdatedProjection = search_projection(
+        search(Bookie2, Schema, <<"gamma OR beta">>, #{
+            rank => bm25, return_positions => true
+        })
+    ),
     ok = leveled_bookie:book_destroy(Bookie2).
 
 consolidation_kill_restart_recovery(_Config) ->
@@ -223,6 +263,7 @@ consolidation_kill_restart_recovery(_Config) ->
     Expected = search(Bookie1, Schema, <<"alpha OR beta">>, #{
         rank => bm25, return_positions => true
     }),
+    ExpectedProjection = search_projection(Expected),
     Parent = self(),
     {Builder, Monitor} = spawn_monitor(fun() ->
         leveled_fts:consolidate(
@@ -232,7 +273,9 @@ consolidation_kill_restart_recovery(_Config) ->
                 reclaim => false,
                 before_consolidate_commit => fun(_EpochConditions) ->
                     Parent ! {consolidation_precommit, self()},
-                    receive continue -> ok end
+                    receive
+                        continue -> ok
+                    end
                 end
             }
         )
@@ -249,21 +292,27 @@ consolidation_kill_restart_recovery(_Config) ->
     after 5000 ->
         ct:fail(consolidation_kill_not_observed)
     end,
-    Expected = search(Bookie1, Schema, <<"alpha OR beta">>, #{
-        rank => bm25, return_positions => true
-    }),
+    ExpectedProjection = search_projection(
+        search(Bookie1, Schema, <<"alpha OR beta">>, #{
+            rank => bm25, return_positions => true
+        })
+    ),
     ok = leveled_bookie:book_close(Bookie1),
     {ok, Bookie2} = leveled_bookie:book_start(Opts),
     try
-        Expected = search(Bookie2, Schema, <<"alpha OR beta">>, #{
-            rank => bm25, return_positions => true
-        }),
+        ExpectedProjection = search_projection(
+            search(Bookie2, Schema, <<"alpha OR beta">>, #{
+                rank => bm25, return_positions => true
+            })
+        ),
         {ok, #{skipped := []}} = leveled_fts:consolidate(
             Bookie2, Schema, #{reclaim => false}
         ),
-        Expected = search(Bookie2, Schema, <<"alpha OR beta">>, #{
-            rank => bm25, return_positions => true
-        })
+        ExpectedProjection = search_projection(
+            search(Bookie2, Schema, <<"alpha OR beta">>, #{
+                rank => bm25, return_positions => true
+            })
+        )
     after
         ok = leveled_bookie:book_destroy(Bookie2)
     end.
@@ -275,13 +324,18 @@ consolidation_write_race(_Config) ->
         Gate = atomics:new(1, []),
         Hook = fun({_S, _Conditions}) ->
             case atomics:exchange(Gate, 1, 1) of
-                0 -> put_doc(Bookie, Schema, <<"late">>, #{body => <<"apple">>});
-                1 -> ok
+                0 ->
+                    put_doc(Bookie, Schema, <<"late">>, #{body => <<"apple">>});
+                1 ->
+                    ok
             end
         end,
         {ok, #{skipped := Skipped, consolidated := []}} =
-            leveled_fts:consolidate(Bookie, Schema,
-                #{before_consolidate_commit => Hook}),
+            leveled_fts:consolidate(
+                Bookie,
+                Schema,
+                #{before_consolidate_commit => Hook}
+            ),
         true = Skipped =:= lists:seq(0, maps:get(shards, Schema) - 1),
         [{<<"late">>, 1}, {<<"seed">>, 1}] = exact_hits(
             search(Bookie, Schema, <<"alpha OR apple">>, #{})
@@ -289,10 +343,15 @@ consolidation_write_race(_Config) ->
     end).
 
 sqlite_oracle_corpus(_Config) ->
-    LibDir = code:lib_dir(leveled),
-    Oracle = filename:absname(filename:join(
-        [LibDir, "..", "..", "..", "..", "test", "fts_sqlite_oracle_corpus.eterm"]
-    )),
+    Oracle = filename:absname(
+        filename:join(
+            [
+                filename:dirname(?FILE),
+                "..",
+                "fts_sqlite_oracle_corpus.eterm"
+            ]
+        )
+    ),
     {ok, [Cases]} = file:consult(Oracle),
     with_bookie(fun(Bookie, _Root) ->
         lists:foreach(fun(Case) -> oracle_case(Bookie, Case) end, Cases)
@@ -342,6 +401,62 @@ parallel_heap_kill_no_hang(_Config) ->
     after 0 ->
         ok
     end.
+
+parallel_worker_timeout_releases_collector(_Config) ->
+    Parent = self(),
+    {Pid, Monitor} = spawn_monitor(fun() ->
+        try
+            leveled_fts:fts2_build_parallel_for_test(
+                workspace_worker,
+                [hang],
+                1,
+                fun(_Item) ->
+                    receive
+                        never -> 1
+                    end
+                end,
+                infinity,
+                Parent,
+                50
+            )
+        of
+            Result -> exit({unexpected_parallel_result, Result})
+        catch
+            error:{fts2_parallel_worker_timeout, workspace_worker, 50} ->
+                exit(worker_timeout_surfaced);
+            Class:Reason ->
+                exit({unexpected_parallel_error, Class, Reason})
+        end
+    end),
+    receive
+        {'DOWN', Monitor, process, Pid, worker_timeout_surfaced} ->
+            ok;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            ct:fail({unexpected_worker_timeout_result, Reason})
+    after 5000 ->
+        exit(Pid, kill),
+        ct:fail(parallel_worker_timeout_timed_out)
+    end,
+    receive
+        {fts2_timeout_report, workspace_worker, 50} -> ok
+    after 1000 ->
+        ct:fail(worker_timeout_report_missing)
+    end,
+    receive
+        {fts2_timeout_report, workspace_worker, 50} ->
+            ct:fail(duplicate_worker_timeout_report)
+    after 0 ->
+        ok
+    end,
+    2 = leveled_fts:fts2_build_parallel_for_test(
+        workspace_worker,
+        [next],
+        1,
+        fun(_Item) -> 2 end,
+        infinity,
+        Parent,
+        1000
+    ).
 
 outer_heap_kill_reports_role(_Config) ->
     try
@@ -502,14 +617,16 @@ coarse_shard_partition_reproduces(_Config) ->
         WordSize = erlang:system_info(wordsize),
         CoarseBoundWords = ?COARSE_SHARD_BOUND_BYTES div WordSize,
         Outcome =
-            case leveled_fts:fts2_consolidate_with_shards_for_test(
-                Coarse,
-                Schema,
-                #{reclaim => false},
-                CoarseBoundWords,
-                ?COARSE_SHARDS,
-                Sampler
-            ) of
+            case
+                leveled_fts:fts2_consolidate_with_shards_for_test(
+                    Coarse,
+                    Schema,
+                    #{reclaim => false},
+                    CoarseBoundWords,
+                    ?COARSE_SHARDS,
+                    Sampler
+                )
+            of
                 {error, {fts2_parallel_worker_lost, LostRole, killed}} ->
                     {killed, LostRole};
                 Result ->
@@ -536,7 +653,10 @@ coarse_shard_partition_reproduces(_Config) ->
         FinePeaks = fts_build_await_peaks(),
         ct:pal(
             "production-partition build against a ~B-byte bound; peaks ~p",
-            [?FINE_SHARD_BOUND_BYTES, fts_build_peak_report(FinePeaks, WordSize)]
+            [
+                ?FINE_SHARD_BOUND_BYTES,
+                fts_build_peak_report(FinePeaks, WordSize)
+            ]
         ),
         {ok, Index} = leveled_fts:fts2_available(Fine, Schema),
         ct:pal(
@@ -550,7 +670,9 @@ coarse_shard_partition_reproduces(_Config) ->
                 byte_size(LargeBody)
             ]
         ),
-        {_FineRole, FineHeapWords, _FineMemory} = fts_build_inner_peak(FinePeaks),
+        {_FineRole, FineHeapWords, _FineMemory} = fts_build_inner_peak(
+            FinePeaks
+        ),
         true = FineHeapWords < FineBoundWords,
         case Outcome of
             {killed, term_shard_worker} ->
@@ -592,13 +714,15 @@ fts_build_await_peaks() ->
 fts_build_peak_report(Peaks, WordSize) ->
     RolePeaks = maps:fold(
         fun(Role0, Peak = {HeapWords, _MemoryBytes, _Function}, Acc) ->
-            Role = case Role0 of
-                {ebloom_worker, _HashCount} -> ebloom_worker;
-                _ -> Role0
-            end,
+            Role =
+                case Role0 of
+                    {ebloom_worker, _HashCount} -> ebloom_worker;
+                    _ -> Role0
+                end,
             case maps:get(Role, Acc, {0, 0, undefined}) of
-                {ExistingHeap, _ExistingMemory, _ExistingFunction}
-                    when ExistingHeap >= HeapWords ->
+                {ExistingHeap, _ExistingMemory, _ExistingFunction} when
+                    ExistingHeap >= HeapWords
+                ->
                     Acc;
                 _ ->
                     Acc#{Role => Peak}
@@ -646,13 +770,15 @@ full_store_build_memory_equivalence(_Config) ->
                 Sampler
             )
         of
-            LegacyResult -> ct:fail({legacy_outer_did_not_reproduce, LegacyResult})
+            LegacyResult ->
+                ct:fail({legacy_outer_did_not_reproduce, LegacyResult})
         catch
             error:{fts2_parallel_worker_lost, outer_build, killed} -> ok
         end,
         Sampler ! {reports, self()},
         receive
-            {fts_build_reports, [{outer_build, killed}]} -> ok;
+            {fts_build_reports, [{outer_build, killed}]} ->
+                ok;
             {fts_build_reports, LegacyReports} ->
                 ct:fail({legacy_outer_report_mismatch, LegacyReports})
         after 5000 ->
@@ -812,12 +938,15 @@ full_store_build_memory_equivalence(_Config) ->
 live_mail_member_build_memory(_Config) ->
     ct:timetrap({minutes, 120}),
     Suffix = integer_to_list(erlang:unique_integer([positive])),
-    ScratchRoot = case os:getenv("TMPDIR") of
-        false -> "/tmp";
-        Path -> Path
-    end,
+    ScratchRoot =
+        case os:getenv("TMPDIR") of
+            false -> "/tmp";
+            Path -> Path
+        end,
     Root = testutil:reset_filestructure(
-        filename:join(ScratchRoot, "test_fts_live_mail_member_memory_" ++ Suffix)
+        filename:join(
+            ScratchRoot, "test_fts_live_mail_member_memory_" ++ Suffix
+        )
     ),
     %% Match the live VFS content store rather than Leveled's standalone
     %% throughput defaults. The small penciller cache is itself part of the
@@ -865,9 +994,13 @@ live_mail_member_build_memory(_Config) ->
         lists:foreach(
             fun({Role, HeapWords, _HeapBytes, _MemoryBytes, _Function}) ->
                 case HeapWords < BoundWords of
-                    true -> ok;
-                    false -> ct:fail({live_mail_member_role_over_bound,
-                        Role, HeapWords, BoundWords})
+                    true ->
+                        ok;
+                    false ->
+                        ct:fail(
+                            {live_mail_member_role_over_bound, Role, HeapWords,
+                                BoundWords}
+                        )
                 end
             end,
             PeakReport
@@ -876,9 +1009,16 @@ live_mail_member_build_memory(_Config) ->
             fun(Role) ->
                 true = maps:is_key(Role, Peaks)
             end,
-            [outer_build, workspace_worker, identity_worker,
-                term_shard_worker, bigram_shard_worker, bookie, penciller,
-                clerk]
+            [
+                outer_build,
+                workspace_worker,
+                identity_worker,
+                term_shard_worker,
+                bigram_shard_worker,
+                bookie,
+                penciller,
+                clerk
+            ]
         ),
         true = lists:any(
             fun
@@ -910,8 +1050,10 @@ live_mail_member_build_memory(_Config) ->
     after
         ok = leveled_ebloom:set_test_observer(undefined),
         Sampler ! stop,
-        try leveled_bookie:book_destroy(Bookie)
-        catch _:_ -> ok
+        try
+            leveled_bookie:book_destroy(Bookie)
+        catch
+            _:_ -> ok
         end
     end.
 
@@ -965,7 +1107,9 @@ fts_build_sampler_add(Pid, Role, Active, Peaks, Reports) ->
 fts_build_sample_workers(Active, Peaks) ->
     maps:fold(
         fun(Pid, {_Monitor, Role}, Acc) ->
-            case process_info(Pid, [total_heap_size, memory, current_function]) of
+            case
+                process_info(Pid, [total_heap_size, memory, current_function])
+            of
                 undefined ->
                     Acc;
                 Info ->
@@ -975,14 +1119,16 @@ fts_build_sample_workers(Active, Peaks) ->
                     Heap = proplists:get_value(total_heap_size, Info),
                     Memory = proplists:get_value(memory, Info),
                     Function = proplists:get_value(current_function, Info),
-                    Acc#{Role => {
-                        erlang:max(Heap, HeapPeak),
-                        erlang:max(Memory, MemoryPeak),
-                        case Heap > HeapPeak of
-                            true -> Function;
-                            false -> PeakFunction
-                        end
-                    }}
+                    Acc#{
+                        Role => {
+                            erlang:max(Heap, HeapPeak),
+                            erlang:max(Memory, MemoryPeak),
+                            case Heap > HeapPeak of
+                                true -> Function;
+                                false -> PeakFunction
+                            end
+                        }
+                    }
             end
         end,
         Peaks,
@@ -991,9 +1137,11 @@ fts_build_sample_workers(Active, Peaks) ->
 
 fts_build_inner_peak(Peaks) ->
     lists:foldl(
-        fun({Role, {HeapWords, MemoryBytes, _Function}},
-            {_BestRole, BestHeap, _BestMemory}
-            = Best) ->
+        fun(
+            {Role, {HeapWords, MemoryBytes, _Function}},
+            {_BestRole, BestHeap, _BestMemory} =
+                Best
+        ) ->
             case Role =/= outer_build andalso HeapWords > BestHeap of
                 true -> {Role, HeapWords, MemoryBytes};
                 false -> Best
@@ -1037,9 +1185,11 @@ live_mail_member_put_corpus(Bookie, Schema, MailNoise) ->
                     {ok, DocumentSpecs} = leveled_fts:derive(
                         Schema,
                         Key,
-                        #{body => live_mail_member_body(
-                            DocumentNumber, MailNoise
-                        )}
+                        #{
+                            body => live_mail_member_body(
+                                DocumentNumber, MailNoise
+                            )
+                        }
                     ),
                     DocumentSpecs
                 end
@@ -1051,15 +1201,16 @@ live_mail_member_put_corpus(Bookie, Schema, MailNoise) ->
     ).
 
 live_mail_member_body(DocumentNumber, MailNoise) ->
-    NoiseCopies = case DocumentNumber of
-        1 -> 128;
-        _ when DocumentNumber rem 50 =:= 0 -> 4;
-        _ when DocumentNumber rem 5 =:= 0 -> 2;
-        _ -> 1
-    end,
+    NoiseCopies =
+        case DocumentNumber of
+            1 -> 128;
+            _ when DocumentNumber rem 50 =:= 0 -> 4;
+            _ when DocumentNumber rem 5 =:= 0 -> 2;
+            _ -> 1
+        end,
     EnvelopeTerms = [
-        <<"message", (integer_to_binary(DocumentNumber))/binary,
-            "field", (integer_to_binary(Position))/binary>>
+        <<"message", (integer_to_binary(DocumentNumber))/binary, "field",
+            (integer_to_binary(Position))/binary>>
      || Position <- lists:seq(1, 8)
     ],
     iolist_to_binary([
@@ -1070,8 +1221,10 @@ live_mail_member_body(DocumentNumber, MailNoise) ->
         integer_to_binary(DocumentNumber),
         <<"@example.test\r\nContent-Type: message/rfc822\r\n\r\n">>,
         lists:join(<<" ">>, EnvelopeTerms),
-        <<"\r\nPlease review the attached correspondence and prior quoted "
-            "thread. Regards accounts legal property trust.\r\n">>,
+        <<
+            "\r\nPlease review the attached correspondence and prior quoted "
+            "thread. Regards accounts legal property trust.\r\n"
+        >>,
         lists:duplicate(NoiseCopies, [<<" ">>, MailNoise])
     ]).
 
@@ -1082,9 +1235,7 @@ live_mail_member_body(DocumentNumber, MailNoise) ->
 %% across build shards, so they concentrate in one shard worker.
 full_store_document_body(DocumentNumber) ->
     Terms = [
-        <<"term",
-            (integer_to_binary(DocumentNumber))/binary,
-            "p",
+        <<"term", (integer_to_binary(DocumentNumber))/binary, "p",
             (integer_to_binary(Position))/binary>>
      || Position <- lists:seq(1, 40)
     ],
@@ -1096,7 +1247,10 @@ full_store_document_body(DocumentNumber) ->
     ]).
 
 zipfian_tokens(Seed, Count) ->
-    lists:join(<<" ">>, [zipfian_token(Seed, Index) || Index <- lists:seq(1, Count)]).
+    lists:join(<<" ">>, [
+        zipfian_token(Seed, Index)
+     || Index <- lists:seq(1, Count)
+    ]).
 
 zipfian_token(Seed, Index) ->
     Uniform = erlang:phash2({Seed, Index}, 1000000) / 1000000,
@@ -1116,25 +1270,36 @@ chunked(Items, Size, Acc) ->
     {Chunk, Rest} = lists:split(Count, Items),
     chunked(Rest, Size, [Chunk | Acc]).
 
-oracle_case(Bookie, #{id := Id, tokenizer_opts := TokOpts,
-        doc := Doc, queries := Queries}) ->
+oracle_case(Bookie, #{
+    id := Id,
+    tokenizer_opts := TokOpts,
+    doc := Doc,
+    queries := Queries
+}) ->
     Index = atom_to_binary(Id, utf8),
     Schema = schema(Index, [body], TokOpts),
     ok = put_doc(Bookie, Schema, <<"doc">>, #{body => Doc}),
-    lists:foreach(fun(#{q := Query, hits := Expected}) ->
-        Quoted = <<"\"", Query/binary, "\"">>,
-        {ok, #{hits := Hits}} = leveled_fts:search(
-            Bookie, Schema, Quoted, #{return_count => true}
-        ),
-        Actual = [
-            {maps:get(key, Hit), maps:get(match_count, Hit)}
-         || Hit <- Hits
-        ],
-        case Actual =:= Expected of
-            true -> ok;
-            false -> ct:fail({sqlite_oracle_mismatch, Id, Query, Expected, Actual})
-        end
-    end, Queries).
+    lists:foreach(
+        fun(#{q := Query, hits := Expected}) ->
+            Quoted = <<"\"", Query/binary, "\"">>,
+            {ok, #{hits := Hits}} = leveled_fts:search(
+                Bookie, Schema, Quoted, #{return_count => true}
+            ),
+            Actual = [
+                {maps:get(key, Hit), maps:get(match_count, Hit)}
+             || Hit <- Hits
+            ],
+            case Actual =:= Expected of
+                true ->
+                    ok;
+                false ->
+                    ct:fail(
+                        {sqlite_oracle_mismatch, Id, Query, Expected, Actual}
+                    )
+            end
+        end,
+        Queries
+    ).
 
 schema(Index, Columns, Opts) ->
     {ok, Schema} = leveled_fts:schema(Opts#{index => Index, columns => Columns}),
@@ -1151,13 +1316,38 @@ search(Bookie, Schema, Query, Opts) ->
 exact_hits(Hits) ->
     [{maps:get(key, Hit), maps:get(match_count, Hit)} || Hit <- Hits].
 
+search_projection(#{hits := Hits} = Result) ->
+    (maps:with([count, count_estimate, truncated], Result))#{
+        hits => search_projection(Hits)
+    };
+search_projection(Hits) when is_list(Hits) ->
+    [
+        maps:with(
+            [
+                key,
+                candidate_key,
+                candidate_version,
+                doc_length,
+                match_count,
+                positions,
+                score,
+                terms
+            ],
+            Hit
+        )
+     || Hit <- Hits
+    ].
+
 with_bookie(Fun) ->
     Root = testutil:reset_filestructure(),
     {ok, Bookie} = leveled_bookie:book_start(start_opts(Root)),
-    try Fun(Bookie, Root)
+    try
+        Fun(Bookie, Root)
     after
-        try leveled_bookie:book_destroy(Bookie)
-        catch _:_ -> ok
+        try
+            leveled_bookie:book_destroy(Bookie)
+        catch
+            _:_ -> ok
         end
     end.
 

@@ -48,6 +48,7 @@
     fts2_build_parallel_for_test/4,
     fts2_build_parallel_for_test/5,
     fts2_build_parallel_for_test/6,
+    fts2_build_parallel_for_test/7,
     fts2_outer_bound_for_test/3,
     fts2_legacy_outer_assemble_for_test/2,
     fts2_consolidate_with_heap_for_test/4,
@@ -99,7 +100,8 @@
 %% Client-library wire format capacities.  These are deliberately exported by
 %% capacities/0 and consumed by schema/1.  Every fixed-width writer below also
 %% checks the same bound immediately before constructing a bit syntax.
--define(MANIFEST_VERSION, 5).
+-define(PREVIOUS_MANIFEST_VERSION, 5).
+-define(MANIFEST_VERSION, 6).
 -define(LEGACY_TEXT_BLOCK_VERSION, 2).
 -define(PREVIOUS_TEXT_BLOCK_VERSION, 3).
 -define(VARINT_TEXT_BLOCK_VERSION, 4).
@@ -282,6 +284,9 @@ client_derive(
         DocKey, Decoded, Schema, BlockDirectory, byte_size(Text)
     ),
     CandidateRecord = client_candidate_record(Decoded, Schema),
+    GroupVersion = fts2_build_group_version(
+        maps:get(candidate_version_field, Schema, undefined), CandidateRecord
+    ),
     ResidentCandidate = CandidateRecord#{
         '$fts_text_blocks' => BlockDirectory,
         '$fts_text_bytes' => byte_size(Text)
@@ -309,12 +314,16 @@ client_derive(
             8
         ),
     DocId = client_doc_id(DocKey, DocVersion),
+    ExactGroupKey = fts2_build_group_key(
+        maps:get(candidate_group_fields, Schema, []), DocId, CandidateRecord
+    ),
     RetiredIds =
         case OldManifest of
             #{doc_id := DocId} -> [];
             #{doc_id := OldDocId} -> [OldDocId];
             _ -> []
         end,
+    RetiredGroups = client_retired_groups(OldManifest),
     Manifest =
         client_encode_manifest(
             DocVersion,
@@ -323,7 +332,11 @@ client_derive(
             DocLength,
             BaseLength,
             Fingerprint,
-            length(Blocks)
+            length(Blocks),
+            ExactGroupKey,
+            GroupVersion,
+            RetiredIds,
+            RetiredGroups
         ),
     BlockSpecs = client_text_block_specs(Bucket, DocId, Blocks, BlockOffsets),
     WriteShards = client_write_shards(Touched),
@@ -345,7 +358,10 @@ client_derive(
                         base_length => BaseLength,
                         posting => client_full_posting(ByShard),
                         candidate_record => ResidentCandidate,
-                        hit_record => HitRecord
+                        hit_record => HitRecord,
+                        group_key => ExactGroupKey,
+                        group_version => GroupVersion,
+                        retired_groups => RetiredGroups
                     }
                 ),
                 client_fts2_state_dirty_spec(Bucket),
@@ -356,11 +372,12 @@ client_derive(
 client_derive(_Schema, DocKey, _Object, _BaseLength, _OldManifest) ->
     erlang:error({invalid_fts_derive, DocKey}).
 
--spec remove(map(), binary(), binary() | map()) ->
+-spec remove(map(), binary(), binary() | map() | tuple()) ->
     [leveled_codec:object_spec()].
-remove(#{index := Bucket, fingerprint := Fingerprint}, DocKey, Manifest0) when
-    is_binary(DocKey)
-->
+remove(
+    #{index := Bucket, fingerprint := Fingerprint} = Schema, DocKey, Old0
+) when is_binary(DocKey) ->
+    {Manifest0, OldRow} = client_old_input(Old0),
     #{
         version := DocVersion,
         doc_id := DocId,
@@ -371,20 +388,29 @@ remove(#{index := Bucket, fingerprint := Fingerprint}, DocKey, Manifest0) when
         Manifest = client_decode_manifest_value(Manifest0),
     BaseLength = maps:get(base_length, Manifest, none),
     BlockCount = maps:get(block_count, Manifest, 0),
+    GroupDescriptor = client_old_group_descriptor(
+        Schema, DocId, Manifest, OldRow
+    ),
     [
         {remove, Bucket, <<"doc">>, DocKey, <<>>},
         client_fts2_delta_spec(
             Bucket,
             DocId,
-            #{
-                status => remove,
-                source_id => DocId,
-                retired_ids => [],
-                doc_key => DocKey,
-                doc_version => DocVersion,
-                doc_length => DocLength,
-                base_length => BaseLength
-            }
+            maps:merge(
+                #{
+                    status => remove,
+                    source_id => DocId,
+                    retired_ids => maps:get(retired_ids, Manifest, []),
+                    doc_key => DocKey,
+                    doc_version => DocVersion,
+                    doc_length => DocLength,
+                    base_length => BaseLength,
+                    retired_groups =>
+                        client_retired_groups(Manifest) ++
+                        maps:get(retired_groups, Manifest, [])
+                },
+                GroupDescriptor
+            )
         ),
         client_fts2_state_dirty_spec(Bucket),
         client_record_tail_dirty_spec(Bucket),
@@ -397,15 +423,72 @@ remove(#{index := Bucket, fingerprint := Fingerprint}, DocKey, Manifest0) when
          || Shard <- client_write_shards(Shards)
         ].
 
--spec update(map(), binary(), term(), binary() | map()) ->
+-spec update(map(), binary(), term(), binary() | map() | tuple()) ->
     {ok, [leveled_codec:object_spec()]}.
-update(Schema, DocKey, Object, OldManifest) ->
+update(Schema, DocKey, Object, OldInput) ->
+    {OldManifest, OldRow} = client_old_input(OldInput),
     Old = client_decode_manifest_value(OldManifest),
+    OldWithGroup = maps:merge(
+        Old,
+        client_old_group_descriptor(
+            Schema, maps:get(doc_id, Old), Old, OldRow
+        )
+    ),
     BaseLength = maps:get(base_length, Old, none),
     {ok, NewSpecs} = client_derive(
-        Schema, DocKey, Object, BaseLength, Old
+        Schema, DocKey, Object, BaseLength, OldWithGroup
     ),
-    {ok, client_dedupe_specs(remove(Schema, DocKey, OldManifest) ++ NewSpecs)}.
+    {ok,
+        client_dedupe_specs(
+            [
+                Spec
+             || Spec <- remove(
+                    Schema, DocKey, {OldManifest, OldRow}
+                ),
+                case Spec of
+                    {add, _Bucket, <<"f2:d">>, _SubKey, _Value} -> false;
+                    _ -> true
+                end
+            ] ++ NewSpecs
+        )}.
+
+client_old_input({Manifest, OldRow}) ->
+    {Manifest, OldRow};
+client_old_input(#{manifest := Manifest, old_row := OldRow}) ->
+    {Manifest, OldRow};
+client_old_input(Manifest) ->
+    {Manifest, undefined}.
+
+client_old_group_descriptor(Schema, SourceId, Manifest, OldRow) ->
+    case maps:find(group_key, Manifest) of
+        {ok, GroupKey} ->
+            #{
+                group_key => GroupKey,
+                group_version => maps:get(group_version, Manifest, 0)
+            };
+        error when OldRow =/= undefined ->
+            Candidate = client_candidate_record(
+                maybe_decode_object(OldRow, Schema), Schema
+            ),
+            #{
+                group_key => fts2_build_group_key(
+                    maps:get(candidate_group_fields, Schema, []),
+                    SourceId,
+                    Candidate
+                ),
+                group_version => fts2_build_group_version(
+                    maps:get(candidate_version_field, Schema, undefined),
+                    Candidate
+                )
+            };
+        error ->
+            #{}
+    end.
+
+client_retired_groups(#{doc_id := SourceId, group_key := GroupKey} = Old) ->
+    [{SourceId, GroupKey, maps:get(group_version, Old, 0)}];
+client_retired_groups(_Old) ->
+    [].
 
 client_dedupe_specs(Specs) ->
     {_Seen, Kept} = lists:foldl(
@@ -910,7 +993,11 @@ client_encode_manifest(
     DocLength,
     BaseLength,
     Fingerprint,
-    BlockCount
+    BlockCount,
+    GroupKey,
+    GroupVersion,
+    RetiredIds,
+    RetiredGroups
 ) when
     byte_size(DocVersion) == 8
 ->
@@ -924,10 +1011,15 @@ client_encode_manifest(
         client_encode_shard_id(Shard)
      || Shard <- Shards
     ]),
+    GroupDescriptor = term_to_binary(
+        {GroupKey, GroupVersion, RetiredIds, RetiredGroups}, [deterministic]
+    ),
+    client_guard(group_descriptor_bytes, byte_size(GroupDescriptor), ?MAX_U32),
     <<?MANIFEST_VERSION:8, DocVersion:8/binary, DocId:64/unsigned-big,
         (length(Shards)):16/unsigned-big, ShardBin/binary,
         DocLength:64/unsigned-big, BaseFlag:8, BaseValue:64/unsigned-big,
-        Fingerprint/binary, BlockCount:32/unsigned-big>>.
+        Fingerprint/binary, BlockCount:32/unsigned-big,
+        (byte_size(GroupDescriptor)):32/unsigned-big, GroupDescriptor/binary>>.
 
 client_decode_manifest_value(
     #{shards := _, doc_length := _, fingerprint := _} = M
@@ -935,6 +1027,34 @@ client_decode_manifest_value(
     M;
 client_decode_manifest_value(
     <<?MANIFEST_VERSION:8, DocVersion:8/binary, DocId:64/unsigned-big,
+        N:16/unsigned-big, Rest/binary>>
+) ->
+    ShardBytes = N * 2,
+    case Rest of
+        <<ShardBin:ShardBytes/binary, DocLength:64/unsigned-big, BaseFlag:8,
+            BaseValue:64/unsigned-big, Fingerprint:32/binary,
+            BlockCount:32/unsigned-big, GroupBytes:32/unsigned-big,
+            GroupDescriptor:GroupBytes/binary>> ->
+            {GroupKey, GroupVersion, RetiredIds, RetiredGroups} =
+                client_decode_manifest_group_descriptor(GroupDescriptor),
+            #{
+                version => DocVersion,
+                doc_id => DocId,
+                shards => [S || <<S:16/unsigned-big>> <= ShardBin],
+                doc_length => DocLength,
+                base_length => client_decode_base_length(BaseFlag, BaseValue),
+                fingerprint => Fingerprint,
+                block_count => BlockCount,
+                group_key => GroupKey,
+                group_version => GroupVersion,
+                retired_ids => RetiredIds,
+                retired_groups => RetiredGroups
+            };
+        _ ->
+            erlang:error({invalid_fts_manifest, Rest})
+    end;
+client_decode_manifest_value(
+    <<?PREVIOUS_MANIFEST_VERSION:8, DocVersion:8/binary, DocId:64/unsigned-big,
         N:16/unsigned-big, Rest/binary>>
 ) ->
     ShardBytes = N * 2,
@@ -956,6 +1076,18 @@ client_decode_manifest_value(
     end;
 client_decode_manifest_value(Bad) ->
     erlang:error({invalid_fts_manifest, Bad}).
+
+client_decode_manifest_group_descriptor(Encoded) ->
+    case binary_to_term(Encoded, [safe]) of
+        {GroupKey, GroupVersion} ->
+            {GroupKey, GroupVersion, [], []};
+        {GroupKey, GroupVersion, RetiredIds, RetiredGroups} when
+            is_list(RetiredIds), is_list(RetiredGroups)
+        ->
+            {GroupKey, GroupVersion, RetiredIds, RetiredGroups};
+        Bad ->
+            erlang:error({invalid_fts_manifest_group_descriptor, Bad})
+    end.
 
 client_encode_shard_id(Shard) ->
     client_guard(shard_id, Shard, ?MAX_U16),
@@ -2428,22 +2560,9 @@ client_search(Bookie, Schema, AST, Opts, Hook) ->
                 {clean, Root} when is_map(Root) ->
                     fts2_search(Bookie, Schema, Root, AST, Opts);
                 {dirty, Root} when is_map(Root) ->
-                    case
-                        {
-                            maps:get(grouping, Opts, grouped),
-                            maps:get(candidate_group_fields, Schema, [])
-                        }
-                    of
-                        {grouped, [_ | _]} ->
-                            {error,
-                                {fts_index_dirty,
-                                    grouped_search_requires_consolidation,
-                                    maps:get(generation, Root)}};
-                        _ExactDirtyMode ->
-                            fts2_search_dirty(
-                                Bookie, Schema, Root, AST, Opts, Hook
-                            )
-                    end;
+                    fts2_search_dirty(
+                        Bookie, Schema, Root, AST, Opts, Hook
+                    );
                 {_State, Root} ->
                     fts2_search_dirty(Bookie, Schema, Root, AST, Opts, Hook)
             end;
@@ -6153,6 +6272,7 @@ fts2_posting_read_dirty(Bookie, Schema, Root, AST, SourceIds, Opts) ->
 -define(WRITE_SLICE, 192).
 -define(WRITE_BARRIER_SLICES, 512).
 -define(FTS2_MAX_BUILD_CONCURRENCY, 1).
+-define(FTS2_BUILD_WORKER_TIMEOUT_MS, 600000).
 %% Term and bigram rows are assembled one shard at a time. A shard's document
 %% fragments are stored SHARD-MAJOR, so a shard worker reads only its own data
 %% in one range fold. Its heap is therefore proportional to its share of the
@@ -6380,9 +6500,13 @@ fts2_build_delta_descriptors(
                                 {SourceId, live, Retired,
                                     fts2_build_descriptor(
                                         Schema, Metadata, delta, undefined
-                                    )};
+                                    ),
+                                    maps:get(doc_key, Delta),
+                                    maps:get(doc_version, Delta)};
                             remove ->
-                                {SourceId, remove, Retired, undefined}
+                                {SourceId, remove, Retired, undefined,
+                                    maps:get(doc_key, Delta),
+                                    maps:get(doc_version, Delta)}
                         end
                     end,
                     RefBatch
@@ -6391,20 +6515,54 @@ fts2_build_delta_descriptors(
         )
      || RefBatch <- fts2_build_chunks(DeltaRefs, 8, [])
     ],
-    {DescriptorMap, RetiredIds} = lists:foldl(
-        fun({SourceId, Status, Retired, Descriptor}, {Descriptors, RetiredAcc}) ->
-            WithoutRetired = maps:without(Retired, Descriptors),
-            NextDescriptors =
-                case Status of
-                    live -> WithoutRetired#{SourceId => Descriptor};
-                    remove -> maps:remove(SourceId, WithoutRetired)
-                end,
-            {NextDescriptors, Retired ++ RetiredAcc}
+    Rows = lists:append(Results),
+    CurrentSources = fts2_build_current_delta_sources(Bookie, Schema, Rows),
+    Descriptors = [
+        Descriptor
+     || {SourceId, live, _Retired, Descriptor, _DocKey, _DocVersion} <- Rows,
+        maps:is_key(SourceId, CurrentSources)
+    ],
+    RetiredIds = lists:append([
+        Retired
+     || {_SourceId, _Status, Retired, _Descriptor, _DocKey, _DocVersion} <-
+            Rows
+    ]),
+    {Descriptors, RetiredIds}.
+
+fts2_build_current_delta_sources(
+    Bookie, #{index := Bucket, fingerprint := Fingerprint}, Rows
+) ->
+    LiveRows = [
+        {SourceId, DocKey, DocVersion}
+     || {SourceId, live, _Retired, _Descriptor, DocKey, DocVersion} <- Rows
+    ],
+    DocKeys = lists:usort([DocKey || {_SourceId, DocKey, _Version} <- LiveRows]),
+    Values =
+        case DocKeys of
+            [] ->
+                [];
+            _ ->
+                leveled_bookie:book_headonly_many(
+                    Bookie,
+                    Bucket,
+                    [{<<"doc">>, DocKey} || DocKey <- DocKeys]
+                )
         end,
-        {#{}, []},
-        lists:append(Results)
-    ),
-    {maps:values(DescriptorMap), RetiredIds}.
+    Manifests = maps:from_list([
+        {DocKey, client_decode_manifest_value(Value)}
+     || {DocKey, {ok, Value}} <- lists:zip(DocKeys, Values)
+    ]),
+    maps:from_keys(
+        [
+            SourceId
+         || {SourceId, DocKey, DocVersion} <- LiveRows,
+            Manifest <- [maps:get(DocKey, Manifests, #{})],
+            maps:get(doc_id, Manifest, undefined) =:= SourceId,
+            maps:get(version, Manifest, undefined) =:= DocVersion,
+            maps:get(fingerprint, Manifest, undefined) =:= Fingerprint
+        ],
+        true
+    ).
 
 fts2_build_existing_descriptors(
     _Bookie,
@@ -8548,6 +8706,23 @@ fts2_build_parallel_for_test(
         end
     end.
 
+fts2_build_parallel_for_test(
+    Role, Items, Concurrency0, Fun, MaxHeapWords, Observer, TimeoutMs
+) when
+    is_integer(TimeoutMs), TimeoutMs > 0
+->
+    PreviousTimeout = put('$fts2_build_worker_timeout_ms', TimeoutMs),
+    try
+        fts2_build_parallel_for_test(
+            Role, Items, Concurrency0, Fun, MaxHeapWords, Observer
+        )
+    after
+        case PreviousTimeout of
+            undefined -> erase('$fts2_build_worker_timeout_ms');
+            _ -> put('$fts2_build_worker_timeout_ms', PreviousTimeout)
+        end
+    end.
+
 fts2_outer_bound_for_test(Fun, MaxHeapWords, Observer) ->
     PreviousObserver = put('$fts2_build_report_observer', Observer),
     try
@@ -8682,6 +8857,12 @@ fts2_build_max_heap_words() ->
         MaxHeapWords -> MaxHeapWords
     end.
 
+fts2_build_worker_timeout_ms() ->
+    case get('$fts2_build_worker_timeout_ms') of
+        undefined -> ?FTS2_BUILD_WORKER_TIMEOUT_MS;
+        TimeoutMs -> TimeoutMs
+    end.
+
 %% The gate builds the same corpus at the superseded shard counts to show the
 %% coarse partition breaching a bound the fine partition clears. Shard counts
 %% are read inside build workers too, so the override travels with the worker.
@@ -8732,9 +8913,25 @@ fts2_build_report_bound(Role, Reason) ->
         {reason, Reason},
         {outcome, worker_lost}
     ]).
+
+fts2_build_report_timeout(Role, TimeoutMs) ->
+    case get('$fts2_build_report_observer') of
+        Observer when is_pid(Observer) ->
+            Observer ! {fts2_timeout_report, Role, TimeoutMs};
+        _ ->
+            ok
+    end,
+    error_logger:error_report([
+        {fts2_build_role, Role},
+        {timeout_ms, TimeoutMs},
+        {outcome, worker_timeout}
+    ]).
 -else.
 fts2_build_max_heap_words() ->
     ?FTS2_MAX_BUILD_HEAP_WORDS.
+
+fts2_build_worker_timeout_ms() ->
+    ?FTS2_BUILD_WORKER_TIMEOUT_MS.
 
 fts2_build_term_shards() ->
     ?FTS2_BUILD_TERM_SHARDS.
@@ -8763,6 +8960,13 @@ fts2_build_report_bound(Role, Reason) ->
         {fts2_build_role, Role},
         {reason, Reason},
         {outcome, worker_lost}
+    ]).
+
+fts2_build_report_timeout(Role, TimeoutMs) ->
+    error_logger:error_report([
+        {fts2_build_role, Role},
+        {timeout_ms, TimeoutMs},
+        {outcome, worker_timeout}
     ]).
 -endif.
 
@@ -8818,7 +9022,19 @@ fts2_build_collect_parallel(
             fts2_build_drain_parallel(maps:remove(Monitor, Monitors)),
             fts2_build_report_bound(WorkerRole, Reason),
             erlang:error({fts2_parallel_worker_lost, WorkerRole, Reason})
+    after fts2_build_worker_timeout_ms() ->
+        TimeoutMs = fts2_build_worker_timeout_ms(),
+        fts2_build_abort_parallel(Monitors),
+        fts2_build_report_timeout(Role, TimeoutMs),
+        erlang:error({fts2_parallel_worker_timeout, Role, TimeoutMs})
     end.
+
+fts2_build_abort_parallel(Monitors) ->
+    maps:foreach(
+        fun(_Monitor, {Pid, _Role}) -> exit(Pid, kill) end,
+        Monitors
+    ),
+    fts2_build_drain_parallel(Monitors).
 
 fts2_build_drain_parallel(Monitors) when map_size(Monitors) =:= 0 ->
     ok;
@@ -10552,6 +10768,7 @@ fts2_codec_row_wire_atoms() ->
         hit_record,
         status,
         retired_ids,
+        retired_groups,
         posting,
         live,
         remove
@@ -10719,6 +10936,9 @@ fts2_delta_overlay_documents(Documents, Deltas) ->
 
 fts2_delta_evaluate(Deltas, Schema, AST) ->
     Documents = fts2_delta_live_documents(Deltas),
+    fts2_delta_evaluate_documents(Documents, Schema, AST).
+
+fts2_delta_evaluate_documents(Documents, Schema, AST) ->
     Dfs = fts2_delta_delta_dfs(Documents, Schema, AST),
     maps:fold(
         fun(SourceId, Document, Acc) ->
@@ -11802,17 +12022,1236 @@ fts2_search_root(Bookie, #{index := Bucket, fingerprint := Fingerprint}) ->
 fts2_search_search(Bookie, Schema, Root, AST, Opts) ->
     fts2_search_run(Bookie, Schema, Root, AST, Opts, all, []).
 
-fts2_search_search_dirty(Bookie, Schema, Root, AST, Opts, Hook) ->
-    Deltas = fts2_delta_read_for_search(Bookie, Schema, AST, Hook),
+fts2_search_search_dirty(Bookie, Schema, _Root, AST, Opts, Hook) ->
+    case
+        {
+            maps:get(grouping, Opts, grouped),
+            maps:get(candidate_group_fields, Schema, [])
+        }
+    of
+        {grouped, [_ | _]} ->
+            fts2_search_dirty_grouped_snapshot(
+                Bookie, Schema, AST, Opts, Hook
+            );
+        _Ungrouped ->
+            fts2_search_dirty_ungrouped_snapshot(
+                Bookie, Schema, AST, Opts, Hook
+            )
+    end.
+
+fts2_search_dirty_result({ok, Result}) when is_map(Result) ->
+    {ok, Result#{
+        index_state => updating,
+        serving_mode => serve_while_dirty
+    }};
+fts2_search_dirty_result(Result) ->
+    Result.
+
+fts2_search_dirty_grouped_snapshot(
+    Bookie, Schema, AST, Opts, Hook
+) ->
+    fts2_search_check_cancellation(),
+    StampBefore = fts2_search_root_stamp(Bookie, Schema),
+    State = client_fts2_state_for_ast(Bookie, Schema, AST),
+    case fts2_search_root_stamp(Bookie, Schema) of
+        StampBefore ->
+            fts2_search_dirty_grouped_state(
+                Bookie, Schema, AST, Opts, Hook, State, StampBefore
+            );
+        _Changed ->
+            fts2_search_dirty_grouped_snapshot(
+                Bookie, Schema, AST, Opts, Hook
+            )
+    end.
+
+fts2_search_dirty_grouped_state(
+    _Bookie, _Schema, _AST, Opts, _Hook, {clean_absent, _Root}, _Stamp
+) ->
+    client_empty_search_result(Opts);
+fts2_search_dirty_grouped_state(
+    Bookie,
+    Schema,
+    AST,
+    Opts,
+    _Hook,
+    {clean, CleanRoot},
+    _Stamp
+) when is_map(CleanRoot) ->
+    fts2_search(Bookie, Schema, CleanRoot, AST, Opts);
+fts2_search_dirty_grouped_state(
+    Bookie, Schema, AST, Opts, Hook, {dirty, CurrentRoot}, Stamp
+) ->
+    Deltas = fts2_search_read_complete_delta_snapshot(
+        Bookie, Schema, Hook
+    ),
+    case fts2_search_root_stamp(Bookie, Schema) of
+        Stamp ->
+            fts2_search_dirty_grouped_evaluate_snapshot(
+                Bookie,
+                Schema,
+                CurrentRoot,
+                AST,
+                Opts,
+                Deltas,
+                Stamp
+            );
+        _Changed ->
+            fts2_search_dirty_grouped_snapshot(
+                Bookie, Schema, AST, Opts, undefined
+            )
+    end.
+
+fts2_search_dirty_grouped_evaluate_snapshot(
+    Bookie, Schema, Root, AST, Opts, Deltas, Stamp
+) ->
+    try
+        Context = fts2_dirty_group_context(Bookie, Schema, Root, Deltas),
+        Result = fts2_search_dirty_grouped_result(
+            Bookie, Schema, Root, AST, Opts, Deltas, Context
+        ),
+        case fts2_search_root_stamp(Bookie, Schema) of
+            Stamp ->
+                fts2_search_dirty_result(Result);
+            _ ->
+                fts2_search_dirty_grouped_snapshot(
+                    Bookie, Schema, AST, Opts, undefined
+                )
+        end
+    catch
+        throw:{fts_retry, tail_changed} ->
+            fts2_search_dirty_grouped_snapshot(
+                Bookie, Schema, AST, Opts, undefined
+            );
+        Class:Reason:Stacktrace ->
+            case fts2_search_root_stamp(Bookie, Schema) of
+                Stamp ->
+                    erlang:raise(Class, Reason, Stacktrace);
+                _ ->
+                    fts2_search_dirty_grouped_snapshot(
+                        Bookie, Schema, AST, Opts, undefined
+                    )
+            end
+    end.
+
+fts2_search_dirty_ungrouped_snapshot(Bookie, Schema, AST, Opts, Hook) ->
+    fts2_search_check_cancellation(),
+    StampBefore = fts2_search_root_stamp(Bookie, Schema),
+    State = client_fts2_state_for_ast(Bookie, Schema, AST),
+    case fts2_search_root_stamp(Bookie, Schema) of
+        StampBefore ->
+            fts2_search_dirty_ungrouped_state(
+                Bookie, Schema, AST, Opts, Hook, State, StampBefore
+            );
+        _Changed ->
+            fts2_search_dirty_ungrouped_snapshot(
+                Bookie, Schema, AST, Opts, Hook
+            )
+    end.
+
+fts2_search_dirty_ungrouped_state(
+    _Bookie, _Schema, _AST, Opts, _Hook, {clean_absent, _Root}, _Stamp
+) ->
+    client_empty_search_result(Opts);
+fts2_search_dirty_ungrouped_state(
+    Bookie,
+    Schema,
+    AST,
+    Opts,
+    _Hook,
+    {clean, CleanRoot},
+    _Stamp
+) when is_map(CleanRoot) ->
+    fts2_search(Bookie, Schema, CleanRoot, AST, Opts);
+fts2_search_dirty_ungrouped_state(
+    Bookie, Schema, AST, Opts, Hook, {dirty, Root}, Stamp
+) ->
+    Deltas = fts2_search_read_delta_snapshot_for_ast(
+        Bookie, Schema, AST, Hook
+    ),
+    case fts2_search_root_stamp(Bookie, Schema) of
+        Stamp ->
+            try
+                Affected = fts2_delta_affected_sources(Deltas),
+                Context = fts2_dirty_group_context(
+                    Bookie, Schema, Root, Deltas
+                ),
+                Current = maps:get(live_documents, Context),
+                Admitted = [
+                    Row
+                 || Row = {SourceId, Delta} <- Deltas,
+                    maps:get(status, Delta) =:= remove orelse
+                        maps:is_key(SourceId, Current)
+                ],
+                Result = fts2_search_run(
+                    Bookie,
+                    Schema,
+                    Root,
+                    AST,
+                    Opts#{dirty_context => Context},
+                    {all_except, Affected},
+                    Admitted
+                ),
+                case fts2_search_root_stamp(Bookie, Schema) of
+                    Stamp ->
+                        fts2_search_dirty_result(Result);
+                    _Changed ->
+                        fts2_search_dirty_ungrouped_snapshot(
+                            Bookie, Schema, AST, Opts, undefined
+                        )
+                end
+            catch
+                throw:{fts_retry, tail_changed} ->
+                    fts2_search_dirty_ungrouped_snapshot(
+                        Bookie, Schema, AST, Opts, undefined
+                    )
+            end;
+        _Changed ->
+            fts2_search_dirty_ungrouped_snapshot(
+                Bookie, Schema, AST, Opts, undefined
+            )
+    end.
+
+fts2_search_root_stamp(Bookie, #{index := Bucket}) ->
+    {Key, SubKey} = fts2_codec_root_key(),
+    case
+        leveled_bookie:book_sqn(
+            Bookie, Bucket, {Key, SubKey}, ?HEAD_TAG
+        )
+    of
+        {ok, SQN} -> {root, SQN};
+        not_found -> absent
+    end.
+
+fts2_search_read_complete_delta_snapshot(Bookie, Schema, Hook) ->
+    try fts2_delta_read(Bookie, Schema, Hook) of
+        Deltas -> fts2_search_validate_delta_snapshot(Deltas)
+    catch
+        error:{invalid_fts2_row, delta} = Reason ->
+            throw({fts_error, {fts_delta_incomplete, Reason}});
+        error:{invalid_fts2_delta, _} = Reason ->
+            throw({fts_error, {fts_delta_incomplete, Reason}});
+        error:Reason ->
+            throw({fts_error, {fts_delta_incomplete, Reason}})
+    end.
+
+fts2_search_read_delta_snapshot_for_ast(Bookie, Schema, AST, Hook) ->
+    try fts2_delta_read_for_search(Bookie, Schema, AST, Hook) of
+        Deltas -> fts2_search_validate_delta_snapshot(Deltas)
+    catch
+        throw:{fts_error, _} = Error ->
+            throw(Error);
+        error:Reason ->
+            throw({fts_error, {fts_delta_incomplete, Reason}})
+    end.
+
+fts2_search_validate_delta_snapshot(Deltas) ->
+    lists:foreach(
+        fun
+            (
+                {RowId,
+                    #{
+                        status := Status,
+                        source_id := RowId,
+                        retired_ids := RetiredIds,
+                        doc_key := DocKey,
+                        doc_version := DocVersion,
+                        doc_length := DocLength
+                    } = Delta}
+            ) when
+                (Status =:= live orelse Status =:= remove),
+                is_integer(RowId),
+                is_list(RetiredIds),
+                is_binary(DocKey),
+                is_binary(DocVersion),
+                is_integer(DocLength),
+                DocLength >= 0
+            ->
+                true = lists:all(fun erlang:is_integer/1, RetiredIds),
+                case Status of
+                    live ->
+                        true = is_map(maps:get(posting, Delta)),
+                        true = is_map(maps:get(candidate_record, Delta)),
+                        true = is_map(maps:get(hit_record, Delta));
+                    remove ->
+                        ok
+                end,
+                case maps:find(group_key, Delta) of
+                    {ok, _GroupKey} ->
+                        true = maps:is_key(group_version, Delta);
+                    error ->
+                        ok
+                end,
+                true = lists:all(
+                    fun
+                        ({SourceId, _GroupKey, _Version}) ->
+                            is_integer(SourceId);
+                        (_) ->
+                            false
+                    end,
+                    maps:get(retired_groups, Delta, [])
+                );
+            (Bad) ->
+                erlang:error({invalid_fts2_delta, Bad})
+        end,
+        Deltas
+    ),
+    Deltas.
+
+fts2_search_dirty_grouped_result(
+    Bookie, Schema, Root, AST, Opts, Deltas, Context
+) ->
+    case maps:get(count_only, Opts, false) of
+        true ->
+            Facet = maps:get(impact_facet, Opts, nil),
+            case
+                Deltas =:= [] andalso
+                    fts2_search_facet_uniform(Schema, Root, Facet)
+            of
+                true ->
+                    {ok, #{
+                        hits => [],
+                        count => undefined,
+                        count_kind => grouped,
+                        facet_universal => true
+                    }};
+                false ->
+                    Matches = fts2_dirty_eval_grouped(
+                        Bookie,
+                        Schema,
+                        Root,
+                        fts2_search_facet_ast(Schema, Facet, AST),
+                        false,
+                        Deltas,
+                        Context
+                    ),
+                    {ok, #{
+                        hits => [],
+                        count => map_size(Matches),
+                        count_kind => grouped,
+                        facet_universal => false
+                    }}
+            end;
+        false ->
+            fts2_search_dirty_grouped_page(
+                Bookie, Schema, Root, AST, Opts, Deltas, Context
+            )
+    end.
+
+fts2_search_dirty_grouped_page(
+    Bookie, Schema, Root, AST, Opts, Deltas, Context
+) ->
+    NeedPositions = maps:get(return_positions, Opts, false),
+    Ranked = maps:get(rank, Opts, none) =:= bm25,
+    Matches = fts2_dirty_eval_grouped(
+        Bookie, Schema, Root, AST, NeedPositions, Deltas, Context
+    ),
+    ScoreRoot = (maps:get(score_root, Context))#{
+        scoring_grouping => grouped
+    },
+    Scored0 = fts2_search_score_matches(Matches, ScoreRoot, Ranked),
+    Count0 = length(Scored0),
+    Offset = maps:get(offset, Opts, 0),
+    Limit = maps:get(limit, Opts, ?DEFAULT_LIMIT),
+    PrePage = fts2_search_can_page_before_identity(Opts, Ranked),
+    {Scored, PageOffset} =
+        case PrePage of
+            true ->
+                fts2_search_prepage_matches(
+                    Scored0, Ranked, Offset, Limit
+                );
+            false ->
+                {Scored0, Offset}
+        end,
+    IdentityRequests = [
+        case Match of
+            #fts2_match{group_id = undefined} ->
+                undefined;
+            #fts2_match{group_id = GroupId, chunk_id = ChunkId} ->
+                {GroupId, ChunkId}
+        end
+     || Match <- Scored
+    ],
+    TieFields = maps:get(rank_tie_fields, Opts, []),
+    ServeRoot =
+        case Root of
+            undefined -> undefined;
+            _ -> maps:remove(group_order, Root)
+        end,
+    {Hits, Count} = fts2_search_serve(
+        Bookie,
+        Schema,
+        ServeRoot,
+        Scored,
+        IdentityRequests,
+        Opts,
+        Ranked,
+        PrePage,
+        Count0,
+        PageOffset,
+        Limit,
+        TieFields
+    ),
+    case maps:get(return_count, Opts, false) of
+        true ->
+            {ok, #{
+                hits => Hits,
+                count => Count,
+                count_kind => grouped
+            }};
+        false ->
+            {ok, Hits}
+    end.
+
+fts2_dirty_group_context(Bookie, Schema, Root, Deltas) ->
     Affected = fts2_delta_affected_sources(Deltas),
-    fts2_search_run(
+    Live = fts2_dirty_current_live_documents(Bookie, Schema, Deltas),
+    Explicit = fts2_dirty_explicit_group_descriptors(Deltas, Schema, Live),
+    Missing = maps:without(maps:keys(Explicit), Affected),
+    Legacy = fts2_dirty_resolve_legacy_sources(
+        Bookie, Schema, Root, maps:keys(Missing)
+    ),
+    Descriptors = maps:merge(Explicit, Legacy),
+    TouchKeys = lists:usort([
+        GroupKey
+     || {_SourceId, {GroupKey, _Version}} <- maps:to_list(Descriptors)
+    ]),
+    BaseGroups = maps:from_list([
+        {GroupKey, fts2_dirty_find_group(Bookie, Schema, Root, GroupKey)}
+     || GroupKey <- TouchKeys
+    ]),
+    TailByGroup = fts2_dirty_tail_documents_by_group(Live, Schema),
+    Authority = maps:from_list([
+        {GroupKey,
+            fts2_dirty_group_authority(
+                GroupKey,
+                maps:get(GroupKey, BaseGroups, not_found),
+                maps:get(GroupKey, TailByGroup, []),
+                Affected,
+                Schema
+            )}
+     || GroupKey <- lists:usort(TouchKeys ++ maps:keys(TailByGroup))
+    ]),
+    #{
+        affected => Affected,
+        authority => Authority,
+        live_documents => Live,
+        score_root => fts2_dirty_score_root(Root, Authority)
+    }.
+
+fts2_dirty_current_live_documents(
+    Bookie, #{index := Bucket, fingerprint := Fingerprint} = Schema, Deltas
+) ->
+    LiveRows = [
+        {SourceId, Delta}
+     || {SourceId, #{status := live} = Delta} <- Deltas
+    ],
+    DocKeys = lists:usort([
+        maps:get(doc_key, Delta)
+     || {_SourceId, Delta} <- LiveRows
+    ]),
+    ManifestResults =
+        case DocKeys of
+            [] ->
+                [];
+            _ ->
+                leveled_fts_residency:headonly_many(
+                    Bookie,
+                    Bucket,
+                    [{<<"doc">>, DocKey} || DocKey <- DocKeys]
+                )
+        end,
+    Manifests = lists:foldl(
+        fun
+            ({_DocKey, not_found}, Acc) ->
+                Acc;
+            ({DocKey, {ok, Encoded}}, Acc) ->
+                Manifest =
+                    try client_decode_manifest_value(Encoded) of
+                        Decoded -> Decoded
+                    catch
+                        error:Reason ->
+                            throw(
+                                {fts_error, {fts_format_unsupported, Reason}}
+                            )
+                    end,
+                case maps:get(fingerprint, Manifest) of
+                    Fingerprint ->
+                        Acc#{DocKey => Manifest};
+                    OtherFingerprint ->
+                        throw(
+                            {fts_error,
+                                {fts_manifest_conflict,
+                                    {fingerprint, DocKey, OtherFingerprint}}}
+                        )
+                end
+        end,
+        #{},
+        lists:zip(DocKeys, ManifestResults)
+    ),
+    {Current, _CurrentSources} = lists:foldl(
+        fun({SourceId, Delta}, {Acc, Sources}) ->
+            DocKey = maps:get(doc_key, Delta),
+            DocVersion = maps:get(doc_version, Delta),
+            case maps:find(DocKey, Manifests) of
+                {ok, #{doc_id := SourceId, version := DocVersion}} ->
+                    case maps:find(SourceId, Sources) of
+                        error ->
+                            {
+                                Acc#{SourceId => Delta},
+                                Sources#{SourceId => DocKey}
+                            };
+                        {ok, DocKey} ->
+                            {Acc#{SourceId => Delta}, Sources};
+                        {ok, OtherDocKey} ->
+                            throw(
+                                {fts_error,
+                                    {fts_manifest_conflict,
+                                        {source, SourceId, OtherDocKey, DocKey}}}
+                            )
+                    end;
+                _StaleOrDeleted ->
+                    {Acc, Sources}
+            end
+        end,
+        {#{}, #{}},
+        LiveRows
+    ),
+    Missing = [
+        {DocKey, maps:get(doc_id, Manifest)}
+     || {DocKey, Manifest} <- maps:to_list(Manifests),
+        not maps:is_key(maps:get(doc_id, Manifest), Current)
+    ],
+    case Missing of
+        [] ->
+            Current;
+        _ ->
+            case
+                fts2_search_read_complete_delta_snapshot(
+                    Bookie, Schema, undefined
+                )
+            of
+                Deltas ->
+                    throw(
+                        {fts_error, {fts_manifest_conflict, Missing}}
+                    );
+                _Changed ->
+                    throw({fts_retry, tail_changed})
+            end
+    end.
+
+fts2_dirty_explicit_group_descriptors(Deltas, Schema, Live) ->
+    FromLive = maps:fold(
+        fun(SourceId, Document, Acc) ->
+            {GroupKey, Version} = fts2_dirty_document_group(
+                SourceId, Document, Schema
+            ),
+            Acc#{SourceId => {GroupKey, Version}}
+        end,
+        #{},
+        Live
+    ),
+    lists:foldl(
+        fun({_RowId, Delta}, Acc0) ->
+            Acc1 =
+                case maps:find(group_key, Delta) of
+                    {ok, GroupKey} ->
+                        Acc0#{
+                            maps:get(source_id, Delta) => {
+                                GroupKey, maps:get(group_version, Delta, 0)
+                            }
+                        };
+                    error ->
+                        Acc0
+                end,
+            lists:foldl(
+                fun({SourceId, GroupKey, Version}, Acc) ->
+                    Acc#{SourceId => {GroupKey, Version}}
+                end,
+                Acc1,
+                maps:get(retired_groups, Delta, [])
+            )
+        end,
+        FromLive,
+        Deltas
+    ).
+
+fts2_dirty_document_group(SourceId, Document, Schema) ->
+    Candidate = maps:get(candidate_record, Document),
+    {
+        maps:get(
+            group_key,
+            Document,
+            fts2_build_group_key(
+                maps:get(candidate_group_fields, Schema, []),
+                SourceId,
+                Candidate
+            )
+        ),
+        maps:get(
+            group_version,
+            Document,
+            fts2_build_group_version(
+                maps:get(candidate_version_field, Schema, undefined),
+                Candidate
+            )
+        )
+    }.
+
+fts2_dirty_resolve_legacy_sources(_Bookie, _Schema, _Root, []) ->
+    #{};
+fts2_dirty_resolve_legacy_sources(_Bookie, _Schema, undefined, _SourceIds) ->
+    #{};
+fts2_dirty_resolve_legacy_sources(Bookie, Schema, Root, SourceIds) ->
+    Wanted = maps:from_keys(SourceIds, true),
+    fts2_dirty_scan_identity_pages(
         Bookie,
         Schema,
         Root,
-        AST,
-        Opts,
-        {all_except, Affected},
-        Deltas
+        0,
+        maps:get(identity_page_count, Root),
+        Wanted,
+        #{}
+    ).
+
+fts2_dirty_scan_identity_pages(
+    _Bookie, _Schema, _Root, _Page, _PageCount, Wanted, Acc
+) when map_size(Wanted) =:= 0 ->
+    Acc;
+fts2_dirty_scan_identity_pages(
+    _Bookie, _Schema, _Root, PageCount, PageCount, _Wanted, Acc
+) ->
+    Acc;
+fts2_dirty_scan_identity_pages(
+    Bookie, Schema, Root, Page, PageCount, Wanted, Acc
+) ->
+    Groups = fts2_dirty_read_identity_page(Bookie, Schema, Root, Page),
+    {NextWanted, NextAcc} = maps:fold(
+        fun(_GroupId, Group, {Wanted0, Acc0}) ->
+            GroupKey = maps:get(group_key, Group),
+            lists:foldl(
+                fun(Chunk, {Wanted1, Acc1}) ->
+                    SourceId = maps:get(source_id, Chunk),
+                    case maps:is_key(SourceId, Wanted1) of
+                        false ->
+                            {Wanted1, Acc1};
+                        true ->
+                            Candidate = maps:get(candidate_record, Chunk),
+                            Version = fts2_build_group_version(
+                                maps:get(
+                                    candidate_version_field, Schema, undefined
+                                ),
+                                Candidate
+                            ),
+                            {
+                                maps:remove(SourceId, Wanted1),
+                                Acc1#{SourceId => {GroupKey, Version}}
+                            }
+                    end
+                end,
+                {Wanted0, Acc0},
+                maps:get(chunks, Group)
+            )
+        end,
+        {Wanted, Acc},
+        Groups
+    ),
+    fts2_dirty_scan_identity_pages(
+        Bookie,
+        Schema,
+        Root,
+        Page + 1,
+        PageCount,
+        NextWanted,
+        NextAcc
+    ).
+
+fts2_dirty_read_identity_page(
+    Bookie, #{index := Bucket} = Schema, Root, Page
+) ->
+    IdentityBookie = maps:get(identity_bookie, Schema, Bookie),
+    Key = fts2_codec_identity_key(maps:get(generation, Root)),
+    Shift = fts2_search_identity_page_shift(Root, Schema),
+    First = Page bsl Shift,
+    Last = erlang:min(
+        maps:get(group_count, Root) - 1, First + (1 bsl Shift) - 1
+    ),
+    try
+        case
+            leveled_fts_residency:headonly(
+                IdentityBookie,
+                Bucket,
+                Key,
+                fts2_codec_identity_subkey(Page)
+            )
+        of
+            {ok, Value} ->
+                fts2_search_groups_to_map(
+                    fts2_codec_decode_identity_page(
+                        Value, lists:seq(First, Last)
+                    )
+                );
+            not_found ->
+                throw({fts_error, {fts_identity_unresolved, {page, Page}}})
+        end
+    catch
+        throw:{fts_error, _} = Error ->
+            throw(Error);
+        error:Reason ->
+            throw({fts_error, {fts_identity_unresolved, {page, Page, Reason}}})
+    end.
+
+fts2_dirty_find_group(_Bookie, _Schema, undefined, _GroupKey) ->
+    not_found;
+fts2_dirty_find_group(Bookie, Schema, Root, GroupKey) ->
+    fts2_dirty_find_group(
+        Bookie, Schema, Root, GroupKey, 0, maps:get(group_count, Root) - 1
+    ).
+
+fts2_dirty_find_group(_Bookie, _Schema, _Root, _GroupKey, Low, High) when
+    Low > High
+->
+    not_found;
+fts2_dirty_find_group(Bookie, Schema, Root, GroupKey, Low, High) ->
+    GroupId = (Low + High) div 2,
+    case fts2_search_read_identities(Bookie, Schema, Root, [GroupId]) of
+        #{GroupId := #{group_key := GroupKey} = Group} ->
+            Group;
+        #{GroupId := #{group_key := FoundKey}} when FoundKey < GroupKey ->
+            fts2_dirty_find_group(
+                Bookie, Schema, Root, GroupKey, GroupId + 1, High
+            );
+        #{GroupId := #{group_key := _FoundKey}} ->
+            fts2_dirty_find_group(
+                Bookie, Schema, Root, GroupKey, Low, GroupId - 1
+            );
+        _Missing ->
+            throw({fts_error, {fts_identity_unresolved, {group, GroupId}}})
+    end.
+
+fts2_dirty_tail_documents_by_group(Live, Schema) ->
+    maps:fold(
+        fun(SourceId, Document, Acc) ->
+            {GroupKey, Version} = fts2_dirty_document_group(
+                SourceId, Document, Schema
+            ),
+            Row = {SourceId, Document, Version, tail},
+            Acc#{GroupKey => [Row | maps:get(GroupKey, Acc, [])]}
+        end,
+        #{},
+        Live
+    ).
+
+fts2_dirty_group_authority(GroupKey, BaseGroup, TailRows, Affected, Schema) ->
+    BaseRows =
+        case BaseGroup of
+            not_found ->
+                [];
+            _ ->
+                [
+                    begin
+                        SourceId = maps:get(source_id, Chunk),
+                        Candidate = maps:get(candidate_record, Chunk),
+                        Document = Chunk#{
+                            status => live,
+                            retired_ids => [],
+                            group_key => GroupKey,
+                            group_version => fts2_build_group_version(
+                                maps:get(
+                                    candidate_version_field, Schema, undefined
+                                ),
+                                Candidate
+                            )
+                        },
+                        {
+                            SourceId,
+                            Document,
+                            maps:get(group_version, Document),
+                            base
+                        }
+                    end
+                 || Chunk <- maps:get(chunks, BaseGroup),
+                    not maps:is_key(maps:get(source_id, Chunk), Affected)
+                ]
+        end,
+    Rows = BaseRows ++ TailRows,
+    Active =
+        case Rows of
+            [] ->
+                [];
+            _ ->
+                GreatestVersion = lists:max([V || {_S, _D, V, _P} <- Rows]),
+                [
+                    Row
+                 || Row = {_S, _D, V, _P} <- Rows,
+                    V =:= GreatestVersion
+                ]
+        end,
+    case length(Active) =< ?CHUNKS_PER_GROUP of
+        true -> ok;
+        false -> throw({fts_error, {fts_group_ambiguous, GroupKey}})
+    end,
+    #{
+        group_key => GroupKey,
+        version =>
+            case Active of
+                [] -> 0;
+                [{_S, _D, ActiveVersion, _P} | _] -> ActiveVersion
+            end,
+        rows => Active,
+        sources => maps:from_keys([S || {S, _D, _V, _P} <- Active], true),
+        group_length => lists:sum([
+            maps:get(doc_length, Document, 0)
+         || {_S, Document, _V, _P} <- Active
+        ]),
+        base_group => BaseGroup
+    }.
+
+fts2_dirty_score_root(undefined, Authority) ->
+    Active = [
+        Group
+     || Group <- maps:values(Authority), maps:get(rows, Group) =/= []
+    ],
+    #{
+        group_count => length(Active),
+        chunk_count => lists:sum([
+            length(maps:get(rows, Group))
+         || Group <- Active
+        ]),
+        total_length => lists:sum([
+            maps:get(group_length, Group)
+         || Group <- Active
+        ])
+    };
+fts2_dirty_score_root(Root, Authority) ->
+    maps:fold(
+        fun(_GroupKey, Group, Acc) ->
+            Base = maps:get(base_group, Group),
+            {BaseCount, BaseChunks, BaseLength} =
+                case Base of
+                    not_found ->
+                        {0, 0, 0};
+                    _ ->
+                        Chunks = maps:get(chunks, Base),
+                        {
+                            1,
+                            length(Chunks),
+                            lists:sum([
+                                maps:get(doc_length, Chunk, 0)
+                             || Chunk <- Chunks
+                            ])
+                        }
+                end,
+            Rows = maps:get(rows, Group),
+            CurrentCount =
+                case Rows of
+                    [] -> 0;
+                    _ -> 1
+                end,
+            Acc#{
+                group_count => maps:get(group_count, Acc) - BaseCount +
+                    CurrentCount,
+                chunk_count => maps:get(chunk_count, Acc) - BaseChunks +
+                    length(Rows),
+                total_length => maps:get(total_length, Acc) - BaseLength +
+                    maps:get(group_length, Group)
+            }
+        end,
+        Root,
+        Authority
+    ).
+
+fts2_dirty_eval_grouped(
+    _Bookie, _Schema, _Root, {empty}, _NeedPositions, _Deltas, _Context
+) ->
+    #{};
+fts2_dirty_eval_grouped(
+    Bookie, Schema, Root, {'and', A, B}, NeedPositions, Deltas, Context
+) ->
+    fts2_search_intersect(
+        fts2_dirty_eval_grouped(
+            Bookie, Schema, Root, A, NeedPositions, Deltas, Context
+        ),
+        fts2_dirty_eval_grouped(
+            Bookie, Schema, Root, B, NeedPositions, Deltas, Context
+        )
+    );
+fts2_dirty_eval_grouped(
+    Bookie, Schema, Root, {'or', A, B}, NeedPositions, Deltas, Context
+) ->
+    fts2_search_union(
+        fts2_dirty_eval_grouped(
+            Bookie, Schema, Root, A, NeedPositions, Deltas, Context
+        ),
+        fts2_dirty_eval_grouped(
+            Bookie, Schema, Root, B, NeedPositions, Deltas, Context
+        )
+    );
+fts2_dirty_eval_grouped(
+    Bookie, Schema, Root, {'not', A, B}, NeedPositions, Deltas, Context
+) ->
+    Positive = fts2_dirty_eval_grouped(
+        Bookie, Schema, Root, A, NeedPositions, Deltas, Context
+    ),
+    Negative = fts2_dirty_eval_grouped(
+        Bookie, Schema, Root, B, false, Deltas, Context
+    ),
+    maps:without(maps:keys(Negative), Positive);
+fts2_dirty_eval_grouped(
+    Bookie, Schema, Root, Leaf, NeedPositions, Deltas, Context
+) ->
+    Sources = fts2_dirty_leaf_sources(
+        Bookie, Schema, Root, Leaf, NeedPositions, Deltas, Context
+    ),
+    Stats = fts2_dirty_leaf_stats(
+        Bookie, Schema, Root, Leaf, Deltas, Context
+    ),
+    fts2_dirty_collapse_leaf(Leaf, Sources, Stats, Context).
+
+fts2_dirty_leaf_sources(
+    Bookie, Schema, Root, Leaf, NeedPositions, _Deltas, Context
+) ->
+    Affected = maps:get(affected, Context),
+    Base0 =
+        case Root of
+            undefined ->
+                #{};
+            _ ->
+                fts2_search_eval(
+                    Bookie,
+                    Schema,
+                    Root,
+                    Leaf,
+                    NeedPositions,
+                    {all_except, Affected}
+                )
+        end,
+    Base = fts2_dirty_enrich_base_sources(Bookie, Schema, Root, Base0),
+    Tail = fts2_delta_evaluate_documents(
+        maps:get(live_documents, Context), Schema, Leaf
+    ),
+    [
+        Current
+     || Match <- maps:values(Base) ++ maps:values(Tail),
+        {ok, Current} <- [fts2_dirty_current_match(Match, Context)]
+    ].
+
+fts2_dirty_enrich_base_sources(_Bookie, _Schema, undefined, Matches) ->
+    Matches;
+fts2_dirty_enrich_base_sources(_Bookie, _Schema, _Root, Matches) when
+    map_size(Matches) =:= 0
+->
+    Matches;
+fts2_dirty_enrich_base_sources(Bookie, Schema, Root, Matches) ->
+    GroupIds = lists:usort([
+        Meta#fts2_match.group_id
+     || Meta <- maps:values(Matches)
+    ]),
+    Identities = fts2_search_read_identities(
+        Bookie, Schema, Root, GroupIds
+    ),
+    lists:foreach(
+        fun(GroupId) ->
+            case maps:is_key(GroupId, Identities) of
+                true ->
+                    ok;
+                false ->
+                    throw(
+                        {fts_error, {fts_identity_unresolved, {group, GroupId}}}
+                    )
+            end
+        end,
+        GroupIds
+    ),
+    VersionField = maps:get(candidate_version_field, Schema, undefined),
+    maps:map(
+        fun(_ChunkId, Meta) ->
+            Group = maps:get(Meta#fts2_match.group_id, Identities),
+            SourceId = Meta#fts2_match.source_id,
+            case
+                [
+                    Chunk
+                 || Chunk <- maps:get(chunks, Group),
+                    maps:get(source_id, Chunk) =:= SourceId
+                ]
+            of
+                [Chunk] ->
+                    Candidate = maps:get(candidate_record, Chunk),
+                    Version = fts2_build_group_version(
+                        VersionField, Candidate
+                    ),
+                    GroupLength = lists:sum([
+                        maps:get(doc_length, Row, 0)
+                     || Row <- maps:get(chunks, Group)
+                    ]),
+                    Meta#fts2_match{
+                        doc_length = GroupLength,
+                        logical_group = maps:get(group_key, Group),
+                        group_version = Version,
+                        delta_document = Chunk
+                    };
+                _ ->
+                    throw({fts_error, {fts_identity_unresolved, SourceId}})
+            end
+        end,
+        Matches
+    ).
+
+fts2_dirty_current_match(
+    #fts2_match{logical_group = GroupKey, source_id = SourceId} = Match,
+    Context
+) ->
+    case maps:find(GroupKey, maps:get(authority, Context)) of
+        error ->
+            {ok, Match};
+        {ok, Authority} ->
+            case maps:is_key(SourceId, maps:get(sources, Authority)) of
+                false ->
+                    stale;
+                true ->
+                    {ok, Match#fts2_match{
+                        doc_length = maps:get(group_length, Authority),
+                        group_version = maps:get(version, Authority)
+                    }}
+            end
+    end.
+
+fts2_dirty_leaf_stats(
+    Bookie, Schema, Root, Leaf, Deltas, Context
+) ->
+    Specs = lists:usort(
+        fts2_search_group_score_spec(Leaf, all)
+    ),
+    GroupTfs = lists:foldl(
+        fun({term, _Token, _Prefix, _Columns} = Spec, Acc) ->
+            Sources = fts2_dirty_leaf_sources(
+                Bookie, Schema, Root, Spec, false, Deltas, Context
+            ),
+            lists:foldl(
+                fun(Match, GroupAcc) ->
+                    GroupKey = Match#fts2_match.logical_group,
+                    Existing = maps:get(GroupKey, GroupAcc, #{}),
+                    Tfs = lists:foldl(
+                        fun({Term0, Tf, _Plane, _Df}, TfAcc) ->
+                            Term = fts2_dirty_canonical_term(Term0),
+                            TfAcc#{Term => maps:get(Term, TfAcc, 0) + Tf}
+                        end,
+                        Existing,
+                        Match#fts2_match.term_stats
+                    ),
+                    GroupAcc#{GroupKey => Tfs}
+                end,
+                Acc,
+                Sources
+            )
+        end,
+        #{},
+        Specs
+    ),
+    Dfs = maps:fold(
+        fun(GroupKey, Tfs, Acc) ->
+            maps:fold(
+                fun
+                    (Term, Tf, Inner) when Tf > 0 ->
+                        Groups = maps:get(Term, Inner, #{}),
+                        Inner#{Term => Groups#{GroupKey => true}};
+                    (_Term, _Tf, Inner) ->
+                        Inner
+                end,
+                Acc,
+                Tfs
+            )
+        end,
+        #{},
+        GroupTfs
+    ),
+    maps:map(
+        fun(_GroupKey, Tfs) ->
+            [
+                {Term, Tf, merged, map_size(maps:get(Term, Dfs))}
+             || {Term, Tf} <- lists:sort(maps:to_list(Tfs)), Tf > 0
+            ]
+        end,
+        GroupTfs
+    ).
+
+fts2_dirty_ungrouped_rewrite_stats(
+    Bookie, Schema, Root, Matches, Context
+) ->
+    Terms = lists:usort([
+        fts2_dirty_canonical_term(Term)
+     || Match <- maps:values(Matches),
+        {Term, _Tf, _Plane, _Df} <- Match#fts2_match.term_stats
+    ]),
+    Affected = maps:get(affected, Context),
+    Live = maps:get(live_documents, Context),
+    Dfs = maps:from_list([
+        begin
+            {Column, Token} = Term,
+            ColumnName = lists:nth(
+                Column + 1, maps:get(columns, Schema)
+            ),
+            Leaf = {term, Token, false, [ColumnName]},
+            Base =
+                case Root of
+                    undefined ->
+                        #{};
+                    _ ->
+                        fts2_search_eval(
+                            Bookie,
+                            Schema,
+                            Root,
+                            Leaf,
+                            false,
+                            {all_except, Affected}
+                        )
+                end,
+            Tail = fts2_delta_evaluate_documents(Live, Schema, Leaf),
+            Sources = maps:from_keys(
+                [
+                    Match#fts2_match.source_id
+                 || Match <- maps:values(Base) ++ maps:values(Tail)
+                ],
+                true
+            ),
+            {Term, map_size(Sources)}
+        end
+     || Term = {Column, _Token} <- Terms,
+        is_integer(Column)
+    ]),
+    maps:map(
+        fun(_Key, Match) ->
+            Tfs = lists:foldl(
+                fun({Term0, Tf, _Plane, _Df}, Acc) ->
+                    Term = fts2_dirty_canonical_term(Term0),
+                    Acc#{Term => Tf}
+                end,
+                #{},
+                Match#fts2_match.term_stats
+            ),
+            Match#fts2_match{
+                tf = lists:sum(maps:values(Tfs)),
+                term_stats = [
+                    {Term, Tf, merged, maps:get(Term, Dfs)}
+                 || {Term, Tf} <- lists:sort(maps:to_list(Tfs))
+                ]
+            }
+        end,
+        Matches
+    ).
+
+fts2_dirty_canonical_term({Column, Token, _Prefix}) ->
+    {Column, Token};
+fts2_dirty_canonical_term(Term) ->
+    Term.
+
+fts2_dirty_collapse_leaf(Leaf, Sources, Stats, Context) ->
+    Grouped = lists:foldl(
+        fun(#fts2_match{logical_group = GroupKey} = Match, Acc) ->
+            Acc#{GroupKey => [Match | maps:get(GroupKey, Acc, [])]}
+        end,
+        #{},
+        Sources
+    ),
+    maps:map(
+        fun(GroupKey, Matches) ->
+            Anchor = fts2_dirty_leaf_anchor(Leaf, Matches),
+            TermStats = maps:get(GroupKey, Stats, []),
+            MatchCount = lists:sum([
+                fts2_search_group_match_count(Match)
+             || Match <- Matches
+            ]),
+            {Columns, Positions} =
+                case Leaf of
+                    {term, _Token, _Prefix, _Columns} ->
+                        {
+                            fts2_dirty_merge_position_pairs(
+                                [M#fts2_match.columns || M <- Matches]
+                            ),
+                            fts2_dirty_merge_position_pairs(
+                                [M#fts2_match.match_positions || M <- Matches]
+                            )
+                        };
+                    _PositionalOrAll ->
+                        {
+                            Anchor#fts2_match.columns,
+                            Anchor#fts2_match.match_positions
+                        }
+                end,
+            Authority = maps:get(authority, Context),
+            {Version, Length} =
+                case maps:find(GroupKey, Authority) of
+                    {ok, Group} ->
+                        {
+                            maps:get(version, Group),
+                            maps:get(group_length, Group)
+                        };
+                    error ->
+                        {
+                            Anchor#fts2_match.group_version,
+                            Anchor#fts2_match.doc_length
+                        }
+                end,
+            Anchor#fts2_match{
+                doc_length = Length,
+                tf = lists:sum([Tf || {_Term, Tf, _Plane, _Df} <- TermStats]),
+                term_stats = TermStats,
+                terms = lists:usort([
+                    Token
+                 || {{_Column, Token}, Tf, _Plane, _Df} <- TermStats,
+                    Tf > 0
+                ]),
+                columns = Columns,
+                match_positions = Positions,
+                group_match_count = MatchCount,
+                logical_group = GroupKey,
+                group_version = Version
+            }
+        end,
+        Grouped
+    ).
+
+fts2_dirty_leaf_anchor({term, _Token, _Prefix, _Columns}, Matches) ->
+    hd(
+        lists:sort(
+            fun(A, B) ->
+                fts2_dirty_match_doc_order(A) =< fts2_dirty_match_doc_order(B)
+            end,
+            Matches
+        )
+    );
+fts2_dirty_leaf_anchor(_Leaf, Matches) ->
+    hd(
+        lists:sort(
+            fun(A, B) ->
+                A#fts2_match.source_id =< B#fts2_match.source_id
+            end,
+            Matches
+        )
+    ).
+
+fts2_dirty_match_doc_order(#fts2_match{delta_document = Document} = Match) ->
+    {
+        maps:get(doc_key, Document, <<>>),
+        Match#fts2_match.source_id
+    }.
+
+fts2_dirty_merge_position_pairs(PairLists) ->
+    maps:to_list(
+        lists:foldl(
+            fun(Pairs, Acc) ->
+                lists:foldl(
+                    fun({Key, Positions}, Inner) ->
+                        Inner#{
+                            Key => maps:get(Key, Inner, []) ++ Positions
+                        }
+                    end,
+                    Acc,
+                    Pairs
+                )
+            end,
+            #{},
+            PairLists
+        )
     ).
 
 fts2_search_posting_read(Bookie, Schema, Root, AST, SourceIds, Opts) ->
@@ -12201,15 +13640,34 @@ fts2_search_page(Bookie, Schema, Root, AST, Opts, WantedSources, Deltas) ->
                             DeltaMatches0
                         ),
                         Matches0 = maps:merge(BaseMatches, DeltaMatches),
-                        ScoreRoot = (fts2_search_score_root(
-                            Root, Deltas, Schema
-                        ))#{
+                        {Matches, ScoreRoot0} =
+                            case maps:find(dirty_context, Opts) of
+                                {ok, DirtyContext} ->
+                                    {
+                                        fts2_dirty_ungrouped_rewrite_stats(
+                                            Bookie,
+                                            Schema,
+                                            Root,
+                                            Matches0,
+                                            DirtyContext
+                                        ),
+                                        maps:get(score_root, DirtyContext)
+                                    };
+                                error ->
+                                    {
+                                        Matches0,
+                                        fts2_search_score_root(
+                                            Root, Deltas, Schema
+                                        )
+                                    }
+                            end,
+                        ScoreRoot = ScoreRoot0#{
                             scoring_grouping => maps:get(
                                 grouping, Opts, grouped
                             )
                         },
                         ScoredMatches = fts2_search_score_matches(
-                            Matches0, ScoreRoot, Ranked
+                            Matches, ScoreRoot, Ranked
                         ),
                         GroupedMatches =
                             case maps:get(grouping, Opts, grouped) of

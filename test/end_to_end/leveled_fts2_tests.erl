@@ -173,8 +173,398 @@ generation_residency_budget_fallback_test_() ->
 cold_reopen_result_parity_test_() ->
     {timeout, 180, fun cold_reopen_result_parity/0}.
 
+dirty_grouped_cross_plane_oracle_test_() ->
+    {timeout, 120, fun dirty_grouped_cross_plane_oracle/0}.
+
+dirty_grouped_update_delete_oracle_test_() ->
+    {timeout, 120, fun dirty_grouped_update_delete_oracle/0}.
+
+dirty_grouped_consolidation_race_test_() ->
+    {timeout, 120, fun dirty_grouped_consolidation_race/0}.
+
 residency_failure_is_sticky_test_() ->
     {timeout, 60, fun residency_failure_is_sticky/0}.
+
+dirty_grouped_cross_plane_oracle() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-dirty-cross-plane">>))#{
+            identity_bookie => Identity
+        },
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g1-a">>,
+            <<"group-one">>,
+            <<"default">>,
+            1,
+            <<"quick alpha">>
+        ),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g2-a">>,
+            <<"group-two">>,
+            <<"default">>,
+            1,
+            <<"quick brown alpha">>
+        ),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g3-a">>,
+            <<"group-three">>,
+            <<"default">>,
+            1,
+            <<"alpha solitary">>
+        ),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g5-a">>,
+            <<"group-five">>,
+            <<"default">>,
+            1,
+            <<"quick alpha">>
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g1-b">>,
+            <<"group-one">>,
+            <<"default">>,
+            1,
+            <<"brown beta">>
+        ),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g2-b">>,
+            <<"group-two">>,
+            <<"default">>,
+            1,
+            <<"beta beta">>
+        ),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g4-a">>,
+            <<"group-four">>,
+            <<"other">>,
+            1,
+            <<"alpha beta">>
+        ),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"g5-b">>,
+            <<"group-five">>,
+            <<"default">>,
+            1,
+            <<"brown beta">>
+        ),
+        Queries = [
+            <<"alpha AND beta">>,
+            <<"alpha OR beta">>,
+            <<"alpha NOT beta">>,
+            <<"tenant:default AND alpha AND beta">>,
+            <<"\"quick brown\"">>,
+            <<"NEAR(quick brown, 2)">>
+        ],
+        Opts = #{
+            columns => [content, tenant],
+            limit => 20,
+            rank => bm25,
+            return_count => true,
+            return_positions => true,
+            return_terms => true
+        },
+        Dirty = [search(Main, Schema, Query, Opts) || Query <- Queries],
+        lists:foreach(
+            fun(Result) ->
+                ?assertEqual(updating, maps:get(index_state, Result)),
+                ?assertEqual(
+                    serve_while_dirty, maps:get(serving_mode, Result)
+                )
+            end,
+            Dirty
+        ),
+        [AndDirty, _OrDirty, NotDirty, FilterDirty, PhraseDirty, NearDirty] =
+            Dirty,
+        ?assertEqual(
+            [
+                <<"group-five">>,
+                <<"group-four">>,
+                <<"group-one">>,
+                <<"group-two">>
+            ],
+            dirty_oracle_udis(AndDirty)
+        ),
+        ?assertEqual([<<"group-three">>], dirty_oracle_udis(NotDirty)),
+        ?assertEqual(
+            [<<"group-five">>, <<"group-one">>, <<"group-two">>],
+            dirty_oracle_udis(FilterDirty)
+        ),
+        ?assertEqual([<<"group-two">>], dirty_oracle_udis(PhraseDirty)),
+        ?assertEqual([<<"group-two">>], dirty_oracle_udis(NearDirty)),
+        DirtyFacet = search(
+            Main,
+            Schema,
+            <<"alpha OR beta">>,
+            production_count_only_opts(<<"default">>)
+        ),
+        ?assertEqual(4, maps:get(count, DirtyFacet)),
+        ?assertEqual(updating, maps:get(index_state, DirtyFacet)),
+        ?assertEqual(
+            serve_while_dirty, maps:get(serving_mode, DirtyFacet)
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        Clean = [search(Main, Schema, Query, Opts) || Query <- Queries],
+        lists:foreach(
+            fun({DirtyResult, CleanResult}) ->
+                assert_dirty_clean_oracle(DirtyResult, CleanResult)
+            end,
+            lists:zip(Dirty, Clean)
+        ),
+        CleanFacet = search(
+            Main,
+            Schema,
+            <<"alpha OR beta">>,
+            production_count_only_opts(<<"default">>)
+        ),
+        assert_dirty_clean_oracle_count(DirtyFacet, CleanFacet)
+    end).
+
+dirty_grouped_update_delete_oracle() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-dirty-update-delete">>))#{
+            identity_bookie => Identity
+        },
+        OldObject = seam_object(
+            <<"old-group">>, <<"default">>, 1, <<"alpha old">>, <<"u1">>
+        ),
+        DeleteObject = seam_object(
+            <<"delete-group">>,
+            <<"default">>,
+            1,
+            <<"delete-token">>,
+            <<"d1">>
+        ),
+        RapidV1 = seam_object(
+            <<"rapid-v1">>, <<"default">>, 1, <<"rapid-one">>, <<"r1">>
+        ),
+        RapidV2 = seam_object(
+            <<"rapid-v2">>, <<"default">>, 2, <<"rapid-two">>, <<"r1">>
+        ),
+        RapidV3 = seam_object(
+            <<"rapid-v3">>, <<"default">>, 3, <<"rapid-three">>, <<"r1">>
+        ),
+        DeleteRapidV1 = seam_object(
+            <<"rapid-delete-v1">>,
+            <<"default">>,
+            1,
+            <<"rapid-delete-one">>,
+            <<"rd1">>
+        ),
+        DeleteRapidV2 = seam_object(
+            <<"rapid-delete-v2">>,
+            <<"default">>,
+            2,
+            <<"rapid-delete-two">>,
+            <<"rd1">>
+        ),
+        DeleteRapidV3 = seam_object(
+            <<"rapid-delete-v3">>,
+            <<"default">>,
+            3,
+            <<"rapid-delete-three">>,
+            <<"rd1">>
+        ),
+        RevertV1 = seam_object(
+            <<"revert-group">>,
+            <<"default">>,
+            1,
+            <<"revert-original">>,
+            <<"rv1">>
+        ),
+        RevertV2 = seam_object(
+            <<"revert-group">>,
+            <<"default">>,
+            2,
+            <<"revert-intermediate">>,
+            <<"rv1">>
+        ),
+        ok = seam_put_object(Main, Schema, <<"u1">>, OldObject),
+        ok = seam_put_object(Main, Schema, <<"d1">>, DeleteObject),
+        ok = seam_put_object(Main, Schema, <<"r1">>, RapidV1),
+        ok = seam_put_object(Main, Schema, <<"rd1">>, DeleteRapidV1),
+        ok = seam_put_object(Main, Schema, <<"rv1">>, RevertV1),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        {ok, UpdateManifest0} = leveled_bookie:book_headonly(
+            Main, maps:get(index, Schema), <<"doc">>, <<"u1">>
+        ),
+        {ok, DeleteManifest0} = leveled_bookie:book_headonly(
+            Main, maps:get(index, Schema), <<"doc">>, <<"d1">>
+        ),
+        UpdateManifest = previous_manifest(UpdateManifest0),
+        DeleteManifest = previous_manifest(DeleteManifest0),
+        NewObject = seam_object(
+            <<"new-group">>, <<"default">>, 2, <<"gamma new">>, <<"u1">>
+        ),
+        {ok, UpdateSpecs} = leveled_fts:update(
+            Schema, <<"u1">>, NewObject, {UpdateManifest, OldObject}
+        ),
+        ok = leveled_bookie:book_mput(Main, UpdateSpecs),
+        ok = leveled_bookie:book_mput(
+            Main,
+            leveled_fts:remove(
+                Schema, <<"d1">>, {DeleteManifest, DeleteObject}
+            )
+        ),
+        ok = seam_update_object(
+            Main, Schema, <<"r1">>, RapidV1, RapidV2
+        ),
+        ok = seam_update_object(
+            Main, Schema, <<"r1">>, RapidV2, RapidV3
+        ),
+        ok = seam_update_object(
+            Main, Schema, <<"rd1">>, DeleteRapidV1, DeleteRapidV2
+        ),
+        ok = seam_update_object(
+            Main, Schema, <<"rd1">>, DeleteRapidV2, DeleteRapidV3
+        ),
+        {ok, DeleteRapidManifest} = leveled_bookie:book_headonly(
+            Main, maps:get(index, Schema), <<"doc">>, <<"rd1">>
+        ),
+        ok = leveled_bookie:book_mput(
+            Main,
+            leveled_fts:remove(
+                Schema,
+                <<"rd1">>,
+                {DeleteRapidManifest, DeleteRapidV3}
+            )
+        ),
+        ok = seam_update_object(
+            Main, Schema, <<"rv1">>, RevertV1, RevertV2
+        ),
+        ok = seam_update_object(
+            Main, Schema, <<"rv1">>, RevertV2, RevertV1
+        ),
+        Opts = #{
+            columns => [content],
+            limit => 20,
+            rank => bm25,
+            return_count => true,
+            return_positions => false,
+            return_terms => true
+        },
+        Queries = [
+            <<"alpha">>,
+            <<"gamma">>,
+            <<"delete-token">>,
+            <<"rapid-one">>,
+            <<"rapid-two">>,
+            <<"rapid-three">>,
+            <<"rapid-delete-one">>,
+            <<"rapid-delete-two">>,
+            <<"rapid-delete-three">>,
+            <<"revert-original">>,
+            <<"revert-intermediate">>,
+            all_docs
+        ],
+        Dirty = [search(Main, Schema, Query, Opts) || Query <- Queries],
+        [
+            Alpha,
+            Gamma,
+            Deleted,
+            RapidOne,
+            RapidTwo,
+            RapidThree,
+            RapidDeleteOne,
+            RapidDeleteTwo,
+            RapidDeleteThree,
+            RevertOriginal,
+            RevertIntermediate,
+            All
+        ] = Dirty,
+        ?assertEqual([], dirty_oracle_udis(Alpha)),
+        ?assertEqual([<<"new-group">>], dirty_oracle_udis(Gamma)),
+        ?assertEqual([], dirty_oracle_udis(Deleted)),
+        ?assertEqual([], dirty_oracle_udis(RapidOne)),
+        ?assertEqual([], dirty_oracle_udis(RapidTwo)),
+        ?assertEqual([<<"rapid-v3">>], dirty_oracle_udis(RapidThree)),
+        ?assertEqual([], dirty_oracle_udis(RapidDeleteOne)),
+        ?assertEqual([], dirty_oracle_udis(RapidDeleteTwo)),
+        ?assertEqual([], dirty_oracle_udis(RapidDeleteThree)),
+        ?assertEqual(
+            [<<"revert-group">>], dirty_oracle_udis(RevertOriginal)
+        ),
+        ?assertEqual([], dirty_oracle_udis(RevertIntermediate)),
+        ?assertEqual(
+            [<<"new-group">>, <<"rapid-v3">>, <<"revert-group">>],
+            dirty_oracle_udis(All)
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        Clean = [search(Main, Schema, Query, Opts) || Query <- Queries],
+        lists:foreach(
+            fun({DirtyResult, CleanResult}) ->
+                assert_dirty_clean_oracle(DirtyResult, CleanResult)
+            end,
+            lists:zip(Dirty, Clean)
+        )
+    end).
+
+dirty_grouped_consolidation_race() ->
+    with_bookies(fun(Main, Identity) ->
+        Schema = (seam_schema(<<"fts2-dirty-root-race">>))#{
+            identity_bookie => Identity
+        },
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"a">>,
+            <<"race-group">>,
+            <<"default">>,
+            1,
+            <<"alpha">>
+        ),
+        {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+        ok = seam_put_version(
+            Main,
+            Schema,
+            <<"b">>,
+            <<"race-group">>,
+            <<"default">>,
+            1,
+            <<"beta">>
+        ),
+        Gate = atomics:new(1, []),
+        Hook = fun(_Tail) ->
+            case atomics:exchange(Gate, 1, 1) of
+                0 ->
+                    {ok, _} = leveled_fts:consolidate(Main, Schema, #{}),
+                    ok;
+                1 ->
+                    ok
+            end
+        end,
+        Opts = #{
+            columns => [content],
+            rank => bm25,
+            return_count => true,
+            return_positions => true,
+            tail_fold_hook => Hook
+        },
+        Raced = search(Main, Schema, <<"alpha AND beta">>, Opts),
+        Clean = search(
+            Main,
+            Schema,
+            <<"alpha AND beta">>,
+            maps:remove(tail_fold_hook, Opts)
+        ),
+        assert_dirty_clean_oracle(Raced, Clean),
+        ?assertEqual(1, atomics:get(Gate, 1))
+    end).
 
 cold_reopen_result_parity() ->
     Suffix = integer_to_list(erlang:unique_integer([positive])),
@@ -268,19 +658,26 @@ cold_reopen_result_parity() ->
             end,
             lists:seq(33, 44)
         ),
-        {DirtyErrorUs, DirtyError} = timer:tc(
+        {DirtyServeUs, DirtyServe} = timer:tc(
             leveled_fts,
             search,
             [Main0, Schema0, <<"spitfire">>, Opts]
         ),
         ?assertMatch(
-            {error,
-                {fts_index_dirty, grouped_search_requires_consolidation, _}},
-            DirtyError
+            {ok, #{
+                index_state := updating,
+                serving_mode := serve_while_dirty
+            }},
+            DirtyServe
         ),
-        ?assert(DirtyErrorUs < 50000),
+        {ok, DirtyResult} = DirtyServe,
+        ?assert(DirtyServeUs < 50000),
         {ok, _} = leveled_fts:consolidate(Main0, Schema0, #{}),
         CleanOverlay = search(Main0, Schema0, <<"spitfire">>, Opts),
+        ?assertEqual(
+            cold_reopen_result_projection(DirtyResult),
+            cold_reopen_result_projection(CleanOverlay)
+        ),
         exit(Main0, kill),
         exit(Identity0, kill),
         {ok, Main1} = leveled_bookie:book_start(start_opts(MainRoot)),
@@ -320,9 +717,9 @@ cold_reopen_result_parity() ->
             ?assert(maps:get(fts_resident_rows, Status) > 0),
             io:format(
                 user,
-                "coldnames dirty_error_us=~p first_us=~p second_us=~p "
+                "coldnames dirty_serve_us=~p first_us=~p second_us=~p "
                 "warm_median_us=~p~n",
-                [DirtyErrorUs, FirstUs, SecondUs, WarmUs]
+                [DirtyServeUs, FirstUs, SecondUs, WarmUs]
             )
         after
             try
@@ -2183,16 +2580,93 @@ seam_schema(Index) ->
     Schema.
 
 seam_put(Bookie, Schema, Key, Document, Tenant, Body) ->
-    {ok, Specs} = leveled_fts:derive(Schema, Key, #{
+    seam_put_version(Bookie, Schema, Key, Document, Tenant, 1, Body).
+
+seam_put_version(Bookie, Schema, Key, Document, Tenant, Version, Body) ->
+    seam_put_object(
+        Bookie,
+        Schema,
+        Key,
+        seam_object(Document, Tenant, Version, Body, Key)
+    ).
+
+seam_object(Document, Tenant, Version, Body, Key) ->
+    #{
         content => Body,
         tenant => Tenant,
         udi => Document,
         path => <<"/", Document/binary>>,
         ipath_vec => [<<"root">>, Document],
-        content_version => 1,
+        content_version => Version,
         chunk_key => Key
-    }),
+    }.
+
+seam_put_object(Bookie, Schema, Key, Object) ->
+    {ok, Specs} = leveled_fts:derive(Schema, Key, Object),
     leveled_bookie:book_mput(Bookie, Specs).
+
+seam_update_object(Bookie, Schema, Key, OldObject, NewObject) ->
+    {ok, Manifest} = leveled_bookie:book_headonly(
+        Bookie, maps:get(index, Schema), <<"doc">>, Key
+    ),
+    {ok, Specs} = leveled_fts:update(
+        Schema, Key, NewObject, {Manifest, OldObject}
+    ),
+    leveled_bookie:book_mput(Bookie, Specs).
+
+previous_manifest(
+    <<6, DocVersion:8/binary, DocId:64/unsigned-big, N:16/unsigned-big,
+        Rest/binary>>
+) ->
+    ShardBytes = N * 2,
+    <<ShardBin:ShardBytes/binary, DocLength:64/unsigned-big, BaseFlag:8,
+        BaseValue:64/unsigned-big, Fingerprint:32/binary,
+        BlockCount:32/unsigned-big, GroupBytes:32/unsigned-big,
+        _GroupDescriptor:GroupBytes/binary>> = Rest,
+    <<5, DocVersion/binary, DocId:64/unsigned-big, N:16/unsigned-big,
+        ShardBin/binary, DocLength:64/unsigned-big, BaseFlag:8,
+        BaseValue:64/unsigned-big, Fingerprint/binary,
+        BlockCount:32/unsigned-big>>.
+
+dirty_oracle_udis(#{hits := Hits}) ->
+    lists:sort([seam_hit_udi(Hit) || Hit <- Hits]).
+
+assert_dirty_clean_oracle(Dirty, Clean) ->
+    ?assertEqual(maps:get(count, Clean), maps:get(count, Dirty)),
+    DirtyHits = maps:get(hits, Dirty),
+    CleanHits = maps:get(hits, Clean),
+    ?assertEqual(length(CleanHits), length(DirtyHits)),
+    lists:foreach(
+        fun({DirtyHit, CleanHit}) ->
+            ?assertEqual(
+                dirty_oracle_hit_projection(CleanHit),
+                dirty_oracle_hit_projection(DirtyHit)
+            ),
+            ?assert(
+                abs(maps:get(score, CleanHit) - maps:get(score, DirtyHit)) =<
+                    1.0e-12
+            )
+        end,
+        lists:zip(DirtyHits, CleanHits)
+    ).
+
+assert_dirty_clean_oracle_count(Dirty, Clean) ->
+    ?assertEqual(maps:get(count, Clean), maps:get(count, Dirty)),
+    ?assertEqual(maps:get(count_kind, Clean), maps:get(count_kind, Dirty)),
+    ?assertEqual(
+        maps:get(facet_universal, Clean),
+        maps:get(facet_universal, Dirty)
+    ).
+
+dirty_oracle_hit_projection(Hit) ->
+    {
+        seam_hit_udi(Hit),
+        maps:get(candidate_key, Hit),
+        maps:get(doc_length, Hit),
+        maps:get(match_count, Hit),
+        maps:get(positions, Hit, []),
+        maps:get(matched_terms, Hit, [])
+    }.
 
 seam_hit_udi(Hit) ->
     maps:get(udi, maps:get(candidate_record, Hit)).
