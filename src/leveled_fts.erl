@@ -1208,7 +1208,9 @@ posting_read_groups(
                             limit => ?MAX_WINDOW,
                             offset => 0,
                             rank => none,
-                            return_positions => false
+                            return_positions => maps:get(
+                                return_positions, Opts0N, false
+                            )
                         },
                         client_posting_read_groups(
                             Bookie,
@@ -2048,7 +2050,9 @@ client_posting_read_groups(Bookie, Schema, AST, GroupRequests, Opts) ->
                     Opts#{
                         offset => 0,
                         limit => length(Resolved),
-                        return_positions => false,
+                        return_positions => maps:get(
+                            return_positions, Opts, false
+                        ),
                         page_only => true,
                         resolve_hits => false
                     },

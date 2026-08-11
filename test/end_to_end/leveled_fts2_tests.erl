@@ -1196,6 +1196,28 @@ grouped_boolean_uses_document_candidates() ->
             Main, Schema, <<"alpha AND beta">>, Opts
         ),
         ?assertEqual(2, maps:get(match_count, AndHit)),
+        GroupId = maps:get(group_id, AndHit),
+        GroupKey =
+            {group, [
+                <<"both">>, <<"/both">>, [<<"root">>, <<"both">>], 1
+            ]},
+        {ok, #{
+            hits := [PositionHit],
+            resolved_groups := [{GroupId, GroupId}]
+        }} = leveled_fts:posting_read_groups(
+            Main,
+            Schema,
+            <<"alpha AND beta">>,
+            [{GroupId, GroupKey}],
+            #{
+                columns => [content],
+                grouping => grouped,
+                resolve_hits => false,
+                return_positions => true
+            }
+        ),
+        ?assert(maps:is_key(positions, PositionHit)),
+        ?assert(maps:get(positions, PositionHit) =/= #{}),
         #{count := 2, hits := OrHits} = search(
             Main, Schema, <<"alpha OR beta">>, Opts
         ),
