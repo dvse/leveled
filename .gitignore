@@ -15,3 +15,4 @@ compile_commands.json
 elp
 current_counterexample.eqc
 __pycache__/
+rebar3.crashdump
